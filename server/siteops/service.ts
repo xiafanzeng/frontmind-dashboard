@@ -47,8 +47,9 @@ import {
   siteOpsAliyunDomainListSchema,
   siteOpsObserveInputSchema,
   siteOpsSendMessageInputSchema,
+  siteOpsVisualFailureCategorySchema,
   visualEvidenceV1Schema,
-  type SiteOpsNativeVisualFailureCategory,
+  type SiteOpsVisualFailureCategory,
   type SiteOpsActInput,
   type SiteBrief,
 } from "../../shared/siteops";
@@ -81,6 +82,7 @@ import {
 } from "../auth-service";
 import { getDb } from "../db";
 import { getServicePortal } from "../service-entitlement";
+import { getTwentyFirstCredentialStatus } from "../twenty-first-service";
 import { siteOpsProviderConfigured } from "./providers";
 import {
   AliyunProviderError,
@@ -770,6 +772,34 @@ function publicVisualMetadata(value: unknown) {
   };
 }
 
+const nativeTemplateSelectionMetadataSchema = z
+  .object({
+    schemaVersion: z.literal(6),
+    renderer: z.literal("twenty_first_native_template_v1"),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    framework: z.enum(["vite_react", "next_static"]),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceDirectory: z.literal("source"),
+    entrypoint: z.string().trim().min(1).max(240),
+  })
+  .passthrough();
+
+export function isNativeVisualSelectionMetadata(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    (record.schemaVersion === 5 &&
+      record.renderer === "twenty_first_native_react_v1") ||
+    nativeTemplateSelectionMetadataSchema.safeParse(record).success
+  );
+}
+
 export function freezeSiteOpsReferenceBlueprint(input: {
   sampleId: string;
   previewLocalAssetId?: string | null;
@@ -1145,13 +1175,61 @@ const TERMINAL_VISUAL_OPERATION_STATUSES = new Set([
 ]);
 
 type VisualOperationProjectionRow = {
+  id?: string;
   status: string;
   input?: unknown;
+  result?: unknown;
   errorCode?: string | null;
+  createdAt?: Date | string | number | null;
+  updatedAt?: Date | string | number | null;
+  startedAt?: Date | string | number | null;
+  completedAt?: Date | string | number | null;
 };
 
+function visualOperationAdmissionRevision(row: VisualOperationProjectionRow) {
+  const parsed = visualSearchOperationInputSchema.safeParse(row.input);
+  return parsed.success && "schemaVersion" in parsed.data
+    ? parsed.data.admissionRevision
+    : -1;
+}
+
+function visualOperationTimestamp(value: unknown) {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+/** MySQL timestamps are second-precision in the current schema. Admission
+ * revision is the monotonic visual-operation coordinate and therefore wins
+ * before timestamps when a fast failure is retried in the same second. */
+export function compareSiteOpsVisualOperationsNewestFirst(
+  left: VisualOperationProjectionRow,
+  right: VisualOperationProjectionRow,
+) {
+  const admissionDelta =
+    visualOperationAdmissionRevision(right) -
+    visualOperationAdmissionRevision(left);
+  if (admissionDelta !== 0) return admissionDelta;
+  for (const field of [
+    "updatedAt",
+    "completedAt",
+    "startedAt",
+    "createdAt",
+  ] as const) {
+    const delta =
+      visualOperationTimestamp(right[field]) -
+      visualOperationTimestamp(left[field]);
+    if (delta !== 0) return delta;
+  }
+  return String(right.id ?? "").localeCompare(String(left.id ?? ""));
+}
+
 const VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE: Readonly<
-  Record<string, SiteOpsNativeVisualFailureCategory>
+  Record<string, SiteOpsVisualFailureCategory>
 > = {
   NATIVE_SOURCE_QUOTA_UNAVAILABLE: "provider_quota",
   NATIVE_SOURCE_CONTRACT_UNAVAILABLE: "get_component_contract",
@@ -1164,15 +1242,33 @@ const VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE: Readonly<
   NATIVE_SOURCE_COMPILE_UNAVAILABLE: "compile_failed",
   NATIVE_SOURCE_BROWSER_UNAVAILABLE: "browser_unavailable",
   NATIVE_SOURCE_RENDER_UNAVAILABLE: "render_failed",
+  NATIVE_TEMPLATE_CATALOG_UNAVAILABLE: "catalog_unavailable",
+  NATIVE_TEMPLATE_ENTITLEMENT_REQUIRED: "entitlement_required",
+  NATIVE_TEMPLATE_DOWNLOAD_UNAVAILABLE: "download_failed",
+  NATIVE_TEMPLATE_DEPENDENCIES_UNAVAILABLE: "dependency_unsupported",
+  NATIVE_TEMPLATE_COMPILE_UNAVAILABLE: "compile_failed",
+  NATIVE_TEMPLATE_BROWSER_UNAVAILABLE: "browser_unavailable",
+  NATIVE_TEMPLATE_RENDER_UNAVAILABLE: "render_failed",
+  NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT: "insufficient_live_templates",
   VISUAL_SEARCH_DEADLINE_EXHAUSTED: "deadline_exhausted",
   VISUAL_SEARCH_TIMEOUT: "deadline_exhausted",
 };
 
 function projectNativeVisualFailureCategory(
-  errorCode: string | null | undefined,
+  operation: VisualOperationProjectionRow | null | undefined,
 ) {
-  return errorCode
-    ? (VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE[errorCode] ?? null)
+  const result =
+    operation?.result &&
+    typeof operation.result === "object" &&
+    !Array.isArray(operation.result)
+      ? (operation.result as Record<string, unknown>)
+      : null;
+  const recorded = siteOpsVisualFailureCategorySchema.safeParse(
+    result?.templateFailureCategory,
+  );
+  if (recorded.success) return recorded.data;
+  return operation?.errorCode
+    ? (VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE[operation.errorCode] ?? null)
     : null;
 }
 
@@ -1298,9 +1394,7 @@ export function projectSiteOpsVisualGeneration(input: {
         : ("supplemental" as const)
       : null,
     failureCategory: retryableError
-      ? projectNativeVisualFailureCategory(
-          input.latestVisualOperation?.errorCode,
-        )
+      ? projectNativeVisualFailureCategory(input.latestVisualOperation)
       : null,
     recoveredSelection,
   } as const;
@@ -1755,6 +1849,7 @@ async function projectObservation(
         startedAt: siteOperations.startedAt,
         completedAt: siteOperations.completedAt,
         createdAt: siteOperations.createdAt,
+        updatedAt: siteOperations.updatedAt,
       })
       .from(siteOperations)
       .where(
@@ -1880,9 +1975,9 @@ async function projectObservation(
     batches: publishedBatchRows,
     candidates: candidateRows,
   });
-  const visualOperationRows = timelineOperationRows.filter(
-    (row: { kind: string }) => row.kind === "visual_search",
-  );
+  const visualOperationRows = timelineOperationRows
+    .filter((row: { kind: string }) => row.kind === "visual_search")
+    .sort(compareSiteOpsVisualOperationsNewestFirst);
   const latestVisualOperation = visualOperationRows[0] ?? null;
   const activeVisualOperationRows = visualOperationRows.filter(
     (row: { status: string }) =>
@@ -2643,12 +2738,43 @@ export function parseSiteOpsActionPayload(
   }
 }
 
+type TwentyFirstTemplateAdmission = {
+  version: number;
+  fingerprint: string;
+};
+
+export function requireTwentyFirstTemplateAdmission(
+  status: Awaited<ReturnType<typeof getTwentyFirstCredentialStatus>>,
+): TwentyFirstTemplateAdmission {
+  if (
+    !status.configured ||
+    status.version === null ||
+    status.fingerprint === null ||
+    status.nativeTemplateReadiness !== "ready"
+  ) {
+    throw new SiteOpsServiceError(
+      "PROVIDER_NOT_CONFIGURED",
+      status.nativeTemplateReadiness === "plan_ineligible"
+        ? "当前 21st 账号没有完整 Template 下载权限，请联系 FrontMind 管理员更新。"
+        : status.nativeTemplateReadiness === "compiler_unavailable"
+          ? "完整 Template 构建环境尚未就绪，请联系 FrontMind 管理员处理。"
+          : "完整 Template 目录或下载权限尚未就绪，请联系 FrontMind 管理员更新。",
+      409,
+    );
+  }
+  return { version: status.version, fingerprint: status.fingerprint };
+}
+
 async function ensureActiveProviderCredential(
   tx: any,
   slot: "site_builder_21st",
 ) {
   const rows = await tx
-    .select()
+    .select({
+      id: presalesApiCredentials.id,
+      version: presalesApiCredentials.version,
+      fingerprint: presalesApiCredentials.fingerprint,
+    })
     .from(presalesApiCredentials)
     .where(
       and(
@@ -3186,9 +3312,6 @@ export function visualSearchAllowedForProjectStatus(
     reselect
       ? [
           "awaiting_visual_selection",
-          "preview_ready",
-          "approved",
-          "live",
           "visual_searching",
           "failed",
           "attention_required",
@@ -3207,6 +3330,7 @@ async function handleVisualSearch(
     requestHash: string;
     payload: Record<string, unknown>;
     reselect?: boolean;
+    expectedCredential?: TwentyFirstTemplateAdmission;
   },
 ) {
   if (
@@ -3226,6 +3350,28 @@ async function handleVisualSearch(
       "请先从当前企业知识库开始建站。",
       409,
     );
+  }
+  if (input.reselect) {
+    const existingBuilds = await tx
+      .select({ id: siteBuilds.id })
+      .from(siteBuilds)
+      .where(
+        and(
+          eq(siteBuilds.projectId, input.project.id),
+          eq(siteBuilds.userId, input.actor.id),
+          gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
+          notInArray(siteBuilds.status, ["cancelled", "superseded"]),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (existingBuilds[0]) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "当前周期已经生成官网版本；如需更换视觉方案，请先完成官网重制重置。",
+        409,
+      );
+    }
   }
   const currentPublishedBatches = await tx
     .select({ id: websiteStyleSampleBatches.id })
@@ -3301,6 +3447,17 @@ async function handleVisualSearch(
     tx,
     "site_builder_21st",
   );
+  if (
+    input.expectedCredential &&
+    (credential.version !== input.expectedCredential.version ||
+      credential.fingerprint !== input.expectedCredential.fingerprint)
+  ) {
+    throw new SiteOpsServiceError(
+      "CREDENTIAL_ROTATED",
+      "21st 完整 Template 连接已更新，请刷新后重试。",
+      409,
+    );
+  }
   const mode =
     currentPublishedBatches.length > 0
       ? ("supplemental" as const)
@@ -3449,7 +3606,15 @@ async function selectVisualSample(
   let recoveredSelection = false;
   if (input.project.status !== "awaiting_visual_selection") {
     const latestVisualRows = await tx
-      .select({ status: siteOperations.status })
+      .select({
+        id: siteOperations.id,
+        status: siteOperations.status,
+        input: siteOperations.input,
+        createdAt: siteOperations.createdAt,
+        updatedAt: siteOperations.updatedAt,
+        startedAt: siteOperations.startedAt,
+        completedAt: siteOperations.completedAt,
+      })
       .from(siteOperations)
       .where(
         and(
@@ -3460,8 +3625,11 @@ async function selectVisualSample(
         ),
       )
       .orderBy(desc(siteOperations.createdAt))
-      .limit(1)
+      .limit(10)
       .for("update");
+    const latestVisualOperation = [...latestVisualRows].sort(
+      compareSiteOpsVisualOperationsNewestFirst,
+    )[0];
     const publishedRows = await tx
       .select({ id: websiteStyleSampleBatches.id })
       .from(websiteStyleSampleBatches)
@@ -3501,7 +3669,7 @@ async function selectVisualSample(
     recoveredSelection = siteOpsVisualSelectionRecovery({
       projectStatus: input.project.status,
       completePublishedPages,
-      latestVisualOperationStatus: latestVisualRows[0]?.status ?? null,
+      latestVisualOperationStatus: latestVisualOperation?.status ?? null,
       hasActiveVisualOperation: false,
       hasActiveBuild: false,
       hasBuildAttempt: buildAttemptRows.length > 0,
@@ -3579,32 +3747,32 @@ async function selectVisualSample(
     string,
     unknown
   >;
-  const selectedEvidence = visualEvidenceV1Schema.safeParse(
-    selectedMetadata.visualEvidence,
-  );
-  if (
-    !selectedEvidence.success ||
-    selectedMetadata.providerItemKey !==
-      selectedEvidence.data.providerItemKey ||
-    createVisualEvidenceV1({
-      evidenceKind: selectedEvidence.data.evidenceKind,
-      providerItemKey: selectedEvidence.data.providerItemKey,
-      metadataSha256: selectedEvidence.data.metadataSha256,
-      providerResponseSha256: selectedEvidence.data.providerResponseSha256,
-      previewSha256: selectedEvidence.data.previewSha256,
-      taxonomyDerivationVersion:
-        selectedEvidence.data.taxonomyDerivationVersion,
-    }).evidenceSha256 !== selectedEvidence.data.evidenceSha256
-  ) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "所选视觉参考的冻结证据无法通过校验，请重新检索后选择。",
-      409,
+  const nativeVisual = isNativeVisualSelectionMetadata(selectedMetadataRecord);
+  if (!nativeVisual) {
+    const selectedEvidence = visualEvidenceV1Schema.safeParse(
+      selectedMetadata.visualEvidence,
     );
+    if (
+      !selectedEvidence.success ||
+      selectedMetadata.providerItemKey !==
+        selectedEvidence.data.providerItemKey ||
+      createVisualEvidenceV1({
+        evidenceKind: selectedEvidence.data.evidenceKind,
+        providerItemKey: selectedEvidence.data.providerItemKey,
+        metadataSha256: selectedEvidence.data.metadataSha256,
+        providerResponseSha256: selectedEvidence.data.providerResponseSha256,
+        previewSha256: selectedEvidence.data.previewSha256,
+        taxonomyDerivationVersion:
+          selectedEvidence.data.taxonomyDerivationVersion,
+      }).evidenceSha256 !== selectedEvidence.data.evidenceSha256
+    ) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "所选视觉参考的冻结证据无法通过校验，请重新检索后选择。",
+        409,
+      );
+    }
   }
-  const nativeVisual =
-    selectedMetadataRecord.schemaVersion === 5 &&
-    selectedMetadataRecord.renderer === "twenty_first_native_react_v1";
   const referenceBlueprint = nativeVisual
     ? null
     : freezeSiteOpsReferenceBlueprint({
@@ -3919,9 +4087,7 @@ async function handleRevision(
     string,
     unknown
   >;
-  const nativeVisual =
-    styleMetadata.schemaVersion === 5 &&
-    styleMetadata.renderer === "twenty_first_native_react_v1";
+  const nativeVisual = isNativeVisualSelectionMetadata(styleMetadata);
   const derivedReferenceBlueprint = nativeVisual
     ? null
     : freezeSiteOpsReferenceBlueprint({
@@ -4550,6 +4716,12 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
     input.input,
   ) as Record<string, unknown>;
   const requestHash = hashSiteOpsRequest({ action: input.action, payload });
+  const templateAdmission =
+    input.action === "start_visual_search" || input.action === "reselect_visual"
+      ? requireTwentyFirstTemplateAdmission(
+          await getTwentyFirstCredentialStatus(),
+        )
+      : undefined;
   const db = await requireDb();
   await db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
@@ -4652,13 +4824,18 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         });
         break;
       case "start_visual_search":
-        await handleVisualSearch(tx, { ...common, payload });
+        await handleVisualSearch(tx, {
+          ...common,
+          payload,
+          expectedCredential: templateAdmission,
+        });
         break;
       case "reselect_visual":
         await handleVisualSearch(tx, {
           ...common,
           payload,
           reselect: true,
+          expectedCredential: templateAdmission,
         });
         break;
       case "select_visual":

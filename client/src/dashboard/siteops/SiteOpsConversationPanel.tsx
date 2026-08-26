@@ -4,7 +4,10 @@ import type {
   SiteOpsObservationV1,
   SiteOpsPublicVisualCandidate,
 } from "@shared/siteops-contract";
-import type { SiteOpsActInput } from "@shared/siteops";
+import type {
+  SiteOpsActInput,
+  SiteOpsVisualFailureCategory,
+} from "@shared/siteops";
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import {
   AlertDialog,
@@ -403,6 +406,43 @@ function visualGenerationProgressPage(item: SiteOpsMessageProjection) {
   const numberedPage = item.content.match(/正在生成第\s*(\d+)\s*组/u);
   if (numberedPage) return Number(numberedPage[1]);
   return item.content.includes("正在生成 9 个视觉候选") ? 1 : null;
+}
+
+function visualGenerationFailureCopy(
+  category: SiteOpsVisualFailureCategory | null | undefined,
+  hasExistingCandidates: boolean,
+) {
+  const suffix = hasExistingCandidates
+    ? "当前候选仍可选择，也可稍后重试。"
+    : "建站资料已保留，可以直接重试，无需重置。";
+
+  const message = (() => {
+    switch (category) {
+      case "catalog_unavailable":
+        return "完整官网模板目录暂时不可用。";
+      case "entitlement_required":
+        return "完整官网模板下载权限需要 FrontMind 管理员更新。";
+      case "download_failed":
+        return "完整官网模板暂时无法下载。";
+      case "dependency_unsupported":
+        return "本次实时模板需要当前构建环境尚未支持的依赖。";
+      case "compile_failed":
+        return "本次实时模板未能完成安全编译。";
+      case "browser_unavailable":
+      case "render_failed":
+        return "本次实时模板暂时无法生成本地预览。";
+      case "deadline_exhausted":
+        return "本次实时模板生成超过安全时间限制。";
+      case "insufficient_live_templates":
+        return "本次实时目录未能凑齐 9 个可安全构建的完整官网模板。";
+      default:
+        return hasExistingCandidates
+          ? "本次未能生成完整的新一组。"
+          : "本次未能生成完整的 9 个视觉候选。";
+    }
+  })();
+
+  return `${message}${suffix}`;
 }
 
 function SiteOpsExecutionTimeline({
@@ -1430,8 +1470,10 @@ export default function SiteOpsConversationPanel({
               <div>
                 <h3 id="siteops-visual-retry-title">视觉候选生成未完成</h3>
                 <p>
-                  本次未能生成完整的 9
-                  个视觉候选，建站资料已保留，可以直接重试，无需重置。
+                  {visualGenerationFailureCopy(
+                    visualGeneration.failureCategory,
+                    false,
+                  )}
                 </p>
               </div>
             </div>
@@ -1522,7 +1564,10 @@ export default function SiteOpsConversationPanel({
             <div className="siteops-notice error" role="alert">
               <AlertCircle size={17} aria-hidden="true" />
               <span>
-                本次未能生成完整的新一组，当前候选仍可选择，也可稍后重试。
+                {visualGenerationFailureCopy(
+                  visualGeneration.failureCategory,
+                  true,
+                )}
               </span>
             </div>
           )}

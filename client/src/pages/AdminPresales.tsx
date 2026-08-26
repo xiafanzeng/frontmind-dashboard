@@ -59,6 +59,13 @@ type TwentyFirstCredentialStatus = CredentialStatus & {
     | "source_contract_incompatible"
     | "usage_unavailable"
     | "unverified";
+  nativeTemplateReadiness:
+    | "ready"
+    | "plan_ineligible"
+    | "catalog_unavailable"
+    | "download_unavailable"
+    | "compiler_unavailable"
+    | "unverified";
   capabilities: {
     search: boolean;
     getComponent: boolean;
@@ -96,6 +103,7 @@ const EMPTY_TWENTY_FIRST_STATUS: TwentyFirstCredentialStatus = {
   ...EMPTY_STATUS,
   revocationPending: false,
   nativeVisualReadiness: "unverified",
+  nativeTemplateReadiness: "unverified",
   capabilities: {
     search: false,
     getComponent: false,
@@ -343,16 +351,21 @@ export default function AdminPresales() {
               ...current,
               capabilities: connection.capabilities,
               nativeVisualReadiness: connection.nativeVisualReadiness,
+              nativeTemplateReadiness: connection.nativeTemplateReadiness,
             }
           : current,
       );
-      if (connection.nativeVisualReadiness !== "ready") {
+      if (connection.nativeTemplateReadiness !== "ready") {
         throw new Error(
-          connection.nativeVisualReadiness === "usage_unavailable"
-            ? "21st 原生源码读取额度当前不可用"
-            : connection.nativeVisualReadiness === "missing_get_component"
-              ? "当前连接缺少 get_component 能力"
-              : "21st 原生源码合同尚未通过验证",
+          connection.nativeTemplateReadiness === "plan_ineligible"
+            ? "当前 21st 账号没有完整 Template 下载权限"
+            : connection.nativeTemplateReadiness === "catalog_unavailable"
+              ? "21st 完整 Template 目录暂时不可用"
+              : connection.nativeTemplateReadiness === "download_unavailable"
+                ? "21st 完整 Template 下载暂时不可用"
+                : connection.nativeTemplateReadiness === "compiler_unavailable"
+                  ? "完整 Template 构建环境尚未就绪"
+                  : "21st 完整 Template 下载权限尚未通过验证",
         );
       }
       const latency = Math.max(1, Math.round(performance.now() - startedAt));
@@ -1094,8 +1107,9 @@ export default function AdminPresales() {
               AI建站（21st）
             </h2>
             <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-              21st 只用于检索视觉方向。连接验证仅执行 MCP 初始化和工具能力
-              查询，不调用生成、发布或付费工具，也不与官网任务积分混算。
+              21st 用于实时读取套餐内的完整官网 Template。连接验证只检查目录、
+              下载权限和本地构建准备状态，不调用
+              Manus、发布或客户任务，也不与官网任务积分混算。
             </p>
           </div>
 
@@ -1128,15 +1142,16 @@ export default function AdminPresales() {
                       21st MCP API Key
                     </CardTitle>
                     <p className="mt-1.5 text-sm text-muted-foreground">
-                      服务端固定连接 https://21st.dev/api/mcp，并要求 search 与
-                      get_component 两项建站能力。
+                      服务端固定连接 21st 官方接口，并验证完整 Template
+                      目录与下载权限； 新建站流程不再把 get_component
+                      的局部组件当作完整官网。
                     </p>
                   </div>
                   <Badge
                     variant="secondary"
                     className={
                       twentyFirstStatus.configured &&
-                      twentyFirstStatus.nativeVisualReadiness === "ready"
+                      twentyFirstStatus.nativeTemplateReadiness === "ready"
                         ? "border-emerald-200 bg-emerald-50 text-emerald-700"
                         : twentyFirstStatus.configured ||
                             twentyFirstStatus.revocationPending
@@ -1150,16 +1165,22 @@ export default function AdminPresales() {
                       <Activity className="mr-1 h-3.5 w-3.5" />
                     )}
                     {twentyFirstStatus.configured &&
-                    twentyFirstStatus.nativeVisualReadiness === "ready"
-                      ? "原生视觉已验证"
+                    twentyFirstStatus.nativeTemplateReadiness === "ready"
+                      ? "完整 Template 已验证"
                       : twentyFirstStatus.configured
-                        ? twentyFirstStatus.nativeVisualReadiness ===
-                          "usage_unavailable"
-                          ? "源码额度不可用"
-                          : twentyFirstStatus.nativeVisualReadiness ===
-                              "missing_get_component"
-                            ? "缺少源码读取能力"
-                            : "等待源码能力复验"
+                        ? twentyFirstStatus.nativeTemplateReadiness ===
+                          "plan_ineligible"
+                          ? "套餐无下载权限"
+                          : twentyFirstStatus.nativeTemplateReadiness ===
+                              "catalog_unavailable"
+                            ? "Template 目录不可用"
+                            : twentyFirstStatus.nativeTemplateReadiness ===
+                                "download_unavailable"
+                              ? "Template 下载不可用"
+                              : twentyFirstStatus.nativeTemplateReadiness ===
+                                  "compiler_unavailable"
+                                ? "模板构建环境未就绪"
+                                : "等待 Template 权限复验"
                         : twentyFirstStatus.revocationPending
                           ? "等待安全撤销"
                           : "等待配置"}
@@ -1304,13 +1325,13 @@ export default function AdminPresales() {
                       available={twentyFirstStatus.capabilities.search}
                     />
                     <CapabilityTile
-                      label="get_component"
+                      label="历史组件读取"
                       available={twentyFirstStatus.capabilities.getComponent}
                     />
                     <CapabilityTile
-                      label="原生源码可构建"
+                      label="完整 Template 下载"
                       available={
-                        twentyFirstStatus.nativeVisualReadiness === "ready"
+                        twentyFirstStatus.nativeTemplateReadiness === "ready"
                       }
                     />
                     <CapabilityTile

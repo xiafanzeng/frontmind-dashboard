@@ -29,6 +29,7 @@ import { siteBriefSchema, type SiteBrief } from "../../shared/siteops";
 import { canonicalJson } from "../../shared/siteops-workflow";
 import {
   NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
+  NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
   type ValidatedNativeReactSource,
 } from "./native-react-source";
 
@@ -307,6 +308,20 @@ function hostPackageRoot(name: string) {
     }
     throw new Error("HOST_PACKAGE_ROOT_NOT_FOUND");
   } catch {
+    // CSS-only packages can expose only the `style` condition and therefore
+    // have no CommonJS-resolvable entry. Their package root is still present
+    // in Node's fixed lookup paths and can be linked without running code.
+    for (const searchRoot of require.resolve.paths(name) ?? []) {
+      const candidate = path.join(searchRoot, name);
+      try {
+        const manifest = JSON.parse(
+          readFileSync(path.join(candidate, "package.json"), "utf8"),
+        ) as Record<string, unknown>;
+        if (manifest.name === name) return candidate;
+      } catch {
+        // Continue through the deterministic module search roots.
+      }
+    }
     throw new NativeReactBuildError("NATIVE_BUILD_DEPENDENCY_UNAVAILABLE", [
       { code: "HOST_PACKAGE_MISSING", file: null, line: null, column: null },
     ]);
@@ -358,8 +373,13 @@ function resolveHostModule(name: string) {
 function controlledViteBuilderSource(input: {
   viteModuleUrl: string;
   tailwindModuleUrl: string | null;
+  tailwindV3ModuleUrl: string | null;
+  tailwindAnimateModuleUrl: string | null;
+  autoprefixerModuleUrl: string | null;
+  tailwindV3Config: Record<string, unknown> | null;
   useTailwind: boolean;
   allowedDependencies: string[];
+  sourceAliasRoot: "." | "src";
 }) {
   return `
 import path from "node:path";
@@ -445,7 +465,23 @@ const safeDiagnostic = (error) => {
 try {
   const { build } = await import(${JSON.stringify(input.viteModuleUrl)});
   const plugins = [sourceBoundary];
-  if (${JSON.stringify(input.useTailwind)}) {
+  const postcssPlugins = [];
+  if (${JSON.stringify(Boolean(input.tailwindV3Config))}) {
+    const tailwindModule = await import(${JSON.stringify(input.tailwindV3ModuleUrl)});
+    const tailwind = tailwindModule.default ?? tailwindModule;
+    const config = ${JSON.stringify(input.tailwindV3Config)};
+    config.content = ["./index.html", "./src/**/*.{js,jsx,ts,tsx}", "./app/**/*.{js,jsx,ts,tsx}", "./pages/**/*.{js,jsx,ts,tsx}"];
+    if (Array.isArray(config.plugins) && config.plugins.includes("__frontmind_tailwindcss_animate__")) {
+      const animateModule = await import(${JSON.stringify(input.tailwindAnimateModuleUrl)});
+      config.plugins = [animateModule.default ?? animateModule];
+    } else {
+      config.plugins = [];
+    }
+    postcssPlugins.push(tailwind(config));
+    const autoprefixerModule = await import(${JSON.stringify(input.autoprefixerModuleUrl)});
+    const autoprefixer = autoprefixerModule.default ?? autoprefixerModule;
+    postcssPlugins.push(autoprefixer());
+  } else if (${JSON.stringify(input.useTailwind)}) {
     const tailwindModule = await import(${JSON.stringify(input.tailwindModuleUrl)});
     const tailwind = tailwindModule.default ?? tailwindModule;
     plugins.push(tailwind());
@@ -460,7 +496,10 @@ try {
     logLevel: "silent",
     clearScreen: false,
     resolve: {
-      alias: { "@": path.join(root, "src") },
+      alias: [
+        { find: "@/frontmind-next", replacement: path.join(root, "src/frontmind-next") },
+        { find: "@", replacement: path.join(root, ${JSON.stringify(input.sourceAliasRoot)}) },
+      ],
       dedupe: ["react", "react-dom"],
     },
     define: {
@@ -469,7 +508,7 @@ try {
       "global": "globalThis",
     },
     esbuild: { jsx: "automatic", jsxDev: false },
-    css: { postcss: { plugins: [] } },
+    css: { postcss: { plugins: postcssPlugins } },
     build: {
       outDir: path.join(root, "dist"),
       emptyOutDir: true,
@@ -511,6 +550,37 @@ function sourceUsesTailwind(files: ReadonlyMap<string, Buffer>) {
   return false;
 }
 
+function sourceTailwindV3Config(files: ReadonlyMap<string, Buffer>) {
+  const bytes = files.get(NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH);
+  if (!bytes) return null;
+  if (bytes.length < 1 || bytes.length > 128 * 1024) {
+    throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
+  }
+  try {
+    const parsed = z
+      .object({
+        schemaVersion: z.literal(1),
+        config: z.record(z.string(), z.unknown()),
+      })
+      .strict()
+      .parse(JSON.parse(bytes.toString("utf8")));
+    return parsed.config;
+  } catch {
+    throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
+  }
+}
+
+function sourceAliasRoot(files: ReadonlyMap<string, Buffer>): "." | "src" {
+  const paths = [...files.keys()];
+  const hasRootAliasTargets = paths.some((value) =>
+    /^(?:app|components|hooks|lib|pages)\//u.test(value),
+  );
+  const hasSrcAliasTargets = paths.some((value) =>
+    /^src\/(?:app|components|hooks|lib|pages)\//u.test(value),
+  );
+  return hasRootAliasTargets && !hasSrcAliasTargets ? "." : "src";
+}
+
 function parseBuildDiagnostics(output: Buffer) {
   const value = output.toString("utf8");
   const markerIndex = value.lastIndexOf(SAFE_BUILD_ERROR_MARKER);
@@ -544,9 +614,23 @@ async function runControlledViteBuild(input: {
 }) {
   assertNotAborted(input.abortSignal);
   const useTailwind = sourceUsesTailwind(input.source.files);
+  const tailwindV3Config = sourceTailwindV3Config(input.source.files);
   const viteModuleUrl = resolveHostModule("vite");
-  const tailwindModuleUrl = useTailwind
-    ? resolveHostModule("@tailwindcss/vite")
+  const tailwindModuleUrl =
+    useTailwind && !tailwindV3Config
+      ? resolveHostModule("@tailwindcss/vite")
+      : null;
+  const tailwindV3ModuleUrl = tailwindV3Config
+    ? resolveHostModule("tailwindcss-v3")
+    : null;
+  const tailwindAnimateModuleUrl =
+    tailwindV3Config &&
+    Array.isArray(tailwindV3Config.plugins) &&
+    tailwindV3Config.plugins.includes("__frontmind_tailwindcss_animate__")
+      ? resolveHostModule("tailwindcss-animate")
+      : null;
+  const autoprefixerModuleUrl = tailwindV3Config
+    ? resolveHostModule("autoprefixer")
     : null;
   const builder = path.join(input.root, ".frontmind-native-build.mjs");
   await writeFile(
@@ -554,8 +638,13 @@ async function runControlledViteBuild(input: {
     controlledViteBuilderSource({
       viteModuleUrl,
       tailwindModuleUrl,
+      tailwindV3ModuleUrl,
+      tailwindAnimateModuleUrl,
+      autoprefixerModuleUrl,
+      tailwindV3Config,
       useTailwind,
       allowedDependencies: input.dependencies,
+      sourceAliasRoot: sourceAliasRoot(input.source.files),
     }),
     { encoding: "utf8", mode: 0o600 },
   );

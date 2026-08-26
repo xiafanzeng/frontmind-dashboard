@@ -7,6 +7,7 @@ import { AuthServiceError } from "./auth-service";
 import { encryptPresalesApiKey } from "./presales-service";
 import {
   TwentyFirstClient,
+  TwentyFirstNativeTemplateError,
   TwentyFirstNativeSourceContractError,
   TwentyFirstToolContractError,
   TWENTY_FIRST_ACTIVE_OPERATION_STATUSES,
@@ -17,7 +18,9 @@ import {
   decryptTwentyFirstApiKey,
   encryptTwentyFirstApiKey,
   hasActiveTwentyFirstConsumers,
+  probeTwentyFirstTemplateCompilerEnvironment,
   projectTwentyFirstToolPayload,
+  projectTwentyFirstNativeTemplateSummaries,
   replaceTwentyFirstApiCredential,
   validateTwentyFirstApiKeyInput,
 } from "./twenty-first-service";
@@ -189,6 +192,140 @@ function createMcpFetch(tools: string[]) {
   });
 }
 
+function createTemplateMcpFetch(input: {
+  results?: Array<Record<string, unknown>>;
+  resultsBySearch?: Array<Array<Record<string, unknown>>>;
+  unlocked?: boolean;
+  verified?: boolean;
+  downloadVersion?: string | number;
+  omitDownloadVersion?: boolean;
+  downloadUrl?: string;
+  advertisePopular?: boolean;
+  advertiseTemplateType?: boolean;
+  purchaseStatus?: number;
+  includedWithPlan?: boolean;
+  purchaseAccess?: (slug: string) => {
+    isUnlocked: boolean;
+    verified: boolean;
+    includedWithPlan: boolean;
+  };
+}) {
+  const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+  const httpCalls: Array<{ url: string; authorization: string | null }> = [];
+  const fetchImpl = vi.fn(async (rawUrl: string | URL, init?: RequestInit) => {
+    const url = new URL(String(rawUrl));
+    if (url.pathname.startsWith("/api/templates/")) {
+      httpCalls.push({
+        url: url.toString(),
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      if (url.pathname.endsWith("/purchase")) {
+        if (input.purchaseStatus) {
+          return new Response("denied", { status: input.purchaseStatus });
+        }
+        const slug = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+        const access = input.purchaseAccess?.(slug);
+        return new Response(
+          JSON.stringify({
+            isUnlocked: access?.isUnlocked ?? input.unlocked ?? true,
+            verified: access?.verified ?? input.verified ?? true,
+            includedWithPlan:
+              access?.includedWithPlan ?? input.includedWithPlan ?? true,
+            name: "Verified starter",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          ...(!input.omitDownloadVersion
+            ? { version: input.downloadVersion ?? "7" }
+            : {}),
+          url: input.downloadUrl ?? "https://objects.example.test/site.zip",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    const body = JSON.parse(String(init?.body)) as {
+      id?: string | number;
+      method: string;
+      params?: { name: string; arguments: Record<string, unknown> };
+    };
+    if (body.method === "initialize") {
+      return jsonRpcResponse(body.id!, {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: {} },
+        serverInfo: { name: "21st-test", version: "1.0.0" },
+      });
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (body.method === "tools/list") {
+      return jsonRpcResponse(body.id!, {
+        tools: [
+          {
+            name: "search",
+            inputSchema: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+                type:
+                  input.advertiseTemplateType === false
+                    ? { type: "string" }
+                    : {
+                        type: "string",
+                        enum: ["component", "template"],
+                      },
+                limit: { type: "integer", minimum: 1, maximum: 18 },
+                sort: {
+                  type: "string",
+                  enum:
+                    input.advertisePopular === false
+                      ? ["recommended"]
+                      : ["recommended", "popular"],
+                },
+              },
+              required: ["query", "type"],
+            },
+          },
+          {
+            name: "get_component",
+            inputSchema: {
+              type: "object",
+              properties: { id: { type: "number" } },
+              required: ["id"],
+            },
+          },
+        ],
+      });
+    }
+    if (body.method === "tools/call" && body.params) {
+      calls.push(body.params);
+      const searchIndex = calls.filter((call) => call.name === "search").length;
+      return jsonRpcResponse(body.id!, {
+        structuredContent: {
+          results: input.resultsBySearch?.[searchIndex - 1] ??
+            input.results ?? [
+              {
+                id: 41,
+                slug: "verified-starter",
+                name: "Verified starter",
+                type: "template",
+                verified: true,
+                version: "7",
+              },
+            ],
+        },
+        content: [],
+        isError: false,
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname} ${body.method}`);
+  });
+  return { calls, httpCalls, fetchImpl };
+}
+
 function createNativeProbeFetch(input: {
   usageResult?: Record<string, unknown>;
   searchResult: Record<string, unknown>;
@@ -269,11 +406,16 @@ function createNativeProbeFetch(input: {
 }
 
 describe("TwentyFirstClient", () => {
-  it("discovers tools and performs one bounded native-source readiness probe", async () => {
-    const fetchImpl = createMcpFetch(["search", "get_component", "get_usage"]);
+  it("discovers tools and performs a bounded complete-Template readiness probe", async () => {
+    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({});
+    const templateBinaryFetch = vi.fn(async () =>
+      Uint8Array.from([0x50, 0x4b, 0x03, 0x04]),
+    );
     const result = await new TwentyFirstClient({
       fetchImpl: fetchImpl as unknown as typeof fetch,
       timeoutMs: 1_000,
+      templateBinaryFetch,
+      templateCompilerProbe: async () => true,
     }).inspectCapabilities("21st_sk_test_secret");
 
     expect(result).toMatchObject({
@@ -282,47 +424,58 @@ describe("TwentyFirstClient", () => {
       capabilities: {
         search: true,
         getComponent: true,
-        getUsage: true,
+        getUsage: false,
         getTheme: false,
       },
       nativeVisualReadiness: "ready",
+      nativeTemplateReadiness: "ready",
       server: { name: "21st-test", version: "1.0.0" },
     });
-    const methods = fetchImpl.mock.calls
-      .filter(([, init]) => init?.body !== undefined)
-      .map(([, init]) => JSON.parse(String(init?.body)).method);
-    expect(methods).toEqual([
-      "initialize",
-      "notifications/initialized",
-      "tools/list",
-      "tools/call",
-      "tools/call",
-      "tools/call",
-    ]);
-    const toolCalls = fetchImpl.mock.calls
-      .filter(([, init]) => {
-        if (init?.body === undefined) return false;
-        const body = JSON.parse(String(init?.body));
-        return body.method === "tools/call";
-      })
-      .map(([, init]) => JSON.parse(String(init?.body)).params);
-    expect(toolCalls).toEqual([
-      { name: "get_usage", arguments: {} },
-      {
-        name: "search",
-        arguments: {
-          query: "responsive enterprise landing page",
-          type: "component",
-          limit: 1,
-        },
-      },
-      { name: "get_component", arguments: { id: 143 } },
-    ]);
-    for (const [, init] of fetchImpl.mock.calls) {
-      expect(new Headers(init?.headers).get("x-api-key")).toBe(
-        "21st_sk_test_secret",
-      );
-    }
+    expect(calls).toHaveLength(1);
+    expect(
+      calls.every(
+        (call) =>
+          call.name === "search" &&
+          call.arguments.type === "template" &&
+          call.arguments.sort === "popular",
+      ),
+    ).toBe(true);
+    expect(calls.map((call) => call.name)).not.toContain("get_component");
+    expect(httpCalls).toHaveLength(2);
+    expect(
+      httpCalls.every(
+        (call) => call.authorization === "Bearer 21st_sk_test_secret",
+      ),
+    ).toBe(true);
+    expect(
+      httpCalls.every((call) => !call.url.includes("21st_sk_test_secret")),
+    ).toBe(true);
+    expect(templateBinaryFetch).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: "probe", maxBytes: 4_096 }),
+    );
+  });
+
+  it("validates the pinned CLI 1.16 compiler and Chromium environment", async () => {
+    await expect(probeTwentyFirstTemplateCompilerEnvironment()).resolves.toBe(
+      true,
+    );
+  });
+
+  it("reports compiler_unavailable after a valid Template ZIP probe", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({});
+    const templateBinaryFetch = vi.fn(async () =>
+      Uint8Array.from([0x50, 0x4b, 0x03, 0x04]),
+    );
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+        templateBinaryFetch,
+        templateCompilerProbe: async () => false,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({
+      nativeTemplateReadiness: "compiler_unavailable",
+    });
   });
 
   it("bounds capability discovery to three pages and one hundred tools", async () => {
@@ -437,14 +590,14 @@ describe("TwentyFirstClient", () => {
       capabilities: { search: true, getComponent: true },
       nativeVisualReadiness: "source_contract_incompatible",
     });
-    expect(
-      fetchImpl.mock.calls.some(([, init]) =>
-        String(init?.body).includes('"tools/call"'),
-      ),
-    ).toBe(false);
+    const calledTools = fetchImpl.mock.calls.flatMap(([, init]) => {
+      if (!String(init?.body).includes('"tools/call"')) return [];
+      return [JSON.parse(String(init?.body)).params?.name];
+    });
+    expect(calledTools).not.toContain("get_component");
   });
 
-  it("keeps an empty fixed-query catalog unverified without fabricating an ID", async () => {
+  it("reports a component-only search contract as Template catalog unavailable", async () => {
     const { calls, fetchImpl } = createNativeProbeFetch({
       searchResult: {
         structuredContent: { results: [] },
@@ -457,11 +610,14 @@ describe("TwentyFirstClient", () => {
         fetchImpl: fetchImpl as unknown as typeof fetch,
         timeoutMs: 1_000,
       }).inspectCapabilities("21st_sk_test_secret"),
-    ).resolves.toMatchObject({ nativeVisualReadiness: "unverified" });
-    expect(calls).toEqual(["get_usage", "search"]);
+    ).resolves.toMatchObject({
+      nativeVisualReadiness: "ready",
+      nativeTemplateReadiness: "catalog_unavailable",
+    });
+    expect(calls).toEqual([]);
   });
 
-  it("stops before source reads when structured usage explicitly reports exhaustion", async () => {
+  it("does not use component-code usage to decide Template entitlement", async () => {
     const { calls, fetchImpl } = createNativeProbeFetch({
       usageResult: {
         structuredContent: {
@@ -481,11 +637,14 @@ describe("TwentyFirstClient", () => {
         fetchImpl: fetchImpl as unknown as typeof fetch,
         timeoutMs: 1_000,
       }).inspectCapabilities("21st_sk_test_secret"),
-    ).resolves.toMatchObject({ nativeVisualReadiness: "usage_unavailable" });
-    expect(calls).toEqual(["get_usage"]);
+    ).resolves.toMatchObject({
+      nativeVisualReadiness: "ready",
+      nativeTemplateReadiness: "catalog_unavailable",
+    });
+    expect(calls).toEqual([]);
   });
 
-  it("classifies an explicitly locked source probe as usage unavailable", async () => {
+  it("does not call a locked get_component while probing Templates", async () => {
     const { calls, fetchImpl } = createNativeProbeFetch({
       searchResult: {
         structuredContent: { results: [{ id: 143 }] },
@@ -503,11 +662,14 @@ describe("TwentyFirstClient", () => {
         fetchImpl: fetchImpl as unknown as typeof fetch,
         timeoutMs: 1_000,
       }).inspectCapabilities("21st_sk_test_secret"),
-    ).resolves.toMatchObject({ nativeVisualReadiness: "usage_unavailable" });
-    expect(calls).toEqual(["get_usage", "search", "get_component"]);
+    ).resolves.toMatchObject({
+      nativeVisualReadiness: "ready",
+      nativeTemplateReadiness: "catalog_unavailable",
+    });
+    expect(calls).toEqual([]);
   });
 
-  it("classifies a changed successful source payload as contract incompatible", async () => {
+  it("ignores changed component payloads in the Template readiness path", async () => {
     const { fetchImpl } = createNativeProbeFetch({
       searchResult: {
         structuredContent: { results: [{ id: 143 }] },
@@ -526,11 +688,12 @@ describe("TwentyFirstClient", () => {
         timeoutMs: 1_000,
       }).inspectCapabilities("21st_sk_test_secret"),
     ).resolves.toMatchObject({
-      nativeVisualReadiness: "source_contract_incompatible",
+      nativeVisualReadiness: "ready",
+      nativeTemplateReadiness: "catalog_unavailable",
     });
   });
 
-  it("requires official source text to contain a bounded code block", async () => {
+  it("does not require component source code for complete Templates", async () => {
     const { fetchImpl } = createNativeProbeFetch({
       searchResult: {
         structuredContent: { results: [{ id: 143 }] },
@@ -549,7 +712,8 @@ describe("TwentyFirstClient", () => {
         timeoutMs: 1_000,
       }).inspectCapabilities("21st_sk_test_secret"),
     ).resolves.toMatchObject({
-      nativeVisualReadiness: "source_contract_incompatible",
+      nativeVisualReadiness: "ready",
+      nativeTemplateReadiness: "catalog_unavailable",
     });
   });
 
@@ -980,6 +1144,466 @@ describe("TwentyFirstClient", () => {
     });
   });
 
+  it("projects only explicit complete Template metadata", () => {
+    expect(
+      projectTwentyFirstNativeTemplateSummaries({
+        results: [
+          {
+            id: 7,
+            slug: "saas-starter",
+            name: "SaaS starter",
+            type: "template",
+            verified: true,
+            version: 3,
+          },
+          { id: 8, slug: "hero-card", type: "component" },
+          { id: 10, slug: "untyped-template-looking-result" },
+          { id: 9, name: "missing slug", type: "template" },
+        ],
+      }),
+    ).toEqual([
+      {
+        templateId: 7,
+        slug: "saas-starter",
+        name: "SaaS starter",
+        version: "3",
+        verified: true,
+        includedWithPlan: false,
+        sortRank: 0,
+      },
+    ]);
+  });
+
+  it("accepts an untyped coordinate only inside an explicitly Template-filtered search", () => {
+    const payload = {
+      results: [
+        {
+          id: 11,
+          slug: "official-template",
+          name: "Official template",
+          verified: true,
+        },
+        { id: 12, slug: "hero", type: "component", verified: true },
+      ],
+    };
+    expect(projectTwentyFirstNativeTemplateSummaries(payload)).toEqual([]);
+    expect(
+      projectTwentyFirstNativeTemplateSummaries(payload, 0, {
+        templateFilteredSearch: true,
+      }),
+    ).toEqual([
+      expect.objectContaining({
+        templateId: 11,
+        slug: "official-template",
+      }),
+    ]);
+  });
+
+  it("lists only provider-verified and account-unlocked Templates without calling get_component", async () => {
+    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
+      verified: true,
+      results: [
+        {
+          id: 41,
+          slug: "verified-starter",
+          name: "Verified starter",
+          type: "template",
+          verified: true,
+          version: "7",
+        },
+      ],
+    });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await expect(
+      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        templateId: 41,
+        slug: "verified-starter",
+        verified: true,
+        includedWithPlan: true,
+      }),
+    ]);
+    expect(calls).toHaveLength(1);
+    expect(
+      calls.every(
+        (call) =>
+          call.name === "search" &&
+          call.arguments.type === "template" &&
+          call.arguments.sort === "popular",
+      ),
+    ).toBe(true);
+    expect(calls.map((call) => call.name)).not.toContain("get_component");
+    expect(httpCalls).toHaveLength(1);
+  });
+
+  it("accepts an explicitly plan-included unlocked Template without inventing verification", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      verified: false,
+      includedWithPlan: true,
+      results: [
+        {
+          id: 41,
+          slug: "unverified-starter",
+          type: "template",
+          verified: false,
+        },
+      ],
+    });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await expect(
+      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        verified: false,
+        includedWithPlan: true,
+      }),
+    ]);
+  });
+
+  it("does not promote an unlocked unverified item without explicit plan inclusion", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      verified: false,
+      includedWithPlan: false,
+      results: [
+        {
+          id: 41,
+          slug: "unverified-starter",
+          type: "template",
+          verified: false,
+        },
+      ],
+    });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await expect(
+      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).rejects.toMatchObject({ category: "catalog_unavailable" });
+  });
+
+  it("does not equate an individually unlocked Template with plan inclusion", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      verified: true,
+      includedWithPlan: false,
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        verified: true,
+        includedWithPlan: false,
+      }),
+    ]);
+  });
+
+  it("requires tools/list to explicitly enumerate template/page search", async () => {
+    const { calls, fetchImpl } = createTemplateMcpFetch({
+      advertiseTemplateType: false,
+    });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await expect(
+      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).rejects.toMatchObject({ category: "catalog_unavailable" });
+    expect(calls).toEqual([]);
+  });
+
+  it("hard-caps discovery and stops progressive access checks at limit one", async () => {
+    const results = Array.from({ length: 70 }, (_, index) => ({
+      id: index + 1,
+      slug: `template-${index + 1}`,
+      type: "template",
+      verified: true,
+    }));
+    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({ results });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await expect(
+      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).resolves.toHaveLength(1);
+    expect(calls).toHaveLength(1);
+    expect(
+      httpCalls.filter((call) => call.url.endsWith("/purchase")),
+    ).toHaveLength(1);
+  });
+
+  it("discovers beyond locked popular results before returning thirty-two eligible Templates", async () => {
+    const resultsBySearch = Array.from({ length: 4 }, (_, queryIndex) =>
+      Array.from({ length: 18 }, (_, resultIndex) => {
+        const ordinal = queryIndex * 18 + resultIndex + 1;
+        return {
+          id: ordinal,
+          slug: `template-${ordinal}`,
+          type: "template",
+          verified: true,
+        };
+      }),
+    );
+    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
+      resultsBySearch,
+      purchaseAccess: (slug) => {
+        const ordinal = Number(slug.replace("template-", ""));
+        return {
+          isUnlocked: ordinal > 32,
+          verified: true,
+          includedWithPlan: ordinal > 32,
+        };
+      },
+    });
+
+    const templates = await new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    }).listNativeTemplates("21st_sk_test_secret", { limit: 32 });
+
+    expect(calls).toHaveLength(4);
+    expect(templates).toHaveLength(32);
+    expect(templates[0]).toMatchObject({
+      templateId: 33,
+      slug: "template-33",
+    });
+    expect(templates.at(-1)).toMatchObject({
+      templateId: 64,
+      slug: "template-64",
+    });
+    expect(
+      httpCalls.filter((call) => call.url.endsWith("/purchase")),
+    ).toHaveLength(64);
+  });
+
+  it("excludes prior Template IDs and slugs before spending entitlement reads", async () => {
+    const { httpCalls, fetchImpl } = createTemplateMcpFetch({
+      results: [
+        { id: 1, slug: "already-by-id", type: "template", verified: true },
+        { id: 2, slug: "already-by-slug", type: "template", verified: true },
+        { id: 3, slug: "fresh-template", type: "template", verified: true },
+      ],
+    });
+    const result = await new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    }).listNativeTemplates("21st_sk_test_secret", {
+      limit: 1,
+      excludeTemplateIds: ["1"],
+      excludeSlugs: ["already-by-slug"],
+    });
+    expect(result).toEqual([
+      expect.objectContaining({ templateId: 3, slug: "fresh-template" }),
+    ]);
+    expect(
+      httpCalls.filter((call) => call.url.endsWith("/purchase")),
+    ).toHaveLength(1);
+    expect(httpCalls[0]?.url).toContain("fresh-template");
+  });
+
+  it("classifies a Template entitlement 403 as plan_ineligible", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({ purchaseStatus: 403 });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await expect(
+      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).rejects.toMatchObject({ category: "plan_ineligible" });
+  });
+
+  it("classifies a Template endpoint 401 as an invalid credential", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({ purchaseStatus: 401 });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
+  });
+
+  it("omits popular sorting unless tools/list explicitly advertises it", async () => {
+    const { calls, fetchImpl } = createTemplateMcpFetch({
+      advertisePopular: false,
+    });
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await client.listNativeTemplates("21st_sk_test_secret", { limit: 1 });
+    expect(calls).toHaveLength(1);
+    expect(
+      calls.every(
+        (call) =>
+          call.name === "search" &&
+          call.arguments.type === "template" &&
+          !("sort" in call.arguments),
+      ),
+    ).toBe(true);
+  });
+
+  it("downloads a version-bound raw ZIP without putting the key in URLs", async () => {
+    const { httpCalls, fetchImpl } = createTemplateMcpFetch({});
+    const archive = Uint8Array.from([
+      0x50, 0x4b, 0x03, 0x04, 0x66, 0x72, 0x6f, 0x6e, 0x74,
+    ]);
+    const templateBinaryFetch = vi.fn(async () => archive);
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+      templateBinaryFetch,
+    });
+    const result = await client.downloadNativeTemplate("21st_sk_test_secret", {
+      templateId: 41,
+      slug: "verified-starter",
+      version: "7",
+    });
+    expect(result).toMatchObject({
+      templateId: 41,
+      slug: "verified-starter",
+      version: "7",
+      contentType: "application/zip",
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    expect(result.archive).toEqual(archive);
+    expect(templateBinaryFetch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mode: "full",
+        maxBytes: 50 * 1024 * 1024,
+      }),
+    );
+    expect(httpCalls).toHaveLength(2);
+    expect(
+      httpCalls.every((call) => !call.url.includes("21st_sk_test_secret")),
+    ).toBe(true);
+  });
+
+  it("reuses the bounded catalog entitlement proof during the same operation", async () => {
+    const { httpCalls, fetchImpl } = createTemplateMcpFetch({});
+    const archive = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x01]);
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+      templateBinaryFetch: vi.fn(async () => archive),
+    });
+    const listed = await client.listNativeTemplates("21st_sk_test_secret", {
+      limit: 1,
+    });
+    await client.downloadNativeTemplate("21st_sk_test_secret", {
+      templateId: listed[0]!.templateId,
+      slug: listed[0]!.slug,
+      version: listed[0]!.version,
+    });
+    expect(
+      httpCalls.filter((call) => call.url.endsWith("/purchase")),
+    ).toHaveLength(1);
+    expect(
+      httpCalls.filter((call) => call.url.includes("/download?json=1")),
+    ).toHaveLength(1);
+  });
+
+  it("rechecks verified or plan-included entitlement at the download boundary", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      verified: false,
+      includedWithPlan: false,
+    });
+    const templateBinaryFetch = vi.fn();
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+        templateBinaryFetch,
+      }).downloadNativeTemplate("21st_sk_test_secret", {
+        templateId: 41,
+        slug: "unverified-starter",
+        version: "7",
+      }),
+    ).rejects.toMatchObject({ category: "plan_ineligible" });
+    expect(templateBinaryFetch).not.toHaveBeenCalled();
+  });
+
+  it("requires an immutable provider version in the download descriptor", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({ omitDownloadVersion: true });
+    const templateBinaryFetch = vi.fn();
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+        templateBinaryFetch,
+      }).downloadNativeTemplate("21st_sk_test_secret", {
+        templateId: 41,
+        slug: "verified-starter",
+        version: "7",
+      }),
+    ).rejects.toMatchObject({ category: "download_unavailable" });
+    expect(templateBinaryFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a download descriptor that rotated away from the selected version", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({ downloadVersion: "8" });
+    const templateBinaryFetch = vi.fn();
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+        templateBinaryFetch,
+      }).downloadNativeTemplate("21st_sk_test_secret", {
+        templateId: 41,
+        slug: "verified-starter",
+        version: "7",
+      }),
+    ).rejects.toMatchObject({ category: "download_unavailable" });
+    expect(templateBinaryFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a successful download response that is not a ZIP archive", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({});
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+      templateBinaryFetch: vi.fn(async () =>
+        Uint8Array.from([0x7b, 0x7d, 0x0a]),
+      ),
+    });
+    await expect(
+      client.downloadNativeTemplate("21st_sk_test_secret", {
+        templateId: 41,
+        slug: "verified-starter",
+        version: "7",
+      }),
+    ).rejects.toMatchObject({ category: "download_unavailable" });
+  });
+
+  it("fails closed on an unsafe signed Template URL before fetching bytes", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      downloadUrl: "http://127.0.0.1/private.zip",
+    });
+    const templateBinaryFetch = vi.fn();
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+      templateBinaryFetch,
+    });
+    await expect(
+      client.downloadNativeTemplate("21st_sk_test_secret", {
+        templateId: 41,
+        slug: "verified-starter",
+        version: "7",
+      }),
+    ).rejects.toBeInstanceOf(TwentyFirstNativeTemplateError);
+    expect(templateBinaryFetch).not.toHaveBeenCalled();
+  });
+
   it("classifies locked, missing and unknown get_component responses without reflecting text", () => {
     for (const [structuredContent, nativeCode] of [
       [{ found: true, locked: true }, "NATIVE_SOURCE_QUOTA_UNAVAILABLE"],
@@ -1032,6 +1656,7 @@ describe("TwentyFirstClient", () => {
           getTheme: false,
         },
         nativeVisualReadiness: "missing_get_component",
+        nativeTemplateReadiness: "plan_ineligible",
         server: null,
       })),
     ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });

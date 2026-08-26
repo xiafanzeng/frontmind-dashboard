@@ -328,6 +328,37 @@ export type SiteOpsNativeVisualFailureCategory = z.infer<
   typeof siteOpsNativeVisualFailureCategorySchema
 >;
 
+/**
+ * Failures emitted by the complete-template visual workflow. Keep this
+ * separate from the V5 component-source categories so cached observations and
+ * immutable operation results remain readable during the rolling upgrade.
+ */
+export const siteOpsNativeTemplateFailureCategorySchema = z.enum([
+  "catalog_unavailable",
+  "entitlement_required",
+  "download_failed",
+  "dependency_unsupported",
+  "compile_failed",
+  "browser_unavailable",
+  "render_failed",
+  "deadline_exhausted",
+  "insufficient_live_templates",
+]);
+
+export type SiteOpsNativeTemplateFailureCategory = z.infer<
+  typeof siteOpsNativeTemplateFailureCategorySchema
+>;
+
+/** Rolling public compatibility across source-backed V5 and template V6. */
+export const siteOpsVisualFailureCategorySchema = z.union([
+  siteOpsNativeTemplateFailureCategorySchema,
+  siteOpsNativeVisualFailureCategorySchema,
+]);
+
+export type SiteOpsVisualFailureCategory = z.infer<
+  typeof siteOpsVisualFailureCategorySchema
+>;
+
 export const siteOpsCardSchema = z
   .object({
     kind: siteOpsCardKindSchema,
@@ -1195,8 +1226,154 @@ export const visualSelectionBundleV5Schema = z
     }
   });
 
-/** Immutable V1/V2/V3/V4 artifacts remain readable; workflow 2.5 writes V5. */
+const visualTemplateSourcePathSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(240)
+  // Next.js route groups are filesystem-only coordinates such as
+  // `src/app/(marketing)/page.tsx`; they do not create a URL segment. Keep
+  // parentheses confined to a complete, static route-group segment so
+  // dynamic, parallel and intercepting routes remain outside the contract.
+  .regex(
+    /^(?:[a-zA-Z0-9_.-]+|\([a-zA-Z0-9_-]+\))(?:\/(?:[a-zA-Z0-9_.-]+|\([a-zA-Z0-9_-]+\)))*$/u,
+  )
+  .refine(
+    (value) =>
+      !value.split("/").some((segment) => segment === "." || segment === ".."),
+    "Template source path cannot traverse directories",
+  );
+
+/**
+ * V6 stores only the immutable coordinates needed to bind a locally rendered
+ * preview to the exact complete 21st template source tree. Provider download
+ * URLs, license receipts and archives stay inside the server artifact
+ * boundary and are intentionally absent from the public/shared manifest.
+ */
+export const visualCandidateV6Schema = z
+  .object({
+    id: z.string().trim().min(1).max(191),
+    sampleId: z.string().trim().min(1).max(191),
+    label: z.string().regex(/^[A-I]$/u),
+    title: z.string().trim().min(1).max(300),
+    description: z.string().trim().min(1).max(300).nullable(),
+    author: z.string().trim().min(1).max(300).nullable(),
+    previewLocalAssetId: z.string().uuid(),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z
+      .string()
+      .trim()
+      .min(1)
+      .max(191)
+      .regex(/^[a-zA-Z0-9]+(?:[._\/-][a-zA-Z0-9]+)*$/u),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    framework: z.enum(["vite_react", "next_static"]),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchivePath: z.string().regex(/^candidates\/[A-I]\/source\.zip$/u),
+    sourceDirectory: visualTemplateSourcePathSchema,
+    entrypoint: visualTemplateSourcePathSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.id !== value.sampleId) {
+      context.addIssue({
+        code: "custom",
+        path: ["sampleId"],
+        message: "V6 sample ID must match the canonical candidate ID",
+      });
+    }
+    if (value.sourceArchivePath !== `candidates/${value.label}/source.zip`) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceArchivePath"],
+        message: "V6 source archive path does not match candidate label",
+      });
+    }
+  });
+
+export const visualSelectionBundleV6Schema = z
+  .object({
+    schemaVersion: z.literal(6),
+    renderer: z.literal("twenty_first_native_template_v1"),
+    queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    displayTarget: z.literal(9),
+    candidates: z.array(visualCandidateV6Schema).length(9),
+    selectedCandidateId: z.string().trim().min(1).max(191).nullable(),
+    delegated: z.boolean().default(false),
+    degradedReasons: z.array(z.string().max(500)).max(30).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const unique = (coordinates: string[], path: string) => {
+      if (new Set(coordinates).size !== coordinates.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates", path],
+          message: `V6 visual ${path} coordinates must be unique`,
+        });
+      }
+    };
+
+    unique(
+      value.candidates.map((candidate) => candidate.id),
+      "id",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sampleId),
+      "sampleId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.label),
+      "label",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.providerTemplateId),
+      "providerTemplateId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.providerSlug),
+      "providerSlug",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sourceTreeSha256),
+      "sourceTreeSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.previewSha256),
+      "previewSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.previewLocalAssetId),
+      "previewLocalAssetId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sourceArchiveSha256),
+      "sourceArchiveSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sourceArchivePath),
+      "sourceArchivePath",
+    );
+
+    if (
+      value.selectedCandidateId !== null &&
+      !value.candidates.some(
+        (candidate) => candidate.sampleId === value.selectedCandidateId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedCandidateId"],
+        message: "Selected V6 visual candidate is absent",
+      });
+    }
+  });
+
+/** Immutable V1-V5 artifacts remain readable; the template workflow writes V6. */
 export const visualSelectionBundleSchema = z.union([
+  visualSelectionBundleV6Schema,
   visualSelectionBundleV5Schema,
   visualSelectionBundleV4Schema,
   visualSelectionBundleV3Schema,
@@ -1347,6 +1524,9 @@ export type VisualSelectionBundleV4 = z.infer<
 >;
 export type VisualSelectionBundleV5 = z.infer<
   typeof visualSelectionBundleV5Schema
+>;
+export type VisualSelectionBundleV6 = z.infer<
+  typeof visualSelectionBundleV6Schema
 >;
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;

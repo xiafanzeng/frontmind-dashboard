@@ -28,7 +28,10 @@ describe("presalesUsageDisplayState", () => {
     expect(source).toContain("官网任务与积分");
     expect(source).toContain("AI建站（21st）");
     expect(source).toContain("search");
+    expect(source).toContain("完整 Template 下载");
+    expect(source).toContain("nativeTemplateReadiness");
     expect(source).toContain("get_component");
+    expect(source).toContain("局部组件当作完整官网");
     expect(source).toContain("不与官网任务积分混算");
     expect(source).toContain("域名与发布平台");
     expect(source).toContain("阿里云 OAuth 与 ESA 发布");
@@ -131,6 +134,19 @@ describe("presalesUsageDisplayState", () => {
     );
     expect(source).not.toContain("twentyFirst.replace.useMutation");
     expect(source).not.toContain("twentyFirst.test.useMutation");
+  });
+
+  it("gates the new visual workflow on complete Template readiness", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
+      "utf8",
+    );
+    expect(source).toContain('connection.nativeTemplateReadiness !== "ready"');
+    expect(source).toContain("完整 Template 已验证");
+    expect(source).toContain("当前 21st 账号没有完整 Template 下载权限");
+    expect(source).not.toContain(
+      'if (connection.nativeVisualReadiness !== "ready")',
+    );
   });
   it("keeps the locally recorded Website total visible without a Key pool snapshot", () => {
     expect(

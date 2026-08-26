@@ -361,8 +361,8 @@ describe("SiteOps worker claim boundary", () => {
       leaseMs: 12 * 60_000,
     });
     expect(siteOpsWorkerExecutionPolicy("visual_search")).toEqual({
-      timeoutMs: 6 * 60_000,
-      leaseMs: 8 * 60_000,
+      timeoutMs: 12 * 60_000,
+      leaseMs: 15 * 60_000,
     });
   });
 

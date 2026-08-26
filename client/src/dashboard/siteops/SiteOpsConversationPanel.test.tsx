@@ -188,7 +188,7 @@ describe("SiteOpsConversationPanel", () => {
     });
   });
 
-  it("accepts the public retry action and safe native-source failure category", () => {
+  it("accepts the public retry action and both V5 and V6 failure categories", () => {
     expect(
       siteOpsVisualGenerationProjectionSchema.parse({
         status: "retryable_error",
@@ -204,6 +204,35 @@ describe("SiteOpsConversationPanel", () => {
       retryAction: "start",
       failureCategory: "compile_failed",
     });
+
+    expect(
+      siteOpsVisualGenerationProjectionSchema.parse({
+        status: "retryable_error",
+        targetPage: null,
+        generatedPages: 0,
+        maxPages: 3,
+        canGenerateMore: true,
+        canSelectExisting: false,
+        retryAction: "start",
+        failureCategory: "catalog_unavailable",
+      }),
+    ).toMatchObject({
+      retryAction: "start",
+      failureCategory: "catalog_unavailable",
+    });
+
+    expect(
+      siteOpsVisualGenerationProjectionSchema.parse({
+        status: "retryable_error",
+        targetPage: null,
+        generatedPages: 0,
+        maxPages: 3,
+        canGenerateMore: true,
+        canSelectExisting: false,
+        retryAction: "start",
+        failureCategory: "source_incomplete",
+      }),
+    ).toMatchObject({ failureCategory: "source_incomplete" });
   });
 
   it("accepts observations monotonically by project revision then message sequence", () => {
@@ -715,7 +744,7 @@ describe("SiteOpsConversationPanel", () => {
             canGenerateMore: true,
             canSelectExisting: false,
             retryAction: "start",
-            failureCategory: "compile_failed",
+            failureCategory: "insufficient_live_templates",
           },
         })}
         onAction={onAction}
@@ -727,6 +756,9 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByRole("heading", { name: "视觉候选生成未完成" }),
     ).toBeInTheDocument();
     expect(screen.getByText(/无需重置/u)).toBeInTheDocument();
+    expect(
+      screen.getByText(/未能凑齐 9 个可安全构建的完整官网模板/u),
+    ).toBeInTheDocument();
     const retryButton = screen.getByRole("button", {
       name: "重新生成 9 个视觉候选",
     });

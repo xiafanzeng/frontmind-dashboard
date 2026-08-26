@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, hkdfSync, randomUUID } from "node:crypto";
 import { and, eq, max } from "drizzle-orm";
 import sharp from "sharp";
 import { z } from "zod";
@@ -36,9 +36,12 @@ import {
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
   visualSelectionBundleV4Schema,
   visualSelectionBundleV5Schema,
+  visualSelectionBundleV6Schema,
   type SiteBrief,
+  type SiteOpsNativeTemplateFailureCategory,
   type VisualSelectionBundleV4,
   type VisualSelectionBundleV5,
+  type VisualSelectionBundleV6,
 } from "../../shared/siteops";
 import {
   FRONTMIND_VISUAL_FAMILIES_V3,
@@ -52,8 +55,10 @@ import { AuthServiceError } from "../auth-service";
 import { getDb } from "../db";
 import {
   TwentyFirstClient,
+  TwentyFirstNativeTemplateError,
   TwentyFirstToolContractError,
   getTwentyFirstCredentialById,
+  type TwentyFirstNativeTemplateSummary,
   type TwentyFirstReadOnlySession,
 } from "../twenty-first-service";
 import { persistSiteOpsArtifact } from "./artifact-store";
@@ -61,11 +66,18 @@ import {
   SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
   VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
+  VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
+  VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE,
   assertTwentyFirstNativeSourcePayloadAvailable,
   createVisualSelectionBundleV5Artifact,
+  createVisualSelectionBundleV6Artifact,
+  classifyNativeTemplateRuntimeFailure,
   classifyNativeVisualFailure,
+  prepareNativeTemplateCandidate,
   prepareNativeVisualCandidate,
+  type NativeTemplateRuntimeFailureCategory,
   type NativeVisualFailureCategory,
+  type PreparedNativeTemplateCandidate,
   type PreparedNativeVisualCandidate,
 } from "./native-visual-source";
 import { registerSiteOpsProviderHandler } from "./providers";
@@ -99,6 +111,8 @@ export type TwentyFirstProviderContext = {
     perceptualHashes: string[];
     sourceTreeSha256s?: string[];
     nativePreviewSha256s?: string[];
+    providerTemplateIds?: string[];
+    providerTemplateSlugs?: string[];
   };
 };
 
@@ -166,7 +180,31 @@ type NativeBoardCandidate = {
   rationale: string;
 };
 
-type BoardCandidate = FrontMindBoardCandidate | NativeBoardCandidate;
+type NativeTemplateBoardCandidate = {
+  sampleId: string;
+  optionLabel: string;
+  providerTemplateId: string;
+  providerSlug: string;
+  providerVersion: string | null;
+  providerItemKey: string;
+  title: string;
+  description: string | null;
+  author: string | null;
+  previewLocalAssetId: string;
+  previewSha256: string;
+  previewPerceptualHash: string;
+  framework: PreparedNativeTemplateCandidate["framework"];
+  sourceTreeSha256: string;
+  sourceArchiveSha256: string;
+  sourceArchive: Buffer;
+  sourceDirectory: string;
+  entrypoint: string;
+};
+
+type BoardCandidate =
+  | FrontMindBoardCandidate
+  | NativeBoardCandidate
+  | NativeTemplateBoardCandidate;
 
 export type ResolvedVisualSearchPlan = {
   schemaVersion: 1 | 2;
@@ -221,6 +259,20 @@ export type VisualSearchDiagnostics = {
   sourcePrepared: number;
   sourceRejectedByReason: Partial<Record<NativeVisualFailureCategory, number>>;
   nativeFailureCategory: NativeVisualFailureCategory | null;
+  templateMode: boolean;
+  catalogCandidates: number;
+  templateDownloadAttempts: number;
+  templateDownloadsSucceeded: number;
+  dependencyResolutionAttempts: number;
+  compileAttempts: number;
+  compileSucceeded: number;
+  renderAttempts: number;
+  renderSucceeded: number;
+  publishedCount: number;
+  templateRejectedByReason: Partial<
+    Record<SiteOpsNativeTemplateFailureCategory, number>
+  >;
+  templateFailureCategory: SiteOpsNativeTemplateFailureCategory | null;
   terminalReason:
     | "complete"
     | "catalog_insufficient"
@@ -257,7 +309,10 @@ export type TwentyFirstBoardPersistenceInput = {
   operation: SiteOperation;
   searchPlan: ResolvedVisualSearchPlan;
   context: TwentyFirstProviderContext;
-  selectionBundle: VisualSelectionBundleV4 | VisualSelectionBundleV5;
+  selectionBundle:
+    | VisualSelectionBundleV4
+    | VisualSelectionBundleV5
+    | VisualSelectionBundleV6;
   selectionBundleArtifact: PreviewArtifact;
   mirroredCandidates: BoardCandidate[];
 };
@@ -269,10 +324,15 @@ export type TwentyFirstProviderDependencies = {
     operation: SiteOperation,
   ) => Promise<TwentyFirstProviderContext>;
   getCredential?: typeof getTwentyFirstCredentialById;
-  client?: Pick<TwentyFirstClient, "withReadOnlySession">;
+  client?: Pick<TwentyFirstClient, "withReadOnlySession"> &
+    Partial<
+      Pick<TwentyFirstClient, "listNativeTemplates" | "downloadNativeTemplate">
+    >;
   fetchPreview?: typeof fetchSafeVisualPreview;
   renderCandidates?: typeof renderTrustedVisualCandidatePreviews;
   prepareNativeCandidate?: typeof prepareNativeVisualCandidate;
+  prepareNativeTemplateCandidate?: typeof prepareNativeTemplateCandidate;
+  resolveNativeTemplateShuffleKey?: () => Buffer;
   persistArtifact?: typeof persistSiteOpsArtifact;
   persistBoard?: (
     db: any,
@@ -424,6 +484,18 @@ function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
     sourcePrepared: 0,
     sourceRejectedByReason: {},
     nativeFailureCategory: null,
+    templateMode: false,
+    catalogCandidates: 0,
+    templateDownloadAttempts: 0,
+    templateDownloadsSucceeded: 0,
+    dependencyResolutionAttempts: 0,
+    compileAttempts: 0,
+    compileSucceeded: 0,
+    renderAttempts: 0,
+    renderSucceeded: 0,
+    publishedCount: 0,
+    templateRejectedByReason: {},
+    templateFailureCategory: null,
     terminalReason: null,
     diversity: {
       summaryVersion: 1,
@@ -585,6 +657,124 @@ function nativeSourceProviderFailure(category: NativeVisualFailureCategory) {
     contract.message,
     "attention_required",
   );
+}
+
+const NATIVE_TEMPLATE_FAILURE_CONTRACT = {
+  catalog_unavailable: {
+    code: "NATIVE_TEMPLATE_CATALOG_UNAVAILABLE",
+    message: "21st 完整 Template 目录暂不可用，请稍后重试。",
+  },
+  entitlement_required: {
+    code: "NATIVE_TEMPLATE_ENTITLEMENT_REQUIRED",
+    message:
+      "当前 21st 账号缺少完整 Template 下载权限，请由 FrontMind 管理员更新。",
+  },
+  download_failed: {
+    code: "NATIVE_TEMPLATE_DOWNLOAD_UNAVAILABLE",
+    message: "21st 完整 Template 下载暂不可用，请稍后重试。",
+  },
+  dependency_unsupported: {
+    code: "NATIVE_TEMPLATE_DEPENDENCIES_UNAVAILABLE",
+    message: "本次完整 Template 使用了当前环境不支持的依赖，请稍后重试。",
+  },
+  compile_failed: {
+    code: "NATIVE_TEMPLATE_COMPILE_UNAVAILABLE",
+    message: "本次完整 Template 未能完成本地编译，请稍后重试。",
+  },
+  browser_unavailable: {
+    code: "NATIVE_TEMPLATE_BROWSER_UNAVAILABLE",
+    message: "完整 Template 预览浏览器当前不可用，请稍后重试。",
+  },
+  render_failed: {
+    code: "NATIVE_TEMPLATE_RENDER_UNAVAILABLE",
+    message: "完整 Template 预览暂未能安全生成，请稍后重试。",
+  },
+  deadline_exhausted: {
+    code: "VISUAL_SEARCH_DEADLINE_EXHAUSTED",
+    message: "本次完整 Template 候选处理已达到时间上限，请稍后重试。",
+  },
+  insufficient_live_templates: {
+    code: "NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT",
+    message:
+      "本次实时目录中未能凑齐 9 个可安全构建的完整 Template，请稍后重试。",
+  },
+} as const satisfies Record<
+  SiteOpsNativeTemplateFailureCategory,
+  { code: string; message: string }
+>;
+
+export function nativeTemplateProviderErrorCode(
+  category: SiteOpsNativeTemplateFailureCategory,
+) {
+  return NATIVE_TEMPLATE_FAILURE_CONTRACT[category].code;
+}
+
+function nativeTemplateProviderFailure(
+  category: SiteOpsNativeTemplateFailureCategory,
+) {
+  const contract = NATIVE_TEMPLATE_FAILURE_CONTRACT[category];
+  return new TwentyFirstProviderFailure(
+    contract.code,
+    contract.message,
+    "attention_required",
+  );
+}
+
+function rejectNativeTemplate(
+  diagnostics: VisualSearchDiagnostics,
+  category: SiteOpsNativeTemplateFailureCategory,
+) {
+  diagnostics.templateRejectedByReason[category] =
+    (diagnostics.templateRejectedByReason[category] ?? 0) + 1;
+  diagnostics.templateFailureCategory = category;
+}
+
+function publicTemplateRuntimeCategory(
+  category: NativeTemplateRuntimeFailureCategory,
+): SiteOpsNativeTemplateFailureCategory {
+  switch (category) {
+    case "download_failed":
+      return "download_failed";
+    case "dependency_unsupported":
+    case "source_unsafe":
+      return "dependency_unsupported";
+    case "compile_failed":
+      return "compile_failed";
+    case "browser_unavailable":
+      return "browser_unavailable";
+    case "render_failed":
+      return "render_failed";
+    case "deadline_exhausted":
+      return "deadline_exhausted";
+  }
+}
+
+function terminalNativeTemplateFailureCategory(
+  diagnostics: VisualSearchDiagnostics,
+  signal: AbortSignal,
+): SiteOpsNativeTemplateFailureCategory {
+  if (signal.aborted) return "deadline_exhausted";
+  const priority: readonly SiteOpsNativeTemplateFailureCategory[] = [
+    "deadline_exhausted",
+    "browser_unavailable",
+    "render_failed",
+    "dependency_unsupported",
+    "compile_failed",
+    "entitlement_required",
+    "download_failed",
+  ];
+  const ranked = priority
+    .map((category, priorityIndex) => ({
+      category,
+      priorityIndex,
+      count: diagnostics.templateRejectedByReason[category] ?? 0,
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort(
+      (left, right) =>
+        right.count - left.count || left.priorityIndex - right.priorityIndex,
+    );
+  return ranked[0]?.category ?? "insufficient_live_templates";
 }
 
 function cleanText(value: unknown, fallback: string, maxLength: number) {
@@ -838,9 +1028,11 @@ async function loadDefaultContext(
           : [],
       ),
       perceptualHashes: priorMetadata.flatMap((metadata) =>
-        typeof metadata.referencePerceptualHash === "string"
-          ? [metadata.referencePerceptualHash]
-          : [],
+        typeof metadata.previewPerceptualHash === "string"
+          ? [metadata.previewPerceptualHash]
+          : typeof metadata.referencePerceptualHash === "string"
+            ? [metadata.referencePerceptualHash]
+            : [],
       ),
       sourceTreeSha256s: priorMetadata.flatMap((metadata) =>
         typeof metadata.sourceTreeSha256 === "string"
@@ -848,9 +1040,20 @@ async function loadDefaultContext(
           : [],
       ),
       nativePreviewSha256s: priorMetadata.flatMap((metadata) =>
-        metadata.renderer === "twenty_first_native_react_v1" &&
+        (metadata.renderer === "twenty_first_native_react_v1" ||
+          metadata.renderer === "twenty_first_native_template_v1") &&
         typeof metadata.previewSha256 === "string"
           ? [metadata.previewSha256]
+          : [],
+      ),
+      providerTemplateIds: priorMetadata.flatMap((metadata) =>
+        typeof metadata.providerTemplateId === "string"
+          ? [metadata.providerTemplateId]
+          : [],
+      ),
+      providerTemplateSlugs: priorMetadata.flatMap((metadata) =>
+        typeof metadata.providerSlug === "string"
+          ? [metadata.providerSlug]
           : [],
       ),
     },
@@ -2444,53 +2647,83 @@ async function persistDefaultBoard(
         batchId,
         attachmentId: null,
         previewLocalAssetId: item.previewLocalAssetId,
-        sourceMetadata: {
-          ...("sourceTreeSha256" in item
+        sourceMetadata:
+          "providerTemplateId" in item
             ? {
-                schemaVersion: 5,
-                renderer: "twenty_first_native_react_v1" as const,
-                providerItemId: item.providerItemId,
+                schemaVersion: 6,
+                renderer: "twenty_first_native_template_v1" as const,
+                providerTemplateId: item.providerTemplateId,
+                providerSlug: item.providerSlug,
                 providerVersion: item.providerVersion,
+                providerItemKey: item.providerItemKey,
+                framework: item.framework,
                 sourceTreeSha256: item.sourceTreeSha256,
                 sourceArchiveSha256: item.sourceArchiveSha256,
+                sourceDirectory: item.sourceDirectory,
                 entrypoint: item.entrypoint,
-                demoEntrypoint: item.demoEntrypoint,
-                referencePreviewLocalAssetId: item.referencePreviewLocalAssetId,
-                referencePreviewSha256: item.referencePreviewSha256,
-                referencePerceptualHash: item.referencePerceptualHash,
                 previewSha256: item.previewSha256,
+                previewPerceptualHash: item.previewPerceptualHash,
+                title: item.title,
+                description: item.description,
+                author: item.author,
+                rationale:
+                  "该候选由对应完整 21st Template 源码本地构建；选择后使用同一份源码作为官网基线。",
               }
-            : {
-                heroFamily: item.referenceBlueprint.heroFamily,
-                heroEligibility: {
-                  eligible: true,
-                  confidence: "explicit",
-                  variant: legacyHeroVariantForFamily(
-                    item.referenceBlueprint.heroFamily,
-                  ),
-                  reasons: ["frontmind-trusted-react-family"],
+            : "sourceTreeSha256" in item
+              ? {
+                  schemaVersion: 5,
+                  renderer: "twenty_first_native_react_v1" as const,
+                  providerItemId: item.providerItemId,
+                  providerVersion: item.providerVersion,
+                  sourceTreeSha256: item.sourceTreeSha256,
+                  sourceArchiveSha256: item.sourceArchiveSha256,
+                  entrypoint: item.entrypoint,
+                  demoEntrypoint: item.demoEntrypoint,
+                  referencePreviewLocalAssetId:
+                    item.referencePreviewLocalAssetId,
+                  referencePreviewSha256: item.referencePreviewSha256,
+                  referencePerceptualHash: item.referencePerceptualHash,
+                  previewSha256: item.previewSha256,
+                  providerItemKey: item.providerItemKey,
+                  queryAxis: item.queryAxis,
+                  title: item.title,
+                  description: item.description,
+                  author: item.author,
+                  sourceUrl: item.sourceUrl,
+                  catalogRole: "hero",
+                  visualEvidence: item.visualEvidence,
+                  taxonomy: { ...item.taxonomy },
+                  score: item.score,
+                  rationale: item.rationale,
+                }
+              : {
+                  heroFamily: item.referenceBlueprint.heroFamily,
+                  heroEligibility: {
+                    eligible: true,
+                    confidence: "explicit",
+                    variant: legacyHeroVariantForFamily(
+                      item.referenceBlueprint.heroFamily,
+                    ),
+                    reasons: ["frontmind-trusted-react-family"],
+                  },
+                  referenceBlueprint: item.referenceBlueprint,
+                  realizationPreviewLocalAssetId:
+                    item.realizationPreviewLocalAssetId,
+                  realizationPreviewSha256: item.realizationPreviewSha256,
+                  referencePerceptualHash: item.referencePerceptualHash,
+                  realizationPerceptualHash: item.realizationPerceptualHash,
+                  providerItemKey: item.providerItemKey,
+                  queryAxis: item.queryAxis,
+                  title: item.title,
+                  description: item.description,
+                  author: item.author,
+                  sourceUrl: item.sourceUrl,
+                  catalogRole: "hero",
+                  visualEvidence: item.visualEvidence,
+                  taxonomy: { ...item.taxonomy },
+                  score: item.score,
+                  rationale: item.rationale,
                 },
-                referenceBlueprint: item.referenceBlueprint,
-                realizationPreviewLocalAssetId:
-                  item.realizationPreviewLocalAssetId,
-                realizationPreviewSha256: item.realizationPreviewSha256,
-                referencePerceptualHash: item.referencePerceptualHash,
-                realizationPerceptualHash: item.realizationPerceptualHash,
-              }),
-          providerItemKey: item.providerItemKey,
-          queryAxis: item.queryAxis,
-          title: item.title,
-          description: item.description,
-          author: item.author,
-          sourceUrl: item.sourceUrl,
-          catalogRole: "hero",
-          visualEvidence: item.visualEvidence,
-          taxonomy: {
-            ...item.taxonomy,
-          },
-          score: item.score,
-          rationale: item.rationale,
-        },
         label: item.optionLabel,
         note: item.title,
         sortOrder: index + 1,
@@ -2572,6 +2805,16 @@ function safeProviderFailure(
   diagnostics.exactEligibilityEdges = diagnostics.exactEligibilityEdgeCount;
   diagnostics.safeFallbackEdges = diagnostics.safeFallbackEdgeCount;
   if (signal.aborted || abortLike(error)) {
+    if (diagnostics.templateMode) {
+      diagnostics.templateFailureCategory = "deadline_exhausted";
+      return {
+        status: "attention_required",
+        code: "VISUAL_SEARCH_DEADLINE_EXHAUSTED",
+        message:
+          "本次完整 Template 候选处理已达到时间上限；当前知识库和建站资料已保留，可直接重试。",
+        result: diagnostics,
+      };
+    }
     return {
       status: "failed",
       code: "VISUAL_SEARCH_TIMEOUT",
@@ -2693,6 +2936,550 @@ async function mapWithBoundedConcurrency<T, R>(input: {
   return results;
 }
 
+const NATIVE_TEMPLATE_CATALOG_LIMIT = 32;
+const NATIVE_TEMPLATE_BATCH_CONCURRENCY = 3;
+const NATIVE_TEMPLATE_CATALOG_TIMEOUT_MS = 45_000;
+const NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS = 30_000;
+const NATIVE_TEMPLATE_PREPARE_TIMEOUT_MS = 120_000;
+const NATIVE_TEMPLATE_SHUFFLE_SALT = Buffer.from(
+  "frontmind-siteops-native-template-shuffle-salt-v1",
+  "utf8",
+);
+const NATIVE_TEMPLATE_SHUFFLE_INFO = Buffer.from(
+  "frontmind-siteops-native-template-shuffle-key-v1",
+  "utf8",
+);
+
+export function deriveNativeTemplateShuffleKey(encodedMasterKey: string) {
+  const trimmed = encodedMasterKey.trim();
+  const masterKey = trimmed.startsWith("base64:")
+    ? Buffer.from(trimmed.slice(7), "base64")
+    : trimmed.startsWith("hex:")
+      ? Buffer.from(trimmed.slice(4), "hex")
+      : /^[a-f\d]{64}$/iu.test(trimmed)
+        ? Buffer.from(trimmed, "hex")
+        : Buffer.from(trimmed, "base64");
+  if (masterKey.length !== 32) {
+    throw new AuthServiceError(
+      "INVALID_MASTER_KEY",
+      "完整 Template 随机排序服务配置不可用",
+    );
+  }
+  return Buffer.from(
+    hkdfSync(
+      "sha256",
+      masterKey,
+      NATIVE_TEMPLATE_SHUFFLE_SALT,
+      NATIVE_TEMPLATE_SHUFFLE_INFO,
+      32,
+    ),
+  );
+}
+
+function resolveNativeTemplateShuffleKey() {
+  const configured = process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY?.trim();
+  if (!configured) {
+    throw new AuthServiceError(
+      "INVALID_MASTER_KEY",
+      "完整 Template 随机排序服务配置不可用",
+    );
+  }
+  return deriveNativeTemplateShuffleKey(configured);
+}
+
+function nativeTemplateProviderKey(
+  template: Pick<TwentyFirstNativeTemplateSummary, "templateId" | "slug">,
+) {
+  return `t:${String(template.templateId)}:${template.slug}`;
+}
+
+function deterministicallyShuffleTemplates(input: {
+  templates: readonly TwentyFirstNativeTemplateSummary[];
+  hmacKey: Buffer;
+  projectId: string;
+  operationId: string;
+  page: 1 | 2 | 3;
+  attempt: number;
+}) {
+  const domain = `frontmind:siteops:21st-template-v6:${input.projectId}:${input.operationId}:${input.page}:${input.attempt}`;
+  return input.templates
+    .map((template, providerIndex) => ({
+      template,
+      providerIndex,
+      rank: createHmac("sha256", input.hmacKey)
+        .update(domain)
+        .update("\0")
+        .update(String(template.templateId))
+        .update("\0")
+        .update(template.slug)
+        .update("\0")
+        .update(template.version ?? "")
+        .digest("hex"),
+    }))
+    .sort(
+      (left, right) =>
+        left.rank.localeCompare(right.rank) ||
+        left.providerIndex - right.providerIndex,
+    )
+    .map(({ template }) => template);
+}
+
+function logSafeNativeTemplateStage(input: {
+  event:
+    | "template_catalog"
+    | "template_download"
+    | "template_build"
+    | "template_page_published";
+  operationId: string;
+  projectId: string;
+  page: 1 | 2 | 3;
+  diagnostics: VisualSearchDiagnostics;
+  latencyMs: number;
+}) {
+  console.info("[SiteOps21st] native_template_stage", {
+    event: input.event,
+    operationId: input.operationId,
+    projectId: input.projectId,
+    page: input.page,
+    catalogCandidates: input.diagnostics.catalogCandidates,
+    templateDownloadAttempts: input.diagnostics.templateDownloadAttempts,
+    templateDownloadsSucceeded: input.diagnostics.templateDownloadsSucceeded,
+    dependencyResolutionAttempts:
+      input.diagnostics.dependencyResolutionAttempts,
+    compileAttempts: input.diagnostics.compileAttempts,
+    compileSucceeded: input.diagnostics.compileSucceeded,
+    renderAttempts: input.diagnostics.renderAttempts,
+    renderSucceeded: input.diagnostics.renderSucceeded,
+    publishedCount: input.diagnostics.publishedCount,
+    failureCategory: input.diagnostics.templateFailureCategory,
+    failureCounts: input.diagnostics.templateRejectedByReason,
+    latencyMs: Math.max(0, Math.trunc(input.latencyMs)),
+  });
+}
+
+function templateCatalogFailure(error: unknown) {
+  if (error instanceof TwentyFirstNativeTemplateError) {
+    if (error.category === "plan_ineligible") return "entitlement_required";
+    if (error.category === "download_unavailable") return "download_failed";
+  }
+  return "catalog_unavailable";
+}
+
+function templateDownloadFailure(error: unknown) {
+  if (
+    error instanceof TwentyFirstNativeTemplateError &&
+    error.category === "plan_ineligible"
+  ) {
+    return "entitlement_required" as const;
+  }
+  return "download_failed" as const;
+}
+
+async function runNativeTemplateVisualSearch(input: {
+  operation: SiteOperation;
+  signal: AbortSignal;
+  assertLeaseActive?: () => Promise<void>;
+  client: Pick<
+    TwentyFirstClient,
+    "listNativeTemplates" | "downloadNativeTemplate"
+  >;
+  apiKey: string;
+  context: TwentyFirstProviderContext;
+  searchPlan: ResolvedVisualSearchPlan;
+  diagnostics: VisualSearchDiagnostics;
+  prepareCandidate: typeof prepareNativeTemplateCandidate;
+  shuffleKey: Buffer;
+  fetchPreview: typeof fetchSafeVisualPreview;
+  persistArtifact: typeof persistSiteOpsArtifact;
+  persistBoard: (
+    db: any,
+    input: TwentyFirstBoardPersistenceInput,
+  ) => Promise<ExistingBoard>;
+  db: any;
+}) {
+  const startedAt = Date.now();
+  input.diagnostics.templateMode = true;
+  const priorProviderKeys = new Set(
+    input.context.previousReferences?.providerItemKeys ?? [],
+  );
+  const priorTemplateIds = new Set(
+    input.context.previousReferences?.providerTemplateIds ?? [],
+  );
+  const priorTemplateSlugs = new Set(
+    input.context.previousReferences?.providerTemplateSlugs ?? [],
+  );
+  const priorSourceTrees = new Set(
+    input.context.previousReferences?.sourceTreeSha256s ?? [],
+  );
+  const priorPreviewHashes = new Set(
+    input.context.previousReferences?.nativePreviewSha256s ?? [],
+  );
+  const priorPerceptualHashes = new Set(
+    input.context.previousReferences?.perceptualHashes ?? [],
+  );
+
+  let catalog: TwentyFirstNativeTemplateSummary[];
+  try {
+    const catalogSignal = AbortSignal.any([
+      input.signal,
+      AbortSignal.timeout(NATIVE_TEMPLATE_CATALOG_TIMEOUT_MS),
+    ]);
+    catalog = await input.client.listNativeTemplates(input.apiKey, {
+      limit: NATIVE_TEMPLATE_CATALOG_LIMIT,
+      signal: catalogSignal,
+      excludeTemplateIds: [...priorTemplateIds],
+      excludeSlugs: [...priorTemplateSlugs],
+    });
+  } catch (error) {
+    const category = input.signal.aborted
+      ? "deadline_exhausted"
+      : templateCatalogFailure(error);
+    rejectNativeTemplate(input.diagnostics, category);
+    throw nativeTemplateProviderFailure(category);
+  }
+
+  const uniqueCatalog = new Map<string, TwentyFirstNativeTemplateSummary>();
+  const catalogTemplateIds = new Set<string>();
+  const catalogSlugs = new Set<string>();
+  for (const template of catalog) {
+    if (!template.verified && !template.includedWithPlan) continue;
+    const key = nativeTemplateProviderKey(template);
+    const templateId = String(template.templateId);
+    if (
+      priorProviderKeys.has(key) ||
+      priorTemplateIds.has(templateId) ||
+      priorTemplateSlugs.has(template.slug) ||
+      uniqueCatalog.has(key) ||
+      catalogTemplateIds.has(templateId) ||
+      catalogSlugs.has(template.slug)
+    ) {
+      continue;
+    }
+    catalogTemplateIds.add(templateId);
+    catalogSlugs.add(template.slug);
+    uniqueCatalog.set(key, template);
+  }
+  const catalogWindow = [...uniqueCatalog.values()].slice(
+    0,
+    NATIVE_TEMPLATE_CATALOG_LIMIT,
+  );
+  input.diagnostics.catalogCandidates = catalogWindow.length;
+  logSafeNativeTemplateStage({
+    event: "template_catalog",
+    operationId: input.operation.id,
+    projectId: input.operation.projectId,
+    page: input.searchPlan.page,
+    diagnostics: input.diagnostics,
+    latencyMs: Date.now() - startedAt,
+  });
+  if (catalogWindow.length < SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE) {
+    rejectNativeTemplate(input.diagnostics, "insufficient_live_templates");
+    throw nativeTemplateProviderFailure("insufficient_live_templates");
+  }
+
+  const ordered = deterministicallyShuffleTemplates({
+    templates: catalogWindow,
+    hmacKey: input.shuffleKey,
+    projectId: input.context.project.id,
+    operationId: input.operation.id,
+    page: input.searchPlan.page,
+    attempt: input.operation.attempt,
+  });
+  const accepted: Array<{
+    summary: TwentyFirstNativeTemplateSummary;
+    prepared: PreparedNativeTemplateCandidate;
+    perceptualHash: string;
+  }> = [];
+  const acceptedProviderKeys = new Set<string>();
+  const acceptedSourceTrees = new Set(priorSourceTrees);
+  const acceptedPreviewHashes = new Set(priorPreviewHashes);
+  const acceptedPerceptualHashes = new Set(priorPerceptualHashes);
+  let acceptedArchiveBytes = 0;
+
+  for (
+    let offset = 0;
+    offset < ordered.length &&
+    accepted.length < SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+    offset += NATIVE_TEMPLATE_BATCH_CONCURRENCY
+  ) {
+    if (input.signal.aborted) {
+      rejectNativeTemplate(input.diagnostics, "deadline_exhausted");
+      throw nativeTemplateProviderFailure("deadline_exhausted");
+    }
+    await assertCommitLeaseActive(input.assertLeaseActive);
+    const batch = ordered.slice(
+      offset,
+      offset + NATIVE_TEMPLATE_BATCH_CONCURRENCY,
+    );
+    const results = await Promise.all(
+      batch.map(async (summary) => {
+        input.diagnostics.templateDownloadAttempts += 1;
+        let archive;
+        try {
+          archive = await input.client.downloadNativeTemplate(input.apiKey, {
+            templateId: summary.templateId,
+            slug: summary.slug,
+            version: summary.version,
+            signal: AbortSignal.any([
+              input.signal,
+              AbortSignal.timeout(NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS),
+            ]),
+          });
+          input.diagnostics.templateDownloadsSucceeded += 1;
+        } catch (error) {
+          const category = input.signal.aborted
+            ? "deadline_exhausted"
+            : templateDownloadFailure(error);
+          rejectNativeTemplate(input.diagnostics, category);
+          return null;
+        }
+
+        input.diagnostics.dependencyResolutionAttempts += 1;
+        input.diagnostics.compileAttempts += 1;
+        input.diagnostics.renderAttempts += 1;
+        try {
+          const prepared = await input.prepareCandidate({
+            templateId: archive.templateId,
+            slug: archive.slug,
+            version: archive.version,
+            archive: archive.archive,
+            expectedArchiveSha256: archive.sha256,
+            signal: AbortSignal.any([
+              input.signal,
+              AbortSignal.timeout(NATIVE_TEMPLATE_PREPARE_TIMEOUT_MS),
+            ]),
+            fetchRemoteAsset: input.fetchPreview,
+          });
+          input.diagnostics.compileSucceeded += 1;
+          const perceptualHash = await perceptualHash64(prepared.preview);
+          input.diagnostics.renderSucceeded += 1;
+          return { summary, prepared, perceptualHash };
+        } catch (error) {
+          const runtimeCategory = input.signal.aborted
+            ? "deadline_exhausted"
+            : classifyNativeTemplateRuntimeFailure(error);
+          rejectNativeTemplate(
+            input.diagnostics,
+            publicTemplateRuntimeCategory(runtimeCategory),
+          );
+          return null;
+        }
+      }),
+    );
+    for (const result of results) {
+      if (!result) continue;
+      const providerKey = nativeTemplateProviderKey(result.summary);
+      if (
+        acceptedProviderKeys.has(providerKey) ||
+        acceptedSourceTrees.has(result.prepared.sourceTreeSha256) ||
+        acceptedPreviewHashes.has(result.prepared.previewSha256) ||
+        acceptedArchiveBytes + result.prepared.sourceArchive.length >
+          VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES - 1024 * 1024 ||
+        [...acceptedPerceptualHashes].some(
+          (hash) => perceptualHashDistance(hash, result.perceptualHash) < 6,
+        )
+      ) {
+        continue;
+      }
+      acceptedProviderKeys.add(providerKey);
+      acceptedSourceTrees.add(result.prepared.sourceTreeSha256);
+      acceptedPreviewHashes.add(result.prepared.previewSha256);
+      acceptedPerceptualHashes.add(result.perceptualHash);
+      acceptedArchiveBytes += result.prepared.sourceArchive.length;
+      accepted.push(result);
+      if (accepted.length === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE) break;
+    }
+  }
+
+  logSafeNativeTemplateStage({
+    event: "template_download",
+    operationId: input.operation.id,
+    projectId: input.operation.projectId,
+    page: input.searchPlan.page,
+    diagnostics: input.diagnostics,
+    latencyMs: Date.now() - startedAt,
+  });
+  logSafeNativeTemplateStage({
+    event: "template_build",
+    operationId: input.operation.id,
+    projectId: input.operation.projectId,
+    page: input.searchPlan.page,
+    diagnostics: input.diagnostics,
+    latencyMs: Date.now() - startedAt,
+  });
+  if (accepted.length !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE) {
+    const category = terminalNativeTemplateFailureCategory(
+      input.diagnostics,
+      input.signal,
+    );
+    // Every attempted template is already counted at its rejection boundary.
+    // Preserve the actual terminal cause without inventing one more rejection.
+    input.diagnostics.templateFailureCategory = category;
+    throw nativeTemplateProviderFailure(category);
+  }
+
+  await assertCommitLeaseActive(input.assertLeaseActive);
+  const nativeCandidates: NativeTemplateBoardCandidate[] = [];
+  for (let index = 0; index < accepted.length; index += 1) {
+    const { summary, prepared, perceptualHash } = accepted[index]!;
+    const sampleId = randomUUID();
+    const optionLabel = String.fromCharCode(65 + index);
+    const previewAsset = await input.persistArtifact({
+      userId: input.operation.userId,
+      projectId: input.context.project.id,
+      kind: "21st-native-template-preview",
+      filename: `21st-template-${optionLabel.toLowerCase()}.png`,
+      mimeType: "image/png",
+      buffer: prepared.preview,
+      maxBytes: 5 * 1024 * 1024,
+    });
+    if (previewAsset.contentSha256 !== prepared.previewSha256) {
+      throw new TwentyFirstProviderFailure(
+        "NATIVE_TEMPLATE_PREVIEW_HASH_MISMATCH",
+        "完整 Template 预览写入校验失败。",
+        "attention_required",
+      );
+    }
+    nativeCandidates.push({
+      sampleId,
+      optionLabel,
+      providerTemplateId: String(summary.templateId),
+      providerSlug: summary.slug,
+      providerVersion: prepared.providerVersion,
+      providerItemKey: prepared.providerItemKey,
+      title: cleanText(summary.name, `Template ${optionLabel}`, 300),
+      description: null,
+      author: null,
+      previewLocalAssetId: previewAsset.id,
+      previewSha256: prepared.previewSha256,
+      previewPerceptualHash: perceptualHash,
+      framework: prepared.framework,
+      sourceTreeSha256: prepared.sourceTreeSha256,
+      sourceArchiveSha256: prepared.sourceArchiveSha256,
+      sourceArchive: prepared.sourceArchive,
+      sourceDirectory: prepared.sourceDirectory,
+      entrypoint: prepared.entrypoint,
+    });
+  }
+
+  const queryPlanHash = canonicalSha256({
+    schemaVersion: 6,
+    page: input.searchPlan.page,
+    templates: ordered.map((template) => ({
+      templateId: String(template.templateId),
+      slug: template.slug,
+      version: template.version,
+    })),
+  });
+  const selectionBundle = visualSelectionBundleV6Schema.parse({
+    schemaVersion: 6,
+    renderer: "twenty_first_native_template_v1",
+    queryPlanHash,
+    displayTarget: 9,
+    candidates: nativeCandidates.map((candidate) => ({
+      id: candidate.sampleId,
+      sampleId: candidate.sampleId,
+      label: candidate.optionLabel,
+      title: candidate.title,
+      description: candidate.description,
+      author: candidate.author,
+      previewLocalAssetId: candidate.previewLocalAssetId,
+      previewSha256: candidate.previewSha256,
+      providerTemplateId: candidate.providerTemplateId,
+      providerSlug: candidate.providerSlug,
+      providerVersion: candidate.providerVersion,
+      framework: candidate.framework,
+      sourceTreeSha256: candidate.sourceTreeSha256,
+      sourceArchiveSha256: candidate.sourceArchiveSha256,
+      sourceArchivePath: `candidates/${candidate.optionLabel}/source.zip`,
+      sourceDirectory: candidate.sourceDirectory,
+      entrypoint: candidate.entrypoint,
+    })),
+    selectedCandidateId: null,
+    delegated: false,
+    degradedReasons: [],
+  });
+  const selectionBuffer = await createVisualSelectionBundleV6Artifact({
+    bundle: selectionBundle,
+    sourceArchives: new Map(
+      nativeCandidates.map((candidate) => [
+        candidate.sampleId,
+        candidate.sourceArchive,
+      ]),
+    ),
+  });
+  const expectedSelectionHash = sha256Buffer(selectionBuffer);
+  await assertCommitLeaseActive(input.assertLeaseActive);
+  const selectionBundleArtifact = await input.persistArtifact({
+    userId: input.operation.userId,
+    projectId: input.context.project.id,
+    kind: "21st-selection-bundle",
+    filename: `visual-selection-${input.operation.id}.zip`,
+    mimeType: VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE,
+    buffer: selectionBuffer,
+    maxBytes: VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
+  });
+  if (selectionBundleArtifact.contentSha256 !== expectedSelectionHash) {
+    throw new TwentyFirstProviderFailure(
+      "SELECTION_BUNDLE_HASH_MISMATCH",
+      "视觉选择包写入校验失败。",
+      "attention_required",
+    );
+  }
+  await assertCommitLeaseActive(input.assertLeaseActive);
+  const board = await input.persistBoard(input.db, {
+    operation: input.operation,
+    searchPlan: input.searchPlan,
+    context: input.context,
+    selectionBundle,
+    selectionBundleArtifact,
+    mirroredCandidates: nativeCandidates,
+  });
+  input.diagnostics.normalizedUnique = input.diagnostics.catalogCandidates;
+  input.diagnostics.shortlistCount = input.diagnostics.catalogCandidates;
+  input.diagnostics.mirrorAttempted = input.diagnostics.renderAttempts;
+  input.diagnostics.mirrorAttempts = input.diagnostics.renderAttempts;
+  input.diagnostics.mirrorSucceeded = input.diagnostics.renderSucceeded;
+  input.diagnostics.sourceFetchAttempts =
+    input.diagnostics.templateDownloadAttempts;
+  input.diagnostics.sourceFetchSucceeded =
+    input.diagnostics.templateDownloadsSucceeded;
+  input.diagnostics.sourcePreparationAttempts =
+    input.diagnostics.compileAttempts;
+  input.diagnostics.sourcePrepared = input.diagnostics.compileSucceeded;
+  input.diagnostics.publishedCount = nativeCandidates.length;
+  input.diagnostics.templateFailureCategory = null;
+  input.diagnostics.terminalReason = "complete";
+  logSafeNativeTemplateStage({
+    event: "template_page_published",
+    operationId: input.operation.id,
+    projectId: input.operation.projectId,
+    page: input.searchPlan.page,
+    diagnostics: input.diagnostics,
+    latencyMs: Date.now() - startedAt,
+  });
+  return {
+    status: "succeeded" as const,
+    projectStatus: "awaiting_visual_selection" as const,
+    result: {
+      batchId: board.batchId,
+      mode: input.searchPlan.mode,
+      page: input.searchPlan.page,
+      candidateCount: board.candidateCount,
+      selectionBundleHash: board.selectionBundleHash ?? undefined,
+      actual: {
+        searched: input.diagnostics.catalogCandidates,
+        shortlisted: input.diagnostics.catalogCandidates,
+        mirrored: input.diagnostics.renderSucceeded,
+        presented: nativeCandidates.length,
+      },
+      diagnostics: input.diagnostics,
+      degradedReasons: selectionBundle.degradedReasons,
+    },
+    message: "9 个完整 Template 视觉候选已准备完成，请选择一个方向。",
+  };
+}
+
 export function createTwentyFirstSiteOpsProviderHandler(
   dependencies: TwentyFirstProviderDependencies = {},
 ): SiteOpsProviderHandler {
@@ -2706,6 +3493,12 @@ export function createTwentyFirstSiteOpsProviderHandler(
     dependencies.renderCandidates ?? renderTrustedVisualCandidatePreviews;
   const prepareNativeCandidate =
     dependencies.prepareNativeCandidate ?? prepareNativeVisualCandidate;
+  const prepareTemplateCandidate =
+    dependencies.prepareNativeTemplateCandidate ??
+    prepareNativeTemplateCandidate;
+  const templateShuffleKey =
+    dependencies.resolveNativeTemplateShuffleKey ??
+    resolveNativeTemplateShuffleKey;
   const persistArtifact =
     dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
@@ -2762,6 +3555,33 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "该视觉检索固定的 FrontMind 目录连接版本不可用。",
           "attention_required",
         );
+      }
+      if (nativeSourceMode) {
+        if (!client.listNativeTemplates || !client.downloadNativeTemplate) {
+          diagnostics.templateMode = true;
+          rejectNativeTemplate(diagnostics, "catalog_unavailable");
+          throw nativeTemplateProviderFailure("catalog_unavailable");
+        }
+        stage = "retrieve_native_sources";
+        return await runNativeTemplateVisualSearch({
+          operation,
+          signal,
+          assertLeaseActive,
+          client: {
+            listNativeTemplates: client.listNativeTemplates.bind(client),
+            downloadNativeTemplate: client.downloadNativeTemplate.bind(client),
+          },
+          apiKey: credential.apiKey,
+          context,
+          searchPlan,
+          diagnostics,
+          prepareCandidate: prepareTemplateCandidate,
+          shuffleKey: templateShuffleKey(),
+          fetchPreview,
+          persistArtifact,
+          persistBoard,
+          db,
+        });
       }
       stage = "mcp_retrieval";
       const retrieval = await client.withReadOnlySession(

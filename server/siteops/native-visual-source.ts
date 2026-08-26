@@ -6,13 +6,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import JSZip from "jszip";
+import JSON5 from "json5";
 import { chromium, type Page } from "playwright";
 import sharp from "sharp";
 import { z } from "zod";
 
 import {
   visualSelectionBundleV5Schema,
+  visualSelectionBundleV6Schema,
   type VisualSelectionBundleV5,
+  type VisualSelectionBundleV6,
 } from "../../shared/siteops";
 import {
   canonicalJson,
@@ -22,6 +25,8 @@ import {
 } from "../../shared/siteops-workflow";
 import {
   NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
+  NATIVE_SOURCE_DEFAULT_LIMITS,
+  NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
   installedNativeSourceDependencyVersion,
   validateNativeReactSourceArchive,
 } from "./native-react-source";
@@ -29,23 +34,37 @@ import {
   NativeReactBuildError,
   compileValidatedNativeReactSource,
 } from "./native-react-build-runtime";
-import { fetchSafeVisualPreview } from "./remote-preview";
+import {
+  fetchPinnedPublicHttps,
+  fetchSafeVisualPreview,
+} from "./remote-preview";
 
 export const SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION = "2.5.0" as const;
 export const VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE = "application/zip" as const;
 export const VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES = 25 * 1024 * 1024;
-export const NATIVE_VISUAL_SOURCE_ARCHIVE_MAX_BYTES = 2_500_000;
+export const VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE = "application/zip" as const;
+export const VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES = 100 * 1024 * 1024;
+export const NATIVE_VISUAL_SOURCE_ARCHIVE_MAX_BYTES = 24 * 1024 * 1024;
+export const VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES =
+  20 * 1024 * 1024;
+export const NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES = 50 * 1024 * 1024;
 
 const NATIVE_SOURCE_DIRECTORY = "source";
 const NATIVE_SOURCE_MANIFEST_PATH = "frontmind-native-source-v1.json";
 const NATIVE_SOURCE_MANIFEST_ARCHIVE_PATH = `${NATIVE_SOURCE_DIRECTORY}/${NATIVE_SOURCE_MANIFEST_PATH}`;
 const V5_SELECTION_MANIFEST_PATH = "visual-selection-v5.json";
-const MAX_SOURCE_FILES = 160;
-const MAX_SOURCE_FILE_BYTES = 512_000;
-const MAX_SOURCE_TOTAL_BYTES = 2_000_000;
+const V6_SELECTION_MANIFEST_PATH = "visual-selection-v6.json";
+const MAX_SOURCE_FILES = 512;
+const MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_SOURCE_TOTAL_BYTES = 48 * 1024 * 1024;
 const MAX_DEPENDENCIES = 80;
 const MAX_GET_COMPONENT_SOURCE_TEXT_BYTES = 1024 * 1024;
-const MAX_STATIC_MEDIA_ASSETS = 16;
+const MAX_STATIC_MEDIA_ASSETS = 64;
+const MAX_REMOTE_STYLESHEETS = 8;
+const MAX_REMOTE_STYLESHEET_BYTES = 256 * 1024;
+const MAX_REMOTE_FONT_BYTES = 3 * 1024 * 1024;
+const MAX_REMOTE_STYLE_ASSET_BYTES = 12 * 1024 * 1024;
+const MAX_TEMPLATE_ARCHIVE_ENTRIES = 4096;
 const FIXED_ZIP_DATE = new Date("1980-01-01T00:00:00.000Z");
 const CONTROLLED_HTML_ENTRYPOINT = "index.html";
 const CONTROLLED_APP_ENTRYPOINT = "src/main.tsx";
@@ -56,12 +75,14 @@ const CONTROLLED_SOURCE_PATHS = new Set([
   CONTROLLED_APP_ENTRYPOINT,
   CONTROLLED_TAILWIND_STYLESHEET,
   CONTROLLED_PACKAGE_MANIFEST,
+  NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
   NATIVE_SOURCE_MANIFEST_PATH,
 ]);
 const CONTROLLED_COMPILER_DEPENDENCIES = [
   "@tailwindcss/vite",
   "@vitejs/plugin-react",
   "tailwindcss",
+  "tw-animate-css",
   "vite",
 ] as const;
 
@@ -71,7 +92,7 @@ const sourcePathSchema = z
   .min(1)
   .max(240)
   .regex(
-    /^(?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+\.(?:[cm]?[jt]sx?|css|html|json|svg|png|jpe?g|webp|gif|woff2)$/u,
+    /^(?:(?:(?:[a-zA-Z0-9_.-]+|\([a-zA-Z0-9_-]+\)|\[[a-zA-Z0-9_-]+\])\/)*(?:[a-zA-Z0-9_.-]+|\([a-zA-Z0-9_-]+\)|\[[a-zA-Z0-9_-]+\])\.(?:[cm]?[jt]sx?|css|html|json|svg|png|jpe?g|webp|avif|gif|ico|woff2?|eot|otf|ttf|mp3|mp4|ogg|wav|webm)|(?:LICENSE|NOTICE)(?:\.(?:md|txt))?)$/u,
   );
 
 const nativeSourceManifestV1Schema = z
@@ -146,6 +167,27 @@ export type PreparedNativeVisualCandidate =
     previewSha256: string;
   };
 
+export type NativeTemplateFramework = "vite_react" | "next_static";
+
+export type PreparedNativeTemplateCandidate = PreparedNativeVisualCandidate & {
+  templateId: string;
+  templateSlug: string;
+  framework: NativeTemplateFramework;
+  sourceDirectory: typeof NATIVE_SOURCE_DIRECTORY;
+};
+
+export type NativeTemplateStaticAsset = {
+  buffer: Buffer;
+  mimeType: string;
+  finalUrl: string;
+};
+
+export type FetchNativeTemplateStaticAsset = (input: {
+  url: string;
+  kind: "css" | "font";
+  signal: AbortSignal;
+}) => Promise<NativeTemplateStaticAsset>;
+
 type PayloadRecord = Record<string, unknown>;
 
 type BoundedZipEntry = JSZip.JSZipObject & {
@@ -164,6 +206,15 @@ export type NativeVisualFailureCategory =
   | "render_failed"
   | "deadline_exhausted";
 
+export type NativeTemplateRuntimeFailureCategory =
+  | "download_failed"
+  | "dependency_unsupported"
+  | "source_unsafe"
+  | "compile_failed"
+  | "browser_unavailable"
+  | "render_failed"
+  | "deadline_exhausted";
+
 export class NativeVisualSourceError extends Error {
   constructor(
     public readonly code: string,
@@ -171,6 +222,17 @@ export class NativeVisualSourceError extends Error {
   ) {
     super(code, cause === undefined ? undefined : { cause });
     this.name = "NativeVisualSourceError";
+  }
+}
+
+export function assertVisualSelectionBundleV6SourceArchiveSize(
+  bytes: Uint8Array,
+) {
+  if (
+    bytes.byteLength < 1 ||
+    bytes.byteLength > VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES
+  ) {
+    throw new NativeVisualSourceError("V6_SOURCE_ARCHIVE_SIZE_INVALID");
   }
 }
 
@@ -235,6 +297,31 @@ export function classifyNativeVisualFailure(
     return "source_unsafe";
   }
   return "source_incomplete";
+}
+
+export function classifyNativeTemplateRuntimeFailure(
+  error: unknown,
+): NativeTemplateRuntimeFailureCategory {
+  const native = classifyNativeVisualFailure(error);
+  if (native === "dependency_unsupported") return "dependency_unsupported";
+  if (native === "source_unsafe") return "source_unsafe";
+  if (native === "compile_failed") return "compile_failed";
+  if (native === "browser_unavailable") return "browser_unavailable";
+  if (native === "render_failed") return "render_failed";
+  if (native === "deadline_exhausted") return "deadline_exhausted";
+  const code = error instanceof Error ? error.message : safeErrorCode(error);
+  if (/NATIVE_TEMPLATE_(?:DEPENDENCY|LIFECYCLE)/u.test(code)) {
+    return "dependency_unsupported";
+  }
+  if (
+    /(?:NATIVE_SOURCE_STATIC_MEDIA_UNSUPPORTED|VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_SIZE_INVALID)/u.test(
+      code,
+    )
+  ) {
+    return "dependency_unsupported";
+  }
+  if (/NATIVE_TEMPLATE_SOURCE_UNSAFE/u.test(code)) return "source_unsafe";
+  return "download_failed";
 }
 
 function sha256(bytes: Uint8Array | string) {
@@ -386,7 +473,7 @@ function collectDependencies(
   // dependency array. Imports are safe to use only as names: every inferred
   // package must still pass the closed allowlist and installed-version pin.
   for (const [filename, bytes] of providerFiles) {
-    if (!isTextSourcePath(filename)) continue;
+    if (!/\.[cm]?[jt]sx?$/u.test(filename)) continue;
     for (const specifier of sourceImports(bytes.toString("utf8"))) {
       const name = packageNameForImport(specifier);
       if (name) names.add(name);
@@ -408,7 +495,10 @@ function collectDependencies(
 }
 
 function isTextSourcePath(filename: string) {
-  return /\.(?:[cm]?[jt]sx?|css|html|json|svg)$/u.test(filename);
+  return (
+    /\.(?:[cm]?[jt]sx?|css|html|json|svg)$/u.test(filename) ||
+    /^(?:LICENSE|NOTICE)(?:\.(?:md|txt))?$/u.test(filename)
+  );
 }
 
 function bytesFromFileValue(value: unknown, filename: string) {
@@ -639,15 +729,28 @@ function inferCodePath(input: {
 }
 
 function sourceImports(text: string) {
+  // Type-only imports disappear before runtime and must not force a package
+  // into the controlled browser dependency closure (for example Next.js'
+  // `Metadata` type in an otherwise static page).
+  const runtimeText = text
+    .replace(
+      /\bimport\s+type\b[\s\S]{0,4096}?\bfrom\s*["'][^"']+["']\s*;?/gu,
+      "",
+    )
+    .replace(
+      /\bexport\s+type\b[\s\S]{0,4096}?\bfrom\s*["'][^"']+["']\s*;?/gu,
+      "",
+    );
   return [
-    ...text.matchAll(
+    ...runtimeText.matchAll(
       /(?:\bfrom\s*|\bimport\s*\(|\brequire\s*\()\s*["']([^"']+)["']/gu,
     ),
+    ...runtimeText.matchAll(/\bimport\s*["']([^"']+)["']/gu),
   ].map((match) => match[1]!);
 }
 
 function staticRemoteMediaPattern() {
-  return /(?:\b(?:src|poster)\s*=\s*["'](https:\/\/[^"'\s]+)["']|\burl\(\s*["']?(https:\/\/[^"')\s]+)["']?\s*\))/giu;
+  return /(?:(?:["']?(?:src|poster|image|imageUrl|avatar|logo)["']?)\s*(?:=|:)\s*["'](https:\/\/[^"'\s]+)["']|\burl\(\s*["']?(https:\/\/[^"')\s]+)["']?\s*\))/giu;
 }
 
 function staticRemoteMediaUrls(text: string) {
@@ -660,9 +763,259 @@ function staticRemoteMediaUrls(text: string) {
 }
 
 function withoutAllowedStaticRemoteMedia(text: string) {
-  return text.replace(staticRemoteMediaPattern(), (matched, first, second) =>
-    matched.replace(String(first ?? second ?? ""), ""),
+  return text
+    .replace(staticRemoteMediaPattern(), (matched, first, second) =>
+      matched.replace(String(first ?? second ?? ""), ""),
+    )
+    .replace(/@import\s+(?:url\(\s*)?["']https:\/\/[^;\r\n]{1,2048};/giu, "");
+}
+
+function remoteCssImportPattern() {
+  return /@import\s+(?:url\(\s*)?(?:"([^"]+)"|'([^']+)'|([^"'\s;)]+))\s*\)?\s*;/giu;
+}
+
+function remoteFontExtension(raw: string) {
+  let pathname: string;
+  try {
+    pathname = new URL(raw).pathname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const matched = /\.(woff2?|eot|otf|ttf)$/u.exec(pathname);
+  return matched?.[1] ?? null;
+}
+
+function remoteRuntimeMediaIsUnsupported(raw: string) {
+  try {
+    return /\.(?:m3u8|mp3|mp4|ogg|wav|webm)$/u.test(
+      new URL(raw).pathname.toLowerCase(),
+    );
+  } catch {
+    return true;
+  }
+}
+
+const NATIVE_TEMPLATE_OPTIONAL_MEDIA_PLACEHOLDER = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 240"><rect width="320" height="240" rx="24" fill="#e2e8f0"/><circle cx="160" cy="94" r="42" fill="#94a3b8"/><path d="M72 224c12-55 43-82 88-82s76 27 88 82" fill="#94a3b8"/></svg>',
+  "utf8",
+);
+
+function optionalStaticMediaMayUsePlaceholder(
+  files: readonly NativeSourceFile[],
+  url: string,
+) {
+  try {
+    const parsed = new URL(url);
+    if (
+      parsed.hostname === "i.pravatar.cc" ||
+      parsed.hostname === "avatars.githubusercontent.com" ||
+      parsed.hostname === "notion-avatars.netlify.app" ||
+      (parsed.hostname === "ui.shadcn.com" &&
+        parsed.pathname === "/placeholder.svg") ||
+      (parsed.hostname === "github.com" && /\.png$/iu.test(parsed.pathname))
+    ) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  const references = files.filter(
+    (file) => isTextSourcePath(file.path) && file.bytes.includes(url),
   );
+  if (references.length < 1) return false;
+  return references.every((file) => {
+    if (/(?:avatar|testimonial|team|partner|sponsor|logo)/iu.test(file.path)) {
+      return true;
+    }
+    const escaped = url.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    return new RegExp(
+      `["']?(?:avatar|logo)["']?\\s*:\\s*(?:assetUrl\\(\\s*)?["']${escaped}["']`,
+      "iu",
+    ).test(file.bytes.toString("utf8"));
+  });
+}
+
+async function readBoundedStaticAssetBody(
+  response: Response,
+  maxBytes: number,
+) {
+  if (!response.body) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+  const declaredHeader = response.headers.get("content-length");
+  const declared =
+    declaredHeader === null ? Number.NaN : Number(declaredHeader);
+  if (Number.isFinite(declared) && (declared <= 0 || declared > maxBytes)) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+  }
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      if (bytes > maxBytes) {
+        throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+      }
+      chunks.push(Buffer.from(part.value));
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  if (bytes < 1) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+  return Buffer.concat(chunks, bytes);
+}
+
+async function fetchSafeNativeTemplateStaticAsset(input: {
+  url: string;
+  kind: "css" | "font";
+  signal: AbortSignal;
+}): Promise<NativeTemplateStaticAsset> {
+  const timeout = AbortSignal.timeout(12_000);
+  const signal = AbortSignal.any([input.signal, timeout]);
+  const fetched = await fetchPinnedPublicHttps({
+    url: input.url,
+    signal,
+    maxRedirects: 3,
+    headers: {
+      Accept:
+        input.kind === "css"
+          ? "text/css"
+          : "font/woff2,font/woff,application/font-woff,application/octet-stream",
+      "User-Agent": "FrontMind-SiteOps-Template-Asset/1.0",
+    },
+  });
+  if (!fetched.response.ok) {
+    await fetched.response.body?.cancel().catch(() => undefined);
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+  const mimeType = (fetched.response.headers.get("content-type") ?? "")
+    .split(";", 1)[0]!
+    .trim()
+    .toLowerCase();
+  const allowedMime =
+    input.kind === "css"
+      ? mimeType === "text/css"
+      : new Set([
+          "application/font-woff",
+          "application/octet-stream",
+          "font/otf",
+          "font/ttf",
+          "font/woff",
+          "font/woff2",
+        ]).has(mimeType);
+  if (!allowedMime) {
+    await fetched.response.body?.cancel().catch(() => undefined);
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+  const buffer = await readBoundedStaticAssetBody(
+    fetched.response,
+    input.kind === "css" ? MAX_REMOTE_STYLESHEET_BYTES : MAX_REMOTE_FONT_BYTES,
+  );
+  return {
+    buffer,
+    mimeType,
+    finalUrl: fetched.finalUrl.toString(),
+  };
+}
+
+function withoutSafeExternalNavigation(text: string) {
+  return text.replace(
+    /(<(?:a|Link)\b[^>]{0,512}\bhref\s*=\s*["'])https:\/\/[^"'\s>]+(["'])/giu,
+    "$1$2",
+  );
+}
+
+function withoutSafeMarkupNamespaces(text: string) {
+  let result = text;
+  for (const namespace of [
+    "http://www.w3.org/1999/xlink",
+    "http://www.w3.org/1998/Math/MathML",
+    "http://www.w3.org/1999/xhtml",
+    "http://www.w3.org/2000/svg",
+    "http://www.w3.org/2000/xmlns/",
+    "http://www.w3.org/2001/XMLSchema-instance",
+    "http://www.w3.org/XML/1998/namespace",
+  ]) {
+    result = result.replaceAll(namespace, "");
+  }
+  return result;
+}
+
+function withoutJavaScriptComments(text: string) {
+  let output = "";
+  let quote: '"' | "'" | "`" | null = null;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const current = text[index]!;
+    const next = text[index + 1] ?? "";
+    if (quote) {
+      output += current;
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === quote) quote = null;
+      continue;
+    }
+    if (current === '"' || current === "'" || current === "`") {
+      quote = current;
+      output += current;
+      continue;
+    }
+    if (current === "/" && next === "/") {
+      output += "  ";
+      index += 2;
+      while (index < text.length && !/[\r\n]/u.test(text[index]!)) {
+        output += " ";
+        index += 1;
+      }
+      if (index < text.length) output += text[index];
+      continue;
+    }
+    if (current === "/" && next === "*") {
+      output += "  ";
+      index += 2;
+      while (
+        index < text.length &&
+        !(text[index] === "*" && text[index + 1] === "/")
+      ) {
+        output += /[\r\n]/u.test(text[index]!) ? text[index] : " ";
+        index += 1;
+      }
+      if (index < text.length) {
+        output += "  ";
+        index += 1;
+      }
+      continue;
+    }
+    output += current;
+  }
+  return output;
+}
+
+function javascriptCodeOnly(text: string) {
+  let output = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const current of text) {
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === quote) quote = null;
+      output += /[\r\n]/u.test(current) ? current : " ";
+      continue;
+    }
+    if (current === '"' || current === "'") {
+      quote = current;
+      output += " ";
+      continue;
+    }
+    output += current;
+  }
+  return output;
 }
 
 function packageNameForImport(specifier: string) {
@@ -685,9 +1038,23 @@ function localImportCandidates(from: string, specifier: string) {
     if (/\.[a-zA-Z0-9]+$/u.test(root)) return [root];
     return [
       root,
-      ...["ts", "tsx", "js", "jsx", "css", "json", "svg"].map(
-        (extension) => `${root}.${extension}`,
-      ),
+      ...[
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "css",
+        "json",
+        "svg",
+        "png",
+        "jpg",
+        "jpeg",
+        "webp",
+        "avif",
+        "gif",
+        "woff",
+        "woff2",
+      ].map((extension) => `${root}.${extension}`),
       ...["ts", "tsx", "js", "jsx"].map(
         (extension) => `${root}/index.${extension}`,
       ),
@@ -740,9 +1107,18 @@ function assertHardSourceSafety(
             "",
           )
         : text;
-    const safetyText = options.allowStaticRemoteMedia
+    const mediaSafeText = options.allowStaticRemoteMedia
       ? withoutAllowedStaticRemoteMedia(withoutControlledShellScript)
       : withoutControlledShellScript;
+    const markupSafeText = withoutSafeMarkupNamespaces(
+      withoutSafeExternalNavigation(mediaSafeText),
+    );
+    const safetyText = /\.[cm]?[jt]sx?$/u.test(file.path)
+      ? withoutJavaScriptComments(markupSafeText)
+      : markupSafeText;
+    const codeSafetyText = /\.[cm]?[jt]sx?$/u.test(file.path)
+      ? javascriptCodeOnly(safetyText)
+      : safetyText;
     if (Buffer.from(text, "utf8").length !== file.bytes.length) {
       throw new NativeVisualSourceError("NATIVE_SOURCE_TEXT_ENCODING_INVALID");
     }
@@ -751,18 +1127,20 @@ function assertHardSourceSafety(
         safetyText,
       ) ||
       /\b(?:eval|Function)\s*\(|\bnew\s+Function\b|\bimport\s*\(|\brequire\s*\([^"']/u.test(
-        safetyText,
+        codeSafetyText,
       ) ||
       /\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\s*\(|navigator\.sendBeacon\s*\(/u.test(
-        safetyText,
+        codeSafetyText,
       ) ||
       /dangerouslySetInnerHTML|\b(?:node:)?(?:fs|child_process|worker_threads|vm|net|tls|dgram|cluster)\b/u.test(
-        safetyText,
+        codeSafetyText,
       ) ||
-      /<\s*(?:script|iframe|object|embed)\b/iu.test(safetyText) ||
+      /<\s*(?:script|iframe|object|embed)\b/iu.test(codeSafetyText) ||
       /(?:javascript|vbscript|data\s*:\s*text\/html)\s*:/iu.test(safetyText) ||
       /https?:\/\//iu.test(safetyText) ||
-      /\bprocess\s*\.|\bglobalThis\s*\[|\bdocument\.cookie\b/u.test(safetyText)
+      /\bprocess\s*\.|\bglobalThis\s*\[|\bdocument\.cookie\b/u.test(
+        codeSafetyText,
+      )
     ) {
       throw new NativeVisualSourceError("NATIVE_SOURCE_EXECUTION_UNSAFE");
     }
@@ -837,6 +1215,10 @@ function assertHardSourceSafety(
         throw new NativeVisualSourceError("NATIVE_SOURCE_PACKAGE_INVALID");
       }
     }
+    // JSON manifests and the inert Tailwind-v3 marker can legitimately contain
+    // keys such as `from`; dependency discovery is only meaningful for
+    // executable TypeScript/JavaScript modules.
+    if (!/\.[cm]?[jt]sx?$/u.test(file.path)) continue;
     for (const specifier of sourceImports(text)) {
       if (specifier.startsWith("@/")) {
         if (specifier.split("/").some((segment) => segment === "..")) {
@@ -895,13 +1277,29 @@ function controlledSourceProject(input: {
   providerFiles: readonly NativeSourceFile[];
   demoEntrypoint: string;
   dependencies: readonly NativeSourceDependency[];
+  tailwindV3Config?: Record<string, unknown> | null;
 }) {
   if (
     input.providerFiles.some((file) => CONTROLLED_SOURCE_PATHS.has(file.path))
   ) {
     throw new NativeVisualSourceError("NATIVE_SOURCE_SHELL_COLLISION");
   }
-  const cssImports = input.providerFiles
+  const providerFiles = input.providerFiles;
+  if (input.tailwindV3Config) {
+    const directiveStylesheets = providerFiles.filter(
+      (file) =>
+        file.path.endsWith(".css") &&
+        /@tailwind\s+(?:base|components|utilities)\s*;/iu.test(
+          file.bytes.toString("utf8"),
+        ),
+    );
+    if (directiveStylesheets.length !== 1) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+  }
+  const cssImports = providerFiles
     .filter((file) => file.path.endsWith(".css"))
     .map(
       (file) =>
@@ -910,7 +1308,7 @@ function controlledSourceProject(input: {
         )};`,
     );
   const sourceRoots = new Set<string>(["src"]);
-  for (const file of input.providerFiles) {
+  for (const file of providerFiles) {
     if (!/\.(?:[cm]?[jt]sx?|html)$/u.test(file.path)) continue;
     const firstSegment = file.path.split("/")[0]!;
     sourceRoots.add(file.path.includes("/") ? firstSegment : file.path);
@@ -968,17 +1366,36 @@ function controlledSourceProject(input: {
     {
       path: CONTROLLED_TAILWIND_STYLESHEET,
       bytes: Buffer.from(
-        [
-          '@import "tailwindcss";',
-          ...tailwindSourceLines,
-          "html,body,#root{min-height:100%;margin:0}",
-          "",
-        ].join("\n"),
+        input.tailwindV3Config
+          ? [
+              // Tailwind v3 requires its @tailwind directives and @layer
+              // blocks to be processed in the same provider global CSS file.
+              // The host stylesheet therefore adds only the fixed shell rule.
+              "html,body,#root{min-height:100%;margin:0}",
+              "",
+            ].join("\n")
+          : [
+              '@import "tailwindcss";',
+              ...tailwindSourceLines,
+              "html,body,#root{min-height:100%;margin:0}",
+              "",
+            ].join("\n"),
         "utf8",
       ),
     },
+    ...(input.tailwindV3Config
+      ? [
+          {
+            path: NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
+            bytes: Buffer.from(
+              `${canonicalJson({ schemaVersion: 1, config: input.tailwindV3Config })}\n`,
+              "utf8",
+            ),
+          },
+        ]
+      : []),
   ];
-  return [...input.providerFiles, ...controlledFiles].sort((left, right) =>
+  return [...providerFiles, ...controlledFiles].sort((left, right) =>
     left.path.localeCompare(right.path),
   );
 }
@@ -1172,70 +1589,1279 @@ export function normalizeTwentyFirstNativeSource(input: {
   };
 }
 
-async function mirrorNativeStaticMedia(input: {
-  source: NormalizedTwentyFirstNativeSource;
-  signal: AbortSignal;
-  fetchRemoteAsset: typeof fetchSafeVisualPreview;
-}) {
-  const urls = new Set<string>();
-  for (const file of input.source.files) {
-    if (!isTextSourcePath(file.path)) continue;
-    staticRemoteMediaUrls(file.bytes.toString("utf8")).forEach((url) =>
-      urls.add(url),
+type NativeTemplateZipEntry = BoundedZipEntry;
+
+const TEMPLATE_RUNTIME_FILE_PATTERN =
+  /\.(?:[cm]?[jt]sx?|css|html|json|svg|png|jpe?g|webp|avif|gif|ico|woff2?|eot|otf|ttf|mp3|mp4|ogg|wav|webm)$/iu;
+const TEMPLATE_ROOT_LICENSE_PATTERN = /^(?:LICENSE|NOTICE)(?:\.(?:md|txt))?$/u;
+const TEMPLATE_IGNORED_PATH_PATTERN =
+  /(?:^|\/)(?:node_modules|\.git|\.github|\.next|dist|out|build|coverage|\.turbo|\.vercel)(?:\/|$)/u;
+const TEMPLATE_IGNORED_BUILD_FILE_PATTERN =
+  /(?:^|\/)(?:package-lock\.json|(?:eslint|prettier)(?:\.config)?\.[cm]?[jt]s|tsconfig(?:\.[a-zA-Z0-9_-]+)?\.json)$/u;
+const NEXT_STATIC_ENTRYPOINTS = [
+  "app/page.tsx",
+  "app/page.jsx",
+  "src/app/page.tsx",
+  "src/app/page.jsx",
+  "pages/index.tsx",
+  "pages/index.jsx",
+  "src/pages/index.tsx",
+  "src/pages/index.jsx",
+] as const;
+const VITE_APP_ENTRYPOINTS = [
+  "src/app/landing/page.tsx",
+  "src/app/landing/page.jsx",
+  "src/pages/index.tsx",
+  "src/pages/index.jsx",
+  "src/App.tsx",
+  "src/App.jsx",
+  "src/app.tsx",
+  "src/app.jsx",
+] as const;
+const NEXT_STATIC_MODULE_REWRITES = new Map([
+  ["next", "@/frontmind-next/types"],
+  ["next/image", "@/frontmind-next/image"],
+  ["next/link", "@/frontmind-next/link"],
+  ["next/head", "@/frontmind-next/head"],
+  ["next/navigation", "@/frontmind-next/navigation"],
+  ["next/font/google", "@/frontmind-next/font-google"],
+  ["next/font/local", "@/frontmind-next/font-local"],
+]);
+
+function cleanTemplateCoordinate(value: unknown, fallback: string) {
+  const clean = cleanVersion(String(value ?? ""));
+  if (!clean || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,190}$/u.test(clean)) {
+    throw new NativeVisualSourceError(fallback);
+  }
+  return clean;
+}
+
+function safeTemplateArchivePath(value: string) {
+  const normalized = value
+    .normalize("NFKC")
+    .replaceAll("\\", "/")
+    .replace(/^\.\//u, "")
+    .replace(/\/$/u, "");
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    normalized.includes("\0") ||
+    Buffer.byteLength(normalized, "utf8") > 240 ||
+    normalized
+      .split("/")
+      .some((segment) => !segment || segment === "." || segment === "..")
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function packageManifestFromTemplateFiles(files: ReadonlyMap<string, Buffer>) {
+  const bytes = files.get(CONTROLLED_PACKAGE_MANIFEST);
+  if (!bytes) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  try {
+    const value = JSON.parse(bytes.toString("utf8")) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("manifest");
+    }
+    return value as PayloadRecord;
+  } catch (error) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID", error);
+  }
+}
+
+function assertTemplatePackageIsInert(manifest: PayloadRecord) {
+  const scripts = manifest.scripts;
+  if (scripts !== undefined) {
+    if (!scripts || typeof scripts !== "object" || Array.isArray(scripts)) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+    }
+    for (const [name, command] of Object.entries(scripts as PayloadRecord)) {
+      if (
+        !/^[a-zA-Z0-9:_-]{1,96}$/u.test(name) ||
+        typeof command !== "string" ||
+        Buffer.byteLength(command, "utf8") > 4096
+      ) {
+        throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+      }
+    }
+  }
+  if (
+    manifest.optionalDependencies !== undefined ||
+    manifest.bundledDependencies !== undefined ||
+    manifest.bundleDependencies !== undefined
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  for (const key of ["dependencies", "devDependencies", "peerDependencies"]) {
+    const value = manifest[key];
+    if (value === undefined) continue;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+    }
+    for (const [name, version] of Object.entries(value as PayloadRecord)) {
+      if (
+        !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/u.test(name) ||
+        typeof version !== "string" ||
+        /(?:file|git|github|https?|link|workspace|portal|patch):/iu.test(
+          version,
+        )
+      ) {
+        throw new NativeVisualSourceError(
+          "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+        );
+      }
+    }
+  }
+}
+
+function templateManifestHasReact(manifest: PayloadRecord) {
+  const names = new Set<string>();
+  for (const key of ["dependencies", "devDependencies", "peerDependencies"]) {
+    const value = manifest[key];
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    Object.keys(value as PayloadRecord).forEach((name) => names.add(name));
+  }
+  return names.has("react") && names.has("react-dom");
+}
+
+const STATIC_TAILWIND_V3_TOP_LEVEL_KEYS = new Set([
+  "content",
+  "corePlugins",
+  "darkMode",
+  "important",
+  "plugins",
+  "prefix",
+  "safelist",
+  "separator",
+  "theme",
+]);
+const TAILWIND_ANIMATE_PLUGIN_SENTINEL =
+  "__frontmind_tailwindcss_animate__" as const;
+
+function boundedStaticConfigurationValue(
+  value: unknown,
+  state: { nodes: number },
+  depth = 0,
+): unknown {
+  state.nodes += 1;
+  if (state.nodes > 5_000 || depth > 16) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return value;
+  }
+  if (typeof value === "string") {
+    if (Buffer.byteLength(value, "utf8") > 16_384) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 1_000) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+    return value.map((item) =>
+      boundedStaticConfigurationValue(item, state, depth + 1),
     );
   }
-  if (urls.size === 0) return input.source;
-  if (urls.size > MAX_STATIC_MEDIA_ASSETS) {
-    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+  if (!value || typeof value !== "object") {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
   }
-  const replacements = new Map<string, string>();
-  const assets: NativeSourceFile[] = [];
-  for (const url of [...urls].sort()) {
-    if (input.signal.aborted) throw input.signal.reason;
-    let fetched: Awaited<ReturnType<typeof fetchSafeVisualPreview>>;
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      !/^[^\u0000-\u001f\u007f]{1,191}$/u.test(key) ||
+      ["__proto__", "constructor", "prototype"].includes(key)
+    ) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+    result[key] = boundedStaticConfigurationValue(item, state, depth + 1);
+  }
+  return result;
+}
+
+function staticTailwindV3Config(files: ReadonlyMap<string, Buffer>) {
+  const usesV3Directives = [...files]
+    .filter(([filename]) => filename.endsWith(".css"))
+    .some(([, bytes]) =>
+      /@tailwind\s+(?:base|components|utilities)\s*;/iu.test(
+        bytes.toString("utf8"),
+      ),
+    );
+  if (!usesV3Directives) return null;
+  const configPath = [
+    "tailwind.config.js",
+    "tailwind.config.cjs",
+    "tailwind.config.mjs",
+    "tailwind.config.ts",
+  ].find((candidate) => files.has(candidate));
+  if (!configPath) return {};
+  const bytes = files.get(configPath)!;
+  if (bytes.length > 128 * 1024) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+  } catch (error) {
+    throw new NativeVisualSourceError(
+      "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      error,
+    );
+  }
+  text = text.replace(/^\uFEFF/u, "");
+  text = text.replace(/^\s*import\s+type\s+[^;\r\n]+;?\s*/gmu, "");
+  const animateAlias =
+    /^\s*const\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*["']tailwindcss-animate["']\s*\)\s*;?\s*/u.exec(
+      text,
+    );
+  if (animateAlias) {
+    const alias = animateAlias[1]!;
+    text = text.slice(animateAlias[0].length);
+    const pluginsPattern = new RegExp(
+      `(plugins\\s*:\\s*\\[\\s*)${alias}(\\s*,?\\s*\\])`,
+      "u",
+    );
+    if (!pluginsPattern.test(text)) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+    text = text.replace(
+      pluginsPattern,
+      `$1${JSON.stringify(TAILWIND_ANIMATE_PLUGIN_SENTINEL)}$2`,
+    );
+    if (new RegExp(`\\b${alias}\\b`, "u").test(text)) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+  }
+  text = text.replace(
+    /require\(\s*["']tailwindcss-animate["']\s*\)/gu,
+    JSON.stringify(TAILWIND_ANIMATE_PLUGIN_SENTINEL),
+  );
+  // Strip documentation-only comments before locating the single exported
+  // object. JSON5 then performs the actual non-executing parse; executable
+  // expressions (functions, imports, spread, templates, `new`, remaining
+  // requires) are not JSON5 values and are rejected without evaluation.
+  text = text.replace(
+    /^(?:\s*\/\*[\s\S]*?\*\/\s*|\s*\/\/[^\r\n]*(?:\r?\n|$))+/u,
+    "",
+  );
+  if (/^\s*module\.exports\s*=/u.test(text)) {
+    text = text.replace(/^\s*module\.exports\s*=\s*/u, "");
+  } else if (/^\s*export\s+default\s+/u.test(text)) {
+    text = text.replace(/^\s*export\s+default\s+/u, "");
+  } else {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  text = text.replace(/\s+satisfies\s+[A-Za-z_$][\w$]*\s*;?\s*$/u, "");
+  text = text.replace(/;\s*$/u, "");
+  let parsed: unknown;
+  try {
+    parsed = JSON5.parse(text);
+  } catch (error) {
+    throw new NativeVisualSourceError(
+      "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      error,
+    );
+  }
+  const bounded = boundedStaticConfigurationValue(parsed, { nodes: 0 });
+  if (!bounded || typeof bounded !== "object" || Array.isArray(bounded)) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  const record = bounded as Record<string, unknown>;
+  if (
+    Object.keys(record).some(
+      (key) => !STATIC_TAILWIND_V3_TOP_LEVEL_KEYS.has(key),
+    )
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  if (
+    record.plugins !== undefined &&
+    (!Array.isArray(record.plugins) ||
+      record.plugins.some(
+        (plugin) => plugin !== TAILWIND_ANIMATE_PLUGIN_SENTINEL,
+      ))
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  delete record.content;
+  return record;
+}
+
+async function extractNativeTemplateFiles(archive: Buffer) {
+  if (
+    archive.length < 1 ||
+    archive.length > NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(archive, {
+      checkCRC32: true,
+      createFolders: false,
+    });
+  } catch (error) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID", error);
+  }
+  const entries = Object.values(zip.files) as NativeTemplateZipEntry[];
+  if (entries.length > MAX_TEMPLATE_ARCHIVE_ENTRIES) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  const safeEntries: Array<{ entry: NativeTemplateZipEntry; path: string }> =
+    [];
+  for (const entry of entries) {
+    const rawPath = entry.unsafeOriginalName ?? entry.name;
+    const safePath = safeTemplateArchivePath(rawPath);
+    if (!safePath || rawPath !== entry.name || zipEntryIsSymlink(entry)) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+    }
+    if (!entry.dir) safeEntries.push({ entry, path: safePath });
+  }
+  const packagePaths = safeEntries
+    .map(({ path: filename }) => filename)
+    .filter(
+      (filename) =>
+        (filename === "package.json" || filename.endsWith("/package.json")) &&
+        !TEMPLATE_IGNORED_PATH_PATTERN.test(filename),
+    )
+    .sort((left, right) => {
+      const depth = left.split("/").length - right.split("/").length;
+      return depth || left.localeCompare(right);
+    });
+  if (packagePaths.length === 0) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  const failures: NativeVisualSourceError[] = [];
+  const buildableRoots: Array<{
+    files: Map<string, Buffer>;
+    frameworkRank: number;
+    depth: number;
+    packagePath: string;
+  }> = [];
+  for (const packagePath of packagePaths) {
+    const rootPrefix = packagePath.slice(0, -"package.json".length);
+    const nestedRootPrefixes = packagePaths
+      .filter(
+        (candidate) =>
+          candidate !== packagePath &&
+          candidate.startsWith(rootPrefix) &&
+          candidate.length > packagePath.length,
+      )
+      .map((candidate) => candidate.slice(0, -"package.json".length));
     try {
-      fetched = await input.fetchRemoteAsset({
-        url,
-        signal: input.signal,
+      const files = new Map<string, Buffer>();
+      let expandedBytes = 0;
+      for (const { entry, path: archivePath } of safeEntries) {
+        if (
+          !archivePath.startsWith(rootPrefix) ||
+          nestedRootPrefixes.some((prefix) => archivePath.startsWith(prefix))
+        ) {
+          continue;
+        }
+        const filename = archivePath.slice(rootPrefix.length);
+        if (
+          !filename ||
+          TEMPLATE_IGNORED_PATH_PATTERN.test(filename) ||
+          TEMPLATE_IGNORED_BUILD_FILE_PATTERN.test(filename) ||
+          (!TEMPLATE_RUNTIME_FILE_PATTERN.test(filename) &&
+            !TEMPLATE_ROOT_LICENSE_PATTERN.test(filename) &&
+            filename !== CONTROLLED_PACKAGE_MANIFEST)
+        ) {
+          continue;
+        }
+        const normalized = normalizedSourcePath(filename);
+        if (!normalized) {
+          throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+        }
+        const declared = Number(entry._data?.uncompressedSize ?? 0);
+        if (
+          Number.isFinite(declared) &&
+          declared > NATIVE_SOURCE_DEFAULT_LIMITS.maxSingleFileBytes
+        ) {
+          throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+        }
+        const bytes = await entry.async("nodebuffer");
+        expandedBytes += bytes.length;
+        if (
+          bytes.length > NATIVE_SOURCE_DEFAULT_LIMITS.maxSingleFileBytes ||
+          expandedBytes > NATIVE_SOURCE_DEFAULT_LIMITS.maxExpandedBytes
+        ) {
+          throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+        }
+        const collisionKey = normalized
+          .normalize("NFKC")
+          .toLocaleLowerCase("en-US");
+        if (
+          [...files.keys()].some(
+            (existing) =>
+              existing.normalize("NFKC").toLocaleLowerCase("en-US") ===
+              collisionKey,
+          )
+        ) {
+          throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+        }
+        files.set(normalized, Buffer.from(bytes));
+      }
+      if (
+        files.size < 2 ||
+        files.size > NATIVE_SOURCE_DEFAULT_LIMITS.maxFiles
+      ) {
+        continue;
+      }
+      const packageManifest = packageManifestFromTemplateFiles(files);
+      assertTemplatePackageIsInert(packageManifest);
+      if (!templateManifestHasReact(packageManifest)) continue;
+      const hasViteRoot =
+        files.has("index.html") && Boolean(findViteEntrypoint(files));
+      const hasNextRoot = Boolean(findNextStaticEntrypoint(files));
+      if (!hasViteRoot && !hasNextRoot) continue;
+      buildableRoots.push({
+        files,
+        frameworkRank: hasViteRoot ? 0 : 1,
+        depth: packagePath.split("/").length,
+        packagePath,
       });
+    } catch (error) {
+      if (error instanceof NativeVisualSourceError) {
+        failures.push(error);
+        continue;
+      }
+      throw error;
+    }
+  }
+  buildableRoots.sort(
+    (left, right) =>
+      left.frameworkRank - right.frameworkRank ||
+      left.depth - right.depth ||
+      left.packagePath.localeCompare(right.packagePath),
+  );
+  const selected = buildableRoots[0];
+  if (selected) return selected.files;
+  throw (
+    failures[0] ??
+    new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID")
+  );
+}
+
+function findViteEntrypoint(files: ReadonlyMap<string, Buffer>) {
+  for (const candidate of VITE_APP_ENTRYPOINTS) {
+    if (files.has(candidate)) return candidate;
+  }
+  for (const main of [
+    "src/main.tsx",
+    "src/main.jsx",
+    "src/main.ts",
+    "src/main.js",
+  ]) {
+    const source = files.get(main)?.toString("utf8");
+    if (!source) continue;
+    for (const match of source.matchAll(
+      /\bimport\s+[A-Za-z_$][\w$]*\s+from\s+["']([^"']+)["']/gu,
+    )) {
+      const specifier = match[1]!;
+      if (!specifier.startsWith(".")) continue;
+      const resolved = localImportCandidates(main, specifier).find((value) =>
+        files.has(value),
+      );
+      if (
+        resolved &&
+        /(?:^|\/)(?:app|home|page)\.[cm]?[jt]sx?$/iu.test(resolved)
+      ) {
+        return resolved;
+      }
+    }
+  }
+  return null;
+}
+
+function findNextStaticEntrypoint(files: ReadonlyMap<string, Buffer>) {
+  for (const candidate of NEXT_STATIC_ENTRYPOINTS) {
+    if (files.has(candidate)) return candidate;
+  }
+  const groupedPages = [...files.keys()].filter((filename) => {
+    const matched = /^(src\/)?app\/(.+)\/page\.(?:tsx|jsx)$/u.exec(filename);
+    if (!matched) return false;
+    const segments = matched[2]!.split("/");
+    return (
+      segments.length > 0 &&
+      segments.every((segment) => /^\([a-zA-Z0-9_-]+\)$/u.test(segment))
+    );
+  });
+  groupedPages.sort((left, right) => {
+    const depth = left.split("/").length - right.split("/").length;
+    return depth || left.localeCompare(right);
+  });
+  return groupedPages[0] ?? null;
+}
+
+function nextStaticLayoutEntrypoints(
+  files: ReadonlyMap<string, Buffer>,
+  pageEntrypoint: string,
+) {
+  const pageDirectory = path.posix.dirname(pageEntrypoint);
+  const appRoot = pageEntrypoint.startsWith("src/app/") ? "src/app" : "app";
+  const relative = path.posix.relative(appRoot, pageDirectory);
+  const segments = relative === "." ? [] : relative.split("/");
+  const directories = [appRoot];
+  let current = appRoot;
+  for (const segment of segments) {
+    current = path.posix.join(current, segment);
+    directories.push(current);
+  }
+  return directories.flatMap((directory) => {
+    for (const extension of ["tsx", "jsx"] as const) {
+      const candidate = `${directory}/layout.${extension}`;
+      if (files.has(candidate)) return [candidate];
+    }
+    return [];
+  });
+}
+
+function localStylesheetReferences(from: string, text: string) {
+  const values: string[] = [];
+  for (const match of text.matchAll(
+    /@import\s+(?:url\(\s*)?(?:"([^"]+)"|'([^']+)'|([^"'\s;)]+))/giu,
+  )) {
+    const value = match[1] ?? match[2] ?? match[3];
+    if (value?.startsWith(".")) values.push(value);
+  }
+  for (const match of text.matchAll(
+    /url\(\s*(?:"([^"]+)"|'([^']+)'|([^"')\s]+))\s*\)/giu,
+  )) {
+    const value = match[1] ?? match[2] ?? match[3];
+    if (value?.startsWith(".")) values.push(value);
+  }
+  return values.flatMap((value) => localImportCandidates(from, value));
+}
+
+function nextStaticRuntimeClosure(
+  files: ReadonlyMap<string, Buffer>,
+  roots: readonly string[],
+) {
+  const selected = new Set<string>();
+  const queue = [...roots];
+  while (queue.length > 0) {
+    const filename = queue.shift()!;
+    if (selected.has(filename) || !files.has(filename)) continue;
+    selected.add(filename);
+    const bytes = files.get(filename)!;
+    const references = /\.[cm]?[jt]sx?$/u.test(filename)
+      ? sourceImports(bytes.toString("utf8")).flatMap((specifier) =>
+          specifier.startsWith(".") || specifier.startsWith("@/")
+            ? localImportCandidates(filename, specifier)
+            : [],
+        )
+      : filename.endsWith(".css")
+        ? localStylesheetReferences(filename, bytes.toString("utf8"))
+        : [];
+    for (const candidate of references) {
+      if (files.has(candidate) && !selected.has(candidate))
+        queue.push(candidate);
+    }
+  }
+  const retained = new Map<string, Buffer>();
+  for (const [filename, bytes] of files) {
+    if (
+      selected.has(filename) ||
+      filename === CONTROLLED_PACKAGE_MANIFEST ||
+      filename === "index.html" ||
+      TEMPLATE_ROOT_LICENSE_PATTERN.test(filename) ||
+      filename.startsWith("public/") ||
+      /^(?:tailwind|postcss)\.config\.[cm]?[jt]s$/u.test(filename)
+    ) {
+      retained.set(filename, Buffer.from(bytes));
+    }
+  }
+  return retained;
+}
+
+function nextFontNames(files: ReadonlyMap<string, Buffer>) {
+  const names = new Set<string>();
+  for (const [filename, bytes] of files) {
+    if (!/\.[cm]?[jt]sx?$/u.test(filename)) continue;
+    for (const match of bytes
+      .toString("utf8")
+      .matchAll(
+        /\bimport\s*\{([^}]+)\}\s*from\s*["']next\/font\/google["']/gu,
+      )) {
+      for (const raw of match[1]!.split(",")) {
+        const imported = raw.trim().split(/\s+as\s+/u, 1)[0];
+        if (imported && /^[A-Za-z_$][\w$]*$/u.test(imported))
+          names.add(imported);
+      }
+    }
+  }
+  return [...names].sort();
+}
+
+function rewriteNextStaticImports(files: ReadonlyMap<string, Buffer>) {
+  const rewritten = new Map<string, Buffer>();
+  for (const [filename, bytes] of files) {
+    if (!/\.[cm]?[jt]sx?$/u.test(filename)) {
+      rewritten.set(filename, Buffer.from(bytes));
+      continue;
+    }
+    let text = bytes.toString("utf8");
+    const nextImports = sourceImports(text).filter((value) =>
+      value.startsWith("next/"),
+    );
+    if (nextImports.some((value) => !NEXT_STATIC_MODULE_REWRITES.has(value))) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+      );
+    }
+    for (const [source, replacement] of NEXT_STATIC_MODULE_REWRITES) {
+      text = text.replaceAll(`"${source}"`, `"${replacement}"`);
+      text = text.replaceAll(`'${source}'`, `'${replacement}'`);
+    }
+    text = text
+      .replaceAll('"@devnomic/marquee"', '"@/frontmind-next/marquee"')
+      .replaceAll("'@devnomic/marquee'", "'@/frontmind-next/marquee'")
+      .replaceAll(
+        '"@devnomic/marquee/dist/index.css"',
+        '"@/frontmind-next/marquee.css"',
+      )
+      .replaceAll(
+        "'@devnomic/marquee/dist/index.css'",
+        "'@/frontmind-next/marquee.css'",
+      );
+    rewritten.set(filename, Buffer.from(text, "utf8"));
+  }
+  return rewritten;
+}
+
+function removeTemplateExternalNavigation(files: ReadonlyMap<string, Buffer>) {
+  const rewritten = new Map<string, Buffer>();
+  for (const [filename, bytes] of files) {
+    if (!isTextSourcePath(filename)) {
+      rewritten.set(filename, Buffer.from(bytes));
+      continue;
+    }
+    const text = bytes
+      .toString("utf8")
+      .replace(
+        /(<(?:a|Link)\b[^>]{0,512}\bhref\s*=\s*["'])https:\/\/[^"'\s>]+(["'])/giu,
+        "$1#$2",
+      )
+      .replace(
+        /(["']?(?:href|link|url|site|locationLink)["']?\s*:\s*["'])https:\/\/[^"'\s]+(["'])/giu,
+        "$1#$2",
+      )
+      .replace(/(\bimages\s*:\s*\[\s*["'])https:\/\/[^"'\s]+(["'])/giu, "$1#$2")
+      .replace(/\]\(https:\/\/[^)\s]+\)/giu, "](#)")
+      .replace(/\bprocess\.env\.NEXT_PUBLIC_[A-Z0-9_]+\b/gu, "undefined");
+    const metadataSafeText = /(?:^|\/)metadata\.[cm]?[jt]sx?$/u.test(filename)
+      ? text
+          .replace(
+            /new\s+URL\(\s*["']https:\/\/[^"']+["']\s*\)/gu,
+            'new URL("about:blank")',
+          )
+          .replace(/(["'])https:\/\/[^"'\s]+\1/gu, '"about:blank"')
+      : text;
+    const interactionSafeText = metadataSafeText.replace(
+      /window\.open\(\s*["']https:\/\/[^"']+["']\s*(?:,\s*["'][^"']*["'])?\s*\)/gu,
+      "void 0",
+    );
+    const compatibleRuntimeText =
+      /import\s*\{\s*icons\s*\}\s*from\s*["']lucide-react["']/u.test(
+        interactionSafeText,
+      )
+        ? interactionSafeText.replace(
+            /(const\s+[A-Za-z_$][\w$]*\s*=\s*icons\s*\[[^;\r\n]+\])(\s*;)/gu,
+            "$1 ?? icons.Circle$2",
+          )
+        : interactionSafeText;
+    rewritten.set(filename, Buffer.from(compatibleRuntimeText, "utf8"));
+  }
+  return rewritten;
+}
+
+function nextStaticShimFiles(input: {
+  pageEntrypoint: string;
+  layoutEntrypoints: readonly string[];
+  fontNames: readonly string[];
+}): NativeSourceFile[] {
+  const pageImport = relativeSourceImport(
+    "src/frontmind-next/root.tsx",
+    input.pageEntrypoint,
+  );
+  const layoutImports = input.layoutEntrypoints.map((entrypoint) =>
+    relativeSourceImport("src/frontmind-next/root.tsx", entrypoint),
+  );
+  let renderedPage = "<Page />";
+  for (let index = layoutImports.length - 1; index >= 0; index -= 1) {
+    renderedPage = `<Layout${index}>${renderedPage}</Layout${index}>`;
+  }
+  const fontExports = input.fontNames.map(
+    (name) =>
+      `export const ${name} = (_options?: unknown) => ({ className: "", variable: "", style: {} });`,
+  );
+  return [
+    {
+      path: "src/frontmind-next/root.tsx",
+      bytes: Buffer.from(
+        [
+          'import React from "react";',
+          `import Page from ${JSON.stringify(pageImport)};`,
+          ...layoutImports.map(
+            (entrypoint, index) =>
+              `import Layout${index} from ${JSON.stringify(entrypoint)};`,
+          ),
+          `export default function FrontMindTemplateRoot(){return ${renderedPage}}`,
+          "",
+        ].join("\n"),
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/image.tsx",
+      bytes: Buffer.from(
+        'import React from "react";\ntype Props=React.ImgHTMLAttributes<HTMLImageElement>&{fill?:boolean;priority?:boolean;quality?:number;src:string|{src:string}};\nexport default function Image({fill:_,priority:__,quality:___,src,...props}:Props){return <img src={typeof src==="string"?src:src.src} {...props} />}\n',
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/link.tsx",
+      bytes: Buffer.from(
+        'import React from "react";\nexport default function Link(props:React.AnchorHTMLAttributes<HTMLAnchorElement>){return <a {...props} />}\n',
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/head.tsx",
+      bytes: Buffer.from(
+        'import React from "react";\nexport default function Head({children}:{children?:React.ReactNode}){return <>{children}</>}\n',
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/navigation.ts",
+      bytes: Buffer.from(
+        'export const usePathname=()=>"/"; export const useSearchParams=()=>new URLSearchParams(); export const useRouter=()=>({push:()=>undefined,replace:()=>undefined,back:()=>undefined,refresh:()=>undefined,prefetch:async()=>undefined});\n',
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/types.ts",
+      bytes: Buffer.from(
+        "export type Metadata=Record<string,unknown>; export type Viewport=Record<string,unknown>;\n",
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/font-google.ts",
+      bytes: Buffer.from(`${fontExports.join("\n")}\n`, "utf8"),
+    },
+    {
+      path: "src/frontmind-next/font-local.ts",
+      bytes: Buffer.from(
+        'export default function localFont(_options?:unknown){return {className:"",variable:"",style:{}}}\n',
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/marquee.tsx",
+      bytes: Buffer.from(
+        'import React from "react";\nexport function Marquee({children,direction="left",pauseOnHover=false,reverse=false,fade=false,className="",innerClassName="",numberOfCopies=2,...rest}:React.HTMLAttributes<HTMLDivElement>&{children:React.ReactNode;direction?:"left"|"up";pauseOnHover?:boolean;reverse?:boolean;fade?:boolean;innerClassName?:string;numberOfCopies?:number}){const outer=["group flex gap-[1rem] overflow-hidden",direction==="left"?"flex-row":"flex-col",className].filter(Boolean).join(" ");const inner=["flex justify-around gap-[1rem] [--gap:1rem] shrink-0",direction==="left"?"animate-marquee-left flex-row":"animate-marquee-up flex-col",pauseOnHover?"group-hover:[animation-play-state:paused]":"",reverse?"direction-reverse":"",innerClassName].filter(Boolean).join(" ");const gradient=fade?`linear-gradient(${direction==="left"?"to right":"to bottom"},transparent 0%,rgba(0,0,0,1) 10%,rgba(0,0,0,1) 90%,transparent 100%)`:undefined;return <div className={outer} style={{maskImage:gradient,WebkitMaskImage:gradient}} {...rest}>{Array.from({length:numberOfCopies},(_,index)=><div key={index} className={inner}>{children}</div>)}</div>}\n',
+        "utf8",
+      ),
+    },
+    {
+      path: "src/frontmind-next/marquee.css",
+      bytes: Buffer.from(
+        "@keyframes marquee-left{from{transform:translateX(0)}to{transform:translateX(calc(-100% - var(--gap)))}}.animate-marquee-left{animation:marquee-left var(--duration,40s) linear infinite}@keyframes marquee-up{from{transform:translateY(0)}to{transform:translateY(calc(-100% - var(--gap)))}}.animate-marquee-up{animation:marquee-up var(--duration,40s) linear infinite}\n",
+        "utf8",
+      ),
+    },
+  ];
+}
+
+function nativeTemplateDependencies(files: ReadonlyMap<string, Buffer>) {
+  try {
+    return collectDependencies([], files);
+  } catch (error) {
+    if (error instanceof NativeVisualSourceError) {
+      throw new NativeVisualSourceError(
+        "NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED",
+        error,
+      );
+    }
+    throw error;
+  }
+}
+
+/** Converts a complete 21st Template ZIP into the same controlled, immutable
+ * source archive contract used after selection and by Manus. Provider package
+ * scripts/config are never executed. Next.js static pages are rendered through
+ * local compatibility shims, while their components, CSS and assets remain the
+ * selected source baseline. */
+export async function normalizeTwentyFirstNativeTemplateArchive(input: {
+  templateId: string | number;
+  slug: string;
+  version: string | null;
+  archive: Uint8Array;
+  expectedArchiveSha256?: string;
+}): Promise<
+  NormalizedTwentyFirstNativeSource & {
+    templateId: string;
+    templateSlug: string;
+    framework: NativeTemplateFramework;
+    sourceDirectory: typeof NATIVE_SOURCE_DIRECTORY;
+  }
+> {
+  const templateId = cleanTemplateCoordinate(
+    input.templateId,
+    "NATIVE_TEMPLATE_COORDINATE_INVALID",
+  );
+  const templateSlug = cleanTemplateCoordinate(
+    input.slug,
+    "NATIVE_TEMPLATE_COORDINATE_INVALID",
+  );
+  const archive = Buffer.from(input.archive);
+  if (
+    input.expectedArchiveSha256 &&
+    sha256(archive) !== input.expectedArchiveSha256
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_HASH_MISMATCH");
+  }
+  let templateFiles = await extractNativeTemplateFiles(archive);
+  const manifest = packageManifestFromTemplateFiles(templateFiles);
+  assertTemplatePackageIsInert(manifest);
+  if (
+    [...templateFiles.keys()].some((filename) =>
+      /(?:^|\/)(?:app|pages)\/(?:[^/]+\/)*api(?:\/|$)/u.test(filename),
+    )
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
+  }
+  const nextEntrypoint = findNextStaticEntrypoint(templateFiles);
+  const framework: NativeTemplateFramework = nextEntrypoint
+    ? "next_static"
+    : "vite_react";
+  let entrypoint: string;
+  let demoEntrypoint: string;
+  if (framework === "next_static") {
+    entrypoint = nextEntrypoint!;
+    const originalLayoutEntrypoints = nextStaticLayoutEntrypoints(
+      templateFiles,
+      entrypoint,
+    );
+    templateFiles = nextStaticRuntimeClosure(templateFiles, [
+      entrypoint,
+      ...originalLayoutEntrypoints,
+    ]);
+    const fontNames = nextFontNames(templateFiles);
+    templateFiles = rewriteNextStaticImports(templateFiles);
+    const layoutEntrypoints = nextStaticLayoutEntrypoints(
+      templateFiles,
+      entrypoint,
+    );
+    const shims = nextStaticShimFiles({
+      pageEntrypoint: entrypoint,
+      layoutEntrypoints,
+      fontNames,
+    });
+    for (const file of shims) templateFiles.set(file.path, file.bytes);
+    demoEntrypoint = "src/frontmind-next/root.tsx";
+  } else {
+    const detected = findViteEntrypoint(templateFiles);
+    if (!detected || !templateFiles.has("index.html")) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_ENTRYPOINT_MISSING");
+    }
+    entrypoint = detected;
+    demoEntrypoint = detected;
+    // Keep only the selected page's local runtime closure. Template archives
+    // frequently contain docs, lockfiles and server examples that are not part
+    // of the homepage and must not affect the controlled static build. The
+    // original bootstrap is included only while computing this closure so its
+    // global CSS imports survive; it is discarded before the fixed host shell
+    // is written and is never executed.
+    const bootstrapEntrypoints = [
+      "src/main.tsx",
+      "src/main.jsx",
+      "src/main.ts",
+      "src/main.js",
+    ].filter((candidate) => templateFiles.has(candidate));
+    const bootstrapStylesheets = bootstrapEntrypoints.flatMap((bootstrap) =>
+      sourceImports(templateFiles.get(bootstrap)!.toString("utf8")).flatMap(
+        (specifier) =>
+          specifier.startsWith(".") && specifier.endsWith(".css")
+            ? localImportCandidates(bootstrap, specifier).filter((candidate) =>
+                templateFiles.has(candidate),
+              )
+            : [],
+      ),
+    );
+    templateFiles = nextStaticRuntimeClosure(templateFiles, [
+      detected,
+      ...bootstrapStylesheets,
+    ]);
+  }
+  templateFiles = removeTemplateExternalNavigation(templateFiles);
+  const tailwindV3Config = staticTailwindV3Config(templateFiles);
+  for (const controlled of [
+    CONTROLLED_HTML_ENTRYPOINT,
+    CONTROLLED_PACKAGE_MANIFEST,
+    CONTROLLED_APP_ENTRYPOINT,
+    CONTROLLED_TAILWIND_STYLESHEET,
+    NATIVE_SOURCE_MANIFEST_PATH,
+  ]) {
+    templateFiles.delete(controlled);
+  }
+  // The original entry bootstrap/config is inert and intentionally omitted;
+  // the selected components, CSS and assets are compiled by FrontMind's fixed
+  // shell without invoking Provider scripts.
+  for (const filename of [...templateFiles.keys()]) {
+    if (
+      /(?:^|\/)(?:vite|next|postcss|tailwind)\.config\.[cm]?[jt]s$/u.test(
+        filename,
+      ) ||
+      /(?:^|\/)src\/main\.[cm]?[jt]sx?$/u.test(filename)
+    ) {
+      templateFiles.delete(filename);
+    }
+  }
+  if (!templateFiles.has(entrypoint) || !templateFiles.has(demoEntrypoint)) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ENTRYPOINT_MISSING");
+  }
+  assertLocalSourceImportClosure(templateFiles);
+  const dependencies = nativeTemplateDependencies(templateFiles);
+  const providerFiles = [...templateFiles]
+    .filter(([, bytes]) => bytes.length > 0)
+    .map(([filename, bytes]) => ({ path: filename, bytes: Buffer.from(bytes) }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const projectFiles = controlledSourceProject({
+    providerFiles,
+    demoEntrypoint,
+    dependencies,
+    tailwindV3Config,
+  });
+  const totalBytes = projectFiles.reduce(
+    (sum, file) => sum + file.bytes.length,
+    0,
+  );
+  if (
+    projectFiles.length > MAX_SOURCE_FILES ||
+    totalBytes > MAX_SOURCE_TOTAL_BYTES ||
+    projectFiles.some((file) => file.bytes.length > MAX_SOURCE_FILE_BYTES)
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  assertHardSourceSafety(projectFiles, dependencies, {
+    allowStaticRemoteMedia: true,
+  });
+  return {
+    templateId,
+    templateSlug,
+    framework,
+    sourceDirectory: NATIVE_SOURCE_DIRECTORY,
+    providerItemKey: `t:${templateId}:${templateSlug}`,
+    providerVersion: cleanVersion(input.version),
+    entrypoint,
+    demoEntrypoint,
+    dependencies,
+    htmlEntrypoint: CONTROLLED_HTML_ENTRYPOINT,
+    appEntrypoint: CONTROLLED_APP_ENTRYPOINT,
+    files: projectFiles,
+    sourceTreeSha256: nativeSourceTreeSha256(projectFiles),
+  };
+}
+
+function decodeStaticStylesheet(bytes: Buffer) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new NativeVisualSourceError(
+      "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+      error,
+    );
+  }
+}
+
+function absolutizeRemoteStylesheetUrls(text: string, baseUrl: string) {
+  return text.replace(
+    /url\(\s*(?:"([^"]+)"|'([^']+)'|([^"')\s]+))\s*\)/giu,
+    (matched, doubleQuoted, singleQuoted, bare) => {
+      const raw = String(doubleQuoted ?? singleQuoted ?? bare ?? "").trim();
+      if (!raw || raw.startsWith("data:") || raw.startsWith("#")) {
+        return matched;
+      }
+      let resolved: URL;
+      try {
+        resolved = new URL(raw, baseUrl);
+      } catch (error) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          error,
+        );
+      }
+      if (resolved.protocol !== "https:") {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+        );
+      }
+      resolved.hash = "";
+      return `url(${JSON.stringify(resolved.toString())})`;
+    },
+  );
+}
+
+async function inlineRemoteTemplateStylesheets(input: {
+  files: readonly NativeSourceFile[];
+  signal: AbortSignal;
+  fetchRemoteStyleAsset: FetchNativeTemplateStaticAsset;
+}) {
+  const active = new Set<string>();
+  const cache = new Map<string, string>();
+  let stylesheetCount = 0;
+  let fetchedBytes = 0;
+  const load = async (rawUrl: string, depth: number): Promise<string> => {
+    if (depth > 1 || input.signal.aborted) {
+      throw (
+        input.signal.reason ??
+        new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE")
+      );
+    }
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
     } catch (error) {
       throw new NativeVisualSourceError(
         "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
         error,
       );
     }
-    let bytes = await sharp(fetched.buffer)
-      .rotate()
-      .resize({
-        width: 1600,
-        height: 1200,
-        fit: "inside",
-        withoutEnlargement: true,
-      })
-      .webp({ quality: 80, effort: 4 })
-      .toBuffer();
-    if (bytes.length > MAX_SOURCE_FILE_BYTES) {
+    if (url.protocol !== "https:") {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+      );
+    }
+    const cacheKey = url.toString();
+    const cached = cache.get(cacheKey);
+    if (cached !== undefined) return cached;
+    if (active.has(cacheKey)) {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+      );
+    }
+    active.add(cacheKey);
+    stylesheetCount += 1;
+    if (stylesheetCount > MAX_REMOTE_STYLESHEETS) {
+      throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+    }
+    try {
+      const fetched = await input.fetchRemoteStyleAsset({
+        url: cacheKey,
+        kind: "css",
+        signal: input.signal,
+      });
+      fetchedBytes += fetched.buffer.length;
+      if (fetchedBytes > MAX_REMOTE_STYLE_ASSET_BYTES) {
+        throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+      }
+      let text = decodeStaticStylesheet(fetched.buffer);
+      const imports = [...text.matchAll(remoteCssImportPattern())];
+      if (imports.length > 0 && depth >= 1) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+        );
+      }
+      for (const match of imports) {
+        const specifier = match[1] ?? match[2] ?? match[3];
+        if (!specifier) {
+          throw new NativeVisualSourceError(
+            "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          );
+        }
+        const nestedUrl = new URL(specifier, fetched.finalUrl);
+        if (nestedUrl.protocol !== "https:") {
+          throw new NativeVisualSourceError(
+            "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          );
+        }
+        const nested = await load(nestedUrl.toString(), depth + 1);
+        text = text.replace(match[0], nested);
+      }
+      const resolved = absolutizeRemoteStylesheetUrls(text, fetched.finalUrl);
+      cache.set(cacheKey, resolved);
+      return resolved;
+    } finally {
+      active.delete(cacheKey);
+    }
+  };
+
+  const files: NativeSourceFile[] = [];
+  for (const file of input.files) {
+    if (!file.path.endsWith(".css")) {
+      files.push(file);
+      continue;
+    }
+    let text = file.bytes.toString("utf8");
+    for (const match of [...text.matchAll(remoteCssImportPattern())]) {
+      const specifier = match[1] ?? match[2] ?? match[3];
+      if (!specifier?.startsWith("https://")) continue;
+      const imported = await load(specifier, 0);
+      text = text.replace(match[0], imported);
+    }
+    files.push({ path: file.path, bytes: Buffer.from(text, "utf8") });
+  }
+  return { files, fetchedBytes };
+}
+
+function assertMirroredFontBytes(bytes: Buffer, extension: string) {
+  const signature = bytes.subarray(0, 4).toString("latin1");
+  const valid =
+    (extension === "woff" && signature === "wOFF") ||
+    (extension === "woff2" && signature === "wOF2") ||
+    (extension === "otf" && signature === "OTTO") ||
+    (extension === "ttf" &&
+      bytes.length >= 4 &&
+      bytes[0] === 0 &&
+      bytes[1] === 1 &&
+      bytes[2] === 0 &&
+      bytes[3] === 0) ||
+    (extension === "eot" && bytes.length >= 82);
+  if (!valid) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+}
+
+async function mirrorNativeStaticMedia(input: {
+  source: NormalizedTwentyFirstNativeSource;
+  signal: AbortSignal;
+  fetchRemoteAsset: typeof fetchSafeVisualPreview;
+  fetchRemoteStyleAsset: FetchNativeTemplateStaticAsset;
+}) {
+  const inlined = await inlineRemoteTemplateStylesheets({
+    files: input.source.files,
+    signal: input.signal,
+    fetchRemoteStyleAsset: input.fetchRemoteStyleAsset,
+  });
+  const urls = new Set<string>();
+  for (const file of inlined.files) {
+    if (!isTextSourcePath(file.path)) continue;
+    staticRemoteMediaUrls(file.bytes.toString("utf8")).forEach((url) =>
+      urls.add(url),
+    );
+  }
+  if (urls.size === 0) {
+    const files = [...inlined.files].sort((left, right) =>
+      left.path.localeCompare(right.path),
+    );
+    assertHardSourceSafety(files, input.source.dependencies);
+    return {
+      ...input.source,
+      files,
+      sourceTreeSha256: nativeSourceTreeSha256(files),
+    };
+  }
+  if (urls.size > MAX_STATIC_MEDIA_ASSETS) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+  }
+  const replacements = new Map<string, string>();
+  const assets: NativeSourceFile[] = [];
+  let fetchedStaticBytes = inlined.fetchedBytes;
+  for (const url of [...urls].sort()) {
+    if (input.signal.aborted) throw input.signal.reason;
+    if (remoteRuntimeMediaIsUnsupported(url)) {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_STATIC_MEDIA_UNSUPPORTED",
+      );
+    }
+    const fontExtension = remoteFontExtension(url);
+    if (fontExtension) {
+      let fetched: NativeTemplateStaticAsset;
+      try {
+        fetched = await input.fetchRemoteStyleAsset({
+          url,
+          kind: "font",
+          signal: input.signal,
+        });
+      } catch (error) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          error,
+        );
+      }
+      fetchedStaticBytes += fetched.buffer.length;
+      if (fetchedStaticBytes > MAX_REMOTE_STYLE_ASSET_BYTES) {
+        throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+      }
+      assertMirroredFontBytes(fetched.buffer, fontExtension);
+      const filename = `public/frontmind-native-media/${sha256(fetched.buffer)}.${fontExtension}`;
+      replacements.set(url, `/${filename.slice("public/".length)}`);
+      if (!assets.some((asset) => asset.path === filename)) {
+        assets.push({ path: filename, bytes: Buffer.from(fetched.buffer) });
+      }
+      continue;
+    }
+    let bytes: Buffer;
+    let extension = "webp";
+    try {
+      const fetched = await input.fetchRemoteAsset({
+        url,
+        signal: input.signal,
+      });
       bytes = await sharp(fetched.buffer)
         .rotate()
         .resize({
-          width: 1280,
-          height: 960,
+          width: 1600,
+          height: 1200,
           fit: "inside",
           withoutEnlargement: true,
         })
-        .webp({ quality: 62, effort: 4 })
+        .webp({ quality: 80, effort: 4 })
         .toBuffer();
+      if (bytes.length > MAX_SOURCE_FILE_BYTES) {
+        bytes = await sharp(fetched.buffer)
+          .rotate()
+          .resize({
+            width: 1280,
+            height: 960,
+            fit: "inside",
+            withoutEnlargement: true,
+          })
+          .webp({ quality: 62, effort: 4 })
+          .toBuffer();
+      }
+    } catch (error) {
+      if (!optionalStaticMediaMayUsePlaceholder(inlined.files, url)) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          error,
+        );
+      }
+      bytes = Buffer.from(NATIVE_TEMPLATE_OPTIONAL_MEDIA_PLACEHOLDER);
+      extension = "svg";
     }
     if (bytes.length < 1 || bytes.length > MAX_SOURCE_FILE_BYTES) {
       throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
     }
-    const filename = `public/frontmind-native-media/${sha256(bytes)}.webp`;
+    const filename = `public/frontmind-native-media/${sha256(bytes)}.${extension}`;
     replacements.set(url, `/${filename.slice("public/".length)}`);
     if (!assets.some((asset) => asset.path === filename)) {
       assets.push({ path: filename, bytes });
     }
   }
-  const files = input.source.files.map((file) => {
+  const files = inlined.files.map((file) => {
     if (!isTextSourcePath(file.path)) return file;
     let text = file.bytes.toString("utf8");
     for (const [url, replacement] of replacements) {
@@ -1465,9 +3091,7 @@ async function serveDirectory(root: string) {
   return { server, origin: `http://127.0.0.1:${address.port}` };
 }
 
-type NativePreviewRuntimeFailureCode =
-  | "NATIVE_PREVIEW_PAGE_ERROR"
-  | "NATIVE_PREVIEW_CONSOLE_ERROR";
+type NativePreviewRuntimeFailureCode = "NATIVE_PREVIEW_PAGE_ERROR";
 
 async function assertNativePreviewRendered(
   page: Page,
@@ -1485,9 +3109,6 @@ async function assertNativePreviewRendered(
         hasContent: false,
         hasLayout: false,
         hasVisibleContent: false,
-        viewportCoverage: 0,
-        pageRegionCount: 0,
-        headingCount: 0,
       };
     }
     const visible = (element: Element) => {
@@ -1520,21 +3141,6 @@ async function assertNativePreviewRendered(
       hasVisibleContent:
         (hasDirectText && visible(root)) ||
         [...root.querySelectorAll("*")].some(visible),
-      viewportCoverage: Math.min(
-        1,
-        Math.max(
-          0,
-          (rootBounds.width / Math.max(1, window.innerWidth)) *
-            (rootBounds.height / Math.max(1, window.innerHeight)),
-        ),
-      ),
-      pageRegionCount: [
-        ...root.querySelectorAll(
-          "header,nav,main,section,article,footer,[role=banner],[role=navigation],[role=main],[role=contentinfo]",
-        ),
-      ].filter(visible).length,
-      headingCount: [...root.querySelectorAll("h1,h2,h3")].filter(visible)
-        .length,
     };
   });
   if (
@@ -1545,13 +3151,6 @@ async function assertNativePreviewRendered(
     !rootState.hasVisibleContent
   ) {
     throw new NativeVisualSourceError("NATIVE_PREVIEW_RENDER_FAILED");
-  }
-  if (
-    rootState.viewportCoverage < 0.85 ||
-    rootState.pageRegionCount < 2 ||
-    rootState.headingCount < 1
-  ) {
-    throw new NativeVisualSourceError("NATIVE_SOURCE_PAGE_LEVEL_REQUIRED");
   }
 }
 
@@ -1580,6 +3179,11 @@ export async function renderNativeReactSourcePreview(input: {
   const outputRoot = path.join(root, "dist");
   let server: ReturnType<typeof createServer> | null = null;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  let renderTimer: ReturnType<typeof setTimeout> | null = null;
+  let renderDeadlineExceeded = false;
+  const abortBrowser = () => {
+    void browser?.close().catch(() => undefined);
+  };
   let runtimeStage: "compile" | "browser" | "render" = "compile";
   try {
     await compileValidatedNativeReactSource({
@@ -1612,6 +3216,11 @@ export async function renderNativeReactSourcePreview(input: {
       );
     }
     runtimeStage = "render";
+    input.signal.addEventListener("abort", abortBrowser, { once: true });
+    renderTimer = setTimeout(() => {
+      renderDeadlineExceeded = true;
+      abortBrowser();
+    }, 30_000);
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1000 },
       reducedMotion: "no-preference",
@@ -1623,21 +3232,12 @@ export async function renderNativeReactSourcePreview(input: {
     page.on("pageerror", () => {
       runtimeFailureCodes.add("NATIVE_PREVIEW_PAGE_ERROR");
     });
-    await page.exposeBinding("__frontmindNativeConsoleError", () => {
-      runtimeFailureCodes.add("NATIVE_PREVIEW_CONSOLE_ERROR");
-    });
     await page.exposeBinding("__frontmindNativePolicyViolation", () => {
       networkViolationDetected = true;
     });
     await page.addInitScript(() => {
       const scope = globalThis as typeof globalThis & {
-        __frontmindNativeConsoleError: () => Promise<void>;
         __frontmindNativePolicyViolation: () => Promise<void>;
-      };
-      const originalConsoleError = console.error.bind(console);
-      console.error = (...args: unknown[]) => {
-        void scope.__frontmindNativeConsoleError();
-        originalConsoleError(...args);
       };
       document.addEventListener("securitypolicyviolation", (event) => {
         const blocked = event.blockedURI;
@@ -1674,13 +3274,16 @@ export async function renderNativeReactSourcePreview(input: {
     const screenshot = await page.screenshot({
       type: "png",
       fullPage: false,
-      animations: "allow",
+      animations: "disabled",
       timeout: 10_000,
     });
     await context.close();
     return Buffer.from(screenshot);
   } catch (error) {
     if (error instanceof NativeVisualSourceError) throw error;
+    if (renderDeadlineExceeded) {
+      throw new NativeVisualSourceError("NATIVE_PREVIEW_RENDER_FAILED", error);
+    }
     if (input.signal.aborted) {
       throw new NativeVisualSourceError(
         "NATIVE_SOURCE_DEADLINE_EXHAUSTED",
@@ -1719,6 +3322,8 @@ export async function renderNativeReactSourcePreview(input: {
       error,
     );
   } finally {
+    if (renderTimer) clearTimeout(renderTimer);
+    input.signal.removeEventListener("abort", abortBrowser);
     await browser?.close().catch(() => undefined);
     if (server?.listening)
       await new Promise<void>((resolve) => server!.close(() => resolve()));
@@ -1731,6 +3336,7 @@ export async function prepareNativeVisualCandidate(input: {
   payload: unknown;
   signal: AbortSignal;
   fetchRemoteAsset?: typeof fetchSafeVisualPreview;
+  fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
 }): Promise<PreparedNativeVisualCandidate> {
   const normalized = normalizeTwentyFirstNativeSource({
     candidate: input.candidate,
@@ -1741,6 +3347,8 @@ export async function prepareNativeVisualCandidate(input: {
     source: normalized,
     signal: input.signal,
     fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
+    fetchRemoteStyleAsset:
+      input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
   });
   const sourceArchive = await createNativeSourceArchive(source);
   const preview = await renderNativeReactSourcePreview({
@@ -1749,6 +3357,55 @@ export async function prepareNativeVisualCandidate(input: {
   });
   return {
     ...source,
+    sourceArchive,
+    sourceArchiveSha256: sha256(sourceArchive),
+    preview,
+    previewSha256: sha256(preview),
+  };
+}
+
+/** Worker-facing V6 candidate boundary. It consumes the complete Template ZIP
+ * returned by the Provider adapter and emits the same immutable source archive
+ * accepted by selectedNativeSourceArchive, Manus intake and the final native
+ * materializer. Temporary build and Chromium state is cleaned by the shared
+ * preview runtime on every terminal path. */
+export async function prepareNativeTemplateCandidate(input: {
+  templateId: string | number;
+  slug: string;
+  version: string | null;
+  archive: Uint8Array;
+  expectedArchiveSha256?: string;
+  signal: AbortSignal;
+  fetchRemoteAsset?: typeof fetchSafeVisualPreview;
+  fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
+}): Promise<PreparedNativeTemplateCandidate> {
+  if (input.signal.aborted) throw input.signal.reason;
+  const normalized = await normalizeTwentyFirstNativeTemplateArchive({
+    templateId: input.templateId,
+    slug: input.slug,
+    version: input.version,
+    archive: input.archive,
+    expectedArchiveSha256: input.expectedArchiveSha256,
+  });
+  const source = await mirrorNativeStaticMedia({
+    source: normalized,
+    signal: input.signal,
+    fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
+    fetchRemoteStyleAsset:
+      input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
+  });
+  const sourceArchive = await createNativeSourceArchive(source);
+  assertVisualSelectionBundleV6SourceArchiveSize(sourceArchive);
+  const preview = await renderNativeReactSourcePreview({
+    sourceArchive,
+    signal: input.signal,
+  });
+  return {
+    ...source,
+    templateId: normalized.templateId,
+    templateSlug: normalized.templateSlug,
+    framework: normalized.framework,
+    sourceDirectory: normalized.sourceDirectory,
     sourceArchive,
     sourceArchiveSha256: sha256(sourceArchive),
     preview,
@@ -1794,9 +3451,75 @@ export async function createVisualSelectionBundleV5Artifact(input: {
   return bytes;
 }
 
+function expectedV6ProviderItemKey(candidate: {
+  providerTemplateId: string;
+  providerSlug: string;
+}) {
+  return `t:${candidate.providerTemplateId}:${candidate.providerSlug}`;
+}
+
+function assertV6SourceCoordinates(input: {
+  candidate: VisualSelectionBundleV6["candidates"][number];
+  source: Awaited<ReturnType<typeof readNativeSourceArchive>>;
+}) {
+  const { candidate, source } = input;
+  const nextStaticEntrypoint =
+    /^(?:src\/)?app\/(?:\([a-zA-Z0-9_-]+\)\/)*page\.[cm]?[jt]sx?$/u.test(
+      candidate.entrypoint,
+    ) || /^(?:src\/)?pages\/index\.[cm]?[jt]sx?$/u.test(candidate.entrypoint);
+  const entrypointIsFrameworkCompatible =
+    candidate.framework === "next_static"
+      ? nextStaticEntrypoint
+      : !nextStaticEntrypoint;
+  if (
+    candidate.sourceDirectory !== NATIVE_SOURCE_DIRECTORY ||
+    !entrypointIsFrameworkCompatible ||
+    source.manifest.sourceTreeSha256 !== candidate.sourceTreeSha256 ||
+    source.manifest.entrypoint !== candidate.entrypoint ||
+    source.manifest.providerVersion !== candidate.providerVersion ||
+    source.manifest.providerItemKey !== expectedV6ProviderItemKey(candidate)
+  ) {
+    throw new NativeVisualSourceError("V6_SOURCE_COORDINATE_MISMATCH");
+  }
+}
+
+export async function createVisualSelectionBundleV6Artifact(input: {
+  bundle: VisualSelectionBundleV6;
+  sourceArchives: ReadonlyMap<string, Buffer>;
+}) {
+  const bundle = visualSelectionBundleV6Schema.parse(input.bundle);
+  const zip = new JSZip();
+  zip.file(V6_SELECTION_MANIFEST_PATH, canonicalJson(bundle), zipFileOptions());
+  for (const candidate of bundle.candidates) {
+    const archive =
+      input.sourceArchives.get(candidate.sampleId) ??
+      input.sourceArchives.get(candidate.id);
+    if (!archive || sha256(archive) !== candidate.sourceArchiveSha256) {
+      throw new NativeVisualSourceError("V6_SOURCE_ARCHIVE_HASH_MISMATCH");
+    }
+    assertVisualSelectionBundleV6SourceArchiveSize(archive);
+    const source = await readNativeSourceArchive(archive);
+    assertV6SourceCoordinates({ candidate, source });
+    zip.file(candidate.sourceArchivePath, archive, {
+      ...zipFileOptions(),
+      compression: "STORE",
+    });
+  }
+  const bytes = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 },
+    platform: "UNIX",
+  });
+  if (bytes.length > VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES) {
+    throw new NativeVisualSourceError("V6_SELECTION_BUNDLE_TOO_LARGE");
+  }
+  return bytes;
+}
+
 export async function readVisualSelectionBundleArtifact(bytes: Buffer) {
-  if (bytes.length < 1 || bytes.length > VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES) {
-    throw new NativeVisualSourceError("V5_SELECTION_BUNDLE_SIZE_INVALID");
+  if (bytes.length < 1 || bytes.length > VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES) {
+    throw new NativeVisualSourceError("VISUAL_SELECTION_BUNDLE_SIZE_INVALID");
   }
   const zip = await JSZip.loadAsync(bytes, {
     checkCRC32: true,
@@ -1811,57 +3534,95 @@ export async function readVisualSelectionBundleArtifact(bytes: Buffer) {
         (entry.unsafeOriginalName ?? entry.name) !== entry.name,
     )
   ) {
-    throw new NativeVisualSourceError("V5_SELECTION_BUNDLE_PATH_UNSAFE");
+    throw new NativeVisualSourceError("VISUAL_SELECTION_BUNDLE_PATH_UNSAFE");
   }
-  const manifestEntry = zip.file(V5_SELECTION_MANIFEST_PATH);
+  const v6Manifest = zip.file(V6_SELECTION_MANIFEST_PATH);
+  const v5Manifest = zip.file(V5_SELECTION_MANIFEST_PATH);
+  if (Boolean(v6Manifest) === Boolean(v5Manifest)) {
+    throw new NativeVisualSourceError("VISUAL_SELECTION_MANIFEST_MISSING");
+  }
+  const manifestEntry = v6Manifest ?? v5Manifest;
   if (!manifestEntry)
-    throw new NativeVisualSourceError("V5_SELECTION_MANIFEST_MISSING");
+    throw new NativeVisualSourceError("VISUAL_SELECTION_MANIFEST_MISSING");
   const manifestText = await manifestEntry.async("string");
   if (Buffer.byteLength(manifestText, "utf8") > 512_000) {
-    throw new NativeVisualSourceError("V5_SELECTION_MANIFEST_TOO_LARGE");
+    throw new NativeVisualSourceError("VISUAL_SELECTION_MANIFEST_TOO_LARGE");
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(manifestText);
   } catch {
-    throw new NativeVisualSourceError("V5_SELECTION_MANIFEST_INVALID");
+    throw new NativeVisualSourceError("VISUAL_SELECTION_MANIFEST_INVALID");
   }
-  const bundle = visualSelectionBundleV5Schema.parse(parsed);
+  const bundle = v6Manifest
+    ? visualSelectionBundleV6Schema.parse(parsed)
+    : visualSelectionBundleV5Schema.parse(parsed);
+  if (
+    bundle.schemaVersion === 5 &&
+    bytes.length > VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES
+  ) {
+    throw new NativeVisualSourceError("V5_SELECTION_BUNDLE_SIZE_INVALID");
+  }
+  const manifestPath =
+    bundle.schemaVersion === 6
+      ? V6_SELECTION_MANIFEST_PATH
+      : V5_SELECTION_MANIFEST_PATH;
   const expected = new Set([
-    V5_SELECTION_MANIFEST_PATH,
+    manifestPath,
     ...bundle.candidates.map((candidate) => candidate.sourceArchivePath),
   ]);
   if (
     entries.length !== expected.size ||
     entries.some((entry) => !expected.has(entry.name))
   ) {
-    throw new NativeVisualSourceError("V5_SELECTION_BUNDLE_UNEXPECTED_ENTRY");
+    throw new NativeVisualSourceError(
+      "VISUAL_SELECTION_BUNDLE_UNEXPECTED_ENTRY",
+    );
   }
   const archives = new Map<string, Buffer>();
   for (const candidate of bundle.candidates) {
     const entry = zip.file(candidate.sourceArchivePath);
-    if (!entry) throw new NativeVisualSourceError("V5_SOURCE_ARCHIVE_MISSING");
+    if (!entry)
+      throw new NativeVisualSourceError("VISUAL_SOURCE_ARCHIVE_MISSING");
     const declared = Number(
       (entry as BoundedZipEntry)._data?.uncompressedSize ?? 0,
     );
-    if (
-      Number.isFinite(declared) &&
-      declared > NATIVE_VISUAL_SOURCE_ARCHIVE_MAX_BYTES
-    ) {
-      throw new NativeVisualSourceError("V5_SOURCE_ARCHIVE_TOO_LARGE");
+    const archiveLimit =
+      bundle.schemaVersion === 6
+        ? VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES
+        : NATIVE_VISUAL_SOURCE_ARCHIVE_MAX_BYTES;
+    if (Number.isFinite(declared) && declared > archiveLimit) {
+      throw new NativeVisualSourceError("VISUAL_SOURCE_ARCHIVE_TOO_LARGE");
     }
     const archive = await entry.async("nodebuffer");
+    if (bundle.schemaVersion === 6) {
+      assertVisualSelectionBundleV6SourceArchiveSize(archive);
+    }
     if (sha256(archive) !== candidate.sourceArchiveSha256) {
-      throw new NativeVisualSourceError("V5_SOURCE_ARCHIVE_HASH_MISMATCH");
+      throw new NativeVisualSourceError(
+        bundle.schemaVersion === 6
+          ? "V6_SOURCE_ARCHIVE_HASH_MISMATCH"
+          : "V5_SOURCE_ARCHIVE_HASH_MISMATCH",
+      );
     }
     const source = await readNativeSourceArchive(archive);
-    if (
-      source.manifest.sourceTreeSha256 !== candidate.sourceTreeSha256 ||
-      source.manifest.entrypoint !== candidate.entrypoint ||
-      source.manifest.demoEntrypoint !== candidate.demoEntrypoint ||
-      source.manifest.providerItemKey !== candidate.providerItemKey
-    ) {
-      throw new NativeVisualSourceError("V5_SOURCE_COORDINATE_MISMATCH");
+    if (bundle.schemaVersion === 6) {
+      if (!("providerTemplateId" in candidate)) {
+        throw new NativeVisualSourceError("VISUAL_SOURCE_COORDINATE_MISMATCH");
+      }
+      assertV6SourceCoordinates({ candidate, source });
+    } else {
+      if (!("providerItemKey" in candidate)) {
+        throw new NativeVisualSourceError("VISUAL_SOURCE_COORDINATE_MISMATCH");
+      }
+      if (
+        source.manifest.sourceTreeSha256 !== candidate.sourceTreeSha256 ||
+        source.manifest.entrypoint !== candidate.entrypoint ||
+        source.manifest.demoEntrypoint !== candidate.demoEntrypoint ||
+        source.manifest.providerItemKey !== candidate.providerItemKey
+      ) {
+        throw new NativeVisualSourceError("V5_SOURCE_COORDINATE_MISMATCH");
+      }
     }
     archives.set(candidate.id, archive);
   }
@@ -1877,7 +3638,7 @@ export async function selectedNativeSourceArchive(input: {
     (item) => item.id === input.selectedCandidateId,
   );
   if (!candidate)
-    throw new NativeVisualSourceError("V5_SELECTED_CANDIDATE_MISSING");
+    throw new NativeVisualSourceError("VISUAL_SELECTED_CANDIDATE_MISSING");
   const archiveBytes = artifact.archives.get(candidate.id)!;
   const source = await readNativeSourceArchive(archiveBytes);
   return {

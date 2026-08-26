@@ -90,6 +90,14 @@ export const NATIVE_SOURCE_DEFAULT_LIMITS: Readonly<NativeSourceLimits> =
   });
 
 export const NATIVE_SOURCE_ALLOWED_DEPENDENCIES = Object.freeze([
+  "@base-ui/react",
+  "@devnomic/marquee",
+  "@dnd-kit/core",
+  "@dnd-kit/modifiers",
+  "@dnd-kit/sortable",
+  "@dnd-kit/utilities",
+  "@hookform/resolvers",
+  "@number-flow/react",
   "@radix-ui/react-accordion",
   "@radix-ui/react-alert-dialog",
   "@radix-ui/react-aspect-ratio",
@@ -100,6 +108,7 @@ export const NATIVE_SOURCE_ALLOWED_DEPENDENCIES = Object.freeze([
   "@radix-ui/react-dialog",
   "@radix-ui/react-dropdown-menu",
   "@radix-ui/react-hover-card",
+  "@radix-ui/react-icons",
   "@radix-ui/react-label",
   "@radix-ui/react-menubar",
   "@radix-ui/react-navigation-menu",
@@ -115,31 +124,48 @@ export const NATIVE_SOURCE_ALLOWED_DEPENDENCIES = Object.freeze([
   "@radix-ui/react-tabs",
   "@radix-ui/react-toggle",
   "@radix-ui/react-toggle-group",
+  "@radix-ui/react-toast",
   "@radix-ui/react-tooltip",
   "@tailwindcss/vite",
   "@vitejs/plugin-react",
+  "@tanstack/react-table",
   "class-variance-authority",
   "clsx",
   "cmdk",
+  "date-fns",
   "embla-carousel-react",
   "framer-motion",
+  "gsap",
+  "hls.js",
   "input-otp",
   "lucide-react",
+  "motion",
   "next-themes",
   "react",
   "react-day-picker",
   "react-dom",
   "react-hook-form",
+  "react-markdown",
   "react-resizable-panels",
+  "react-router-dom",
   "recharts",
+  "shaders",
   "sonner",
   "tailwind-merge",
   "tailwindcss",
   "tailwindcss-animate",
+  "tw-animate-css",
   "vaul",
   "vite",
   "wouter",
+  "zod",
+  "zustand",
 ] as const);
+
+/** Host-owned, data-only Tailwind v3 coordinates. Templates cannot import or
+ * declare this as a package; the controlled compiler consumes the JSON. */
+export const NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH =
+  "frontmind-tailwind-v3.json" as const;
 
 export type NativeReactSourceErrorCode =
   | "NATIVE_SOURCE_ARCHIVE_INVALID"
@@ -195,7 +221,7 @@ type UnsafeZipObject = JSZipObject & {
 };
 
 const TEXT_FILE_PATTERN =
-  /(?:^|\/)(?:[^/]+\.(?:cjs|css|html|js|jsx|json|less|md|mdx|mjs|sass|scss|svg|toml|ts|tsx|txt|xml|ya?ml)|Dockerfile|Makefile)$/iu;
+  /(?:^|\/)(?:[^/]+\.(?:cjs|css|html|js|jsx|json|less|md|mdx|mjs|sass|scss|svg|toml|ts|tsx|txt|xml|ya?ml)|Dockerfile|Makefile|LICENSE|NOTICE)$/iu;
 const LOCK_FILE_PATTERN =
   /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/u;
 const ALLOWED_BINARY_FILE_PATTERN =
@@ -328,7 +354,27 @@ export function installedNativeSourceDependencyVersion(name: string) {
       directory = parent;
     }
   } catch {
-    // Report one uniform dependency-version failure below.
+    // CSS-only packages may intentionally expose only the `style` condition,
+    // so CommonJS resolution has no entrypoint. Resolve their package root
+    // from Node's deterministic module search paths without bypassing the
+    // closed dependency allowlist.
+    for (const searchRoot of require.resolve.paths(name) ?? []) {
+      try {
+        const manifest = JSON.parse(
+          readFileSync(path.join(searchRoot, name, "package.json"), "utf8"),
+        ) as Record<string, unknown>;
+        if (
+          manifest.name === name &&
+          typeof manifest.version === "string" &&
+          /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(manifest.version)
+        ) {
+          installedDependencyVersions.set(name, manifest.version);
+          return manifest.version;
+        }
+      } catch {
+        // Continue through the fixed Node module resolution roots.
+      }
+    }
   }
   throw new NativeReactSourceError("NATIVE_SOURCE_DEPENDENCY_VERSION_MISMATCH");
 }
@@ -457,11 +503,62 @@ const SAFE_SOURCE_ABSOLUTE_URLS = new Set([
   "http://www.w3.org/XML/1998/namespace",
 ]);
 
+function withoutSourceComments(text: string) {
+  let output = "";
+  let quote: '"' | "'" | "`" | null = null;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const current = text[index]!;
+    const next = text[index + 1] ?? "";
+    if (quote) {
+      output += current;
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === quote) quote = null;
+      continue;
+    }
+    if (current === '"' || current === "'" || current === "`") {
+      quote = current;
+      output += current;
+      continue;
+    }
+    if (current === "/" && next === "/") {
+      output += "  ";
+      index += 2;
+      while (index < text.length && !/[\r\n]/u.test(text[index]!)) {
+        output += " ";
+        index += 1;
+      }
+      if (index < text.length) output += text[index];
+      continue;
+    }
+    if (current === "/" && next === "*") {
+      output += "  ";
+      index += 2;
+      while (
+        index < text.length &&
+        !(text[index] === "*" && text[index + 1] === "/")
+      ) {
+        output += /[\r\n]/u.test(text[index]!) ? text[index] : " ";
+        index += 1;
+      }
+      if (index < text.length) {
+        output += "  ";
+        index += 1;
+      }
+      continue;
+    }
+    output += current;
+  }
+  return output;
+}
+
 function assertNoExternalUrlLiterals(text: string) {
-  const absoluteUrls = text.match(/https?:\/\/[^\s"'`<>{}\\]+/giu) ?? [];
+  const inspected = withoutSourceComments(text);
+  const absoluteUrls = inspected.match(/https?:\/\/[^\s"'`<>{}\\]+/giu) ?? [];
   if (
     absoluteUrls.some((url) => !SAFE_SOURCE_ABSOLUTE_URLS.has(url)) ||
-    /["'`]\/\/[A-Za-z0-9\[]/u.test(text)
+    /["'`]\/\/[A-Za-z0-9\[]/u.test(inspected)
   ) {
     throw new NativeReactSourceError("NATIVE_SOURCE_NETWORK_FORBIDDEN");
   }
@@ -542,7 +639,7 @@ function assertStyleImportsSafe(
     if (!specifier) {
       throw new NativeReactSourceError("NATIVE_SOURCE_STYLE_IMPORT_FORBIDDEN");
     }
-    if (specifier === "tailwindcss") continue;
+    if (specifier === "tailwindcss" || specifier === "tw-animate-css") continue;
     if (
       !specifier.startsWith("./") ||
       specifier.includes("\\") ||

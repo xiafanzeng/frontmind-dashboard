@@ -5,6 +5,12 @@ const dependencies = vi.hoisted(() => ({
   getServicePortal: vi.fn(async () => ({})),
   reserveQuota: vi.fn(async () => "50000000-0000-4000-8000-000000000005"),
   loadRebuild: vi.fn(),
+  getTwentyFirstCredentialStatus: vi.fn(async () => ({
+    configured: true,
+    version: 3,
+    fingerprint: "fingerprint",
+    nativeTemplateReadiness: "ready" as const,
+  })),
 }));
 
 vi.mock("../db", () => ({ getDb: dependencies.getDb }));
@@ -28,6 +34,9 @@ vi.mock("./providers", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./providers")>();
   return { ...actual, siteOpsProviderConfigured: () => false };
 });
+vi.mock("../twenty-first-service", () => ({
+  getTwentyFirstCredentialStatus: dependencies.getTwentyFirstCredentialStatus,
+}));
 
 import {
   apiCredentials,
@@ -187,7 +196,9 @@ function serviceDatabaseFixture() {
     }
     if (table === presalesApiCredentials) {
       if (inTransaction && keys.includes("version")) {
-        return [{ id: platformCredentialId, version: 3 }];
+        return [
+          { id: platformCredentialId, version: 3, fingerprint: "fingerprint" },
+        ];
       }
       return keys.includes("slot") ? [{ slot: "site_builder_21st" }] : [];
     }
@@ -331,6 +342,7 @@ beforeEach(() => {
     acceptedForCurrentCycle: false,
   });
   dependencies.getServicePortal.mockClear();
+  dependencies.getTwentyFirstCredentialStatus.mockClear();
 });
 
 describe("SiteOps visual selection and current-task revisions", () => {
@@ -400,13 +412,10 @@ describe("SiteOps visual selection and current-task revisions", () => {
     ).toHaveLength(1);
 
     await expect(
-      actOnSiteOps(
-        actor as never,
-        {
-          ...connectKnowledgeInput(fixture.project.revision),
-          clientRequestId: "connect-current-knowledge-2",
-        },
-      ),
+      actOnSiteOps(actor as never, {
+        ...connectKnowledgeInput(fixture.project.revision),
+        clientRequestId: "connect-current-knowledge-2",
+      }),
     ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
     expect(
       fixture.inserts.filter(

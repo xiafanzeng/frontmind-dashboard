@@ -34,6 +34,7 @@ import {
   type VisualSelectionBundleV3,
   type VisualSelectionBundleV4,
   type VisualSelectionBundleV5,
+  type VisualSelectionBundleV6,
 } from "../../shared/siteops";
 import { createHostOwnedSiteDesignResultV2 } from "../../shared/siteops-host-design";
 import {
@@ -133,6 +134,8 @@ import {
 import {
   SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
+  VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
+  assertVisualSelectionBundleV6SourceArchiveSize,
   selectedNativeSourceArchive,
 } from "./native-visual-source";
 import {
@@ -902,11 +905,18 @@ function isVisualSelectionBundleV5(
   return "schemaVersion" in bundle && bundle.schemaVersion === 5;
 }
 
+function isVisualSelectionBundleV6(
+  bundle: VisualSelectionBundle,
+): bundle is VisualSelectionBundleV6 {
+  return "schemaVersion" in bundle && bundle.schemaVersion === 6;
+}
+
 function visualSelectionQueryHash(bundle: VisualSelectionBundle) {
   return isVisualSelectionBundleV2(bundle) ||
     isVisualSelectionBundleV3(bundle) ||
     isVisualSelectionBundleV4(bundle) ||
-    isVisualSelectionBundleV5(bundle)
+    isVisualSelectionBundleV5(bundle) ||
+    isVisualSelectionBundleV6(bundle)
     ? bundle.queryPlanHash
     : (bundle as VisualSelectionBundleV1).queryHash;
 }
@@ -1825,6 +1835,9 @@ function nativeSourceOutputAttachment(
 type NativeSelection = Awaited<ReturnType<typeof selectedNativeSourceArchive>>;
 
 function nativeSourceInputAttachment(source: NativeSelection) {
+  if (source.bundle.schemaVersion === 6) {
+    assertVisualSelectionBundleV6SourceArchiveSize(source.archiveBytes);
+  }
   return {
     filename: "frontmind-selected-21st-source-v1.zip",
     mime_type: "application/zip",
@@ -3379,23 +3392,62 @@ export function createManusSiteOpsProviderHandler(
           "failed",
         );
       const metadataRecord = metadata as unknown as Record<string, unknown>;
-      const rawTaxonomy = metadata.taxonomy;
-      const parsedTaxonomy = visualTaxonomySchema.parse({
-        role: rawTaxonomy.role,
-        palette: rawTaxonomy.palette,
-        typography: rawTaxonomy.typography,
-        layout: rawTaxonomy.layout,
-        motion: rawTaxonomy.motion,
-        accessibility: rawTaxonomy.accessibility,
-      });
-      const taxonomy = {
-        ...parsedTaxonomy,
-        palette: accessibleRuntimePalette(parsedTaxonomy.palette),
-      };
+      const nativeTemplateMetadata =
+        metadataRecord.schemaVersion === 6 &&
+        metadataRecord.renderer === "twenty_first_native_template_v1";
       const documents = safePublicDocuments(context.snapshot);
-      const visualEvidence = visualEvidenceV1Schema.parse(
-        metadataRecord.visualEvidence,
-      );
+      const taxonomy = nativeTemplateMetadata
+        ? visualTaxonomySchema.parse({
+            role: "foundation",
+            palette: [],
+            typography: [],
+            layout: [],
+            motion: [],
+            accessibility: [],
+          })
+        : (() => {
+            const rawTaxonomy = metadata.taxonomy;
+            const parsed = visualTaxonomySchema.parse({
+              role: rawTaxonomy.role,
+              palette: rawTaxonomy.palette,
+              typography: rawTaxonomy.typography,
+              layout: rawTaxonomy.layout,
+              motion: rawTaxonomy.motion,
+              accessibility: rawTaxonomy.accessibility,
+            });
+            return {
+              ...parsed,
+              palette: accessibleRuntimePalette(parsed.palette),
+            };
+          })();
+      const templateEvidenceSeed = nativeTemplateMetadata
+        ? canonicalSiteOpsSha256({
+            schemaVersion: 6,
+            providerTemplateId: metadataRecord.providerTemplateId,
+            providerSlug: metadataRecord.providerSlug,
+            providerVersion: metadataRecord.providerVersion,
+            framework: metadataRecord.framework,
+            sourceTreeSha256: metadataRecord.sourceTreeSha256,
+            sourceArchiveSha256: metadataRecord.sourceArchiveSha256,
+            previewSha256: metadataRecord.previewSha256,
+          })
+        : null;
+      const visualEvidence = nativeTemplateMetadata
+        ? createVisualEvidenceV1({
+            evidenceKind: "catalog_metadata_preview_v1",
+            providerItemKey: `s:template:${templateEvidenceSeed}`,
+            metadataSha256: templateEvidenceSeed!,
+            providerResponseSha256: z
+              .string()
+              .regex(/^[a-f0-9]{64}$/u)
+              .parse(metadataRecord.sourceArchiveSha256),
+            previewSha256: z
+              .string()
+              .regex(/^[a-f0-9]{64}$/u)
+              .parse(metadataRecord.previewSha256),
+            taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+          })
+        : visualEvidenceV1Schema.parse(metadataRecord.visualEvidence);
       const recomposedVisualEvidence = createVisualEvidenceV1({
         evidenceKind: visualEvidence.evidenceKind,
         providerItemKey: visualEvidence.providerItemKey,
@@ -3404,18 +3456,21 @@ export function createManusSiteOpsProviderHandler(
         previewSha256: visualEvidence.previewSha256,
         taxonomyDerivationVersion: visualEvidence.taxonomyDerivationVersion,
       });
-      const metadataProviderItemKey = z
-        .string()
-        .trim()
-        .min(1)
-        .max(512)
-        .parse(metadataRecord.providerItemKey);
+      const metadataProviderItemKey = nativeTemplateMetadata
+        ? visualEvidence.providerItemKey
+        : z
+            .string()
+            .trim()
+            .min(1)
+            .max(512)
+            .parse(metadataRecord.providerItemKey);
       if (
         recomposedVisualEvidence.evidenceSha256 !==
           visualEvidence.evidenceSha256 ||
         metadataProviderItemKey !== visualEvidence.providerItemKey ||
-        context.sample.sourceMetadata?.visualEvidence?.previewSha256 !==
-          visualEvidence.previewSha256
+        (!nativeTemplateMetadata &&
+          context.sample.sourceMetadata?.visualEvidence?.previewSha256 !==
+            visualEvidence.previewSha256)
       ) {
         throw new SiteOpsManusFailure(
           "VISUAL_EVIDENCE_COORDINATES_MISMATCH",
@@ -3452,33 +3507,51 @@ export function createManusSiteOpsProviderHandler(
       if (
         selectionArtifact.row.mimeType === VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE
       ) {
-        if (
-          context.build.workflowVersion !==
-          SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION
-        ) {
-          throw new SiteOpsManusFailure(
-            "VISUAL_SELECTION_COORDINATES_MISMATCH",
-            "原生视觉源码与建站工作流版本不一致。",
-            "failed",
-          );
-        }
         const artifactBytes = await storedArtifactBytes(
           selectionArtifact,
-          25 * 1024 * 1024,
+          VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
         );
         const nativeSelection = await selectedNativeSourceArchive({
           artifactBytes,
           selectedCandidateId: context.sample.id,
         });
-        if (
-          metadataRecord.renderer !== "twenty_first_native_react_v1" ||
-          metadataRecord.schemaVersion !== 5 ||
-          metadataRecord.sourceTreeSha256 !==
-            nativeSelection.candidate.sourceTreeSha256 ||
-          metadataRecord.sourceArchiveSha256 !==
-            nativeSelection.candidate.sourceArchiveSha256 ||
-          metadataProviderItemKey !== nativeSelection.candidate.providerItemKey
-        ) {
+        const selectedV6 = isVisualSelectionBundleV6(nativeSelection.bundle)
+          ? nativeSelection.bundle.candidates.find(
+              (candidate) => candidate.id === context.sample.id,
+            )
+          : null;
+        const selectedV5 = isVisualSelectionBundleV5(nativeSelection.bundle)
+          ? nativeSelection.bundle.candidates.find(
+              (candidate) => candidate.id === context.sample.id,
+            )
+          : null;
+        const coordinatesMatch = nativeTemplateMetadata
+          ? Boolean(
+              selectedV6 &&
+                metadataRecord.sourceTreeSha256 ===
+                  selectedV6.sourceTreeSha256 &&
+                metadataRecord.sourceArchiveSha256 ===
+                  selectedV6.sourceArchiveSha256 &&
+                metadataRecord.providerTemplateId ===
+                  selectedV6.providerTemplateId &&
+                metadataRecord.providerSlug === selectedV6.providerSlug &&
+                metadataRecord.providerVersion === selectedV6.providerVersion &&
+                metadataRecord.framework === selectedV6.framework &&
+                metadataRecord.previewSha256 === selectedV6.previewSha256,
+            )
+          : Boolean(
+              selectedV5 &&
+                context.build.workflowVersion ===
+                  SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION &&
+                metadataRecord.renderer === "twenty_first_native_react_v1" &&
+                metadataRecord.schemaVersion === 5 &&
+                metadataRecord.sourceTreeSha256 ===
+                  selectedV5.sourceTreeSha256 &&
+                metadataRecord.sourceArchiveSha256 ===
+                  selectedV5.sourceArchiveSha256 &&
+                metadataProviderItemKey === selectedV5.providerItemKey,
+            );
+        if (!coordinatesMatch) {
           throw new SiteOpsManusFailure(
             "VISUAL_SELECTION_COORDINATES_MISMATCH",
             "冻结的原生源码与所选视觉候选不一致。",
@@ -3524,6 +3597,8 @@ export function createManusSiteOpsProviderHandler(
         evidencePreviewSha256: visualEvidence.previewSha256,
       });
       if (
+        !("providerItemKey" in selection.candidate) ||
+        !("visualEvidence" in selection.candidate) ||
         selection.candidate.providerItemKey !==
           visualEvidence.providerItemKey ||
         selection.candidate.visualEvidence.evidenceSha256 !==

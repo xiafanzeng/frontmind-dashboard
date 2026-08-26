@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { visualSelectionBundleSchema } from "./siteops";
+import {
+  visualSelectionBundleSchema,
+  visualSelectionBundleV6Schema,
+} from "./siteops";
 import {
   buildTwentyFirstVisualFunnel,
   buildTwentyFirstSearchOnlyFunnel,
@@ -377,6 +380,51 @@ describe("siteops workflow", () => {
         degradedReasons: [],
       }),
     ).toMatchObject({ queryHash: "d".repeat(64) });
+  });
+
+  it("accepts nine unique complete-template candidates in a V6 bundle", () => {
+    const candidates = Array.from({ length: 9 }, (_, index) => ({
+      id: `template-${index + 1}`,
+      sampleId: `template-${index + 1}`,
+      label: String.fromCharCode(65 + index),
+      title: `Template ${index + 1}`,
+      description: null,
+      author: null,
+      previewLocalAssetId: `00000000-0000-4000-8000-${(index + 1)
+        .toString()
+        .padStart(12, "0")}`,
+      previewSha256: "abcdef012"[index]!.repeat(64),
+      providerTemplateId: `provider-template-${index + 1}`,
+      providerSlug: `template-${index + 1}`,
+      providerVersion: index % 2 === 0 ? `v${index + 1}` : null,
+      framework: index % 2 === 0 ? "vite_react" : "next_static",
+      sourceTreeSha256: (index + 1).toString(16).repeat(64),
+      sourceArchiveSha256: "fedcba987"[index]!.repeat(64),
+      sourceArchivePath: `candidates/${String.fromCharCode(
+        65 + index,
+      )}/source.zip`,
+      sourceDirectory: `candidates/template-${index + 1}/source`,
+      entrypoint: index % 2 === 0 ? "src/main.tsx" : "app/page.tsx",
+    }));
+    const bundle = {
+      schemaVersion: 6,
+      renderer: "twenty_first_native_template_v1",
+      queryPlanHash: "f".repeat(64),
+      displayTarget: 9,
+      candidates,
+      selectedCandidateId: null,
+      delegated: false,
+      degradedReasons: [],
+    };
+
+    expect(visualSelectionBundleV6Schema.parse(bundle)).toEqual(bundle);
+    expect(visualSelectionBundleSchema.parse(bundle)).toEqual(bundle);
+    expect(() =>
+      visualSelectionBundleV6Schema.parse({
+        ...bundle,
+        candidates: [candidates[0], ...candidates.slice(0, 8)],
+      }),
+    ).toThrow(/providerTemplateId|sampleId/u);
   });
 
   it("builds a strict contract whose hash excludes the hash field", () => {

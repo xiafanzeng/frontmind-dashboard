@@ -5,11 +5,13 @@ import {
   assertSiteOpsDeploymentTargetAvailable,
   assertCurrentVisualWorkflowVersion,
   completePublishedVisualPageCount,
+  compareSiteOpsVisualOperationsNewestFirst,
   createVisualSearchOperationInput,
   currentSiteOpsBuildWorkflowCoordinates,
   freezeSiteOpsCustomerAiCredential,
   freezeSiteOpsReferenceBlueprint,
   hashSiteOpsRequest,
+  isNativeVisualSelectionMetadata,
   isSiteOpsOperationReplay,
   isSiteOpsIcpApprovedForCurrentDomain,
   normalizeSiteOpsDomain,
@@ -20,6 +22,7 @@ import {
   projectSiteOpsBuildDelivery,
   projectSiteOpsCurrentResetCycle,
   referenceBlueprintForSiteOpsRevision,
+  requireTwentyFirstTemplateAdmission,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
   siteBriefFromSnapshot,
@@ -45,6 +48,50 @@ import {
 } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it("admits visual work only for the exact ready Template credential", () => {
+    expect(
+      requireTwentyFirstTemplateAdmission({
+        configured: true,
+        version: 7,
+        fingerprint: "fingerprint",
+        nativeTemplateReadiness: "ready",
+      } as never),
+    ).toEqual({ version: 7, fingerprint: "fingerprint" });
+    expect(() =>
+      requireTwentyFirstTemplateAdmission({
+        configured: true,
+        version: 7,
+        fingerprint: "fingerprint",
+        nativeTemplateReadiness: "plan_ineligible",
+      } as never),
+    ).toThrow(/下载权限/u);
+  });
+
+  it("recognizes complete-template V6 metadata without legacy visual evidence", () => {
+    expect(
+      isNativeVisualSelectionMetadata({
+        schemaVersion: 6,
+        renderer: "twenty_first_native_template_v1",
+        providerTemplateId: "template-42",
+        providerSlug: "saas-landing",
+        providerVersion: null,
+        framework: "vite_react",
+        sourceTreeSha256: "a".repeat(64),
+        sourceArchiveSha256: "b".repeat(64),
+        previewSha256: "c".repeat(64),
+        sourceDirectory: "source",
+        entrypoint: "src/App.tsx",
+      }),
+    ).toBe(true);
+    expect(
+      isNativeVisualSelectionMetadata({
+        schemaVersion: 6,
+        renderer: "twenty_first_native_template_v1",
+        providerTemplateId: "template-42",
+      }),
+    ).toBe(false);
+  });
+
   it("projects only the fresh workflow cycle after a successful reset", () => {
     const boundary = new Date("2026-08-26T00:00:00.000Z");
     const before = new Date("2026-08-25T23:59:59.999Z");
@@ -283,6 +330,10 @@ describe("SiteOps core contracts", () => {
     expect(visualSearchAllowedForProjectStatus("visual_searching", true)).toBe(
       true,
     );
+    expect(visualSearchAllowedForProjectStatus("preview_ready", true)).toBe(
+      false,
+    );
+    expect(visualSearchAllowedForProjectStatus("live", true)).toBe(false);
   });
 
   it.each([
@@ -586,6 +637,38 @@ describe("SiteOps core contracts", () => {
     });
   });
 
+  it("orders same-second visual retries by monotonic admission revision", () => {
+    const at = new Date("2026-08-26T08:00:00.000Z");
+    const baseInput = {
+      schemaVersion: 2 as const,
+      knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+      credentialId: "20000000-0000-4000-8000-000000000002",
+      credentialVersion: 7,
+      workflowVersion: "2.5.0",
+      mode: "initial" as const,
+      page: 1 as const,
+    };
+    const oldFailure = {
+      id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      status: "attention_required",
+      input: { ...baseInput, admissionRevision: 9 },
+      createdAt: at,
+      updatedAt: at,
+    };
+    const activeRetry = {
+      id: "00000000-0000-4000-8000-000000000000",
+      status: "running",
+      input: { ...baseInput, admissionRevision: 10 },
+      createdAt: at,
+      updatedAt: at,
+    };
+    expect(
+      [oldFailure, activeRetry].sort(
+        compareSiteOpsVisualOperationsNewestFirst,
+      )[0],
+    ).toBe(activeRetry);
+  });
+
   it("makes a terminal first-page visual failure directly retryable without a reset", () => {
     expect(
       projectSiteOpsVisualGeneration({
@@ -618,6 +701,58 @@ describe("SiteOps core contracts", () => {
       retryAction: "start",
       failureCategory: "compile_failed",
       recoveredSelection: false,
+    });
+  });
+
+  it("projects a complete-template pool failure as a retryable initial generation", () => {
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "attention_required",
+        generatedPages: 0,
+        latestVisualOperation: {
+          status: "attention_required",
+          errorCode: "NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT",
+          input: {
+            schemaVersion: 2,
+            knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+            credentialId: "20000000-0000-4000-8000-000000000002",
+            credentialVersion: 7,
+            workflowVersion: "2.5.0",
+            mode: "initial",
+            page: 1,
+            admissionRevision: 9,
+          },
+        },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+      }),
+    ).toMatchObject({
+      status: "retryable_error",
+      retryAction: "start",
+      failureCategory: "insufficient_live_templates",
+      canGenerateMore: true,
+    });
+  });
+
+  it("prefers the recorded complete-template failure cause over the aggregate pool code", () => {
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "attention_required",
+        generatedPages: 0,
+        latestVisualOperation: {
+          status: "attention_required",
+          errorCode: "NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT",
+          result: { templateFailureCategory: "compile_failed" },
+        },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+      }),
+    ).toMatchObject({
+      status: "retryable_error",
+      failureCategory: "compile_failed",
+      canGenerateMore: true,
     });
   });
 
