@@ -124,9 +124,9 @@ jobs:
       - run: pnpm check:governance
       - run: node scripts/check-migration-append-only.mjs
       - run: pnpm exec drizzle-kit check
-      - run: pnpm test
       - name: Install the pinned Chromium runtime for native visual source tests
         run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test
       - name: Compile and render a real native visual source fixture
         env:
           FRONTMIND_RUN_SITEOPS_BROWSER_INTEGRATION: "1"

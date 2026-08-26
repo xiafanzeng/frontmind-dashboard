@@ -62,6 +62,18 @@ afterEach(async () => {
 });
 
 describe("release workflow source-ordering contracts", () => {
+  it("installs the pinned browser before required native Template tests run", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    const browserInstall = workflow.indexOf(
+      "pnpm exec playwright install --with-deps chromium",
+    );
+    const fullTest = workflow.indexOf("- run: pnpm test\n");
+
+    expect(browserInstall).toBeGreaterThan(-1);
+    expect(fullTest).toBeGreaterThan(-1);
+    expect(browserInstall).toBeLessThan(fullTest);
+  });
+
   it("pins independent external DNS only for the production Dashboard app", async () => {
     const compose = await readFile(dashboardCompose, "utf8");
 
