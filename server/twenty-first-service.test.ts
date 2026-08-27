@@ -204,6 +204,7 @@ function createTemplateMcpFetch(input: {
   advertiseTemplateType?: boolean;
   purchaseStatus?: number;
   includedWithPlan?: boolean;
+  omitIncludedWithPlan?: boolean;
   purchaseAccess?: (slug: string) => {
     isUnlocked: boolean;
     verified: boolean;
@@ -229,8 +230,12 @@ function createTemplateMcpFetch(input: {
           JSON.stringify({
             isUnlocked: access?.isUnlocked ?? input.unlocked ?? true,
             verified: access?.verified ?? input.verified ?? true,
-            includedWithPlan:
-              access?.includedWithPlan ?? input.includedWithPlan ?? true,
+            ...(input.omitIncludedWithPlan
+              ? {}
+              : {
+                  includedWithPlan:
+                    access?.includedWithPlan ?? input.includedWithPlan ?? true,
+                }),
             name: "Verified starter",
           }),
           { status: 200, headers: { "content-type": "application/json" } },
@@ -431,7 +436,7 @@ describe("TwentyFirstClient", () => {
       nativeTemplateReadiness: "ready",
       server: { name: "21st-test", version: "1.0.0" },
     });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(4);
     expect(
       calls.every(
         (call) =>
@@ -1227,7 +1232,7 @@ describe("TwentyFirstClient", () => {
         includedWithPlan: true,
       }),
     ]);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(4);
     expect(
       calls.every(
         (call) =>
@@ -1267,10 +1272,10 @@ describe("TwentyFirstClient", () => {
     ]);
   });
 
-  it("does not promote an unlocked unverified item without explicit plan inclusion", async () => {
+  it("accepts an officially unlocked item when optional catalog flags are absent", async () => {
     const { fetchImpl } = createTemplateMcpFetch({
       verified: false,
-      includedWithPlan: false,
+      omitIncludedWithPlan: true,
       results: [
         {
           id: 41,
@@ -1286,7 +1291,12 @@ describe("TwentyFirstClient", () => {
     });
     await expect(
       client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).rejects.toMatchObject({ category: "catalog_unavailable" });
+    ).resolves.toEqual([
+      expect.objectContaining({
+        verified: false,
+        includedWithPlan: false,
+      }),
+    ]);
   });
 
   it("does not equate an individually unlocked Template with plan inclusion", async () => {
@@ -1340,6 +1350,94 @@ describe("TwentyFirstClient", () => {
     expect(
       httpCalls.filter((call) => call.url.endsWith("/purchase")),
     ).toHaveLength(1);
+  });
+
+  it("continues fixed catalog discovery when the first readiness query is empty", async () => {
+    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
+      resultsBySearch: [
+        [],
+        [
+          {
+            id: 41,
+            slug: "verified-starter",
+            name: "Verified starter",
+            type: "template",
+            verified: true,
+            version: "7",
+          },
+        ],
+      ],
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        templateId: 41,
+        slug: "verified-starter",
+      }),
+    ]);
+    expect(calls).toHaveLength(4);
+    expect(
+      httpCalls.filter((call) => call.url.endsWith("/purchase")),
+    ).toHaveLength(1);
+  });
+
+  it("continues past a locked first window to the next downloadable Template", async () => {
+    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
+      resultsBySearch: [
+        [
+          {
+            id: 1,
+            slug: "locked-template",
+            type: "template",
+          },
+        ],
+        [
+          {
+            id: 2,
+            slug: "downloadable-template",
+            type: "template",
+          },
+        ],
+      ],
+      purchaseAccess: (slug) => ({
+        isUnlocked: slug === "downloadable-template",
+        verified: false,
+        includedWithPlan: false,
+      }),
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        templateId: 2,
+        slug: "downloadable-template",
+      }),
+    ]);
+    expect(calls).toHaveLength(4);
+    expect(
+      httpCalls.filter((call) => call.url.endsWith("/purchase")),
+    ).toHaveLength(2);
+  });
+
+  it("classifies locked Templates without optional catalog flags as plan_ineligible", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      unlocked: false,
+      verified: false,
+      omitIncludedWithPlan: true,
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+    ).rejects.toMatchObject({ category: "plan_ineligible" });
   });
 
   it("discovers beyond locked popular results before returning thirty-two eligible Templates", async () => {
@@ -1441,7 +1539,36 @@ describe("TwentyFirstClient", () => {
       timeoutMs: 1_000,
     });
     await client.listNativeTemplates("21st_sk_test_secret", { limit: 1 });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(4);
+    expect(
+      calls.every(
+        (call) =>
+          call.name === "search" &&
+          call.arguments.type === "template" &&
+          !("sort" in call.arguments),
+      ),
+    ).toBe(true);
+  });
+
+  it("returns nine unlocked Templates from the default catalog when popular sorting is unavailable", async () => {
+    const { calls, fetchImpl } = createTemplateMcpFetch({
+      advertisePopular: false,
+      results: Array.from({ length: 12 }, (_, index) => ({
+        id: index + 1,
+        slug: `default-template-${index + 1}`,
+        type: "template",
+        verified: false,
+      })),
+      verified: false,
+      omitIncludedWithPlan: true,
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", { limit: 9 }),
+    ).resolves.toHaveLength(9);
+    expect(calls).toHaveLength(4);
     expect(
       calls.every(
         (call) =>
@@ -1512,12 +1639,13 @@ describe("TwentyFirstClient", () => {
     ).toHaveLength(1);
   });
 
-  it("rechecks verified or plan-included entitlement at the download boundary", async () => {
+  it("downloads an officially unlocked Template without optional catalog flags", async () => {
     const { fetchImpl } = createTemplateMcpFetch({
       verified: false,
-      includedWithPlan: false,
+      omitIncludedWithPlan: true,
     });
-    const templateBinaryFetch = vi.fn();
+    const archive = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x01]);
+    const templateBinaryFetch = vi.fn(async () => archive);
     await expect(
       new TwentyFirstClient({
         fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -1528,8 +1656,8 @@ describe("TwentyFirstClient", () => {
         slug: "unverified-starter",
         version: "7",
       }),
-    ).rejects.toMatchObject({ category: "plan_ineligible" });
-    expect(templateBinaryFetch).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ archive });
+    expect(templateBinaryFetch).toHaveBeenCalledTimes(1);
   });
 
   it("requires an immutable provider version in the download descriptor", async () => {

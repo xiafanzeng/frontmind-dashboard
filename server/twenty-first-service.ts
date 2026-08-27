@@ -1616,14 +1616,11 @@ export class TwentyFirstClient {
         seen.add(`slug:${slugCoordinate}`);
         discovered.push(summary);
       }
-      if (
-        discovered.length >= TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT ||
-        // A credential-readiness probe needs only one provider-ranked search
-        // window. Generation deliberately keeps discovering up to the wider
-        // 64-item window before entitlement filtering, so locked items in the
-        // popular Top 32 cannot hide later downloadable Templates.
-        (input.limit === 1 && successfulSearches >= 1)
-      ) {
+      // Read every fixed catalog window unless the hard discovery cap is full.
+      // A readiness probe cannot stop at the first non-empty window because it
+      // may contain only locked or otherwise unusable Templates while a later
+      // provider-ranked window contains the first downloadable one.
+      if (discovered.length >= TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT) {
         break;
       }
     }
@@ -1633,8 +1630,9 @@ export class TwentyFirstClient {
 
     // Access checks are deliberately progressive. We retain at most the first
     // 64 provider-ranked coordinates, issue at most three reads concurrently,
-    // and stop as soon as the requested number of verified, unlocked Templates
-    // is known. In particular limit=1 performs one purchase-status read.
+    // and stop as soon as the requested number of unlocked Templates is known.
+    // limit=1 therefore performs only as many purchase-status reads as needed
+    // to find the first downloadable item in the merged catalog.
     const catalog = discovered.slice(0, TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT);
     const eligible: TwentyFirstNativeTemplateSummary[] = [];
     let cursor = 0;
@@ -1654,14 +1652,12 @@ export class TwentyFirstClient {
             });
             const verified = summary.verified || access.verified;
             if (!access.isUnlocked) {
-              if (verified) sawPlanIneligible = true;
+              sawPlanIneligible = true;
               return null;
             }
-            // Download access is the hard entitlement boundary. Inside that
-            // boundary the product contract accepts either a provider-verified
-            // Template or one the provider explicitly marks as included with
-            // the current plan; an unlocked item alone proves neither.
-            if (!verified && !access.includedWithPlan) return null;
+            // The official CLI treats isUnlocked as the download entitlement
+            // boundary. verified and includedWithPlan are optional catalog
+            // metadata and may be absent from an otherwise authorized response.
             return {
               ...summary,
               name: access.name ?? summary.name,
@@ -2058,7 +2054,7 @@ export class TwentyFirstClient {
       ? AbortSignal.any([input.signal, timeoutSignal])
       : timeoutSignal;
     const access = await this.templateAccess({ apiKey: value, slug, signal });
-    if (!access.isUnlocked || (!access.verified && !access.includedWithPlan)) {
+    if (!access.isUnlocked) {
       throw new TwentyFirstNativeTemplateError("plan_ineligible");
     }
     const descriptor = await this.templateDownloadDescriptor({
