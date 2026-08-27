@@ -394,6 +394,20 @@ describe("siteops workflow", () => {
         .toString()
         .padStart(12, "0")}`,
       previewSha256: "abcdef012"[index]!.repeat(64),
+      styleTokens: {
+        schemaVersion: 1 as const,
+        derivation: "normalized-preview-bounded-source-v1" as const,
+        previewSha256: "abcdef012"[index]!.repeat(64),
+        sourceTreeSha256: (index + 1).toString(16).repeat(64),
+        dominantHex: index % 2 === 0 ? "#10212b" : "#f5f2ea",
+        canvasTone: index % 2 === 0 ? ("dark" as const) : ("light" as const),
+        contrast: "high" as const,
+        typeSystem:
+          index % 2 === 0
+            ? ("technical_sans" as const)
+            : ("editorial_serif" as const),
+        density: index % 3 === 0 ? ("compact" as const) : ("spacious" as const),
+      },
       providerTemplateId: `provider-template-${index + 1}`,
       providerSlug: `template-${index + 1}`,
       providerVersion: index % 2 === 0 ? `v${index + 1}` : null,
@@ -426,6 +440,36 @@ describe("siteops workflow", () => {
         candidates: [candidates[0], ...candidates.slice(0, 8)],
       }),
     ).toThrow(/providerTemplateId|sampleId/u);
+    expect(() =>
+      visualSelectionBundleV6Schema.parse({
+        ...bundle,
+        candidates: [
+          {
+            ...candidates[0],
+            styleTokens: {
+              ...candidates[0]!.styleTokens,
+              previewSha256: "0".repeat(64),
+            },
+          },
+          ...candidates.slice(1),
+        ],
+      }),
+    ).toThrow(/style tokens/u);
+    expect(() =>
+      visualSelectionBundleV6Schema.parse({
+        ...bundle,
+        candidates: [
+          {
+            ...candidates[0],
+            styleTokens: {
+              ...candidates[0]!.styleTokens,
+              sourceTreeSha256: "0".repeat(64),
+            },
+          },
+          ...candidates.slice(1),
+        ],
+      }),
+    ).toThrow(/style tokens/u);
   });
 
   it("builds a strict contract whose hash excludes the hash field", () => {

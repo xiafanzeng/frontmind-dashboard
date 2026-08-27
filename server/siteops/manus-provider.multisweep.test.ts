@@ -30,6 +30,7 @@ import {
   createManusSiteOpsProviderHandler,
   nativeTemplateCoordinateDirective,
 } from "./manus-provider";
+import { siteOpsArtifactIdForIdempotency } from "./artifact-store";
 import { SiteOpsMaterializationError } from "./materialization-error";
 import { ManusV2ApiError } from "../manus-v2-client";
 import {
@@ -827,6 +828,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         },
         selectionHash: sha256("native-selection"),
         repairAttempts: 0,
+        parentBuildId: null,
         upstreamManusTaskId: null as string | null,
         status: "queued",
       },
@@ -876,6 +878,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     query.innerJoin = () => query;
     query.where = () => query;
     query.limit = async () => [context];
+    let persistedOperationResult: unknown = null;
     const db = {
       select: () => query,
       transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
@@ -883,7 +886,11 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       update: () => ({
         set: (values: Record<string, unknown>) => ({
           where: async () => {
-            if (!("result" in values)) Object.assign(context.build, values);
+            if ("result" in values) {
+              persistedOperationResult = values.result;
+            } else {
+              Object.assign(context.build, values);
+            }
             return [{ affectedRows: 1 }];
           },
         }),
@@ -891,41 +898,66 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     };
     const taskId = "native-manus-task";
     const createTask = vi.fn(async () => ({ taskId }));
+    remotePreview.fetchPinnedPublicHttps
+      .mockReset()
+      .mockResolvedValueOnce({
+        response: new Response(null, { status: 503 }),
+        finalUrl: { origin: "https://files.example.test", path: "/source" },
+      })
+      .mockResolvedValueOnce({
+        response: new Response(null, { status: 503 }),
+        finalUrl: { origin: "https://files.example.test", path: "/source" },
+      })
+      .mockResolvedValueOnce({
+        response: new Response(null, { status: 503 }),
+        finalUrl: { origin: "https://files.example.test", path: "/source" },
+      })
+      .mockResolvedValue({
+        response: new Response(finalSourceZip, {
+          status: 200,
+          headers: {
+            "content-type": "application/zip",
+            "content-length": String(finalSourceZip.length),
+          },
+        }),
+        finalUrl: { origin: "https://files.example.test", path: "/source" },
+      });
+    const formalEvents = [
+      operationMarker(operationToken, 0),
+      {
+        id: "native-receipt",
+        type: "structured_output_result",
+        timestamp: 1,
+        structured_output_result: { success: true, value: receipt },
+      },
+      {
+        id: "native-source",
+        type: "assistant_message",
+        timestamp: 2,
+        assistant_message: {
+          content: "完整源码已返回。",
+          attachments: [
+            {
+              filename: "frontmind-site-source-v1.zip",
+              content_type: "application/zip",
+              url: "https://files.example.test/source.zip?signature=fresh",
+            },
+          ],
+        },
+      },
+      {
+        id: "native-stopped",
+        type: "status_update",
+        timestamp: 3,
+        status_update: { agent_status: "stopped" },
+      },
+    ];
     const client = {
       createTask,
       sendMessage: vi.fn(),
       findCreatedTask: vi.fn(),
       taskDetail: vi.fn(async () => ({ status: "stopped" })),
-      listAllMessages: vi.fn(async () => [
-        operationMarker(operationToken, 0),
-        {
-          id: "native-receipt",
-          type: "structured_output_result",
-          timestamp: 1,
-          structured_output_result: { success: true, value: receipt },
-        },
-        {
-          id: "native-source",
-          type: "assistant_message",
-          timestamp: 2,
-          assistant_message: {
-            content: "完整源码已返回。",
-            attachments: [
-              {
-                filename: "frontmind-site-source-v1.zip",
-                content_type: "application/zip",
-                url: `data:application/zip;base64,${finalSourceZip.toString("base64")}`,
-              },
-            ],
-          },
-        },
-        {
-          id: "native-stopped",
-          type: "status_update",
-          timestamp: 3,
-          status_update: { agent_status: "stopped" },
-        },
-      ]),
+      listAllMessages: vi.fn(async () => formalEvents),
     };
     const contractJson = Buffer.from(
       JSON.stringify({ contractKind: "twenty_first_native_build_contract" }),
@@ -957,44 +989,125 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         warningCodes: [],
       },
     };
+    let crashAfterStaging = true;
     const materializeNativeSite = vi.fn(async (input: any) => {
       expect(input.sourceZip.equals(finalSourceZip)).toBe(true);
       expect(input.mode).toBe("preview");
+      if (crashAfterStaging) {
+        crashAfterStaging = false;
+        throw new Error("SIMULATED_WORKER_CRASH_AFTER_SOURCE_STAGING");
+      }
       return materialized as never;
     });
-    const persistArtifact = vi.fn(
-      async (input: { kind: string; buffer: Buffer }) => ({
-        id: `asset-${input.kind}`,
-        contentSha256: sha256(input.buffer),
-      }),
+    const trustedSourceZip = Buffer.from("frontmind-host-fallback-source");
+    const trustedDistZip = Buffer.from("frontmind-host-fallback-dist");
+    const trustedQaZip = Buffer.from("frontmind-host-fallback-qa");
+    const trustedContract = Buffer.from(
+      JSON.stringify({ contractKind: "frontmind_host_fallback" }),
     );
-    const readArtifact = vi.fn(async () => ({
-      row: {
-        id: context.batch.selectionBundleLocalAssetId,
-        scope: "managed_user",
-        accountUserId: baseOperation.userId,
-        storageKey: `siteops:${baseOperation.projectId}:native-selection`,
-        mimeType: "application/zip",
-        contentSha256: context.batch.selectionBundleHash,
-        sizeBytes: selectionBytes.length,
-      },
-      stored: {
-        sizeBytes: selectionBytes.length,
-        createReadStream: () => Readable.from([selectionBytes]),
-      },
+    const trustedProvenance = Buffer.from(
+      JSON.stringify({ renderer: "frontmind_host" }),
+    );
+    const materializeNativeFallbackSite = vi.fn(async (input: any) => {
+      expect(input).not.toHaveProperty("sourceZip");
+      expect(input.mode).toBe("preview");
+      return {
+        ...materialized,
+        contractJson: trustedContract,
+        contractSha256: sha256(trustedContract),
+        sourceZip: trustedSourceZip,
+        sourceSha256: sha256(trustedSourceZip),
+        distZip: trustedDistZip,
+        distSha256: sha256(trustedDistZip),
+        visualQaZip: trustedQaZip,
+        visualQaSha256: sha256(trustedQaZip),
+        provenanceJson: trustedProvenance,
+        provenanceSha256: sha256(trustedProvenance),
+        buildDelivery: {
+          renderMode: "trusted_fallback" as const,
+          qaStatus: "partial" as const,
+          warningCodes: ["NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK"],
+        },
+      } as never;
+    });
+    const stagedArtifacts = new Map<
+      string,
+      { buffer: Buffer; retainUntil: Date | null }
+    >();
+    let failDistOnce = false;
+    const persistArtifact = vi.fn(async (input: any) => {
+      const id = siteOpsArtifactIdForIdempotency({
+        userId: input.userId,
+        projectId: input.projectId,
+        kind: input.kind,
+        idempotencyKey: input.idempotencyKey,
+      });
+      if (input.kind === "site-dist" && failDistOnce) {
+        failDistOnce = false;
+        throw new Error("SIMULATED_NTH_ARTIFACT_FAILURE");
+      }
+      stagedArtifacts.set(id, {
+        buffer: input.buffer,
+        retainUntil: input.retainUntil ?? null,
+      });
+      return {
+        id,
+        contentSha256: sha256(input.buffer),
+        sizeBytes: input.buffer.length,
+      };
+    });
+    const readArtifact = vi.fn(async (input: { localAssetId: string }) => {
+      if (input.localAssetId === context.batch.selectionBundleLocalAssetId) {
+        return {
+          row: {
+            id: context.batch.selectionBundleLocalAssetId,
+            scope: "managed_user",
+            accountUserId: baseOperation.userId,
+            storageKey: `siteops:${baseOperation.projectId}:native-selection`,
+            mimeType: "application/zip",
+            contentSha256: context.batch.selectionBundleHash,
+            sizeBytes: selectionBytes.length,
+          },
+          stored: {
+            sizeBytes: selectionBytes.length,
+            createReadStream: () => Readable.from([selectionBytes]),
+          },
+        };
+      }
+      const staged = stagedArtifacts.get(input.localAssetId);
+      if (!staged) return null;
+      return {
+        row: {
+          id: input.localAssetId,
+          scope: "managed_user",
+          accountUserId: baseOperation.userId,
+          storageKey: `siteops:${baseOperation.projectId}:site-source-staging:${input.localAssetId}`,
+          mimeType: "application/zip",
+          contentSha256: sha256(staged.buffer),
+          sizeBytes: staged.buffer.length,
+          retainUntil: staged.retainUntil,
+        },
+        stored: {
+          sizeBytes: staged.buffer.length,
+          createReadStream: () => Readable.from([staged.buffer]),
+        },
+      };
+    });
+    const getCredential = vi.fn(async () => ({
+      id: baseOperation.input.manusCredentialId,
+      userId: baseOperation.userId,
+      version: baseOperation.input.manusCredentialVersion,
+      apiKey: "customer-personal-key",
     }));
+    const createClient = vi.fn(() => client as never);
     const handler = createManusSiteOpsProviderHandler({
       getDb: async () => db as never,
-      getCredential: vi.fn(async () => ({
-        id: baseOperation.input.manusCredentialId,
-        userId: baseOperation.userId,
-        version: baseOperation.input.manusCredentialVersion,
-        apiKey: "customer-personal-key",
-      })) as never,
-      createClient: () => client as never,
+      getCredential: getCredential as never,
+      createClient,
       readSnapshotArchive: async () => Buffer.from("x"),
       readArtifact: readArtifact as never,
       materializeNativeSite,
+      materializeNativeTrustedFallbackSite: materializeNativeFallbackSite,
       persistArtifact: persistArtifact as never,
     });
     const assertLeaseActive = vi.fn(async () => undefined);
@@ -1020,11 +1133,197 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       ),
     ).toBe(true);
 
+    const delayedState = {
+      ...(created.result as Record<string, unknown>),
+      nativeSourceReadFailureCount: 2,
+      nativeSourceReadFailureSince: new Date(
+        Date.now() - 15 * 60_000,
+      ).toISOString(),
+      buildPhase: "provider_sync_delayed",
+    };
+    failDistOnce = true;
+    const fallbackDeferred = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        delayedState,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(fallbackDeferred).toMatchObject({
+      status: "pending",
+      providerTaskId: taskId,
+      result: {
+        fallbackPreviewFailureCount: 1,
+        fallbackPreviewLastErrorCode: "SITEOPS_TRUSTED_FALLBACK_FAILED",
+        fallbackPreviewNextPollAt: expect.any(String),
+      },
+    });
+    expect(fallbackDeferred.result).not.toHaveProperty("fallbackPreview");
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(client.sendMessage).not.toHaveBeenCalled();
+
+    const retryFallbackState = {
+      ...(fallbackDeferred.result as Record<string, unknown>),
+      fallbackPreviewNextPollAt: new Date(Date.now() - 1).toISOString(),
+    };
+    const fallback = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        retryFallbackState,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(fallback).toMatchObject({
+      status: "pending",
+      providerTaskId: taskId,
+      buildStatus: "qa_running",
+      result: {
+        fallbackPreview: {
+          status: "staged",
+          trigger: "provider_read_delayed",
+          buildDelivery: { renderMode: "trusted_fallback" },
+        },
+      },
+    });
+    expect(materializeNativeFallbackSite).toHaveBeenCalledTimes(2);
+    expect(materializeNativeSite).not.toHaveBeenCalled();
+    expect(remotePreview.fetchPinnedPublicHttps).toHaveBeenCalledTimes(2);
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(
+      persistArtifact.mock.calls
+        .slice(0, 5)
+        .every(([value]) =>
+          String(value.idempotencyKey).includes(":trusted-fallback:"),
+        ),
+    ).toBe(true);
+
+    const boundFallbackState = {
+      ...(fallback.result as Record<string, unknown>),
+      fallbackPreview: {
+        ...((fallback.result as Record<string, any>).fallbackPreview ?? {}),
+        status: "bound",
+      },
+    };
+    const expiredFallbackState = {
+      ...boundFallbackState,
+      fallbackPreview: {
+        ...(boundFallbackState.fallbackPreview as Record<string, unknown>),
+        reconcileUntilAt: new Date(Date.now() - 1).toISOString(),
+      },
+    };
+    client.taskDetail.mockResolvedValue({ status: "running" });
+    client.listAllMessages.mockResolvedValue([
+      operationMarker(operationToken, 0),
+    ]);
+    const expired = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        expiredFallbackState,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(expired).toMatchObject({
+      status: "attention_required",
+      code: "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+      result: {
+        fallbackPreview: {
+          status: "bound",
+          taskId,
+          buildId: baseOperation.buildId,
+          operationToken: `siteops-native-fallback:${baseOperation.id}`,
+        },
+      },
+    });
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(materializeNativeFallbackSite).toHaveBeenCalledTimes(2);
+
+    client.taskDetail.mockResolvedValue({ status: "stopped" });
+    client.listAllMessages.mockResolvedValue(formalEvents);
+    failDistOnce = true;
+
+    const transientDownload = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        boundFallbackState,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(transientDownload).toMatchObject({
+      status: "pending",
+      providerTaskId: taskId,
+      nextPollMs: 10_000,
+      result: {
+        stage: "native_source_pending",
+        nativeSourceReadFailureCount: 5,
+        buildPhase: "provider_sync_delayed",
+      },
+    });
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(materializeNativeSite).not.toHaveBeenCalled();
+
+    const interrupted = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        transientDownload.result,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(interrupted.status).not.toBe("succeeded");
+    expect(persistedOperationResult).toMatchObject({
+      buildCheckpoint: "compile_started",
+      nativeSourceStaging: {
+        sha256: finalSourceSha256,
+        bytes: finalSourceZip.length,
+        expiresAt: expect.any(String),
+        taskId,
+        repairAttempt: 0,
+        receipt,
+      },
+    });
+
+    client.taskDetail.mockClear();
+    client.listAllMessages.mockClear();
+    client.createTask.mockClear();
+    client.sendMessage.mockClear();
+    getCredential.mockClear();
+    createClient.mockClear();
+    getCredential.mockRejectedValue(new Error("CREDENTIAL_OFFLINE"));
+    createClient.mockImplementation(() => {
+      throw new Error("CLIENT_MUST_NOT_BE_CREATED");
+    });
+    client.taskDetail.mockRejectedValue(new Error("PROVIDER_OFFLINE"));
+    client.listAllMessages.mockRejectedValue(new Error("PROVIDER_OFFLINE"));
+    remotePreview.fetchPinnedPublicHttps.mockClear();
+
+    const artifactInterrupted = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        persistedOperationResult,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(artifactInterrupted.status).not.toBe("succeeded");
+    expect(stagedArtifacts.size).toBe(10);
+
     const finished = await handler({
       operation: operationWithState(
         baseOperation,
         taskId,
-        created.result,
+        persistedOperationResult,
       ) as never,
       signal: new AbortController().signal,
       assertLeaseActive,
@@ -1037,10 +1336,42 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         buildId: baseOperation.buildId,
         distHash: materialized.distSha256,
         buildDelivery: { renderMode: "twenty_first_native" },
+        artifactStaging: {
+          generation: "formal",
+          taskId,
+          operationToken,
+          nativeRepairAttempt: 0,
+          artifactBindings: expect.any(Object),
+          expiresAt: expect.any(String),
+        },
       },
     });
-    expect(materializeNativeSite).toHaveBeenCalledTimes(1);
-    expect(persistArtifact).toHaveBeenCalledTimes(5);
+    expect(materializeNativeSite).toHaveBeenCalledTimes(3);
+    expect(persistArtifact.mock.calls.length).toBeGreaterThanOrEqual(18);
+    expect(stagedArtifacts.size).toBe(11);
+    expect(
+      persistArtifact.mock.calls.find(
+        ([input]) => input.kind === "site-source-staging",
+      )?.[0],
+    ).toMatchObject({
+      kind: "site-source-staging",
+      idempotencyKey: `native-source:${operationToken}`,
+      retainUntil: expect.any(Date),
+    });
+    expect(
+      persistArtifact.mock.calls
+        .filter(([input]) => input.kind !== "site-source-staging")
+        .every(
+          ([input]) =>
+            /^build:/u.test(input.idempotencyKey) &&
+            input.retainUntil instanceof Date,
+        ),
+    ).toBe(true);
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    expect(client.taskDetail).not.toHaveBeenCalled();
+    expect(client.listAllMessages).not.toHaveBeenCalled();
     expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(remotePreview.fetchPinnedPublicHttps).not.toHaveBeenCalled();
   });
 });

@@ -16,6 +16,7 @@ import { getDb } from "../db";
 import { readSiteOpsArtifact } from "./artifact-store";
 import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
 import { completeSiteOpsAliyunOAuth } from "./service";
+import { customerVisibleStyleBatchStatusCondition } from "./visual-batch-visibility";
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -584,14 +585,24 @@ async function sendOwnedAsset(input: {
   userId: number;
   localAssetId: string;
   expectedSha256?: string | null;
+  expectedMimeTypes?: string[];
   disposition?: "inline" | "attachment";
 }) {
   const asset = await readSiteOpsArtifact({
     userId: input.userId,
     localAssetId: input.localAssetId,
     expectedSha256: input.expectedSha256,
+    ...(input.expectedMimeTypes
+      ? { expectedMimeTypes: input.expectedMimeTypes }
+      : {}),
   });
-  if (!asset) return notFound(input.res);
+  if (
+    !asset ||
+    (input.expectedMimeTypes &&
+      !input.expectedMimeTypes.includes(asset.row.mimeType))
+  ) {
+    return notFound(input.res);
+  }
   input.res.setHeader("Cache-Control", "private, no-store, max-age=0");
   input.res.setHeader("Content-Type", asset.row.mimeType);
   input.res.setHeader("Content-Length", String(asset.row.sizeBytes));
@@ -604,6 +615,38 @@ async function sendOwnedAsset(input: {
 }
 
 export const siteOpsArtifactApi = express.Router();
+
+const STYLE_PREVIEW_MIME_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+] as const;
+
+function frozenStylePreviewSha256(sourceMetadata: unknown) {
+  if (
+    !sourceMetadata ||
+    typeof sourceMetadata !== "object" ||
+    Array.isArray(sourceMetadata)
+  ) {
+    return { valid: true as const, value: undefined };
+  }
+  const metadata = sourceMetadata as Record<string, unknown>;
+  const strictSourceBackedPreview =
+    metadata.schemaVersion === 5 ||
+    metadata.schemaVersion === 6 ||
+    metadata.renderer === "twenty_first_native_react_v1" ||
+    metadata.renderer === "twenty_first_native_template_v1";
+  const raw = metadata.previewSha256 ?? metadata.realizationPreviewSha256;
+  if (raw === undefined || raw === null) {
+    return strictSourceBackedPreview
+      ? { valid: false as const, value: undefined }
+      : { valid: true as const, value: undefined };
+  }
+  if (typeof raw !== "string" || !/^[a-f0-9]{64}$/iu.test(raw.trim())) {
+    return { valid: false as const, value: undefined };
+  }
+  return { valid: true as const, value: raw.trim().toLowerCase() };
+}
 
 siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
   const startedAt = Date.now();
@@ -687,6 +730,7 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
     const rows = await db
       .select({
         localAssetId: websiteStyleSamples.previewLocalAssetId,
+        sourceMetadata: websiteStyleSamples.sourceMetadata,
       })
       .from(websiteStyleSamples)
       .innerJoin(
@@ -698,16 +742,20 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
           eq(websiteStyleSamples.id, req.params.sampleId),
           eq(websiteStyleSampleBatches.userId, userId),
           eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-          eq(websiteStyleSampleBatches.status, "published"),
+          customerVisibleStyleBatchStatusCondition(),
         ),
       )
       .limit(1);
-    const localAssetId = rows[0]?.localAssetId;
-    if (!localAssetId) return notFound(res);
+    const row = rows[0];
+    const localAssetId = row?.localAssetId;
+    const expectedHash = frozenStylePreviewSha256(row?.sourceMetadata);
+    if (!localAssetId || !expectedHash.valid) return notFound(res);
     await sendOwnedAsset({
       res,
       userId,
       localAssetId,
+      expectedSha256: expectedHash.value,
+      expectedMimeTypes: [...STYLE_PREVIEW_MIME_TYPES],
       disposition: "inline",
     });
   } catch (error) {

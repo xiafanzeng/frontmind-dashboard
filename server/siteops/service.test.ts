@@ -20,6 +20,7 @@ import {
   projectSiteOpsObservationStatuses,
   projectSiteOpsExecutionSteps,
   projectSiteOpsBuildDelivery,
+  projectSiteOpsBuildProgress,
   projectSiteOpsCurrentResetCycle,
   referenceBlueprintForSiteOpsRevision,
   requireTwentyFirstTemplateAdmission,
@@ -194,6 +195,146 @@ describe("SiteOps core contracts", () => {
       renderMode: "twenty_first_native",
       qaStatus: "passed_with_warnings",
       warningCodes: ["AXE_COLOR_CONTRAST"],
+    });
+  });
+
+  it("exposes a bound trusted fallback while its original task keeps running", () => {
+    const fallbackBuildId = "30000000-0000-4000-8000-000000000003";
+    const artifactBindings = Object.fromEntries(
+      (["contract", "source", "dist", "qa", "provenance"] as const).map(
+        (kind, index) => [
+          kind,
+          {
+            id: `60000000-0000-4000-8000-00000000000${index + 1}`,
+            sha256: String(index + 1).repeat(64),
+            bytes: index + 1,
+            mimeType:
+              kind === "contract" || kind === "provenance"
+                ? "application/json"
+                : "application/zip",
+          },
+        ],
+      ),
+    );
+    const operation = {
+      buildId: fallbackBuildId,
+      kind: "site_build",
+      status: "running",
+      providerTaskId: "manus-task-1",
+      result: {
+        schemaVersion: 2,
+        buildPhase: "provider_sync_delayed",
+        fallbackPreview: {
+          status: "bound",
+          trigger: "provider_read_delayed",
+          createdAt: "2026-08-27T00:15:00.000Z",
+          reconcileUntilAt: "2026-08-28T00:00:00.000Z",
+          buildId: fallbackBuildId,
+          taskId: "manus-task-1",
+          operationToken:
+            "siteops-native-fallback:10000000-0000-4000-8000-000000000001",
+          selectedPreviewSha256: "a".repeat(64),
+          selectedSourceTreeSha256: "b".repeat(64),
+          artifactBindings,
+          buildDelivery: {
+            renderMode: "trusted_fallback",
+            qaStatus: "partial",
+            warningCodes: ["NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK"],
+          },
+        },
+      },
+    };
+    expect(
+      projectSiteOpsBuildDelivery({
+        buildId: fallbackBuildId,
+        operations: [operation],
+      }),
+    ).toEqual({
+      renderMode: "trusted_fallback",
+      qaStatus: "partial",
+      warningCodes: ["NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK"],
+    });
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: fallbackBuildId,
+        operations: [operation],
+      }),
+    ).toMatchObject({
+      buildPhase: "provider_sync_delayed",
+      recoverable: true,
+      previewWarning: expect.stringContaining("基础预览"),
+    });
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: fallbackBuildId,
+        operations: [{ ...operation, status: "attention_required" }],
+      }),
+    ).toMatchObject({
+      recoverable: true,
+      previewWarning: expect.stringContaining("自动对账窗口已结束"),
+    });
+  });
+
+  it("projects recoverable native repair and provider sync phases", () => {
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: "build-1",
+        operations: [
+          {
+            buildId: "build-1",
+            kind: "site_build",
+            status: "running",
+            providerTaskId: "manus-task-1",
+            result: {
+              schemaVersion: 2,
+              stage: "native_repair_pending",
+              buildPhase: "provider_sync_delayed",
+            },
+          },
+        ],
+      }),
+    ).toMatchObject({
+      buildPhase: "provider_sync_delayed",
+      recoverable: true,
+      previewWarning: expect.stringContaining("同一任务"),
+    });
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: "build-1",
+        operations: [
+          {
+            buildId: "build-1",
+            kind: "build_revision",
+            status: "failed",
+            providerTaskId: "manus-task-1",
+            errorCode: "FRONTMIND_BUILD_SERVICE_UNAVAILABLE",
+            result: {
+              schemaVersion: 1,
+              stage: "native_repair_pending",
+            },
+          },
+        ],
+      }),
+    ).toMatchObject({
+      buildPhase: "source_repairing",
+      recoverable: true,
+    });
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: "build-1",
+        operations: [
+          {
+            buildId: "build-1",
+            kind: "site_build",
+            status: "succeeded",
+            result: { buildPhase: "persisting_preview" },
+          },
+        ],
+      }),
+    ).toEqual({
+      buildPhase: null,
+      recoverable: false,
+      previewWarning: null,
     });
   });
 
@@ -630,10 +771,46 @@ describe("SiteOps core contracts", () => {
     ).toMatchObject({
       status: "retryable_error",
       targetPage: null,
+      availablePages: 1,
+      reservedPages: 0,
       canGenerateMore: true,
       canSelectExisting: true,
       retryAction: "supplemental",
       recoveredSelection: true,
+    });
+  });
+
+  it("only advertises pages that the candidate pool has already frozen", () => {
+    const base = {
+      projectStatus: "awaiting_visual_selection",
+      generatedPages: 1,
+      latestVisualOperation: { status: "succeeded" },
+      hasActiveVisualOperation: false,
+      hasActiveBuild: false,
+      hasBuildAttempt: false,
+    };
+
+    expect(
+      projectSiteOpsVisualGeneration({
+        ...base,
+        availablePages: 1,
+        reservedPages: 0,
+      }),
+    ).toMatchObject({
+      availablePages: 1,
+      reservedPages: 0,
+      canGenerateMore: false,
+    });
+    expect(
+      projectSiteOpsVisualGeneration({
+        ...base,
+        availablePages: 2,
+        reservedPages: 1,
+      }),
+    ).toMatchObject({
+      availablePages: 2,
+      reservedPages: 1,
+      canGenerateMore: true,
     });
   });
 

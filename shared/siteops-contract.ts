@@ -95,6 +95,18 @@ export const siteOpsVisualGenerationProjectionSchema = z
       .int()
       .min(0)
       .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+    availablePages: z
+      .number()
+      .int()
+      .min(0)
+      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .optional(),
+    reservedPages: z
+      .number()
+      .int()
+      .min(0)
+      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .optional(),
     maxPages: z.literal(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
     canGenerateMore: z.boolean(),
     canSelectExisting: z.boolean().default(true),
@@ -125,6 +137,18 @@ export const siteOpsBuildProjectionSchema = z
       .strict()
       .nullable()
       .default(null),
+    buildPhase: z
+      .enum([
+        "source_repairing",
+        "provider_sync_delayed",
+        "source_validating",
+        "compiling",
+        "persisting_preview",
+      ])
+      .nullable()
+      .optional(),
+    recoverable: z.boolean().optional(),
+    previewWarning: z.string().trim().min(1).max(500).nullable().optional(),
     needsHelp: z.boolean().default(false),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),

@@ -72,6 +72,7 @@ run("pnpm", [
     ? ["server/knowledge-base-incident-repair-cli.ts"]
     : []),
   "server/pdf-prepare-worker.ts",
+  "scripts/reconcile-siteops-build.ts",
   "scripts/release-db.ts",
   "scripts/verify-presales-file-roundtrip.ts",
   "--platform=node",
@@ -92,6 +93,12 @@ if (knowledgeBaseIncidentRepairCliRequired) {
   if (!output.isFile() || output.size === 0) {
     throw new Error("BUILD_INCIDENT_REPAIR_CLI_OUTPUT_MISSING");
   }
+}
+const siteOpsReconcileBuildCli = await lstat(
+  path.join(buildRoot, "reconcile-siteops-build.js"),
+);
+if (!siteOpsReconcileBuildCli.isFile() || siteOpsReconcileBuildCli.size === 0) {
+  throw new Error("BUILD_SITEOPS_RECONCILE_CLI_OUTPUT_MISSING");
 }
 run(process.execPath, ["scripts/copy-runtime-skills.mjs"]);
 run(process.execPath, ["scripts/copy-runtime-migrations.mjs"]);

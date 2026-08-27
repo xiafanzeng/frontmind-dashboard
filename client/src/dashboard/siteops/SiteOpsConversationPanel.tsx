@@ -85,6 +85,14 @@ const BUILD_STATUS_LABELS: Record<string, string> = {
   superseded: "已被新版本替代",
 };
 
+const BUILD_PHASE_LABELS: Record<string, string> = {
+  source_repairing: "正在修复源码",
+  provider_sync_delayed: "正在同步建站结果",
+  source_validating: "正在校验源码",
+  compiling: "正在构建预览",
+  persisting_preview: "正在保存预览",
+};
+
 const CARD_LABELS: Record<string, string> = {
   brief_question: "建站资料",
   visual_board: "视觉方向",
@@ -1095,12 +1103,26 @@ export default function SiteOpsConversationPanel({
     status: "idle" as const,
     targetPage: null,
     generatedPages: visualPages.length,
+    availablePages: visualPages.length,
+    reservedPages: 0,
     maxPages: 3 as const,
-    canGenerateMore: visualPages.length < 3,
+    canGenerateMore: false,
     canSelectExisting: true,
     retryAction: null,
     failureCategory: null,
   };
+  const publishedVisualPages = Math.max(
+    visualPages.length,
+    visualGeneration.generatedPages,
+  );
+  const frozenVisualPages = Math.max(
+    publishedVisualPages,
+    visualGeneration.availablePages ?? publishedVisualPages,
+  );
+  const remainingFrozenVisualPages = Math.max(
+    0,
+    frozenVisualPages - publishedVisualPages,
+  );
   const visualGenerationPending =
     visualGeneration.status === "generating" ||
     busyAction === "reselect_visual";
@@ -1207,23 +1229,24 @@ export default function SiteOpsConversationPanel({
                 />
               </button>
             )}
-            {(observation.rebuildRequest.allowed || rebuildRequestActive) && (
-              <button
-                type="button"
-                className="siteops-icon-button"
-                aria-label={rebuildRequestLabel}
-                disabled={Boolean(
-                  busyAction || !observation.rebuildRequest.allowed,
-                )}
-                title={rebuildRequestLabel}
-                onClick={() => {
-                  setRebuildError(null);
-                  setRebuildDialogOpen(true);
-                }}
-              >
-                <Wrench size={17} aria-hidden="true" />
-              </button>
-            )}
+            {(observation.rebuildRequest.allowed || rebuildRequestActive) &&
+              !latestAttempt?.recoverable && (
+                <button
+                  type="button"
+                  className="siteops-icon-button"
+                  aria-label={rebuildRequestLabel}
+                  disabled={Boolean(
+                    busyAction || !observation.rebuildRequest.allowed,
+                  )}
+                  title={rebuildRequestLabel}
+                  onClick={() => {
+                    setRebuildError(null);
+                    setRebuildDialogOpen(true);
+                  }}
+                >
+                  <Wrench size={17} aria-hidden="true" />
+                </button>
+              )}
           </div>
         </div>
       </header>
@@ -1554,8 +1577,10 @@ export default function SiteOpsConversationPanel({
                   {visualGenerationPending
                     ? `正在生成第 ${visualGenerationTargetPage} 组`
                     : visualGeneration.canGenerateMore
-                      ? "重新生成 9 个视觉候选"
-                      : "已生成全部 27 个候选"}
+                      ? remainingFrozenVisualPages > 0
+                        ? "显示下一组 9 个视觉候选"
+                        : "获取并冻结下一组视觉候选"
+                      : `已冻结全部 ${publishedVisualPages * 9} 个候选`}
                 </button>
               </div>
             )}
@@ -1609,8 +1634,10 @@ export default function SiteOpsConversationPanel({
               </div>
               <span>
                 {visualGeneration.canGenerateMore
-                  ? `还可生成 ${visualGeneration.maxPages - visualGeneration.generatedPages} 组`
-                  : "27 选 1"}
+                  ? remainingFrozenVisualPages > 0
+                    ? `已冻结 ${frozenVisualPages} 组；还可显示 ${remainingFrozenVisualPages} 组`
+                    : "下一组将在完整冻结后显示"
+                  : `${publishedVisualPages * 9} 选 1`}
               </span>
               <button
                 type="button"
@@ -1652,7 +1679,20 @@ export default function SiteOpsConversationPanel({
       )}
 
       {!hideExistingBuildDuringActiveRebuild &&
+        latestAttempt?.recoverable &&
+        latestBuild?.id !== latestAttempt.id && (
+          <div className="siteops-notice warning" role="status">
+            <AlertCircle size={18} aria-hidden="true" />
+            <span>
+              {latestAttempt.previewWarning ?? "新版本仍在同一任务内安全恢复。"}
+              上一版成功预览仍可继续查看和使用。
+            </span>
+          </div>
+        )}
+
+      {!hideExistingBuildDuringActiveRebuild &&
         latestAttempt?.needsHelp &&
+        !latestAttempt.recoverable &&
         latestBuild?.id !== latestAttempt.id && (
           <div className="siteops-notice warning" role="status">
             <AlertCircle size={18} aria-hidden="true" />
@@ -1669,8 +1709,14 @@ export default function SiteOpsConversationPanel({
         >
           <div>
             <h3 id="siteops-build-title">
-              {BUILD_STATUS_LABELS[latestBuild.status] || "正在处理"}
+              {(latestBuild.buildPhase &&
+                BUILD_PHASE_LABELS[latestBuild.buildPhase]) ||
+                BUILD_STATUS_LABELS[latestBuild.status] ||
+                "正在处理"}
             </h3>
+            {latestBuild.recoverable && latestBuild.previewWarning && (
+              <p>{latestBuild.previewWarning}</p>
+            )}
             {latestBuild.previewUrl &&
               latestBuild.buildDelivery?.renderMode === "trusted_fallback" && (
                 <p>
@@ -1686,11 +1732,13 @@ export default function SiteOpsConversationPanel({
                   官网预览已生成，质量检查中的非阻断建议已记录，不影响查看和后续发布。
                 </p>
               )}
-            {latestBuild.needsHelp && !latestBuild.previewUrl && (
-              <p>
-                本次没有生成可安全展示的版本。可以申请重置；批准并完成旧站下线后，可从当前企业知识库重新开始建站。
-              </p>
-            )}
+            {latestBuild.needsHelp &&
+              !latestBuild.recoverable &&
+              !latestBuild.previewUrl && (
+                <p>
+                  本次没有生成可安全展示的版本。可以申请重置；批准并完成旧站下线后，可从当前企业知识库重新开始建站。
+                </p>
+              )}
           </div>
           <div className="siteops-build-actions">
             {latestBuild.previewUrl && (
@@ -1709,7 +1757,7 @@ export default function SiteOpsConversationPanel({
                 下载网站源码
               </a>
             )}
-            {hasSuccessfulBuild && (
+            {hasSuccessfulBuild && !latestAttempt?.recoverable && (
               <button
                 type="button"
                 className="siteops-secondary-button"
@@ -1725,22 +1773,24 @@ export default function SiteOpsConversationPanel({
                 {rebuildRequestLabel}
               </button>
             )}
-            {latestBuild.needsHelp && !latestBuild.previewUrl && (
-              <button
-                type="button"
-                className="siteops-primary-button"
-                disabled={Boolean(
-                  busyAction || !observation.rebuildRequest.allowed,
-                )}
-                onClick={() => {
-                  setRebuildError(null);
-                  setRebuildDialogOpen(true);
-                }}
-              >
-                <Wrench size={15} aria-hidden="true" />
-                {rebuildRequestLabel}
-              </button>
-            )}
+            {latestBuild.needsHelp &&
+              !latestBuild.recoverable &&
+              !latestBuild.previewUrl && (
+                <button
+                  type="button"
+                  className="siteops-primary-button"
+                  disabled={Boolean(
+                    busyAction || !observation.rebuildRequest.allowed,
+                  )}
+                  onClick={() => {
+                    setRebuildError(null);
+                    setRebuildDialogOpen(true);
+                  }}
+                >
+                  <Wrench size={15} aria-hidden="true" />
+                  {rebuildRequestLabel}
+                </button>
+              )}
             {["preview_ready", "approved"].includes(latestBuild.status) && (
               <button
                 type="button"

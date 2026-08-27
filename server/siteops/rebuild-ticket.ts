@@ -15,6 +15,8 @@ import {
   siteProviderConnections,
   socialPackages,
   users,
+  visualCandidatePoolPages,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   workspaceSiteProfiles,
 } from "../../drizzle/schema";
@@ -1892,6 +1894,44 @@ export async function finalizeApprovedSiteOpsReset(
         isNull(messages.deletedAt),
       ),
     );
+  const candidatePoolRows = await tx
+    .select({ id: visualCandidatePools.id })
+    .from(visualCandidatePools)
+    .where(
+      and(
+        eq(visualCandidatePools.projectId, project.id),
+        eq(visualCandidatePools.userId, project.userId),
+        inArray(visualCandidatePools.status, ["active", "selected"]),
+      ),
+    )
+    .for("update");
+  const candidatePoolIds = candidatePoolRows.map(
+    (pool: { id: string }) => pool.id,
+  );
+  if (candidatePoolIds.length > 0) {
+    await tx
+      .update(visualCandidatePoolPages)
+      .set({ status: "superseded", updatedAt: input.now })
+      .where(
+        and(
+          inArray(visualCandidatePoolPages.poolId, candidatePoolIds),
+          inArray(visualCandidatePoolPages.status, [
+            "reserved",
+            "published",
+            "selected",
+          ]),
+        ),
+      );
+    await tx
+      .update(visualCandidatePools)
+      .set({ status: "superseded", updatedAt: input.now })
+      .where(
+        and(
+          inArray(visualCandidatePools.id, candidatePoolIds),
+          inArray(visualCandidatePools.status, ["active", "selected"]),
+        ),
+      );
+  }
   await tx
     .update(websiteStyleSampleBatches)
     .set({ status: "superseded", updatedAt: input.now })

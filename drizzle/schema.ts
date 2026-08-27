@@ -3965,10 +3965,9 @@ export const siteProjects = mysqlTable(
     currentTaskStartedAt: timestamp("current_task_started_at")
       .defaultNow()
       .notNull(),
-    minimumKnowledgeSnapshotVersion: int(
-      "minimum_knowledge_snapshot_version",
-      { unsigned: true },
-    ),
+    minimumKnowledgeSnapshotVersion: int("minimum_knowledge_snapshot_version", {
+      unsigned: true,
+    }),
     status: mysqlEnum("status", [
       "draft",
       "collecting_brief",
@@ -4020,11 +4019,7 @@ export const siteBuilds = mysqlTable(
     }).notNull(),
     parentBuildId: varchar("parent_build_id", { length: 36 }),
     quotaPeriodId: varchar("quota_period_id", { length: 36 }),
-    quotaState: mysqlEnum("quota_state", [
-      "reserved",
-      "consumed",
-      "released",
-    ]),
+    quotaState: mysqlEnum("quota_state", ["reserved", "consumed", "released"]),
     ordinal: int("ordinal", { unsigned: true }).notNull(),
     workflowUpstreamVersion: varchar("workflow_upstream_version", {
       length: 32,
@@ -4206,6 +4201,236 @@ export const siteOperations = mysqlTable(
   ],
 );
 
+/**
+ * One immutable, task-scoped pool of complete 21st Template candidates.
+ *
+ * Status values deliberately use varchar plus application validation instead
+ * of changing an existing MySQL enum. This keeps the migration additive while
+ * allowing a future lifecycle state to be introduced without rebuilding a
+ * customer-facing table.
+ */
+export const visualCandidatePools = mysqlTable(
+  "visual_candidate_pools",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    projectId: varchar("project_id", { length: 36 }).notNull(),
+    userId: int("user_id").notNull(),
+    knowledgeSnapshotId: varchar("knowledge_snapshot_id", {
+      length: 36,
+    }).notNull(),
+    credentialId: varchar("credential_id", { length: 36 }).notNull(),
+    credentialVersion: int("credential_version", { unsigned: true }).notNull(),
+    initialOperationId: varchar("initial_operation_id", {
+      length: 36,
+    }).notNull(),
+    generationKey: varchar("generation_key", { length: 64 }).notNull(),
+    taskStartedAt: timestamp("task_started_at").notNull(),
+    projectRevision: int("project_revision", { unsigned: true }).notNull(),
+    seed: varchar("seed", { length: 64 }).notNull(),
+    catalogFingerprint: varchar("catalog_fingerprint", {
+      length: 64,
+    }).notNull(),
+    queryPlanHash: varchar("query_plan_hash", { length: 64 }).notNull(),
+    manifestLocalAssetId: varchar("manifest_local_asset_id", {
+      length: 36,
+    }).notNull(),
+    manifestHash: varchar("manifest_hash", { length: 64 }).notNull(),
+    pageCount: int("page_count", { unsigned: true }).notNull(),
+    candidateCount: int("candidate_count", { unsigned: true }).notNull(),
+    status: varchar("status", { length: 32 }).default("active").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      name: "visual_candidate_pools_project_fk",
+      columns: [table.projectId],
+      foreignColumns: [siteProjects.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "visual_candidate_pools_user_fk",
+      columns: [table.userId],
+      foreignColumns: [users.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "visual_candidate_pools_snapshot_fk",
+      columns: [table.knowledgeSnapshotId],
+      foreignColumns: [knowledgeBaseSnapshots.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "visual_candidate_pools_credential_fk",
+      columns: [table.credentialId],
+      foreignColumns: [presalesApiCredentials.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "visual_candidate_pools_operation_fk",
+      columns: [table.initialOperationId],
+      foreignColumns: [siteOperations.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "visual_candidate_pools_manifest_fk",
+      columns: [table.manifestLocalAssetId],
+      foreignColumns: [localAssets.id],
+    }).onDelete("restrict"),
+    uniqueIndex("visual_candidate_pools_generation_uq").on(table.generationKey),
+    index("visual_candidate_pools_project_task_idx").on(
+      table.projectId,
+      table.taskStartedAt,
+      table.status,
+    ),
+    index("visual_candidate_pools_snapshot_credential_idx").on(
+      table.knowledgeSnapshotId,
+      table.credentialId,
+      table.credentialVersion,
+    ),
+    check(
+      "visual_candidate_pools_status_ck",
+      sql`${table.status} IN ('active', 'selected', 'superseded')`,
+    ),
+    check(
+      "visual_candidate_pools_capacity_ck",
+      sql`(${table.pageCount} BETWEEN 1 AND 3 AND ${table.candidateCount} = ${table.pageCount} * 9)`,
+    ),
+  ],
+);
+
+/** A locally frozen V6 page. Only `published` pages have a customer batch. */
+export const visualCandidatePoolPages = mysqlTable(
+  "visual_candidate_pool_pages",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    poolId: varchar("pool_id", { length: 36 }).notNull(),
+    pageNumber: int("page_number", { unsigned: true }).notNull(),
+    status: varchar("status", { length: 32 }).default("reserved").notNull(),
+    selectionBundleLocalAssetId: varchar("selection_bundle_local_asset_id", {
+      length: 36,
+    }).notNull(),
+    selectionBundleHash: varchar("selection_bundle_hash", {
+      length: 64,
+    }).notNull(),
+    candidateCount: int("candidate_count", { unsigned: true }).notNull(),
+    bundleSizeBytes: int("bundle_size_bytes", { unsigned: true }).notNull(),
+    batchId: varchar("batch_id", { length: 36 }),
+    publishedOperationId: varchar("published_operation_id", {
+      length: 36,
+    }),
+    publishedAt: timestamp("published_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      name: "visual_candidate_pool_pages_pool_fk",
+      columns: [table.poolId],
+      foreignColumns: [visualCandidatePools.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "visual_candidate_pool_pages_bundle_fk",
+      columns: [table.selectionBundleLocalAssetId],
+      foreignColumns: [localAssets.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "visual_candidate_pool_pages_batch_fk",
+      columns: [table.batchId],
+      foreignColumns: [websiteStyleSampleBatches.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "visual_candidate_pool_pages_operation_fk",
+      columns: [table.publishedOperationId],
+      foreignColumns: [siteOperations.id],
+    }).onDelete("restrict"),
+    uniqueIndex("visual_candidate_pool_pages_pool_page_uq").on(
+      table.poolId,
+      table.pageNumber,
+    ),
+    uniqueIndex("visual_candidate_pool_pages_batch_uq").on(table.batchId),
+    index("visual_candidate_pool_pages_status_idx").on(
+      table.poolId,
+      table.status,
+      table.pageNumber,
+    ),
+    check(
+      "visual_candidate_pool_pages_status_ck",
+      sql`${table.status} IN ('reserved', 'published', 'selected', 'superseded')`,
+    ),
+    check(
+      "visual_candidate_pool_pages_capacity_ck",
+      sql`(${table.pageNumber} BETWEEN 1 AND 3 AND ${table.candidateCount} = 9 AND ${table.bundleSizeBytes} > 0 AND ${table.bundleSizeBytes} <= 104857600)`,
+    ),
+    check(
+      "visual_candidate_pool_pages_publish_ck",
+      sql`(
+        (${table.status} = 'reserved' AND ${table.batchId} IS NULL AND ${table.publishedOperationId} IS NULL AND ${table.publishedAt} IS NULL)
+        OR
+        (${table.status} IN ('published', 'selected') AND ${table.batchId} IS NOT NULL AND ${table.publishedOperationId} IS NOT NULL AND ${table.publishedAt} IS NOT NULL)
+        OR
+        ${table.status} = 'superseded'
+      )`,
+    ),
+  ],
+);
+
+/**
+ * Durable preview references for every frozen page, including pages that have
+ * not yet been published as a customer-visible batch. Retention must follow
+ * these rows rather than the age of the underlying local asset.
+ */
+export const visualCandidatePoolItems = mysqlTable(
+  "visual_candidate_pool_items",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    poolPageId: varchar("pool_page_id", { length: 36 }).notNull(),
+    sampleId: varchar("sample_id", { length: 36 }).notNull(),
+    position: int("position", { unsigned: true }).notNull(),
+    previewLocalAssetId: varchar("preview_local_asset_id", {
+      length: 36,
+    }).notNull(),
+    previewSha256: varchar("preview_sha256", { length: 64 }).notNull(),
+    sourceTreeSha256: varchar("source_tree_sha256", { length: 64 }).notNull(),
+    providerTemplateId: varchar("provider_template_id", {
+      length: 191,
+    }).notNull(),
+    providerSlug: varchar("provider_slug", { length: 191 }).notNull(),
+    providerVersion: varchar("provider_version", { length: 191 }),
+    providerItemKey: varchar("provider_item_key", { length: 512 }).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      name: "visual_candidate_pool_items_page_fk",
+      columns: [table.poolPageId],
+      foreignColumns: [visualCandidatePoolPages.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "visual_candidate_pool_items_preview_fk",
+      columns: [table.previewLocalAssetId],
+      foreignColumns: [localAssets.id],
+    }).onDelete("restrict"),
+    uniqueIndex("visual_candidate_pool_items_page_sample_uq").on(
+      table.poolPageId,
+      table.sampleId,
+    ),
+    uniqueIndex("visual_candidate_pool_items_page_position_uq").on(
+      table.poolPageId,
+      table.position,
+    ),
+    uniqueIndex("visual_candidate_pool_items_preview_uq").on(
+      table.previewLocalAssetId,
+    ),
+    uniqueIndex("visual_candidate_pool_items_page_provider_uq").on(
+      table.poolPageId,
+      table.providerItemKey,
+    ),
+    index("visual_candidate_pool_items_source_tree_idx").on(
+      table.sourceTreeSha256,
+    ),
+    check(
+      "visual_candidate_pool_items_position_ck",
+      sql`${table.position} BETWEEN 0 AND 8`,
+    ),
+  ],
+);
+
 /** Append-only deployment and rollback records. */
 export const siteDeployments = mysqlTable(
   "site_deployments",
@@ -4293,11 +4518,7 @@ export const socialPackages = mysqlTable(
       { onDelete: "set null" },
     ),
     quotaPeriodId: varchar("quota_period_id", { length: 36 }),
-    quotaState: mysqlEnum("quota_state", [
-      "reserved",
-      "consumed",
-      "released",
-    ]),
+    quotaState: mysqlEnum("quota_state", ["reserved", "consumed", "released"]),
     channel: mysqlEnum("channel", ["wechat", "xiaohongshu"]).notNull(),
     manifest: json("manifest").$type<Record<string, unknown>>(),
     manifestHash: varchar("manifest_hash", { length: 64 }),
@@ -4468,6 +4689,17 @@ export type InsertApiCredential = typeof apiCredentials.$inferInsert;
 export type PresalesApiCredential = typeof presalesApiCredentials.$inferSelect;
 export type InsertPresalesApiCredential =
   typeof presalesApiCredentials.$inferInsert;
+export type VisualCandidatePool = typeof visualCandidatePools.$inferSelect;
+export type InsertVisualCandidatePool =
+  typeof visualCandidatePools.$inferInsert;
+export type VisualCandidatePoolPage =
+  typeof visualCandidatePoolPages.$inferSelect;
+export type InsertVisualCandidatePoolPage =
+  typeof visualCandidatePoolPages.$inferInsert;
+export type VisualCandidatePoolItem =
+  typeof visualCandidatePoolItems.$inferSelect;
+export type InsertVisualCandidatePoolItem =
+  typeof visualCandidatePoolItems.$inferInsert;
 export type AgentOperation = typeof agentOperations.$inferSelect;
 export type InsertAgentOperation = typeof agentOperations.$inferInsert;
 export type AgentTask = typeof agentTasks.$inferSelect;

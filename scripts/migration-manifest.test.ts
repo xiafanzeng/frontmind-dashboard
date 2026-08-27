@@ -42,11 +42,11 @@ describe("migration manifest", () => {
       dialect: "mysql",
       count: journal.entries.length,
       latestTag: journal.entries.at(-1)?.tag,
-      schemaSnapshot: "meta/0065_snapshot.json",
-      schemaTableCount: 81,
+      schemaSnapshot: "meta/0066_snapshot.json",
+      schemaTableCount: 84,
       schemaHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
-    expect(manifest.schemaContract.tables).toHaveLength(81);
+    expect(manifest.schemaContract.tables).toHaveLength(84);
     expect(
       manifest.schemaContract.tables.map((table) => table.name),
     ).not.toContain("__drizzle_migrations");

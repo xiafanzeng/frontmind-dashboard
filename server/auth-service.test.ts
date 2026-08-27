@@ -14,6 +14,7 @@ import {
   providerFileLeases,
   upstreamResources,
   users,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   websiteStyleSamples,
 } from "../drizzle/schema";
@@ -108,17 +109,18 @@ describe("managed account deletion", () => {
 
     await permanentlyDeleteManagedUserRows({ delete: deleteFrom, select }, 42);
 
-    expect(deleteFrom).toHaveBeenCalledTimes(9);
-    expect(deleteFrom).toHaveBeenNthCalledWith(1, websiteStyleSamples);
-    expect(deleteFrom).toHaveBeenNthCalledWith(2, websiteStyleSampleBatches);
-    expect(deleteFrom).toHaveBeenNthCalledWith(3, knowledgeBaseResetRequests);
-    expect(deleteFrom).toHaveBeenNthCalledWith(4, deliveryRedirectPreviews);
-    expect(deleteFrom).toHaveBeenNthCalledWith(5, deliveryTicketAttachments);
-    expect(deleteFrom).toHaveBeenNthCalledWith(6, deliveryTickets);
-    expect(deleteFrom).toHaveBeenNthCalledWith(7, upstreamResources);
-    expect(deleteFrom).toHaveBeenNthCalledWith(8, apiKeyOwnership);
-    expect(deleteFrom).toHaveBeenNthCalledWith(9, users);
-    expect(where).toHaveBeenCalledTimes(9);
+    expect(deleteFrom).toHaveBeenCalledTimes(10);
+    expect(deleteFrom).toHaveBeenNthCalledWith(1, visualCandidatePools);
+    expect(deleteFrom).toHaveBeenNthCalledWith(2, websiteStyleSamples);
+    expect(deleteFrom).toHaveBeenNthCalledWith(3, websiteStyleSampleBatches);
+    expect(deleteFrom).toHaveBeenNthCalledWith(4, knowledgeBaseResetRequests);
+    expect(deleteFrom).toHaveBeenNthCalledWith(5, deliveryRedirectPreviews);
+    expect(deleteFrom).toHaveBeenNthCalledWith(6, deliveryTicketAttachments);
+    expect(deleteFrom).toHaveBeenNthCalledWith(7, deliveryTickets);
+    expect(deleteFrom).toHaveBeenNthCalledWith(8, upstreamResources);
+    expect(deleteFrom).toHaveBeenNthCalledWith(9, apiKeyOwnership);
+    expect(deleteFrom).toHaveBeenNthCalledWith(10, users);
+    expect(where).toHaveBeenCalledTimes(10);
   });
 
   it("rejects deleting the administrator's current account", async () => {

@@ -6,9 +6,9 @@ import {
   type SiteBrief,
 } from "./siteops";
 import {
-  referenceBlueprintV4Schema,
+  referenceBlueprintSchema,
   siteDesignResultV2Schema,
-  type ReferenceBlueprintV4,
+  type ReferenceBlueprint,
   type SiteDesignSpecV2,
 } from "./siteops-design";
 
@@ -18,7 +18,7 @@ type RouteComposition = SiteDesignSpecV2["routeCompositions"][number];
 export type HostOwnedSiteDesignInput = {
   operationToken: string;
   brief: SiteBrief;
-  referenceBlueprint: ReferenceBlueprintV4;
+  referenceBlueprint: ReferenceBlueprint;
   taxonomy: VisualTaxonomy;
 };
 
@@ -98,7 +98,7 @@ function hostOwnedRouteComposition(
 }
 
 function layoutForBlueprint(
-  referenceBlueprint: ReferenceBlueprintV4,
+  referenceBlueprint: ReferenceBlueprint,
 ): SiteDesignSpecV2["layoutArchetype"] {
   switch (referenceBlueprint.composition) {
     case "split":
@@ -116,7 +116,7 @@ function layoutForBlueprint(
 }
 
 function imageTreatmentForBlueprint(
-  referenceBlueprint: ReferenceBlueprintV4,
+  referenceBlueprint: ReferenceBlueprint,
 ): SiteDesignSpecV2["imageTreatment"] {
   switch (referenceBlueprint.mediaRegion) {
     case "none":
@@ -133,7 +133,7 @@ function imageTreatmentForBlueprint(
 }
 
 function typeScaleForBlueprint(
-  referenceBlueprint: ReferenceBlueprintV4,
+  referenceBlueprint: ReferenceBlueprint,
 ): SiteDesignSpecV2["typeScale"] {
   if (referenceBlueprint.typographyStyle === "editorial") return "editorial";
   if (referenceBlueprint.typographyStyle === "display") return "display";
@@ -141,17 +141,16 @@ function typeScaleForBlueprint(
 }
 
 /**
- * Create the complete design contract for workflow 2.4 without accepting any
- * provider-owned route, slot, layout or palette coordinates. The provider's
- * only output in 2.4 is SiteContentDraftV1; this result is derived entirely
- * from the frozen brief, the selected immutable reference blueprint and its
- * frozen safe taxonomy.
+ * Create the complete host-owned design contract without accepting any
+ * provider-owned route, slot, layout or palette coordinates. Normal 2.4
+ * builds pass V4; the native first-build fallback may pass the historical V3
+ * single-preview coordinate when no independent realization was frozen.
  */
 export function createHostOwnedSiteDesignResultV2(
   input: HostOwnedSiteDesignInput,
 ) {
   const brief = siteBriefSchema.parse(input.brief);
-  const referenceBlueprint = referenceBlueprintV4Schema.parse(
+  const referenceBlueprint = referenceBlueprintSchema.parse(
     input.referenceBlueprint,
   );
   const taxonomy = visualTaxonomySchema.parse(input.taxonomy);

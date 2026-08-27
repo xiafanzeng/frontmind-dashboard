@@ -31,6 +31,8 @@ import {
   siteProviderConnections,
   socialPackages,
   users,
+  visualCandidatePoolPages,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   websiteStyleSamples,
   workspaceSiteProfiles,
@@ -108,6 +110,8 @@ import {
   loadSiteOpsRebuildRequest,
   SiteOpsRebuildTicketError,
 } from "./rebuild-ticket";
+import { customerVisibleStyleBatchStatusCondition } from "./visual-batch-visibility";
+import { siteOpsTrustedFallbackPreviewFromResult } from "./trusted-fallback";
 
 export type SiteOpsServiceErrorCode =
   | "CREDENTIAL_ROTATED"
@@ -1334,11 +1338,32 @@ export function completePublishedVisualPageCount(input: {
 export function projectSiteOpsVisualGeneration(input: {
   projectStatus: string;
   generatedPages: number;
+  availablePages?: number | null;
+  reservedPages?: number | null;
   latestVisualOperation?: VisualOperationProjectionRow | null;
   hasActiveVisualOperation: boolean;
   hasActiveBuild: boolean;
   hasBuildAttempt: boolean;
 }) {
+  const hasFrozenAvailability = Number.isInteger(input.availablePages);
+  const availablePages = hasFrozenAvailability
+    ? Math.max(
+        input.generatedPages,
+        Math.min(
+          SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+          Number(input.availablePages),
+        ),
+      )
+    : input.generatedPages;
+  const reservedPages = Math.max(
+    0,
+    Math.min(
+      availablePages - input.generatedPages,
+      hasFrozenAvailability && Number.isInteger(input.reservedPages)
+        ? Number(input.reservedPages)
+        : 0,
+    ),
+  );
   const latestStatus = input.latestVisualOperation?.status ?? null;
   const recoveredSelection = siteOpsVisualSelectionRecovery({
     projectStatus: input.projectStatus,
@@ -1383,10 +1408,14 @@ export function projectSiteOpsVisualGeneration(input: {
         )
       : null,
     generatedPages: input.generatedPages,
+    availablePages,
+    reservedPages,
     maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
     canGenerateMore:
       (canSelectExisting || retryableInitialFailure) &&
-      input.generatedPages < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+      (hasFrozenAvailability
+        ? input.generatedPages < availablePages
+        : input.generatedPages < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
     canSelectExisting,
     retryAction: retryableError
       ? input.generatedPages === 0
@@ -1571,13 +1600,26 @@ export function projectSiteOpsBuildDelivery(input: {
     result?: Record<string, unknown> | null;
   }[];
 }) {
-  const operation = input.operations.find(
-    (candidate) =>
-      candidate.buildId === input.buildId &&
-      candidate.status === "succeeded" &&
-      (candidate.kind === "site_build" || candidate.kind === "build_revision"),
-  );
-  const rawDelivery = operation?.result?.buildDelivery;
+  const operation = input.operations.find((candidate) => {
+    if (
+      candidate.buildId !== input.buildId ||
+      (candidate.kind !== "site_build" && candidate.kind !== "build_revision")
+    ) {
+      return false;
+    }
+    if (candidate.status === "succeeded") return true;
+    return (
+      siteOpsTrustedFallbackPreviewFromResult(candidate.result)?.status ===
+      "bound"
+    );
+  });
+  const fallback = siteOpsTrustedFallbackPreviewFromResult(operation?.result);
+  const rawDelivery =
+    operation?.status === "succeeded"
+      ? operation.result?.buildDelivery
+      : fallback?.status === "bound"
+        ? fallback.buildDelivery
+        : null;
   const delivery =
     rawDelivery &&
     typeof rawDelivery === "object" &&
@@ -1609,6 +1651,85 @@ export function projectSiteOpsBuildDelivery(input: {
         warningCodes: Array.from(new Set(warningCodes)).slice(0, 100),
       }
     : null;
+}
+
+const SITEOPS_BUILD_PHASE_WARNINGS = {
+  source_repairing:
+    "首次源码未通过安全检查，系统正在同一任务内自动修复；已选视觉参考仍会保留。",
+  provider_sync_delayed:
+    "AI 建站结果正在同步，系统会继续读取同一任务，不会重复创建或重复计费。",
+  source_validating: "源码已返回，正在进行安全、格式和任务绑定校验。",
+  compiling: "源码已通过输入校验，正在构建受控预览。",
+  persisting_preview: "预览已完成构建，正在保存并绑定可展示版本。",
+} as const;
+
+type SiteOpsBuildPhase = keyof typeof SITEOPS_BUILD_PHASE_WARNINGS;
+
+export function projectSiteOpsBuildProgress(input: {
+  buildId: string;
+  operations: readonly {
+    buildId: string | null;
+    status: string;
+    kind: string;
+    providerTaskId?: string | null;
+    errorCode?: string | null;
+    result?: Record<string, unknown> | null;
+  }[];
+}) {
+  const operation = input.operations.find(
+    (candidate) =>
+      candidate.buildId === input.buildId &&
+      (candidate.kind === "site_build" || candidate.kind === "build_revision"),
+  );
+  const result =
+    operation?.result &&
+    typeof operation.result === "object" &&
+    !Array.isArray(operation.result)
+      ? operation.result
+      : null;
+  if (operation?.status === "succeeded") {
+    return {
+      buildPhase: null,
+      recoverable: false,
+      previewWarning: null,
+    };
+  }
+  const rawPhase = String(result?.buildPhase ?? "");
+  const legacyStage = String(result?.stage ?? "");
+  const buildPhase = Object.prototype.hasOwnProperty.call(
+    SITEOPS_BUILD_PHASE_WARNINGS,
+    rawPhase,
+  )
+    ? (rawPhase as SiteOpsBuildPhase)
+    : legacyStage === "native_repair_pending" ||
+        legacyStage === "native_repair_send_unknown"
+      ? ("source_repairing" as const)
+      : null;
+  const taskBound = Boolean(
+    operation?.providerTaskId ||
+      (typeof result?.taskId === "string" && result.taskId.trim()),
+  );
+  const fallbackBound =
+    siteOpsTrustedFallbackPreviewFromResult(result)?.status === "bound";
+  const recoverable = Boolean(
+    taskBound &&
+      (buildPhase === "source_repairing" ||
+        buildPhase === "provider_sync_delayed" ||
+        operation?.status === "attention_required" ||
+        (operation?.status === "failed" &&
+          operation.errorCode === "FRONTMIND_BUILD_SERVICE_UNAVAILABLE")),
+  );
+  return {
+    buildPhase,
+    recoverable,
+    previewWarning: fallbackBound
+      ? operation?.status === "attention_required"
+        ? "FrontMind 基础预览已保留；自动对账窗口已结束，运营可使用同一任务编号恢复结果读取，不会重新创建任务。"
+        : "已生成仅使用冻结企业事实与 FrontMind 中性安全版式的基础预览；原 AI 任务仍按同一任务编号继续对账，不会重复创建或计费。"
+      : buildPhase
+        ? SITEOPS_BUILD_PHASE_WARNINGS[buildPhase]
+        : null,
+  };
 }
 
 type SiteOpsResetCycleMessageRow = {
@@ -1739,6 +1860,7 @@ async function projectObservation(
     connectionRows,
     profileRows,
     activeAliyunOperationRows,
+    currentVisualPoolRows,
     rebuildRequest,
   ] = await Promise.all([
     executor
@@ -1830,7 +1952,7 @@ async function projectObservation(
             websiteStyleSampleBatches.createdAt,
             input.project.currentTaskStartedAt,
           ),
-          inArray(websiteStyleSampleBatches.status, ["published", "selected"]),
+          customerVisibleStyleBatchStatusCondition(),
         ),
       )
       .orderBy(desc(websiteStyleSampleBatches.ordinal))
@@ -1898,6 +2020,22 @@ async function projectObservation(
           ]),
         ),
       )
+      .limit(1),
+    executor
+      .select({ id: visualCandidatePools.id })
+      .from(visualCandidatePools)
+      .where(
+        and(
+          eq(visualCandidatePools.projectId, input.project.id),
+          eq(visualCandidatePools.userId, input.userId),
+          eq(
+            visualCandidatePools.taskStartedAt,
+            input.project.currentTaskStartedAt,
+          ),
+          inArray(visualCandidatePools.status, ["active", "selected"]),
+        ),
+      )
+      .orderBy(desc(visualCandidatePools.createdAt))
       .limit(1),
     loadSiteOpsRebuildRequest(executor, {
       userId: input.userId,
@@ -1979,6 +2117,39 @@ async function projectObservation(
     .filter((row: { kind: string }) => row.kind === "visual_search")
     .sort(compareSiteOpsVisualOperationsNewestFirst);
   const latestVisualOperation = visualOperationRows[0] ?? null;
+  const operationPoolAvailability = visualOperationRows
+    .map((row: { result?: unknown }) =>
+      row.result && typeof row.result === "object" && !Array.isArray(row.result)
+        ? (row.result as Record<string, unknown>)
+        : null,
+    )
+    .find(
+      (result: Record<string, unknown> | null) =>
+        result && Number.isInteger(result.availablePages),
+    );
+  const currentVisualPoolPageRows = currentVisualPoolRows[0]
+    ? await executor
+        .select({
+          pageNumber: visualCandidatePoolPages.pageNumber,
+          status: visualCandidatePoolPages.status,
+        })
+        .from(visualCandidatePoolPages)
+        .where(eq(visualCandidatePoolPages.poolId, currentVisualPoolRows[0].id))
+        .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+    : [];
+  const frozenPoolAvailability =
+    currentVisualPoolPageRows.length > 0
+      ? {
+          availablePages: Math.max(
+            ...currentVisualPoolPageRows.map(
+              (row: { pageNumber: number }) => row.pageNumber,
+            ),
+          ),
+          reservedPages: currentVisualPoolPageRows.filter(
+            (row: { status: string }) => row.status === "reserved",
+          ).length,
+        }
+      : operationPoolAvailability;
   const activeVisualOperationRows = visualOperationRows.filter(
     (row: { status: string }) =>
       ACTIVE_VISUAL_OPERATION_STATUSES.has(row.status),
@@ -2120,6 +2291,14 @@ async function projectObservation(
   const visualGeneration = projectSiteOpsVisualGeneration({
     projectStatus: input.project.status,
     generatedPages: completePublishedPages,
+    availablePages:
+      typeof frozenPoolAvailability?.availablePages === "number"
+        ? frozenPoolAvailability.availablePages
+        : null,
+    reservedPages:
+      typeof frozenPoolAvailability?.reservedPages === "number"
+        ? frozenPoolAvailability.reservedPages
+        : null,
     latestVisualOperation,
     hasActiveVisualOperation: activeVisualOperationRows.length > 0,
     hasActiveBuild,
@@ -2198,6 +2377,8 @@ async function projectObservation(
       status: visualGeneration.status,
       targetPage: visualGeneration.targetPage,
       generatedPages: visualGeneration.generatedPages,
+      availablePages: visualGeneration.availablePages,
+      reservedPages: visualGeneration.reservedPages,
       maxPages: visualGeneration.maxPages,
       canGenerateMore: visualGeneration.canGenerateMore,
       canSelectExisting: visualGeneration.canSelectExisting,
@@ -2213,6 +2394,10 @@ async function projectObservation(
         buildId: row.id,
         operations: timelineOperationRows,
       });
+      const buildProgress = projectSiteOpsBuildProgress({
+        buildId: row.id,
+        operations: timelineOperationRows,
+      });
       return {
         id: row.id,
         parentBuildId: row.parentBuildId,
@@ -2225,6 +2410,7 @@ async function projectObservation(
           ? `/api/site-ops/builds/${row.id}/source`
           : null,
         buildDelivery,
+        ...buildProgress,
         needsHelp:
           row.status === "failed" || row.status === "attention_required",
         createdAt: row.createdAt.toISOString(),
@@ -3848,6 +4034,78 @@ async function selectVisualSample(
         ne(websiteStyleSampleBatches.id, selected.batch.id),
       ),
     );
+  const selectedPoolPageRows = await tx
+    .select({
+      id: visualCandidatePoolPages.id,
+      poolId: visualCandidatePoolPages.poolId,
+    })
+    .from(visualCandidatePoolPages)
+    .where(eq(visualCandidatePoolPages.batchId, selected.batch.id))
+    .limit(1)
+    .for("update");
+  if (selectedPoolPageRows[0]) {
+    const now = new Date();
+    await tx
+      .update(visualCandidatePoolPages)
+      .set({ status: "selected", updatedAt: now })
+      .where(eq(visualCandidatePoolPages.id, selectedPoolPageRows[0].id));
+    await tx
+      .update(visualCandidatePoolPages)
+      .set({ status: "superseded", updatedAt: now })
+      .where(
+        and(
+          eq(visualCandidatePoolPages.poolId, selectedPoolPageRows[0].poolId),
+          ne(visualCandidatePoolPages.id, selectedPoolPageRows[0].id),
+        ),
+      );
+    await tx
+      .update(visualCandidatePools)
+      .set({ status: "selected", updatedAt: now })
+      .where(
+        and(
+          eq(visualCandidatePools.id, selectedPoolPageRows[0].poolId),
+          eq(visualCandidatePools.status, "active"),
+        ),
+      );
+  } else {
+    // A legacy first page may predate candidate pools while page two/three
+    // were frozen by the backfill path. Selecting that legacy page still
+    // closes the task-scoped active pool so reserved pages cannot remain
+    // customer-selectable or pinned forever.
+    const activePoolRows = await tx
+      .select({ id: visualCandidatePools.id })
+      .from(visualCandidatePools)
+      .where(
+        and(
+          eq(visualCandidatePools.projectId, input.project.id),
+          eq(visualCandidatePools.userId, input.actor.id),
+          eq(
+            visualCandidatePools.taskStartedAt,
+            input.project.currentTaskStartedAt,
+          ),
+          eq(visualCandidatePools.knowledgeSnapshotId, snapshot.id),
+          eq(visualCandidatePools.status, "active"),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (activePoolRows[0]) {
+      const now = new Date();
+      await tx
+        .update(visualCandidatePoolPages)
+        .set({ status: "superseded", updatedAt: now })
+        .where(eq(visualCandidatePoolPages.poolId, activePoolRows[0].id));
+      await tx
+        .update(visualCandidatePools)
+        .set({ status: "superseded", updatedAt: now })
+        .where(
+          and(
+            eq(visualCandidatePools.id, activePoolRows[0].id),
+            eq(visualCandidatePools.status, "active"),
+          ),
+        );
+    }
+  }
   await tx.insert(siteBuilds).values({
     id: buildId,
     projectId: input.project.id,

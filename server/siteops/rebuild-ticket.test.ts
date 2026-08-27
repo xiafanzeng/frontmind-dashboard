@@ -10,6 +10,8 @@ import {
   siteOperations,
   siteProjects,
   socialPackages,
+  visualCandidatePoolPages,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   workspaceSiteProfiles,
 } from "../../drizzle/schema";
@@ -645,6 +647,9 @@ function fixture(options?: {
         : [];
     }
     if (table === siteDnsRecords) return [];
+    if (table === visualCandidatePools) {
+      return [{ id: "70000000-0000-4000-8000-000000000007" }];
+    }
     if (table === workspaceSiteProfiles) return [profile];
     if (table === messages) return [{ sequence: 7 }];
     return [];
@@ -1228,6 +1233,14 @@ describe("site rebuild reset approval", () => {
         }),
         expect.objectContaining({
           table: websiteStyleSampleBatches,
+          values: expect.objectContaining({ status: "superseded" }),
+        }),
+        expect.objectContaining({
+          table: visualCandidatePoolPages,
+          values: expect.objectContaining({ status: "superseded" }),
+        }),
+        expect.objectContaining({
+          table: visualCandidatePools,
           values: expect.objectContaining({ status: "superseded" }),
         }),
         expect.objectContaining({

@@ -37,6 +37,14 @@ import {
   approvedResetHasNoUnresolvedExternalExposure,
   parseApprovedResetSafeNoExposureProof,
 } from "./esa-provider";
+import {
+  siteOpsTrustedFallbackPreviewFromResult,
+  type SiteOpsTrustedFallbackPreview,
+} from "./trusted-fallback";
+import {
+  formalBuildArtifactStagingSchema,
+  type FormalBuildArtifactStaging,
+} from "./build-artifact-checkpoint";
 
 const DEFAULT_LEASE_MS = 2 * 60_000;
 const DEFAULT_TIMEOUT_MS = 90_000;
@@ -1024,11 +1032,143 @@ export async function enqueueAutomaticDomainSuccessor(
   }
 }
 
+function stagedBuildCheckpointResult(
+  operation: Claimed,
+): SiteOpsProviderResult | null {
+  if (
+    operation.provider !== "manus" ||
+    !operation.buildId ||
+    !["site_build", "build_revision"].includes(operation.kind) ||
+    !operation.result ||
+    typeof operation.result !== "object" ||
+    Array.isArray(operation.result)
+  ) {
+    return null;
+  }
+  const checkpoint = operation.result as Record<string, unknown>;
+  const attention = (): SiteOpsProviderResult => ({
+    status: "attention_required",
+    code: "FRONTMIND_BUILD_ARTIFACT_CHECKPOINT_INVALID",
+    message: "官网产物恢复坐标未通过一致性校验，已保留任务与产物等待处理。",
+    providerTaskId: operation.providerTaskId ?? undefined,
+    result: checkpoint,
+  });
+  const formalDeclared = checkpoint.artifactStaging !== undefined;
+  const fallbackDeclared = checkpoint.fallbackPreview !== undefined;
+  const fallback = fallbackDeclared
+    ? siteOpsTrustedFallbackPreviewFromResult(checkpoint)
+    : null;
+  if (fallbackDeclared && !fallback) return attention();
+
+  if (!formalDeclared) {
+    if (fallback?.status === "staged") {
+      // Finalize owns the existing fallback_bind transaction. Feed it the
+      // durable pending marker directly without a provider read.
+      return {
+        status: "pending",
+        providerTaskId: fallback.taskId,
+        buildStatus: "qa_running",
+        nextPollMs: 10_000,
+        result: checkpoint,
+      };
+    }
+    // A bound fallback keeps reconciling the same provider task; the provider
+    // may later return a formal result. A legacy/no-marker state also remains
+    // on the ordinary provider path.
+    return null;
+  }
+  if (fallback?.status === "staged") return attention();
+  if (checkpoint.buildCheckpoint !== "artifacts_staged") return attention();
+  const parsed = formalBuildArtifactStagingSchema.safeParse(
+    checkpoint.artifactStaging,
+  );
+  const staging = parsed.success ? parsed.data : null;
+  const expectedTaskId = operation.providerTaskId;
+  const expectedAttempt = staging?.nativeRepairAttempt;
+  const expectedOperationToken =
+    expectedAttempt === undefined
+      ? null
+      : `siteops-native-source:${operation.id}:${expectedAttempt}`;
+  const leaseExpiresAt = operation.leaseExpiresAt?.getTime() ?? Number.NaN;
+  if (
+    !staging ||
+    checkpoint.schemaVersion !== 2 ||
+    checkpoint.buildPhase !== "persisting_preview" ||
+    checkpoint.taskId !== staging.taskId ||
+    checkpoint.nativeRepairAttempt !== staging.nativeRepairAttempt ||
+    staging.projectId !== operation.projectId ||
+    staging.buildId !== operation.buildId ||
+    !expectedTaskId ||
+    staging.taskId !== expectedTaskId ||
+    staging.operationToken !== expectedOperationToken ||
+    Date.parse(staging.expiresAt) <= Date.now() ||
+    operation.status !== "running" ||
+    !operation.leaseOwner ||
+    !Number.isFinite(leaseExpiresAt) ||
+    leaseExpiresAt <= Date.now()
+  ) {
+    return attention();
+  }
+  const bindings = staging.artifactBindings;
+  return {
+    status: "succeeded",
+    providerTaskId: staging.taskId,
+    projectStatus: "preview_ready",
+    buildStatus: "preview_ready",
+    result: {
+      buildId: staging.buildId,
+      buildCheckpoint: "artifacts_staged",
+      buildCheckpoints: [
+        "receipt_validated",
+        "archive_downloaded",
+        "archive_validated",
+        "compile_started",
+        "artifacts_staged",
+      ],
+      specHash: staging.specHash,
+      distHash: staging.distHash,
+      buildDelivery: staging.buildDelivery,
+      qaSummary: staging.qaSummary,
+      artifactIds: Object.fromEntries(
+        BUILD_ARTIFACT_KINDS.map((kind) => [kind, bindings[kind].id]),
+      ),
+      artifactBindings: bindings,
+      artifactStaging: staging,
+      ...(fallback?.status === "bound" ? { fallbackPreview: fallback } : {}),
+      artifactCheckpointResume: true,
+    },
+    message: "FrontMind 静态官网已完成构建和 QA，可以在私有预览中检查并批准。",
+  };
+}
+
+function fallbackMarkerFromOperationResult(result: unknown) {
+  return siteOpsTrustedFallbackPreviewFromResult(result);
+}
+
+function fallbackMarkerMatchesOperation(input: {
+  marker: SiteOpsTrustedFallbackPreview;
+  operation: Claimed;
+  buildId: string;
+  taskId: string | null;
+}) {
+  return (
+    input.marker.buildId === input.buildId &&
+    input.marker.taskId === input.taskId &&
+    input.marker.operationToken ===
+      `siteops-native-fallback:${input.operation.id}`
+  );
+}
+
+type BuildArtifactVerification = {
+  projection: ReturnType<typeof siteOpsBuildArtifactProjection>;
+  mode: "initial" | "fallback_bind" | "formal_upgrade";
+};
+
 async function verifiedBuildArtifactProjection(
   tx: any,
   operation: Claimed,
-  result: Extract<SiteOpsProviderResult, { status: "succeeded" }>,
-) {
+  result: Extract<SiteOpsProviderResult, { status: "succeeded" | "pending" }>,
+): Promise<BuildArtifactVerification | null> {
   if (
     !operation.buildId ||
     !["site_build", "build_revision"].includes(operation.kind)
@@ -1048,20 +1188,135 @@ async function verifiedBuildArtifactProjection(
     .limit(1)
     .for("update");
   const build = buildRows[0];
+  const rawArtifactStaging = result.result?.artifactStaging;
+  const parsedArtifactStaging = rawArtifactStaging
+    ? formalBuildArtifactStagingSchema.safeParse(rawArtifactStaging)
+    : null;
+  if (parsedArtifactStaging && !parsedArtifactStaging.success) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_CHECKPOINT_INVALID");
+  }
+  const artifactStaging: FormalBuildArtifactStaging | null =
+    parsedArtifactStaging?.success ? parsedArtifactStaging.data : null;
+  const pendingFallback =
+    result.status === "pending"
+      ? fallbackMarkerFromOperationResult(result.result)
+      : null;
+  const boundFallback = fallbackMarkerFromOperationResult(operation.result);
+  const fallbackBind = pendingFallback?.status === "staged";
+  const formalUpgrade =
+    result.status === "succeeded" && boundFallback?.status === "bound";
+  if (!build || build.status !== "qa_running") {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+  }
   if (
-    !build ||
-    build.status !== "qa_running" ||
-    build.contractLocalAssetId !== null ||
-    build.sourceLocalAssetId !== null ||
-    build.distLocalAssetId !== null ||
-    build.qaLocalAssetId !== null ||
-    build.provenanceLocalAssetId !== null
+    artifactStaging &&
+    (artifactStaging.projectId !== operation.projectId ||
+      artifactStaging.buildId !== operation.buildId ||
+      artifactStaging.knowledgeSnapshotId !== build.knowledgeSnapshotId ||
+      artifactStaging.taskId !== operation.providerTaskId ||
+      artifactStaging.taskId !== build.upstreamManusTaskId ||
+      artifactStaging.taskId !== result.providerTaskId ||
+      artifactStaging.operationToken !==
+        `siteops-native-source:${operation.id}:${artifactStaging.nativeRepairAttempt}` ||
+      Date.parse(artifactStaging.expiresAt) <= Date.now())
+  ) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_CHECKPOINT_INVALID");
+  }
+  if (
+    build.upstreamManusTaskId !==
+    (result.providerTaskId ?? operation.providerTaskId)
   ) {
     throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
   }
-  const bindings = parseSiteOpsBuildArtifactBindings(
-    result.result?.artifactBindings,
-  );
+  const expectedTaskId = result.providerTaskId ?? operation.providerTaskId;
+  if (
+    (pendingFallback &&
+      !fallbackMarkerMatchesOperation({
+        marker: pendingFallback,
+        operation,
+        buildId: build.id,
+        taskId: expectedTaskId,
+      })) ||
+    (boundFallback &&
+      !fallbackMarkerMatchesOperation({
+        marker: boundFallback,
+        operation,
+        buildId: build.id,
+        taskId: expectedTaskId,
+      }))
+  ) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+  }
+  if (fallbackBind || formalUpgrade) {
+    const projectRows = await tx
+      .select()
+      .from(siteProjects)
+      .where(eq(siteProjects.id, operation.projectId))
+      .limit(1)
+      .for("update");
+    const project = projectRows[0];
+    if (
+      !project ||
+      project.currentBuildId !== build.id ||
+      project.currentKnowledgeSnapshotId !== build.knowledgeSnapshotId ||
+      project.status !== "building" ||
+      build.parentBuildId !== null
+    ) {
+      throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+    }
+  }
+  const allCurrentNull =
+    build.contractLocalAssetId === null &&
+    build.sourceLocalAssetId === null &&
+    build.distLocalAssetId === null &&
+    build.qaLocalAssetId === null &&
+    build.provenanceLocalAssetId === null;
+  if (fallbackBind) {
+    if (
+      build.parentBuildId !== null ||
+      build.quotaState !== "reserved" ||
+      !allCurrentNull
+    ) {
+      throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+    }
+  } else if (formalUpgrade) {
+    const fallback = boundFallback!.artifactBindings;
+    const fallbackMatches =
+      build.contractLocalAssetId === fallback.contract.id &&
+      build.contractHash === fallback.contract.sha256 &&
+      build.sourceLocalAssetId === fallback.source.id &&
+      build.sourceHash === fallback.source.sha256 &&
+      build.distLocalAssetId === fallback.dist.id &&
+      build.distHash === fallback.dist.sha256 &&
+      build.qaLocalAssetId === fallback.qa.id &&
+      build.provenanceLocalAssetId === fallback.provenance.id;
+    const delivery = result.result?.buildDelivery as
+      | Record<string, unknown>
+      | undefined;
+    if (!fallbackMatches || delivery?.renderMode !== "twenty_first_native") {
+      throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+    }
+  } else if (!allCurrentNull) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+  }
+  const bindings = fallbackBind
+    ? pendingFallback!.artifactBindings
+    : parseSiteOpsBuildArtifactBindings(result.result?.artifactBindings);
+  if (
+    artifactStaging &&
+    BUILD_ARTIFACT_KINDS.some((kind) => {
+      const staged = artifactStaging.artifactBindings[kind];
+      const binding = bindings[kind];
+      return (
+        staged.id !== binding.id ||
+        staged.sha256 !== binding.sha256 ||
+        staged.bytes !== binding.bytes ||
+        staged.mimeType !== binding.mimeType
+      );
+    })
+  ) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_CHECKPOINT_INVALID");
+  }
   const ids = BUILD_ARTIFACT_KINDS.map((kind) => bindings[kind].id);
   const rows = await tx
     .select({
@@ -1082,12 +1337,19 @@ async function verifiedBuildArtifactProjection(
         eq(localAssets.accountUserId, operation.userId),
       ),
     );
-  return siteOpsBuildArtifactProjection({
-    bindings,
-    rows,
-    userId: operation.userId,
-    projectId: operation.projectId,
-  });
+  return {
+    projection: siteOpsBuildArtifactProjection({
+      bindings,
+      rows,
+      userId: operation.userId,
+      projectId: operation.projectId,
+    }),
+    mode: fallbackBind
+      ? "fallback_bind"
+      : formalUpgrade
+        ? "formal_upgrade"
+        : "initial",
+  };
 }
 
 async function finalize(
@@ -1115,24 +1377,36 @@ async function finalize(
       providerResult,
     );
     let finalizedResult: SiteOpsProviderResult = publicResult;
-    let buildArtifactProjection: ReturnType<
-      typeof siteOpsBuildArtifactProjection
-    > | null = null;
+    let buildArtifactVerification: BuildArtifactVerification | null = null;
+    const pendingFallbackMarker =
+      finalizedResult.status === "pending"
+        ? fallbackMarkerFromOperationResult(finalizedResult.result)
+        : null;
     if (
-      finalizedResult.status === "succeeded" &&
+      (finalizedResult.status === "succeeded" ||
+        pendingFallbackMarker?.status === "staged") &&
       ["site_build", "build_revision"].includes(locked.kind)
     ) {
       try {
-        buildArtifactProjection = await verifiedBuildArtifactProjection(
+        buildArtifactVerification = await verifiedBuildArtifactProjection(
           tx,
           locked,
-          finalizedResult,
+          finalizedResult as Extract<
+            SiteOpsProviderResult,
+            { status: "succeeded" | "pending" }
+          >,
         );
       } catch (error) {
         const internalCode =
           typeof (error as { code?: unknown })?.code === "string"
             ? String((error as { code: string }).code)
-            : "SITEOPS_BUILD_ARTIFACT_VERIFICATION_FAILED";
+            : "";
+        if (!/^SITEOPS_BUILD_ARTIFACT_[A-Z0-9_]+$/u.test(internalCode)) {
+          // Database/driver failures are not artifact verdicts. Let the
+          // transaction roll back so the same leased operation can be safely
+          // reclaimed instead of overwriting its task and staged coordinates.
+          throw error;
+        }
         console.error("[SiteOpsWorker] build_artifact_binding_failed", {
           event: "siteops_build_artifact_binding_failed",
           operationId: locked.id,
@@ -1140,47 +1414,166 @@ async function finalize(
           buildId: locked.buildId,
           internalCode,
         });
-        finalizedResult = {
-          status: "failed",
-          code: "BUILD_ARTIFACT_BINDING_FAILED",
-          message:
-            "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
-          providerTaskId:
-            providerResult.providerTaskId ?? locked.providerTaskId ?? undefined,
-          result: {
-            schemaVersion: 1,
-            stage: "artifact_binding_failed",
-            internalCode,
-          },
-        };
+        const returnedFallback = fallbackMarkerFromOperationResult(
+          finalizedResult.result,
+        );
+        const lockedFallback = fallbackMarkerFromOperationResult(locked.result);
+        const retainedFallback = returnedFallback ?? lockedFallback;
+        const retainedResult = returnedFallback
+          ? finalizedResult.result
+          : lockedFallback
+            ? locked.result
+            : null;
+        finalizedResult = retainedFallback
+          ? {
+              status: "attention_required",
+              code:
+                retainedFallback.status === "bound"
+                  ? "FRONTMIND_BUILD_RECONCILIATION_REQUIRED"
+                  : "FRONTMIND_BUILD_REQUIRES_ATTENTION",
+              message:
+                retainedFallback.status === "bound"
+                  ? "正式结果未能安全替换基础预览；基础预览与原任务坐标已保留，可由运营恢复读取。"
+                  : "基础预览产物未能完整绑定；同一任务与已暂存产物坐标已保留，等待运营处理。",
+              providerTaskId:
+                providerResult.providerTaskId ??
+                locked.providerTaskId ??
+                undefined,
+              result: retainedResult as Record<string, unknown>,
+            }
+          : {
+              status: "attention_required",
+              code: "BUILD_ARTIFACT_BINDING_FAILED",
+              message:
+                "官网产物恢复坐标未通过一致性校验，已保留任务与产物等待处理。",
+              providerTaskId:
+                providerResult.providerTaskId ??
+                locked.providerTaskId ??
+                undefined,
+              result:
+                locked.result &&
+                typeof locked.result === "object" &&
+                !Array.isArray(locked.result)
+                  ? locked.result
+                  : finalizedResult.result,
+            };
       }
     }
     if (
       finalizedResult.status === "succeeded" &&
-      buildArtifactProjection &&
+      buildArtifactVerification &&
       ["site_build", "build_revision"].includes(locked.kind)
     ) {
+      const boundResult = { ...(finalizedResult.result ?? {}) };
+      delete boundResult.buildPhase;
+      const priorCheckpoints = Array.isArray(boundResult.buildCheckpoints)
+        ? boundResult.buildCheckpoints.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [];
       finalizedResult = {
         ...finalizedResult,
         buildStatus: "approved",
         projectStatus: "approved",
         message: "官网已完成，可以打开预览。",
+        // Artifact verification and all five build-column bindings occur in
+        // this same transaction. Publish the final checkpoint only here.
+        result: {
+          ...boundResult,
+          buildCheckpoint: "preview_ready",
+          // `artifacts_bound` cannot be committed as a separate externally
+          // visible state without splitting the all-five binding transaction.
+          // Persist both audit edges in the final operation result instead.
+          buildCheckpoints: [
+            ...new Set([
+              ...priorCheckpoints,
+              "artifacts_bound",
+              "preview_ready",
+            ]),
+          ],
+        },
       };
     }
     const result = finalizedResult;
     const now = new Date();
+    if (buildArtifactVerification?.mode === "formal_upgrade") {
+      const replacedFallback = fallbackMarkerFromOperationResult(locked.result);
+      if (replacedFallback?.status !== "bound") {
+        throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+      }
+      await tx
+        .update(localAssets)
+        .set({
+          retainUntil: new Date(now.getTime() + 24 * 60 * 60 * 1_000),
+          updatedAt: now,
+        })
+        .where(
+          inArray(
+            localAssets.id,
+            BUILD_ARTIFACT_KINDS.map(
+              (kind) => replacedFallback.artifactBindings[kind].id,
+            ),
+          ),
+        );
+    }
     if (result.status === "pending") {
       const nextPollMs = Math.max(
         2_000,
         Math.min(result.nextPollMs ?? 10_000, 5 * 60_000),
       );
-      await tx
+      let durablePendingResult = result.result;
+      if (buildArtifactVerification?.mode === "fallback_bind") {
+        const state =
+          result.result &&
+          typeof result.result === "object" &&
+          !Array.isArray(result.result)
+            ? result.result
+            : null;
+        const marker = state ? fallbackMarkerFromOperationResult(state) : null;
+        if (!state || marker?.status !== "staged" || !locked.buildId) {
+          throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+        }
+        durablePendingResult = {
+          ...state,
+          fallbackPreview: {
+            ...(state.fallbackPreview as Record<string, unknown>),
+            status: "bound",
+          },
+        };
+        const fallbackBound = await tx
+          .update(siteBuilds)
+          .set({
+            ...buildArtifactVerification.projection,
+            status: "qa_running",
+            quotaState: "reserved",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(siteBuilds.id, locked.buildId),
+              eq(siteBuilds.projectId, locked.projectId),
+              eq(siteBuilds.userId, locked.userId),
+              isNull(siteBuilds.parentBuildId),
+              eq(siteBuilds.status, "qa_running"),
+              eq(siteBuilds.quotaState, "reserved"),
+              isNull(siteBuilds.contractLocalAssetId),
+              isNull(siteBuilds.sourceLocalAssetId),
+              isNull(siteBuilds.distLocalAssetId),
+              isNull(siteBuilds.qaLocalAssetId),
+              isNull(siteBuilds.provenanceLocalAssetId),
+            ),
+          );
+        if (affectedRows(fallbackBound) !== 1) {
+          throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+        }
+      }
+      const pendingUpdate = await tx
         .update(siteOperations)
         .set({
           // A running row with a future lease is the existing operation's
           // durable poll schedule. It cannot be mistaken for a new side effect.
           status: "running",
-          result: result.result,
+          result: durablePendingResult,
           providerOperationId:
             result.providerOperationId ?? locked.providerOperationId,
           providerTaskId: result.providerTaskId ?? locked.providerTaskId,
@@ -1194,6 +1587,9 @@ async function finalize(
             eq(siteOperations.leaseOwner, operation.leaseOwner),
           ),
         );
+      if (affectedRows(pendingUpdate) !== 1) {
+        throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+      }
       if (locked.buildId && result.buildStatus) {
         await appendBuildTimelineEvent(tx, {
           operation: locked as Claimed,
@@ -1543,6 +1939,9 @@ async function finalize(
     }
 
     const unsuccessful = result.status !== "succeeded";
+    const terminalFallback =
+      fallbackMarkerFromOperationResult(result.result) ??
+      fallbackMarkerFromOperationResult(locked.result);
     if (locked.buildId) {
       await tx
         .update(siteBuilds)
@@ -1552,15 +1951,20 @@ async function finalize(
               ? "failed"
               : "attention_required"
             : result.buildStatus,
-          ...(!unsuccessful && buildArtifactProjection
-            ? buildArtifactProjection
+          ...(!unsuccessful && buildArtifactVerification
+            ? buildArtifactVerification.projection
             : {}),
           errorCode: unsuccessful ? result.code : null,
           errorMessage: unsuccessful ? result.message : null,
           approvedAt:
             !unsuccessful && result.buildStatus === "approved" ? now : null,
           ...(["site_build", "build_revision"].includes(locked.kind)
-            ? { quotaState: siteOpsQuotaStateForProviderResult(result.status) }
+            ? {
+                quotaState:
+                  result.status === "attention_required" && terminalFallback
+                    ? "released"
+                    : siteOpsQuotaStateForProviderResult(result.status),
+              }
             : {}),
           updatedAt: now,
         })
@@ -1786,7 +2190,9 @@ export async function runSiteOpsWorkerSweep(options?: { max?: number }) {
     const operation = await claimOne(db);
     if (!operation) break;
     summary.claimed += 1;
-    const result = await invokeProvider(db, operation);
+    const result =
+      stagedBuildCheckpointResult(operation) ??
+      (await invokeProvider(db, operation));
     const finalizedStatus = await finalize(db, operation, result);
     if (finalizedStatus === "pending") summary.deferred += 1;
     else if (finalizedStatus === "succeeded") summary.succeeded += 1;

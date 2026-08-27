@@ -40,32 +40,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  promotion-gate:
-    name: Resolve exact production source
-    if: >-
-      github.event_name != 'pull_request' &&
-      (github.event_name != 'workflow_dispatch' || inputs.release_mode == 'build-only')
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    outputs:
-      source_sha: ${{ steps.verify.outputs.source_sha }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - id: verify
-        name: Bind build to current main SHA
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF" = refs/heads/main
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          echo "source_sha=$GITHUB_SHA" >>"$GITHUB_OUTPUT"
-
   changes:
     name: Detect PDF base changes
     if: github.event_name == 'push'
@@ -224,13 +198,15 @@ jobs:
         run: pnpm exec vitest run scripts/auth-mysql-transaction-acceptance.test.ts
 
   build-sign:
-    name: Build and sign immutable production image
+    name: Build, sign and deploy immutable production image
     needs:
       - changes
-      - promotion-gate
+      - quality
+      - mysql-acceptance
     if: >-
       always() &&
-      needs.promotion-gate.result == 'success' &&
+      needs.quality.result == 'success' &&
+      needs.mysql-acceptance.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name != 'workflow_dispatch' || inputs.release_mode == 'build-only') &&
       (
@@ -251,15 +227,15 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.repository }}
       digest: ${{ steps.build.outputs.digest }}
-      source_sha: ${{ needs.promotion-gate.outputs.source_sha }}
+      source_sha: ${{ github.sha }}
     env:
-      FRONTMIND_RELEASE_SOURCE_SHA: ${{ needs.promotion-gate.outputs.source_sha }}
+      FRONTMIND_RELEASE_SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.promotion-gate.outputs.source_sha }}
+          ref: ${{ github.sha }}
       - name: Verify immutable source checkout
         shell: bash
         run: |
@@ -341,13 +317,13 @@ jobs:
           context: .
           file: deploy/production/dashboard/Dockerfile
           push: true
-          tags: ${{ steps.image.outputs.repository }}:sha-${{ needs.promotion-gate.outputs.source_sha }}
+          tags: ${{ steps.image.outputs.repository }}:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.promotion-gate.outputs.source_sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
-            SOURCE_SHA=${{ needs.promotion-gate.outputs.source_sha }}
-            IMAGE_VERSION=sha-${{ needs.promotion-gate.outputs.source_sha }}
+            SOURCE_SHA=${{ github.sha }}
+            IMAGE_VERSION=sha-${{ github.sha }}
             FRONTMIND_PDF_RUNTIME_IMAGE=${{ steps.pdf.outputs.image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -463,6 +463,13 @@
       "when": 1787707303563,
       "tag": "0065_siteops_alidns_oauth",
       "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "5",
+      "when": 1787822850162,
+      "tag": "0066_visual_candidate_pools",
+      "breakpoints": true
     }
   ]
 }

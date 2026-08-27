@@ -98,6 +98,45 @@ describe("SiteOps public error projection", () => {
     expect(JSON.stringify(projected)).not.toMatch(/manus/iu);
   });
 
+  it.each([
+    "NATIVE_SOURCE_ARCHIVE_INVALID",
+    "SITEOPS_NATIVE_SOURCE_PACKAGE_JSON_INVALID",
+    "SITEOPS_NATIVE_SOURCE_RECEIPT_INVALID",
+  ])("projects %s as a safe source-output failure", (code) => {
+    expect(
+      publicSiteOpsErrorProjection({
+        code,
+        message: "internal native source diagnostic",
+        status: "failed",
+        forceBuildProvider: true,
+      }),
+    ).toEqual({
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      message:
+        "返回源码未通过安全、格式或任务绑定校验；如已有成功预览将继续保留，否则可申请重置后重新开始。",
+    });
+  });
+
+  it.each([
+    "VISUAL_SELECTION_BUNDLE_MISSING",
+    "VISUAL_SELECTION_BUNDLE_INVALID",
+    "VISUAL_SELECTION_COORDINATES_MISMATCH",
+    "VISUAL_EVIDENCE_COORDINATES_MISMATCH",
+  ])("projects frozen visual contract failure %s as output-invalid", (code) => {
+    const projected = publicSiteOpsErrorProjection({
+      code,
+      message: "internal frozen visual bundle/hash mismatch",
+      status: "failed",
+      forceBuildProvider: true,
+    });
+    expect(projected).toEqual({
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      message:
+        "冻结的视觉参考未通过完整性或任务绑定校验；如已有成功预览将继续保留，否则可申请重置后重新开始。",
+    });
+    expect(projected.code).not.toBe("FRONTMIND_BUILD_SERVICE_UNAVAILABLE");
+  });
+
   it("normalizes a frozen customer credential failure to the public configuration code", () => {
     expect(
       publicSiteOpsErrorProjection({
@@ -108,6 +147,65 @@ describe("SiteOps public error projection", () => {
     ).toEqual({
       code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
       message: "FrontMind AI 建站服务配置暂不可用，系统已停止继续创建任务。",
+    });
+  });
+
+  it("keeps provider sync attention recoverable without exposing provider internals", () => {
+    const kinds = ["contract", "source", "dist", "qa", "provenance"] as const;
+    const artifactBindings = Object.fromEntries(
+      kinds.map((kind, index) => [
+        kind,
+        {
+          id: `70000000-0000-4000-8000-00000000000${index + 1}`,
+          sha256: String(index + 1).repeat(64),
+          bytes: index + 1,
+          mimeType:
+            kind === "contract" || kind === "provenance"
+              ? "application/json"
+              : "application/zip",
+        },
+      ]),
+    );
+    expect(
+      publicSiteOpsProviderResult("manus", {
+        status: "attention_required",
+        code: "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+        message: "provider reconciliation expired",
+        result: {
+          fallbackPreview: {
+            status: "bound",
+            trigger: "provider_read_delayed",
+            createdAt: "2026-08-27T00:15:00.000Z",
+            reconcileUntilAt: "2026-08-28T00:00:00.000Z",
+            buildId: "30000000-0000-4000-8000-000000000003",
+            taskId: "customer-private-task-1",
+            operationToken:
+              "siteops-native-fallback:10000000-0000-4000-8000-000000000001",
+            selectedPreviewSha256: "a".repeat(64),
+            selectedSourceTreeSha256: "b".repeat(64),
+            artifactBindings,
+            buildDelivery: {
+              renderMode: "trusted_fallback",
+              qaStatus: "partial",
+              warningCodes: ["NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK"],
+            },
+          },
+        },
+      }),
+    ).toMatchObject({
+      status: "attention_required",
+      code: "FRONTMIND_BUILD_RECONCILIATION_REQUIRED",
+      message: expect.stringContaining("原任务编号"),
+    });
+    expect(
+      publicSiteOpsProviderResult("manus", {
+        status: "attention_required",
+        code: "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+        message: "provider reconciliation expired",
+      }),
+    ).toMatchObject({
+      code: "FRONTMIND_BUILD_REQUIRES_ATTENTION",
+      message: expect.not.stringContaining("基础预览已保留"),
     });
   });
 

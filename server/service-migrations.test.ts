@@ -123,6 +123,7 @@ describe("service portal migration chain", () => {
       "0063_lean_blue_marvel",
       "0064_siteops_v1",
       "0065_siteops_alidns_oauth",
+      "0066_visual_candidate_pools",
     ]);
   });
 
@@ -147,6 +148,30 @@ describe("service portal migration chain", () => {
     expect(
       snapshot.tables.website_project_attributions.columns.business_owner_name,
     ).toMatchObject({ type: "varchar(40)", notNull: true });
+  });
+
+  it("adds durable visual candidate pools, pages and item references as one expand migration", async () => {
+    const migrationSql = await migration("0066_visual_candidate_pools.sql");
+    expect(migrationSql).toContain("CREATE TABLE `visual_candidate_pools`");
+    expect(migrationSql).toContain(
+      "CREATE TABLE `visual_candidate_pool_pages`",
+    );
+    expect(migrationSql).toContain(
+      "CREATE TABLE `visual_candidate_pool_items`",
+    );
+    expect(migrationSql).toContain(
+      "CONSTRAINT `visual_candidate_pool_items_preview_fk`",
+    );
+    expect(migrationSql).toContain(
+      "CONSTRAINT `visual_candidate_pool_pages_capacity_ck`",
+    );
+    expect(migrationSql).not.toMatch(
+      /^(?:DROP|DELETE|UPDATE|INSERT|REPLACE|TRUNCATE|RENAME)\b/imu,
+    );
+    const policy = JSON.parse(
+      await readFile(path.join(drizzleRoot, "migration-policy.json"), "utf8"),
+    ) as { migrations: Record<string, string> };
+    expect(policy.migrations["0066_visual_candidate_pools"]).toBe("expand");
   });
 
   it("adds an optional unsigned overseas brand-tracking quota as an expand migration", async () => {

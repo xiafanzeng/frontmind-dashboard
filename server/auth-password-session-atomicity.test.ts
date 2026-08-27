@@ -18,6 +18,7 @@ import {
   upstreamResources,
   userPasswordSetupTokens,
   users,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   websiteStyleSamples,
   websiteUserProvisions,
@@ -223,6 +224,7 @@ describe("password/session atomicity", () => {
       fake.updateValues[1]?.consumedAt,
     );
     expect(fake.deleteTables).toEqual([
+      visualCandidatePools,
       websiteStyleSamples,
       websiteStyleSampleBatches,
       knowledgeBaseResetRequests,

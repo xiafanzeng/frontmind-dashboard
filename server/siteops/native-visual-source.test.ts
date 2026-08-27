@@ -333,8 +333,16 @@ describe("21st native visual source", () => {
       "export default function Agency(){return <main>Agency</main>}",
     );
     zip.file(
+      "hirael/registry/hirael/templates/agency-landing/styles.css",
+      ".agency{font-family:Georgia,serif;padding:64px}",
+    );
+    zip.file(
       "hirael/registry/hirael/templates/velorah/velorah.tsx",
       "export default function Velorah(){return <main>Velorah</main>}",
+    );
+    zip.file(
+      "hirael/registry/hirael/templates/velorah/styles.css",
+      ".velorah{font-family:Inter,system-ui,sans-serif;padding:8px}",
     );
     const providerArchive = await zip.generateAsync({ type: "nodebuffer" });
     const prepare = (slug: string) =>
@@ -372,6 +380,16 @@ describe("21st native visual source", () => {
     );
     expect(agency.sourceTreeSha256).not.toBe(velorah.sourceTreeSha256);
     expect(agency.sourceArchiveSha256).not.toBe(velorah.sourceArchiveSha256);
+    expect(agency.styleTokens).toMatchObject({
+      typeSystem: "editorial_serif",
+      density: "spacious",
+      sourceTreeSha256: agency.sourceTreeSha256,
+    });
+    expect(velorah.styleTokens).toMatchObject({
+      typeSystem: "display_sans",
+      density: "compact",
+      sourceTreeSha256: velorah.sourceTreeSha256,
+    });
     const agencyRetry = await prepare("hirael-agency-landing");
     expect(agencyRetry.sourceTreeSha256).toBe(agency.sourceTreeSha256);
     expect(agencyRetry.sourceArchiveSha256).toBe(agency.sourceArchiveSha256);
@@ -390,8 +408,7 @@ describe("21st native visual source", () => {
       version: "1".repeat(40),
       archive: providerArchive,
       expectedArchiveSha256: digest(providerArchive),
-      previewUrl:
-        "https://cdn.21st.dev/templates/inert-complete-template.png",
+      previewUrl: "https://cdn.21st.dev/templates/inert-complete-template.png",
       signal: new AbortController().signal,
       fetchRemoteAsset: async ({ url }) => {
         previewFetches += 1;
@@ -417,6 +434,17 @@ describe("21st native visual source", () => {
     expect(prepared).toMatchObject({
       sourceFormat: "provider_archive_v1",
       framework: "vite_react",
+      styleTokens: {
+        schemaVersion: 1,
+        derivation: "normalized-preview-bounded-source-v1",
+        previewSha256: digest(officialPreview),
+        sourceTreeSha256: prepared.sourceTreeSha256,
+        dominantHex: "#000000",
+        canvasTone: "dark",
+        contrast: "low",
+        typeSystem: "display_sans",
+        density: "spacious",
+      },
     });
     expect(prepared.preview.equals(officialPreview)).toBe(true);
     const wrapper = await JSZip.loadAsync(prepared.sourceArchive);

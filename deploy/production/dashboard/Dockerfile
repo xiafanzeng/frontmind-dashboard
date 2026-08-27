@@ -37,6 +37,7 @@ RUN test "${#SOURCE_SHA}" -eq 40 \
        else \
          test ! -e dist/knowledge-base-incident-repair-cli.js; \
        fi \
+    && test -s dist/reconcile-siteops-build.js \
     && test -f dist/release-db.js \
     && test -f dist/migration-manifest.json \
     && test -f dist/drizzle/meta/_journal.json \
@@ -86,6 +87,7 @@ RUN node /app/node_modules/playwright/cli.js install-deps chromium \
     && rm -rf /var/lib/apt/lists/* \
     && chmod 0755 /usr/local/bin/frontmind-dashboard-entrypoint \
     && node -e 'const fs=require("node:fs");const p="/app/dist/knowledge-base-incident-repair-cli.js";const m=JSON.parse(fs.readFileSync("/app/dist/artifact-manifest.json","utf8"));const expected=m.files.some((f)=>f.path==="knowledge-base-incident-repair-cli.js");const present=fs.existsSync(p);if(expected!==present||(present&&(!fs.statSync(p).isFile()||fs.statSync(p).size===0)))process.exit(1)' \
+    && test -s /app/dist/reconcile-siteops-build.js \
     && test -f /app/dist/release-db.js \
     && test -f /app/dist/migration-manifest.json \
     && test -f /app/dist/drizzle/meta/_journal.json

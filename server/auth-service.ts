@@ -54,6 +54,7 @@ import {
   userPasswordSetupTokens,
   userUsageOwners,
   users,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   websiteStyleSamples,
   websiteUserProvisions,
@@ -1112,6 +1113,12 @@ export async function permanentlyDeleteManagedUserRows(
   executor: any,
   userId: number,
 ) {
+  // Candidate pools reference style batches, operations, credentials and
+  // snapshots restrictively. Delete the account-owned root first; pages and
+  // items cascade from it before any of those parent rows are removed.
+  await executor
+    .delete(visualCandidatePools)
+    .where(eq(visualCandidatePools.userId, userId));
   const styleBatchRows = await executor
     .select({ id: websiteStyleSampleBatches.id })
     .from(websiteStyleSampleBatches)

@@ -136,6 +136,8 @@ export type TwentyFirstNativeTemplateFailureCategory =
 export class TwentyFirstNativeTemplateError extends AuthServiceError {
   constructor(
     public readonly category: TwentyFirstNativeTemplateFailureCategory,
+    /** Only transport/read failures may be retried by the bounded pool fetch. */
+    public readonly retryable = false,
   ) {
     super(
       "UPSTREAM_UNAVAILABLE",
@@ -1227,7 +1229,11 @@ export function projectTwentyFirstMarketplaceTemplateSummaries(
       sourceSubdirectory,
       sourceLicense,
     });
-    if (summaries.length >= TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT) break;
+    // Keep the complete, bounded provider page here. Callers apply historical
+    // exclusions before taking their requested window, so stopping at the UI
+    // page size would make excluded early rows permanently hide valid later
+    // templates.
+    if (summaries.length >= TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT) break;
   }
   return summaries;
 }
@@ -1328,7 +1334,7 @@ async function defaultTemplateBinaryFetch(input: {
     response.data.once("error", () => {
       if (settled) return;
       settled = true;
-      reject(new TwentyFirstNativeTemplateError("download_unavailable"));
+      reject(new TwentyFirstNativeTemplateError("download_unavailable", true));
     });
   });
 }
@@ -1868,7 +1874,7 @@ export class TwentyFirstClient {
     if (
       !Number.isSafeInteger(requestedLimit) ||
       requestedLimit < 1 ||
-      requestedLimit > TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT
+      requestedLimit > TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT
     ) {
       throw new AuthServiceError(
         "INVALID_CREDENTIAL",
@@ -1885,14 +1891,14 @@ export class TwentyFirstClient {
     const excludedTemplateIds = new Set(
       (options.excludeTemplateIds ?? [])
         .filter((value) => typeof value === "string" && value.length <= 191)
-        .slice(0, TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT),
+        .slice(0, TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT),
     );
     const excludedSlugs = new Set(
       (options.excludeSlugs ?? [])
         .map((value) => safeTemplateSlug(value))
         .filter((value): value is string => Boolean(value))
         .map((value) => value.toLocaleLowerCase("en-US"))
-        .slice(0, TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT),
+        .slice(0, TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT),
     );
     const catalog = await this.requestMarketplaceCatalog(signal);
     const filtered = catalog.filter(
@@ -1986,7 +1992,7 @@ export class TwentyFirstClient {
       });
     } catch (error) {
       if (error instanceof TwentyFirstNativeTemplateError) throw error;
-      throw new TwentyFirstNativeTemplateError("download_unavailable");
+      throw new TwentyFirstNativeTemplateError("download_unavailable", true);
     }
     if (
       archive.byteLength === 0 ||

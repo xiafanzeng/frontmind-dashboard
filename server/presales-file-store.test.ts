@@ -833,6 +833,63 @@ describe("presales file content retention manifest", () => {
     ).toBeInstanceOf(Date);
   });
 
+  it("never adds the default TTL to or deletes a domain-referenced artifact", async () => {
+    await store({ fileId: "siteops-unmanaged-reference" });
+    await store({
+      fileId: "siteops-managed-reference",
+      uploadedAt: "2026-01-01T00:00:00.000Z",
+      contentExpiresAt: "2026-01-31T00:00:00.000Z",
+    });
+    const onRetainedFile = vi.fn();
+    const onExpiredFile = vi.fn();
+
+    const result = await sweepPresalesFileStorageRetention({
+      now: new Date("2027-01-01T00:00:00.000Z"),
+      shouldRetainFile: async ({ fileId }) => fileId.startsWith("siteops-"),
+      onRetainedFile,
+      onExpiredFile,
+    });
+
+    expect(result).toMatchObject({
+      scannedStoredManifests: 2,
+      legacyManifestsBackfilled: 0,
+      deleted: 0,
+      failures: 0,
+    });
+    expect(onRetainedFile).not.toHaveBeenCalled();
+    expect(onExpiredFile).not.toHaveBeenCalled();
+    expect(
+      await readStoredPresalesFile("siteops-unmanaged-reference"),
+    ).toMatchObject({
+      uploadedAt: null,
+      contentExpiresAt: null,
+    });
+    expect(
+      await readStoredPresalesFile("siteops-managed-reference"),
+    ).not.toBeNull();
+  });
+
+  it("keeps bytes when the domain-reference authority is unavailable", async () => {
+    await store({
+      fileId: "siteops-reference-check-failed",
+      uploadedAt: "2026-01-01T00:00:00.000Z",
+      contentExpiresAt: "2026-01-31T00:00:00.000Z",
+    });
+
+    const result = await sweepPresalesFileStorageRetention({
+      now: new Date("2027-01-01T00:00:00.000Z"),
+      shouldRetainFile: async () => {
+        throw new Error("DATABASE_UNAVAILABLE");
+      },
+      onRetainedFile: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ deleted: 0, failures: 1 });
+    expect(
+      await readStoredPresalesFile("siteops-reference-check-failed"),
+    ).not.toBeNull();
+  });
+
   it("removes stale upload temporaries but leaves a recent upload alone", async () => {
     const oldStage = await stagePresalesFileContent({
       fileId: "abandoned-upload",

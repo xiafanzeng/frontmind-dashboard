@@ -276,7 +276,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(getDb).not.toHaveBeenCalled();
   });
 
-  it("treats stopped as completion and waits up to 120 seconds for its structured result", () => {
+  it("treats stopped as completion and waits five minutes for its structured result", () => {
     expect(terminalTaskState("stopped")).toEqual({
       completed: true,
       failed: false,
@@ -308,12 +308,31 @@ describe("Manus SiteOps provider boundary", () => {
       expired: false,
       state: { resultPendingSince: new Date(1_000).toISOString() },
     });
-    expect(structuredResultGrace(started.state, true, 120_999).expired).toBe(
+    expect(structuredResultGrace(started.state, true, 300_999).expired).toBe(
       false,
     );
-    expect(structuredResultGrace(started.state, true, 121_000).expired).toBe(
+    expect(structuredResultGrace(started.state, true, 301_000).expired).toBe(
       true,
     );
+    const stoppedFromDetail = {
+      schemaVersion: 2 as const,
+      stage: "native_repair_pending" as const,
+      taskId: "task-1",
+      nativeRepairAttempt: 1,
+      attempts: {
+        extraction: 0,
+        design: 0,
+        content: 0,
+        materialization: 0,
+      },
+      providerStoppedAt: new Date(1_000).toISOString(),
+    };
+    expect(
+      structuredResultGrace(stoppedFromDetail, false, 300_999).expired,
+    ).toBe(false);
+    expect(
+      structuredResultGrace(stoppedFromDetail, false, 301_000).expired,
+    ).toBe(true);
     expect(combinedTerminalTaskState("running", "stopped")).toEqual({
       completed: true,
       failed: false,
@@ -1272,6 +1291,69 @@ describe("Manus SiteOps provider boundary", () => {
     );
     expect(createClient).not.toHaveBeenCalled();
   });
+
+  it.each(["malformed-receipt", "missing-staging-task"] as const)(
+    "fails closed before provider access for a raw %s source checkpoint",
+    async (variant) => {
+      const taskId = "native-task-1";
+      const operationToken = `siteops-native-source:${operation.id}:0`;
+      const receipt = {
+        operationToken,
+        baseSourceSha256: "b".repeat(64),
+        archiveSha256:
+          variant === "malformed-receipt" ? "invalid" : "c".repeat(64),
+        fileCount: 3,
+      };
+      const rawResult = {
+        schemaVersion: 2,
+        stage: "native_source_pending",
+        attempts: {
+          extraction: 0,
+          design: 0,
+          content: 0,
+          materialization: 0,
+        },
+        taskId,
+        nativeRepairAttempt: 0,
+        buildPhase: "compiling",
+        buildCheckpoint: "archive_validated",
+        nativeSourceStaging: {
+          assetId: "50000000-0000-4000-8000-000000000005",
+          sha256: "c".repeat(64),
+          bytes: 128,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          ...(variant === "missing-staging-task" ? {} : { taskId }),
+          repairAttempt: 0,
+          receipt,
+        },
+      };
+      const getCredential = vi.fn();
+      const createClient = vi.fn();
+      const handler = createManusSiteOpsProviderHandler({
+        getDb: async () => ({}) as never,
+        getCredential: getCredential as never,
+        createClient,
+      });
+
+      const result = await handler({
+        operation: {
+          ...operation,
+          providerTaskId: taskId,
+          result: rawResult,
+        } as never,
+        signal: new AbortController().signal,
+      });
+
+      expect(result).toMatchObject({
+        status: "attention_required",
+        code: "FRONTMIND_BUILD_STAGED_SOURCE_IDENTITY_CONFLICT",
+        providerTaskId: taskId,
+        result: rawResult,
+      });
+      expect(getCredential).not.toHaveBeenCalled();
+      expect(createClient).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed before any provider request when the frozen key was deleted", async () => {
     const createClient = vi.fn();

@@ -107,6 +107,47 @@ describe("release workflow source-ordering contracts", () => {
     expect(dockerfile).toContain(`/app/dist/${output}`);
   });
 
+  it("packages the existing-task SiteOps reconciliation CLI into production", async () => {
+    const [builder, dockerfile] = await Promise.all([
+      readFile(productionBundleBuilder, "utf8"),
+      readFile(dashboardDockerfile, "utf8"),
+    ]);
+
+    expect(builder).toContain('"scripts/reconcile-siteops-build.ts"');
+    expect(builder).toContain('"reconcile-siteops-build.js"');
+    expect(builder).toContain("BUILD_SITEOPS_RECONCILE_CLI_OUTPUT_MISSING");
+    expect(dockerfile).toContain(
+      "test -s dist/reconcile-siteops-build.js",
+    );
+    expect(dockerfile).toContain(
+      "test -s /app/dist/reconcile-siteops-build.js",
+    );
+  });
+
+  it("binds the one ordinary production build directly to github.sha", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    const buildJob = workflow.slice(
+      workflow.indexOf("  build-sign:"),
+      workflow.indexOf("  coupled-stack-deploy:"),
+    );
+
+    expect(workflow).not.toContain("  promotion-gate:");
+    expect(workflow).not.toContain("  promotion-merge-proof:");
+    expect(buildJob).toContain("      - quality");
+    expect(buildJob).toContain("      - mysql-acceptance");
+    expect(buildJob).toContain("needs.quality.result == 'success'");
+    expect(buildJob).toContain("needs.mysql-acceptance.result == 'success'");
+    expect(buildJob).toContain("source_sha: ${{ github.sha }}");
+    expect(buildJob).toContain("FRONTMIND_RELEASE_SOURCE_SHA: ${{ github.sha }}");
+    expect(buildJob).toContain("          ref: ${{ github.sha }}");
+    expect(buildJob).not.toContain("needs.promotion-gate");
+    expect(buildJob.match(/docker\/build-push-action@v6/gu)).toHaveLength(1);
+    expect(buildJob.match(/cosign sign --yes/gu)).toHaveLength(1);
+    expect(
+      buildJob.match(/Deploy through fixed Dashboard capability/gu),
+    ).toHaveLength(1);
+  });
+
   it("wires one exact coupled production deployment without a rollout control plane", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const updater = await readFile(controllerUpdater, "utf8");

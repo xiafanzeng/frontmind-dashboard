@@ -169,6 +169,10 @@ export const NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH =
 
 export type NativeReactSourceErrorCode =
   | "NATIVE_SOURCE_ARCHIVE_INVALID"
+  | "NATIVE_SOURCE_ZIP_INVALID"
+  | "NATIVE_SOURCE_PACKAGE_JSON_INVALID"
+  | "NATIVE_SOURCE_PACKAGE_SHAPE_INVALID"
+  | "NATIVE_SOURCE_FILE_TYPE_FORBIDDEN"
   | "NATIVE_SOURCE_ARCHIVE_HASH_MISMATCH"
   | "NATIVE_SOURCE_TOKEN_MISMATCH"
   | "NATIVE_SOURCE_BASE_HASH_MISMATCH"
@@ -193,7 +197,11 @@ export type NativeReactSourceErrorCode =
   | "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE";
 
 export class NativeReactSourceError extends Error {
-  constructor(readonly code: NativeReactSourceErrorCode) {
+  constructor(
+    readonly code: NativeReactSourceErrorCode,
+    readonly retryable = false,
+    readonly status: number | null = null,
+  ) {
     super(code);
     this.name = "NativeReactSourceError";
   }
@@ -392,16 +400,16 @@ function assertPackageSafe(
     value = JSON.parse(decodeUtf8(bytes));
   } catch (error) {
     if (error instanceof NativeReactSourceError) throw error;
-    throw new NativeReactSourceError("NATIVE_SOURCE_ARCHIVE_INVALID");
+    throw new NativeReactSourceError("NATIVE_SOURCE_PACKAGE_JSON_INVALID");
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new NativeReactSourceError("NATIVE_SOURCE_ARCHIVE_INVALID");
+    throw new NativeReactSourceError("NATIVE_SOURCE_PACKAGE_SHAPE_INVALID");
   }
   const manifest = value as Record<string, unknown>;
   const scripts = manifest.scripts;
   if (scripts !== undefined) {
     if (!scripts || typeof scripts !== "object" || Array.isArray(scripts)) {
-      throw new NativeReactSourceError("NATIVE_SOURCE_ARCHIVE_INVALID");
+      throw new NativeReactSourceError("NATIVE_SOURCE_PACKAGE_SHAPE_INVALID");
     }
     const lifecycle = new Set([
       "preinstall",
@@ -767,7 +775,7 @@ export async function validateNativeReactSourceArchive(input: {
       createFolders: false,
     });
   } catch {
-    throw new NativeReactSourceError("NATIVE_SOURCE_ARCHIVE_INVALID");
+    throw new NativeReactSourceError("NATIVE_SOURCE_ZIP_INVALID");
   }
   const entries = Object.values(archive.files) as UnsafeZipObject[];
   const filesOnly = entries.filter((entry) => !entry.dir);
@@ -817,7 +825,7 @@ export async function validateNativeReactSourceArchive(input: {
       !LOCK_FILE_PATTERN.test(normalizedPath) &&
       !ALLOWED_BINARY_FILE_PATTERN.test(normalizedPath)
     ) {
-      throw new NativeReactSourceError("NATIVE_SOURCE_ARCHIVE_INVALID");
+      throw new NativeReactSourceError("NATIVE_SOURCE_FILE_TYPE_FORBIDDEN");
     }
     const bytes = await entryByRawPath.get(rawPath)!.async("nodebuffer");
     expandedBytes += bytes.length;
@@ -889,7 +897,16 @@ function boundedDataUrl(url: string, maxBytes: number) {
 
 async function readBoundedResponseBody(response: Response, maxBytes: number) {
   if (!response.ok || !response.body) {
-    throw new NativeReactSourceError("NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE");
+    const retryable =
+      response.status === 408 ||
+      response.status === 425 ||
+      response.status === 429 ||
+      response.status >= 500;
+    throw new NativeReactSourceError(
+      "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE",
+      retryable,
+      response.status,
+    );
   }
   const contentType = response.headers.get("content-type");
   if (contentType !== FRONTMIND_SITE_SOURCE_ARCHIVE_MIME) {
@@ -980,7 +997,10 @@ export async function readNativeSourceAttachment(input: {
     return await readBoundedResponseBody(fetched.response, maxBytes);
   } catch (error) {
     if (error instanceof NativeReactSourceError) throw error;
-    throw new NativeReactSourceError("NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE");
+    throw new NativeReactSourceError(
+      "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE",
+      true,
+    );
   } finally {
     clearTimeout(timeout);
     input.signal?.removeEventListener("abort", onAbort);

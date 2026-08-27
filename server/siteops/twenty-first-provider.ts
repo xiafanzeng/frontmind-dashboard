@@ -8,6 +8,9 @@ import {
   messages,
   siteOperations,
   siteProjects,
+  visualCandidatePoolItems,
+  visualCandidatePoolPages,
+  visualCandidatePools,
   websiteStyleSampleBatches,
   websiteStyleSamples,
   type KnowledgeBaseSnapshot,
@@ -61,7 +64,7 @@ import {
   type TwentyFirstNativeTemplateSummary,
   type TwentyFirstReadOnlySession,
 } from "../twenty-first-service";
-import { persistSiteOpsArtifact } from "./artifact-store";
+import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
 import {
   SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
   VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES,
@@ -75,6 +78,7 @@ import {
   classifyNativeVisualFailure,
   prepareNativeTemplateCandidate,
   prepareNativeVisualCandidate,
+  readVisualSelectionBundleArtifact,
   type NativeTemplateRuntimeFailureCategory,
   type NativeVisualFailureCategory,
   type PreparedNativeTemplateCandidate,
@@ -193,6 +197,8 @@ type NativeTemplateBoardCandidate = {
   previewLocalAssetId: string;
   previewSha256: string;
   previewPerceptualHash: string;
+  /** Historical V6 pages predate host-derived style tokens. */
+  styleTokens?: PreparedNativeTemplateCandidate["styleTokens"];
   sourceFormat: PreparedNativeTemplateCandidate["sourceFormat"];
   framework: PreparedNativeTemplateCandidate["framework"];
   sourceTreeSha256: string;
@@ -323,6 +329,56 @@ export type TwentyFirstBoardPersistenceInput = {
     | VisualSelectionBundleV6;
   selectionBundleArtifact: PreviewArtifact;
   mirroredCandidates: BoardCandidate[];
+  candidatePoolPage?: {
+    poolId: string;
+    pageNumber: 1 | 2 | 3;
+  };
+};
+
+export type NativeTemplatePoolPagePersistence = {
+  id: string;
+  pageNumber: 1 | 2 | 3;
+  selectionBundleArtifact: PreviewArtifact;
+  selectionBundleSizeBytes: number;
+  items: Array<{
+    id: string;
+    sampleId: string;
+    position: number;
+    previewLocalAssetId: string;
+    previewSha256: string;
+    sourceTreeSha256: string;
+    providerTemplateId: string;
+    providerSlug: string;
+    providerVersion: string | null;
+    providerItemKey: string;
+  }>;
+};
+
+export type NativeTemplatePoolPersistenceInput = {
+  poolId: string;
+  generationKey: string;
+  operation: SiteOperation;
+  context: TwentyFirstProviderContext;
+  credentialId: string;
+  credentialVersion: number;
+  seed: string;
+  catalogFingerprint: string;
+  queryPlanHash: string;
+  manifestArtifact: PreviewArtifact;
+  pages: NativeTemplatePoolPagePersistence[];
+};
+
+export type NativeTemplatePoolState = {
+  poolId: string;
+  pageCount: number;
+  availablePages: number;
+  reservedPages: number;
+  page: null | {
+    pageNumber: 1 | 2 | 3;
+    selectionBundleLocalAssetId: string;
+    selectionBundleHash: string;
+    items: NativeTemplatePoolPagePersistence["items"];
+  };
 };
 
 export type TwentyFirstProviderDependencies = {
@@ -346,6 +402,19 @@ export type TwentyFirstProviderDependencies = {
     db: any,
     input: TwentyFirstBoardPersistenceInput,
   ) => Promise<ExistingBoard>;
+  loadNativeTemplatePoolState?: (input: {
+    db: any;
+    operation: SiteOperation;
+    context: TwentyFirstProviderContext;
+    credentialId: string;
+    credentialVersion: number;
+    page: 1 | 2 | 3;
+  }) => Promise<NativeTemplatePoolState | null>;
+  persistNativeTemplatePool?: (
+    db: any,
+    input: NativeTemplatePoolPersistenceInput,
+  ) => Promise<{ poolId: string; created: boolean }>;
+  readArtifact?: typeof readSiteOpsArtifact;
 };
 
 class TwentyFirstProviderFailure extends Error {
@@ -2540,6 +2609,54 @@ async function persistDefaultBoard(
       )
       .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
       .for("update");
+    let lockedPoolPage: typeof visualCandidatePoolPages.$inferSelect | null =
+      null;
+    if (input.candidatePoolPage) {
+      const poolRows = await tx
+        .select()
+        .from(visualCandidatePools)
+        .where(
+          and(
+            eq(visualCandidatePools.id, input.candidatePoolPage.poolId),
+            eq(visualCandidatePools.projectId, project.id),
+            eq(visualCandidatePools.userId, input.operation.userId),
+            eq(
+              visualCandidatePools.knowledgeSnapshotId,
+              input.context.snapshot.id,
+            ),
+            eq(visualCandidatePools.status, "active"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const pageRows = await tx
+        .select()
+        .from(visualCandidatePoolPages)
+        .where(
+          and(
+            eq(visualCandidatePoolPages.poolId, input.candidatePoolPage.poolId),
+            eq(
+              visualCandidatePoolPages.pageNumber,
+              input.candidatePoolPage.pageNumber,
+            ),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      lockedPoolPage = pageRows[0] ?? null;
+      if (
+        !poolRows[0] ||
+        !lockedPoolPage ||
+        lockedPoolPage.selectionBundleLocalAssetId !==
+          input.selectionBundleArtifact.id ||
+        lockedPoolPage.selectionBundleHash !==
+          input.selectionBundleArtifact.contentSha256 ||
+        lockedPoolPage.candidateCount !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE ||
+        !["reserved", "published"].includes(lockedPoolPage.status)
+      ) {
+        throw visualSearchSuperseded();
+      }
+    }
     const marker = operationMarker(input.operation.id);
     const existingRows = await tx
       .select()
@@ -2591,6 +2708,28 @@ async function persistDefaultBoard(
         .select({ id: websiteStyleSamples.id })
         .from(websiteStyleSamples)
         .where(eq(websiteStyleSamples.batchId, existingRows[0].id));
+      if (lockedPoolPage?.status === "reserved") {
+        await tx
+          .update(visualCandidatePoolPages)
+          .set({
+            status: "published",
+            batchId: existingRows[0].id,
+            publishedOperationId: input.operation.id,
+            publishedAt: existingRows[0].publishedAt,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(visualCandidatePoolPages.id, lockedPoolPage.id),
+              eq(visualCandidatePoolPages.status, "reserved"),
+            ),
+          );
+      } else if (
+        lockedPoolPage &&
+        lockedPoolPage.batchId !== existingRows[0].id
+      ) {
+        throw visualSearchSuperseded();
+      }
       return {
         batchId: existingRows[0].id,
         candidateCount: sampleRows.length,
@@ -2649,6 +2788,7 @@ async function persistDefaultBoard(
                 entrypoint: item.entrypoint,
                 previewSha256: item.previewSha256,
                 previewPerceptualHash: item.previewPerceptualHash,
+                styleTokens: item.styleTokens ?? null,
                 title: item.title,
                 description: item.description,
                 author: item.author,
@@ -2769,6 +2909,31 @@ async function persistDefaultBoard(
             ?.affectedRows) ?? 0,
     );
     if (affectedRows !== 1) throw visualSearchSuperseded();
+    if (lockedPoolPage) {
+      const poolPageUpdated = await tx
+        .update(visualCandidatePoolPages)
+        .set({
+          status: "published",
+          batchId,
+          publishedOperationId: input.operation.id,
+          publishedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(visualCandidatePoolPages.id, lockedPoolPage.id),
+            eq(visualCandidatePoolPages.status, "reserved"),
+          ),
+        );
+      const poolPageAffectedRows = Number(
+        (Array.isArray(poolPageUpdated)
+          ? (poolPageUpdated[0] as { affectedRows?: unknown } | undefined)
+              ?.affectedRows
+          : (poolPageUpdated as { affectedRows?: unknown } | undefined)
+              ?.affectedRows) ?? 0,
+      );
+      if (poolPageAffectedRows !== 1) throw visualSearchSuperseded();
+    }
     return {
       batchId,
       candidateCount: input.mirroredCandidates.length,
@@ -2922,7 +3087,8 @@ async function mapWithBoundedConcurrency<T, R>(input: {
   return results;
 }
 
-const NATIVE_TEMPLATE_CATALOG_LIMIT = 32;
+const NATIVE_TEMPLATE_CATALOG_DISCOVERY_LIMIT = 60;
+const NATIVE_TEMPLATE_PREPARATION_LIMIT = 32;
 const NATIVE_TEMPLATE_BATCH_CONCURRENCY = 3;
 const NATIVE_TEMPLATE_CATALOG_TIMEOUT_MS = 45_000;
 const NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -2985,12 +3151,9 @@ function nativeTemplateProviderKey(
 function deterministicallyShuffleTemplates(input: {
   templates: readonly TwentyFirstNativeTemplateSummary[];
   hmacKey: Buffer;
-  projectId: string;
-  operationId: string;
-  page: 1 | 2 | 3;
-  attempt: number;
+  seed: string;
 }) {
-  const domain = `frontmind:siteops:21st-template-v6:${input.projectId}:${input.operationId}:${input.page}:${input.attempt}`;
+  const domain = `frontmind:siteops:21st-template-v6:${input.seed}`;
   return input.templates
     .map((template, providerIndex) => ({
       template,
@@ -3277,6 +3440,401 @@ export function planNativeTemplateCapacityPages(input: {
   };
 }
 
+function nativeTemplatePoolGenerationKey(input: {
+  context: TwentyFirstProviderContext;
+  credentialId: string;
+  credentialVersion: number;
+}) {
+  return canonicalSha256({
+    schemaVersion: 1,
+    projectId: input.context.project.id,
+    taskStartedAt: input.context.project.currentTaskStartedAt.toISOString(),
+    knowledgeSnapshotId: input.context.snapshot.id,
+    credentialId: input.credentialId,
+    credentialVersion: input.credentialVersion,
+    renderer: "twenty_first_native_template_v1",
+  });
+}
+
+function nativeTemplatePoolSeed(input: {
+  shuffleKey: Buffer;
+  generationKey: string;
+}) {
+  return createHmac("sha256", input.shuffleKey)
+    .update("frontmind:siteops:21st-template-v6:pool-seed")
+    .update("\0")
+    .update(input.generationKey)
+    .digest("hex");
+}
+
+async function persistDefaultNativeTemplatePool(
+  db: any,
+  input: NativeTemplatePoolPersistenceInput,
+) {
+  return db.transaction(
+    async (tx: any): Promise<{ poolId: string; created: boolean }> => {
+      const projectRows = await tx
+        .select()
+        .from(siteProjects)
+        .where(
+          and(
+            eq(siteProjects.id, input.context.project.id),
+            eq(siteProjects.userId, input.operation.userId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const project = projectRows[0];
+      if (
+        !project ||
+        project.currentKnowledgeSnapshotId !== input.context.snapshot.id ||
+        project.currentTaskStartedAt.getTime() !==
+          input.context.project.currentTaskStartedAt.getTime() ||
+        project.revision !== input.context.project.revision
+      ) {
+        throw visualSearchSuperseded();
+      }
+
+      const existingRows = await tx
+        .select({ id: visualCandidatePools.id })
+        .from(visualCandidatePools)
+        .where(eq(visualCandidatePools.generationKey, input.generationKey))
+        .limit(1)
+        .for("update");
+      if (existingRows[0]) {
+        return { poolId: existingRows[0].id, created: false };
+      }
+
+      const activeRows = await tx
+        .select({
+          id: visualCandidatePools.id,
+          generationKey: visualCandidatePools.generationKey,
+        })
+        .from(visualCandidatePools)
+        .where(
+          and(
+            eq(visualCandidatePools.projectId, project.id),
+            eq(visualCandidatePools.userId, input.operation.userId),
+            eq(
+              visualCandidatePools.taskStartedAt,
+              input.context.project.currentTaskStartedAt,
+            ),
+            eq(visualCandidatePools.status, "active"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (activeRows[0]) throw visualSearchSuperseded();
+
+      const operationRows = await tx
+        .select()
+        .from(siteOperations)
+        .where(eq(siteOperations.id, input.operation.id))
+        .limit(1)
+        .for("update");
+      const leasedOperation = operationRows[0];
+      if (
+        !leasedOperation ||
+        leasedOperation.status !== "running" ||
+        !input.operation.leaseOwner ||
+        leasedOperation.leaseOwner !== input.operation.leaseOwner ||
+        !leasedOperation.leaseExpiresAt ||
+        leasedOperation.leaseExpiresAt.getTime() <= Date.now() ||
+        leasedOperation.projectId !== project.id ||
+        leasedOperation.userId !== input.operation.userId ||
+        leasedOperation.kind !== "visual_search" ||
+        leasedOperation.provider !== "21st"
+      ) {
+        throw visualSearchSuperseded();
+      }
+
+      await tx.insert(visualCandidatePools).values({
+        id: input.poolId,
+        projectId: project.id,
+        userId: input.operation.userId,
+        knowledgeSnapshotId: input.context.snapshot.id,
+        credentialId: input.credentialId,
+        credentialVersion: input.credentialVersion,
+        initialOperationId: input.operation.id,
+        generationKey: input.generationKey,
+        taskStartedAt: input.context.project.currentTaskStartedAt,
+        projectRevision: input.context.project.revision,
+        seed: input.seed,
+        catalogFingerprint: input.catalogFingerprint,
+        queryPlanHash: input.queryPlanHash,
+        manifestLocalAssetId: input.manifestArtifact.id,
+        manifestHash: input.manifestArtifact.contentSha256,
+        pageCount: input.pages.length,
+        candidateCount: input.pages.length * SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+        status: "active",
+      });
+      await tx.insert(visualCandidatePoolPages).values(
+        input.pages.map((page) => ({
+          id: page.id,
+          poolId: input.poolId,
+          pageNumber: page.pageNumber,
+          status: "reserved",
+          selectionBundleLocalAssetId: page.selectionBundleArtifact.id,
+          selectionBundleHash: page.selectionBundleArtifact.contentSha256,
+          candidateCount: SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+          bundleSizeBytes: page.selectionBundleSizeBytes,
+          batchId: null,
+          publishedOperationId: null,
+          publishedAt: null,
+        })),
+      );
+      await tx.insert(visualCandidatePoolItems).values(
+        input.pages.flatMap((page) =>
+          page.items.map((item) => ({
+            ...item,
+            poolPageId: page.id,
+          })),
+        ),
+      );
+      return { poolId: input.poolId, created: true };
+    },
+  );
+}
+
+async function loadDefaultNativeTemplatePoolState(input: {
+  db: any;
+  operation: SiteOperation;
+  context: TwentyFirstProviderContext;
+  credentialId: string;
+  credentialVersion: number;
+  page: 1 | 2 | 3;
+}): Promise<NativeTemplatePoolState | null> {
+  const poolRows = await input.db
+    .select()
+    .from(visualCandidatePools)
+    .where(
+      and(
+        eq(visualCandidatePools.projectId, input.context.project.id),
+        eq(visualCandidatePools.userId, input.operation.userId),
+        eq(visualCandidatePools.knowledgeSnapshotId, input.context.snapshot.id),
+        eq(visualCandidatePools.credentialId, input.credentialId),
+        eq(visualCandidatePools.credentialVersion, input.credentialVersion),
+        eq(
+          visualCandidatePools.taskStartedAt,
+          input.context.project.currentTaskStartedAt,
+        ),
+        eq(visualCandidatePools.status, "active"),
+      ),
+    )
+    .limit(1);
+  const pool = poolRows[0];
+  if (!pool) return null;
+  const pages = await input.db
+    .select()
+    .from(visualCandidatePoolPages)
+    .where(eq(visualCandidatePoolPages.poolId, pool.id));
+  const inPoolPublished = pages.filter(
+    (row: { status: string }) => row.status === "published",
+  ).length;
+  const legacyPublished = Math.max(
+    0,
+    (input.context.publishedPageCount ?? 0) - inPoolPublished,
+  );
+  const availablePages = Math.min(
+    SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+    legacyPublished + pages.length,
+  );
+  const reservedPages = pages.filter(
+    (row: { status: string }) => row.status === "reserved",
+  ).length;
+  const page = pages.find(
+    (row: { pageNumber: number; status: string }) =>
+      row.pageNumber === input.page && row.status === "reserved",
+  );
+  const items = page
+    ? await input.db
+        .select()
+        .from(visualCandidatePoolItems)
+        .where(eq(visualCandidatePoolItems.poolPageId, page.id))
+        .orderBy(visualCandidatePoolItems.position)
+    : [];
+  return {
+    poolId: pool.id,
+    pageCount: pages.length,
+    availablePages,
+    reservedPages,
+    page: page
+      ? {
+          pageNumber: page.pageNumber as 1 | 2 | 3,
+          selectionBundleLocalAssetId: page.selectionBundleLocalAssetId,
+          selectionBundleHash: page.selectionBundleHash,
+          items: items.map(
+            (item: typeof visualCandidatePoolItems.$inferSelect) => ({
+              id: item.id,
+              sampleId: item.sampleId,
+              position: item.position,
+              previewLocalAssetId: item.previewLocalAssetId,
+              previewSha256: item.previewSha256,
+              sourceTreeSha256: item.sourceTreeSha256,
+              providerTemplateId: item.providerTemplateId,
+              providerSlug: item.providerSlug,
+              providerVersion: item.providerVersion,
+              providerItemKey: item.providerItemKey,
+            }),
+          ),
+        }
+      : null,
+  };
+}
+
+async function storedSiteOpsArtifactBytes(input: {
+  artifact: NonNullable<Awaited<ReturnType<typeof readSiteOpsArtifact>>>;
+  expectedSha256: string;
+}) {
+  const maxBytes = VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES;
+  if (
+    input.artifact.stored.sizeBytes < 1 ||
+    input.artifact.stored.sizeBytes > maxBytes
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_ARTIFACT_INVALID",
+      "冻结的视觉候选页大小无效。",
+      "attention_required",
+    );
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of input.artifact.stored.createReadStream()) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += bytes.length;
+    if (total > input.artifact.stored.sizeBytes || total > maxBytes) {
+      throw new TwentyFirstProviderFailure(
+        "VISUAL_CANDIDATE_POOL_ARTIFACT_INVALID",
+        "冻结的视觉候选页读取结果不一致。",
+        "attention_required",
+      );
+    }
+    chunks.push(bytes);
+  }
+  const bytes = Buffer.concat(chunks);
+  if (
+    bytes.length !== input.artifact.stored.sizeBytes ||
+    sha256Buffer(bytes) !== input.expectedSha256
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_ARTIFACT_INVALID",
+      "冻结的视觉候选页未通过哈希校验。",
+      "attention_required",
+    );
+  }
+  return bytes;
+}
+
+async function restoreNativeTemplatePoolPage(input: {
+  operation: SiteOperation;
+  page: NonNullable<NativeTemplatePoolState["page"]>;
+  readArtifact: typeof readSiteOpsArtifact;
+}) {
+  const artifact = await input.readArtifact({
+    userId: input.operation.userId,
+    localAssetId: input.page.selectionBundleLocalAssetId,
+    expectedSha256: input.page.selectionBundleHash,
+    expectedMimeTypes: [VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE],
+  });
+  if (!artifact) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_ARTIFACT_MISSING",
+      "冻结的视觉候选页暂时无法读取。",
+      "attention_required",
+    );
+  }
+  const bytes = await storedSiteOpsArtifactBytes({
+    artifact,
+    expectedSha256: input.page.selectionBundleHash,
+  });
+  const restored = await readVisualSelectionBundleArtifact(bytes);
+  if (restored.bundle.schemaVersion !== 6) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_ARTIFACT_INVALID",
+      "冻结的视觉候选页版本无效。",
+      "attention_required",
+    );
+  }
+  if (
+    restored.bundle.candidates.some(
+      (candidate) => candidate.sourceFormat !== "provider_archive_v1",
+    )
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_ARTIFACT_INVALID",
+      "冻结的完整 Template 源码格式无效。",
+      "attention_required",
+    );
+  }
+  const orderedItems = [...input.page.items].sort(
+    (left, right) => left.position - right.position,
+  );
+  const itemManifestValid =
+    orderedItems.length === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE &&
+    restored.bundle.candidates.length === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE &&
+    restored.bundle.candidates.every((candidate, position) => {
+      const item = orderedItems[position];
+      return (
+        item?.position === position &&
+        item.sampleId === candidate.sampleId &&
+        item.previewLocalAssetId === candidate.previewLocalAssetId &&
+        item.previewSha256 === candidate.previewSha256 &&
+        item.sourceTreeSha256 === candidate.sourceTreeSha256 &&
+        item.providerTemplateId === candidate.providerTemplateId &&
+        item.providerSlug === candidate.providerSlug &&
+        item.providerVersion === candidate.providerVersion &&
+        item.providerItemKey ===
+          nativeTemplateProviderKey({
+            templateId: candidate.providerTemplateId,
+            slug: candidate.providerSlug,
+          }) &&
+        restored.archives.has(candidate.sampleId)
+      );
+    });
+  if (!itemManifestValid) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_ITEM_MISMATCH",
+      "冻结的视觉候选页引用校验失败。",
+      "attention_required",
+    );
+  }
+  const candidates: NativeTemplateBoardCandidate[] =
+    restored.bundle.candidates.map((candidate) => ({
+      sampleId: candidate.sampleId,
+      optionLabel: candidate.label,
+      providerTemplateId: candidate.providerTemplateId,
+      providerSlug: candidate.providerSlug,
+      providerVersion: candidate.providerVersion,
+      providerItemKey: nativeTemplateProviderKey({
+        templateId: candidate.providerTemplateId,
+        slug: candidate.providerSlug,
+      }),
+      title: candidate.title,
+      description: candidate.description,
+      author: candidate.author,
+      previewLocalAssetId: candidate.previewLocalAssetId,
+      previewSha256: candidate.previewSha256,
+      previewPerceptualHash:
+        candidate.previewPerceptualHash ?? candidate.previewSha256.slice(0, 16),
+      styleTokens: candidate.styleTokens,
+      sourceFormat: "provider_archive_v1" as const,
+      framework: candidate.framework,
+      sourceTreeSha256: candidate.sourceTreeSha256,
+      sourceArchiveSha256: candidate.sourceArchiveSha256,
+      sourceArchive: restored.archives.get(candidate.sampleId)!,
+      sourceDirectory: candidate.sourceDirectory,
+      entrypoint: candidate.entrypoint,
+    }));
+  return {
+    selectionBundle: restored.bundle,
+    selectionBundleArtifact: {
+      id: artifact.row.id,
+      contentSha256: artifact.row.contentSha256,
+    },
+    candidates,
+  };
+}
+
 function logSafeNativeTemplateStage(input: {
   event:
     | "template_catalog"
@@ -3347,6 +3905,8 @@ async function runNativeTemplateVisualSearch(input: {
     "listNativeTemplates" | "downloadNativeTemplate"
   >;
   apiKey: string;
+  credentialId: string;
+  credentialVersion: number;
   context: TwentyFirstProviderContext;
   searchPlan: ResolvedVisualSearchPlan;
   diagnostics: VisualSearchDiagnostics;
@@ -3358,10 +3918,23 @@ async function runNativeTemplateVisualSearch(input: {
     db: any,
     input: TwentyFirstBoardPersistenceInput,
   ) => Promise<ExistingBoard>;
+  persistCandidatePool?: (
+    db: any,
+    input: NativeTemplatePoolPersistenceInput,
+  ) => Promise<{ poolId: string; created: boolean }>;
   db: any;
 }) {
   const startedAt = Date.now();
   input.diagnostics.templateMode = true;
+  const generationKey = nativeTemplatePoolGenerationKey({
+    context: input.context,
+    credentialId: input.credentialId,
+    credentialVersion: input.credentialVersion,
+  });
+  const poolSeed = nativeTemplatePoolSeed({
+    shuffleKey: input.shuffleKey,
+    generationKey,
+  });
   const priorProviderKeys = new Set(
     input.context.previousReferences?.providerItemKeys ?? [],
   );
@@ -3385,7 +3958,7 @@ async function runNativeTemplateVisualSearch(input: {
       AbortSignal.timeout(NATIVE_TEMPLATE_CATALOG_TIMEOUT_MS),
     ]);
     catalog = await input.client.listNativeTemplates(input.apiKey, {
-      limit: NATIVE_TEMPLATE_CATALOG_LIMIT,
+      limit: NATIVE_TEMPLATE_CATALOG_DISCOVERY_LIMIT,
       signal: catalogSignal,
       excludeTemplateIds: [...priorTemplateIds],
       excludeSlugs: [...priorTemplateSlugs],
@@ -3423,7 +3996,7 @@ async function runNativeTemplateVisualSearch(input: {
   }
   const catalogWindow = [...uniqueCatalog.values()].slice(
     0,
-    NATIVE_TEMPLATE_CATALOG_LIMIT,
+    NATIVE_TEMPLATE_PREPARATION_LIMIT,
   );
   input.diagnostics.catalogCandidates = catalogWindow.length;
   logSafeNativeTemplateStage({
@@ -3442,10 +4015,7 @@ async function runNativeTemplateVisualSearch(input: {
   const ordered = deterministicallyShuffleTemplates({
     templates: catalogWindow,
     hmacKey: input.shuffleKey,
-    projectId: input.context.project.id,
-    operationId: input.operation.id,
-    page: input.searchPlan.page,
-    attempt: input.operation.attempt,
+    seed: poolSeed,
   });
   const orderedPriority = new Map(
     ordered.map((summary, priorityIndex) => [
@@ -3478,28 +4048,44 @@ async function runNativeTemplateVisualSearch(input: {
     );
     const results = await Promise.all(
       batch.map(async (summary) => {
-        input.diagnostics.templateDownloadAttempts += 1;
-        let archive;
-        try {
-          archive = await input.client.downloadNativeTemplate(input.apiKey, {
-            templateId: summary.templateId,
-            slug: summary.slug,
-            version: summary.version,
-            sourceOwner: summary.sourceOwner,
-            sourceRepo: summary.sourceRepo,
-            sourceCommitSha: summary.sourceCommitSha,
-            sourceSubdirectory: summary.sourceSubdirectory,
-            sourceLicense: summary.sourceLicense,
-            signal: AbortSignal.any([
-              input.signal,
-              AbortSignal.timeout(NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS),
-            ]),
-          });
-          input.diagnostics.templateDownloadsSucceeded += 1;
-        } catch (error) {
+        let archive: Awaited<
+          ReturnType<TwentyFirstClient["downloadNativeTemplate"]>
+        > | null = null;
+        let finalDownloadError: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          input.diagnostics.templateDownloadAttempts += 1;
+          try {
+            archive = await input.client.downloadNativeTemplate(input.apiKey, {
+              templateId: summary.templateId,
+              slug: summary.slug,
+              version: summary.version,
+              sourceOwner: summary.sourceOwner,
+              sourceRepo: summary.sourceRepo,
+              sourceCommitSha: summary.sourceCommitSha,
+              sourceSubdirectory: summary.sourceSubdirectory,
+              sourceLicense: summary.sourceLicense,
+              signal: AbortSignal.any([
+                input.signal,
+                AbortSignal.timeout(NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS),
+              ]),
+            });
+            input.diagnostics.templateDownloadsSucceeded += 1;
+            break;
+          } catch (error) {
+            finalDownloadError = error;
+            const mayRetry =
+              attempt === 0 &&
+              !input.signal.aborted &&
+              error instanceof TwentyFirstNativeTemplateError &&
+              error.category === "download_unavailable" &&
+              error.retryable;
+            if (!mayRetry) break;
+          }
+        }
+        if (!archive) {
           const category = input.signal.aborted
             ? "deadline_exhausted"
-            : templateDownloadFailure(error);
+            : templateDownloadFailure(finalDownloadError);
           rejectNativeTemplate(input.diagnostics, category);
           return null;
         }
@@ -3574,34 +4160,45 @@ async function runNativeTemplateVisualSearch(input: {
   const binDigest = createHmac("sha256", input.shuffleKey)
     .update("frontmind:siteops:21st-template-v6:capacity-bin")
     .update("\0")
-    .update(input.context.project.id)
-    .update("\0")
-    .update(input.operation.id)
-    .update("\0")
-    .update(String(input.searchPlan.page))
-    .update("\0")
-    .update(String(input.operation.attempt))
+    .update(poolSeed)
     .digest();
-  const capacityPlan = planNativeTemplateCapacityPages({
-    candidates: available.map(({ summary, prepared }) => {
-      const key = nativeTemplateProviderKey(summary);
-      return {
-        key,
-        archiveBytes: prepared.sourceArchive.length,
-        priorityIndex: orderedPriority.get(key) ?? Number.MAX_SAFE_INTEGER,
-      };
-    }),
-    pageCount: pagesRemaining,
-    currentBinIndex: binDigest.readUInt32BE(0) % pagesRemaining,
+  const capacityCandidates = available.map(({ summary, prepared }) => {
+    const key = nativeTemplateProviderKey(summary);
+    return {
+      key,
+      archiveBytes: prepared.sourceArchive.length,
+      priorityIndex: orderedPriority.get(key) ?? Number.MAX_SAFE_INTEGER,
+    };
   });
-  input.diagnostics.capacityCandidates = capacityPlan.usable;
-  input.diagnostics.capacityRequired = capacityPlan.required;
-  input.diagnostics.capacityPages = pagesRemaining;
-  input.diagnostics.capacitySelected = capacityPlan.current.length;
-  input.diagnostics.capacityRejectedOversize = capacityPlan.rejectedOversize;
-  input.diagnostics.capacitySolverNodes = capacityPlan.solverNodes;
-  input.diagnostics.capacitySolverExhausted = capacityPlan.solverExhausted;
-  if (!capacityPlan.feasible) {
+  let capacityPlan: NativeTemplateCapacityPlan | null = null;
+  let capacitySolverNodes = 0;
+  let capacitySolverExhausted = false;
+  for (let pageCount = pagesRemaining; pageCount >= 1; pageCount -= 1) {
+    const candidatePlan = planNativeTemplateCapacityPages({
+      candidates: capacityCandidates,
+      pageCount,
+      currentBinIndex: binDigest.readUInt32BE(0) % pageCount,
+    });
+    capacitySolverNodes += candidatePlan.solverNodes;
+    capacitySolverExhausted ||= candidatePlan.solverExhausted;
+    if (candidatePlan.feasible) {
+      capacityPlan = candidatePlan;
+      break;
+    }
+  }
+  input.diagnostics.capacityCandidates = capacityCandidates.filter(
+    (candidate) =>
+      candidate.archiveBytes <= NATIVE_TEMPLATE_PAGE_ARCHIVE_BUDGET_BYTES,
+  ).length;
+  input.diagnostics.capacityRequired =
+    pagesRemaining * SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+  input.diagnostics.capacityPages = capacityPlan?.bins.length ?? 0;
+  input.diagnostics.capacitySelected = capacityPlan?.current.length ?? 0;
+  input.diagnostics.capacityRejectedOversize =
+    capacityPlan?.rejectedOversize ?? 0;
+  input.diagnostics.capacitySolverNodes = capacitySolverNodes;
+  input.diagnostics.capacitySolverExhausted = capacitySolverExhausted;
+  if (!capacityPlan) {
     rejectNativeTemplate(input.diagnostics, "insufficient_live_templates");
     throw nativeTemplateProviderFailure("insufficient_live_templates");
   }
@@ -3611,135 +4208,269 @@ async function runNativeTemplateVisualSearch(input: {
       candidate,
     ]),
   );
-  const accepted = capacityPlan.current.map((candidate) =>
-    availableByKey.get(candidate.key),
-  );
-  if (
-    accepted.length !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE ||
-    accepted.some((candidate) => !candidate)
-  ) {
-    rejectNativeTemplate(input.diagnostics, "insufficient_live_templates");
-    throw nativeTemplateProviderFailure("insufficient_live_templates");
-  }
-
-  await assertCommitLeaseActive(input.assertLeaseActive);
-  const nativeCandidates: NativeTemplateBoardCandidate[] = [];
-  for (let index = 0; index < accepted.length; index += 1) {
-    const { summary, prepared, perceptualHash } = accepted[index]!;
-    const sampleId = randomUUID();
-    const optionLabel = String.fromCharCode(65 + index);
-    const previewAsset = await input.persistArtifact({
-      userId: input.operation.userId,
-      projectId: input.context.project.id,
-      kind: "21st-native-template-preview",
-      filename: `21st-template-${optionLabel.toLowerCase()}.png`,
-      mimeType: "image/png",
-      buffer: prepared.preview,
-      maxBytes: 5 * 1024 * 1024,
-    });
-    if (previewAsset.contentSha256 !== prepared.previewSha256) {
-      throw new TwentyFirstProviderFailure(
-        "NATIVE_TEMPLATE_PREVIEW_HASH_MISMATCH",
-        "完整 Template 预览写入校验失败。",
-        "attention_required",
-      );
-    }
-    nativeCandidates.push({
-      sampleId,
-      optionLabel,
-      providerTemplateId: String(summary.templateId),
-      providerSlug: summary.slug,
-      providerVersion: prepared.providerVersion,
-      providerItemKey: prepared.providerItemKey,
-      title: cleanText(summary.name, `Template ${optionLabel}`, 300),
-      description: null,
-      author: null,
-      previewLocalAssetId: previewAsset.id,
-      previewSha256: prepared.previewSha256,
-      previewPerceptualHash: perceptualHash,
-      sourceFormat: prepared.sourceFormat,
-      framework: prepared.framework,
-      sourceTreeSha256: prepared.sourceTreeSha256,
-      sourceArchiveSha256: prepared.sourceArchiveSha256,
-      sourceArchive: prepared.sourceArchive,
-      sourceDirectory: prepared.sourceDirectory,
-      entrypoint: prepared.entrypoint,
-    });
-  }
-
-  const queryPlanHash = canonicalSha256({
+  const poolQueryPlanHash = canonicalSha256({
     schemaVersion: 6,
-    page: input.searchPlan.page,
+    generationKey,
+    seed: poolSeed,
+    firstPage: input.searchPlan.page,
+    pageCount: capacityPlan.bins.length,
     templates: ordered.map((template) => ({
       templateId: String(template.templateId),
       slug: template.slug,
       version: template.version,
     })),
   });
-  const selectionBundle = visualSelectionBundleV6Schema.parse({
-    schemaVersion: 6,
-    renderer: "twenty_first_native_template_v1",
-    queryPlanHash,
-    displayTarget: 9,
-    candidates: nativeCandidates.map((candidate) => ({
-      id: candidate.sampleId,
-      sampleId: candidate.sampleId,
-      label: candidate.optionLabel,
-      title: candidate.title,
-      description: candidate.description,
-      author: candidate.author,
-      previewLocalAssetId: candidate.previewLocalAssetId,
-      previewSha256: candidate.previewSha256,
-      providerTemplateId: candidate.providerTemplateId,
-      providerSlug: candidate.providerSlug,
-      providerVersion: candidate.providerVersion,
-      sourceFormat: candidate.sourceFormat,
-      framework: candidate.framework,
-      sourceTreeSha256: candidate.sourceTreeSha256,
-      sourceArchiveSha256: candidate.sourceArchiveSha256,
-      sourceArchivePath: `candidates/${candidate.optionLabel}/source.zip`,
-      sourceDirectory: candidate.sourceDirectory,
-      entrypoint: candidate.entrypoint,
-    })),
-    selectedCandidateId: null,
-    delegated: false,
-    degradedReasons: [],
-  });
-  const selectionBuffer = await createVisualSelectionBundleV6Artifact({
-    bundle: selectionBundle,
-    sourceArchives: new Map(
-      nativeCandidates.map((candidate) => [
-        candidate.sampleId,
-        candidate.sourceArchive,
-      ]),
-    ),
-  });
-  const expectedSelectionHash = sha256Buffer(selectionBuffer);
-  await assertCommitLeaseActive(input.assertLeaseActive);
-  const selectionBundleArtifact = await input.persistArtifact({
-    userId: input.operation.userId,
-    projectId: input.context.project.id,
-    kind: "21st-selection-bundle",
-    filename: `visual-selection-${input.operation.id}.zip`,
-    mimeType: VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE,
-    buffer: selectionBuffer,
-    maxBytes: VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
-  });
-  if (selectionBundleArtifact.contentSha256 !== expectedSelectionHash) {
-    throw new TwentyFirstProviderFailure(
-      "SELECTION_BUNDLE_HASH_MISMATCH",
-      "视觉选择包写入校验失败。",
-      "attention_required",
+  const currentBinIndex = binDigest.readUInt32BE(0) % capacityPlan.bins.length;
+  const orderedBins = [
+    ...capacityPlan.bins.slice(currentBinIndex),
+    ...capacityPlan.bins.slice(0, currentBinIndex),
+  ];
+  const frozenPages: Array<{
+    id: string;
+    pageNumber: 1 | 2 | 3;
+    candidates: NativeTemplateBoardCandidate[];
+    selectionBundle: VisualSelectionBundleV6;
+    selectionBundleArtifact: PreviewArtifact;
+    selectionBundleSizeBytes: number;
+  }> = [];
+
+  for (let pageOffset = 0; pageOffset < orderedBins.length; pageOffset += 1) {
+    const pageNumber = (input.searchPlan.page + pageOffset) as 1 | 2 | 3;
+    const accepted = orderedBins[pageOffset]!.map((candidate) =>
+      availableByKey.get(candidate.key),
     );
+    if (
+      accepted.length !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE ||
+      accepted.some((candidate) => !candidate)
+    ) {
+      rejectNativeTemplate(input.diagnostics, "insufficient_live_templates");
+      throw nativeTemplateProviderFailure("insufficient_live_templates");
+    }
+
+    await assertCommitLeaseActive(input.assertLeaseActive);
+    const nativeCandidates: NativeTemplateBoardCandidate[] = [];
+    for (let index = 0; index < accepted.length; index += 1) {
+      const { summary, prepared, perceptualHash } = accepted[index]!;
+      const sampleId = randomUUID();
+      const optionLabel = String.fromCharCode(65 + index);
+      const previewAsset = await input.persistArtifact({
+        userId: input.operation.userId,
+        projectId: input.context.project.id,
+        kind: "21st-native-template-preview",
+        filename: `21st-template-p${pageNumber}-${optionLabel.toLowerCase()}.png`,
+        mimeType: "image/png",
+        buffer: prepared.preview,
+        maxBytes: 5 * 1024 * 1024,
+      });
+      if (previewAsset.contentSha256 !== prepared.previewSha256) {
+        throw new TwentyFirstProviderFailure(
+          "NATIVE_TEMPLATE_PREVIEW_HASH_MISMATCH",
+          "完整 Template 预览写入校验失败。",
+          "attention_required",
+        );
+      }
+      nativeCandidates.push({
+        sampleId,
+        optionLabel,
+        providerTemplateId: String(summary.templateId),
+        providerSlug: summary.slug,
+        providerVersion: prepared.providerVersion,
+        providerItemKey: prepared.providerItemKey,
+        title: cleanText(summary.name, `Template ${optionLabel}`, 300),
+        description: null,
+        author: null,
+        previewLocalAssetId: previewAsset.id,
+        previewSha256: prepared.previewSha256,
+        previewPerceptualHash: perceptualHash,
+        styleTokens: prepared.styleTokens,
+        sourceFormat: prepared.sourceFormat,
+        framework: prepared.framework,
+        sourceTreeSha256: prepared.sourceTreeSha256,
+        sourceArchiveSha256: prepared.sourceArchiveSha256,
+        sourceArchive: prepared.sourceArchive,
+        sourceDirectory: prepared.sourceDirectory,
+        entrypoint: prepared.entrypoint,
+      });
+    }
+
+    const selectionBundle = visualSelectionBundleV6Schema.parse({
+      schemaVersion: 6,
+      renderer: "twenty_first_native_template_v1",
+      queryPlanHash: canonicalSha256({
+        poolQueryPlanHash,
+        page: pageNumber,
+        candidates: nativeCandidates.map(
+          (candidate) => candidate.providerItemKey,
+        ),
+      }),
+      displayTarget: 9,
+      candidates: nativeCandidates.map((candidate) => ({
+        id: candidate.sampleId,
+        sampleId: candidate.sampleId,
+        label: candidate.optionLabel,
+        title: candidate.title,
+        description: candidate.description,
+        author: candidate.author,
+        previewLocalAssetId: candidate.previewLocalAssetId,
+        previewSha256: candidate.previewSha256,
+        previewPerceptualHash: candidate.previewPerceptualHash,
+        styleTokens: candidate.styleTokens,
+        providerTemplateId: candidate.providerTemplateId,
+        providerSlug: candidate.providerSlug,
+        providerVersion: candidate.providerVersion,
+        sourceFormat: candidate.sourceFormat,
+        framework: candidate.framework,
+        sourceTreeSha256: candidate.sourceTreeSha256,
+        sourceArchiveSha256: candidate.sourceArchiveSha256,
+        sourceArchivePath: `candidates/${candidate.optionLabel}/source.zip`,
+        sourceDirectory: candidate.sourceDirectory,
+        entrypoint: candidate.entrypoint,
+      })),
+      selectedCandidateId: null,
+      delegated: false,
+      degradedReasons: [],
+    });
+    const selectionBuffer = await createVisualSelectionBundleV6Artifact({
+      bundle: selectionBundle,
+      sourceArchives: new Map(
+        nativeCandidates.map((candidate) => [
+          candidate.sampleId,
+          candidate.sourceArchive,
+        ]),
+      ),
+    });
+    const expectedSelectionHash = sha256Buffer(selectionBuffer);
+    await assertCommitLeaseActive(input.assertLeaseActive);
+    const selectionBundleArtifact = await input.persistArtifact({
+      userId: input.operation.userId,
+      projectId: input.context.project.id,
+      kind: "21st-selection-bundle",
+      filename: `visual-selection-${input.operation.id}-p${pageNumber}.zip`,
+      mimeType: VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE,
+      buffer: selectionBuffer,
+      maxBytes: VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
+    });
+    if (selectionBundleArtifact.contentSha256 !== expectedSelectionHash) {
+      throw new TwentyFirstProviderFailure(
+        "SELECTION_BUNDLE_HASH_MISMATCH",
+        "视觉选择包写入校验失败。",
+        "attention_required",
+      );
+    }
+    frozenPages.push({
+      id: randomUUID(),
+      pageNumber,
+      candidates: nativeCandidates,
+      selectionBundle,
+      selectionBundleArtifact,
+      selectionBundleSizeBytes: selectionBuffer.length,
+    });
   }
+
+  const poolId = randomUUID();
+  let persistedPoolId: string | null = null;
+  if (input.persistCandidatePool) {
+    const catalogFingerprint = canonicalSha256(
+      catalogWindow.map((template) => ({
+        templateId: String(template.templateId),
+        slug: template.slug,
+        version: template.version,
+      })),
+    );
+    const poolManifest = {
+      schemaVersion: 1,
+      poolId,
+      generationKey,
+      projectId: input.context.project.id,
+      taskStartedAt: input.context.project.currentTaskStartedAt.toISOString(),
+      knowledgeSnapshotId: input.context.snapshot.id,
+      credentialId: input.credentialId,
+      credentialVersion: input.credentialVersion,
+      seed: poolSeed,
+      catalogFingerprint,
+      queryPlanHash: poolQueryPlanHash,
+      pages: frozenPages.map((page) => ({
+        page: page.pageNumber,
+        selectionBundleLocalAssetId: page.selectionBundleArtifact.id,
+        selectionBundleHash: page.selectionBundleArtifact.contentSha256,
+        selectionBundleSizeBytes: page.selectionBundleSizeBytes,
+        candidates: page.selectionBundle.candidates.map((candidate) => ({
+          sampleId: candidate.sampleId,
+          providerTemplateId: candidate.providerTemplateId,
+          providerSlug: candidate.providerSlug,
+          sourceTreeSha256: candidate.sourceTreeSha256,
+          previewSha256: candidate.previewSha256,
+        })),
+      })),
+    } as const;
+    const manifestBuffer = Buffer.from(canonicalJson(poolManifest), "utf8");
+    const manifestArtifact = await input.persistArtifact({
+      userId: input.operation.userId,
+      projectId: input.context.project.id,
+      kind: "21st-candidate-pool-manifest",
+      filename: `visual-candidate-pool-${poolId}.json`,
+      mimeType: "application/json",
+      buffer: manifestBuffer,
+      maxBytes: 512_000,
+    });
+    if (manifestArtifact.contentSha256 !== canonicalSha256(poolManifest)) {
+      throw new TwentyFirstProviderFailure(
+        "VISUAL_CANDIDATE_POOL_MANIFEST_HASH_MISMATCH",
+        "视觉候选池清单写入校验失败。",
+        "attention_required",
+      );
+    }
+    const persisted = await input.persistCandidatePool(input.db, {
+      poolId,
+      generationKey,
+      operation: input.operation,
+      context: input.context,
+      credentialId: input.credentialId,
+      credentialVersion: input.credentialVersion,
+      seed: poolSeed,
+      catalogFingerprint,
+      queryPlanHash: poolQueryPlanHash,
+      manifestArtifact,
+      pages: frozenPages.map((page) => ({
+        id: page.id,
+        pageNumber: page.pageNumber,
+        selectionBundleArtifact: page.selectionBundleArtifact,
+        selectionBundleSizeBytes: page.selectionBundleSizeBytes,
+        items: page.candidates.map((candidate, position) => ({
+          id: randomUUID(),
+          sampleId: candidate.sampleId,
+          position,
+          previewLocalAssetId: candidate.previewLocalAssetId,
+          previewSha256: candidate.previewSha256,
+          sourceTreeSha256: candidate.sourceTreeSha256,
+          providerTemplateId: candidate.providerTemplateId,
+          providerSlug: candidate.providerSlug,
+          providerVersion: candidate.providerVersion,
+          providerItemKey: candidate.providerItemKey,
+        })),
+      })),
+    });
+    if (!persisted.created) throw visualSearchSuperseded();
+    persistedPoolId = persisted.poolId;
+  }
+
+  const currentPage = frozenPages[0]!;
   await assertCommitLeaseActive(input.assertLeaseActive);
   const board = await input.persistBoard(input.db, {
     operation: input.operation,
     searchPlan: input.searchPlan,
     context: input.context,
-    selectionBundle,
-    selectionBundleArtifact,
-    mirroredCandidates: nativeCandidates,
+    selectionBundle: currentPage.selectionBundle,
+    selectionBundleArtifact: currentPage.selectionBundleArtifact,
+    mirroredCandidates: currentPage.candidates,
+    ...(persistedPoolId
+      ? {
+          candidatePoolPage: {
+            poolId: persistedPoolId,
+            pageNumber: currentPage.pageNumber,
+          },
+        }
+      : {}),
   });
   input.diagnostics.normalizedUnique = input.diagnostics.catalogCandidates;
   input.diagnostics.shortlistCount = input.diagnostics.catalogCandidates;
@@ -3750,7 +4481,7 @@ async function runNativeTemplateVisualSearch(input: {
     input.diagnostics.templateDownloadAttempts;
   input.diagnostics.sourceFetchSucceeded =
     input.diagnostics.templateDownloadsSucceeded;
-  input.diagnostics.publishedCount = nativeCandidates.length;
+  input.diagnostics.publishedCount = currentPage.candidates.length;
   input.diagnostics.templateFailureCategory = null;
   input.diagnostics.terminalReason = "complete";
   logSafeNativeTemplateStage({
@@ -3770,14 +4501,19 @@ async function runNativeTemplateVisualSearch(input: {
       page: input.searchPlan.page,
       candidateCount: board.candidateCount,
       selectionBundleHash: board.selectionBundleHash ?? undefined,
+      availablePages: Math.min(
+        SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+        input.searchPlan.page - 1 + frozenPages.length,
+      ),
+      reservedPages: Math.max(0, frozenPages.length - 1),
       actual: {
         searched: input.diagnostics.catalogCandidates,
         shortlisted: input.diagnostics.catalogCandidates,
         mirrored: input.diagnostics.sourcePrepared,
-        presented: nativeCandidates.length,
+        presented: currentPage.candidates.length,
       },
       diagnostics: input.diagnostics,
-      degradedReasons: selectionBundle.degradedReasons,
+      degradedReasons: currentPage.selectionBundle.degradedReasons,
     },
     message: "9 个完整 Template 视觉候选已准备完成，请选择一个方向。",
   };
@@ -3805,6 +4541,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const persistArtifact =
     dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
+  const readArtifact = dependencies.readArtifact ?? readSiteOpsArtifact;
 
   return async ({ operation, signal, assertLeaseActive }) => {
     const providerStartedAt = Date.now();
@@ -3826,6 +4563,18 @@ export function createTwentyFirstSiteOpsProviderHandler(
         );
       }
       const context = await loadContext(db, operation);
+      const supportsDefaultCandidatePool =
+        typeof db.select === "function" && typeof db.transaction === "function";
+      const loadCandidatePoolState =
+        dependencies.loadNativeTemplatePoolState ??
+        (supportsDefaultCandidatePool
+          ? loadDefaultNativeTemplatePoolState
+          : undefined);
+      const persistCandidatePool =
+        dependencies.persistNativeTemplatePool ??
+        (supportsDefaultCandidatePool
+          ? persistDefaultNativeTemplatePool
+          : undefined);
       if (context.existingBoard) {
         if (
           context.existingBoard.candidateCount !==
@@ -3837,6 +4586,17 @@ export function createTwentyFirstSiteOpsProviderHandler(
             "attention_required",
           );
         }
+        const restoredPoolState =
+          nativeSourceMode && loadCandidatePoolState
+            ? await loadCandidatePoolState({
+                db,
+                operation,
+                context,
+                credentialId: parsedInput.credentialId,
+                credentialVersion: parsedInput.credentialVersion,
+                page: "page" in parsedInput ? parsedInput.page : 1,
+              })
+            : null;
         return {
           status: "succeeded",
           projectStatus: "awaiting_visual_selection",
@@ -3845,11 +4605,79 @@ export function createTwentyFirstSiteOpsProviderHandler(
             candidateCount: context.existingBoard.candidateCount,
             selectionBundleHash:
               context.existingBoard.selectionBundleHash ?? undefined,
+            ...(restoredPoolState
+              ? {
+                  availablePages: restoredPoolState.availablePages,
+                  reservedPages: restoredPoolState.reservedPages,
+                }
+              : {}),
           },
           message: "视觉方向已恢复，可继续选择。",
         };
       }
       const searchPlan = resolveVisualSearchPlan(parsedInput, context);
+      if (nativeSourceMode && loadCandidatePoolState) {
+        const poolState = await loadCandidatePoolState({
+          db,
+          operation,
+          context,
+          credentialId: parsedInput.credentialId,
+          credentialVersion: parsedInput.credentialVersion,
+          page: searchPlan.page,
+        });
+        if (poolState) {
+          diagnostics.templateMode = true;
+          if (!poolState.page) {
+            return {
+              status: "attention_required",
+              code: "VISUAL_CANDIDATE_POOL_EXHAUSTED",
+              message: `本轮已冻结 ${poolState.availablePages} 组完整候选，没有更多可发布页面。`,
+              result: {
+                availablePages: poolState.availablePages,
+                reservedPages: poolState.reservedPages,
+              },
+            };
+          }
+          stage = "persist_board";
+          const restored = await restoreNativeTemplatePoolPage({
+            operation,
+            page: poolState.page,
+            readArtifact,
+          });
+          await assertCommitLeaseActive(assertLeaseActive);
+          const board = await persistBoard(db, {
+            operation,
+            searchPlan,
+            context,
+            selectionBundle: restored.selectionBundle,
+            selectionBundleArtifact: restored.selectionBundleArtifact,
+            mirroredCandidates: restored.candidates,
+            candidatePoolPage: {
+              poolId: poolState.poolId,
+              pageNumber: poolState.page.pageNumber,
+            },
+          });
+          diagnostics.capacityPages = poolState.availablePages;
+          diagnostics.capacitySelected = SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+          diagnostics.publishedCount = SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+          diagnostics.terminalReason = "complete";
+          return {
+            status: "succeeded",
+            projectStatus: "awaiting_visual_selection",
+            result: {
+              batchId: board.batchId,
+              mode: searchPlan.mode,
+              page: searchPlan.page,
+              candidateCount: board.candidateCount,
+              selectionBundleHash: board.selectionBundleHash ?? undefined,
+              availablePages: poolState.availablePages,
+              reservedPages: Math.max(0, poolState.reservedPages - 1),
+              diagnostics,
+            },
+            message: `第 ${searchPlan.page} 组 9 个冻结视觉候选已准备完成，请选择一个方向。`,
+          };
+        }
+      }
       stage = "load_credential";
       const credential = await getCredential(parsedInput.credentialId);
       if (!credential || credential.version !== parsedInput.credentialVersion) {
@@ -3875,6 +4703,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
             downloadNativeTemplate: client.downloadNativeTemplate.bind(client),
           },
           apiKey: credential.apiKey,
+          credentialId: credential.id,
+          credentialVersion: credential.version,
           context,
           searchPlan,
           diagnostics,
@@ -3883,6 +4713,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           fetchPreview,
           persistArtifact,
           persistBoard,
+          persistCandidatePool,
           db,
         });
       }

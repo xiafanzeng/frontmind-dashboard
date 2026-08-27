@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
+import JSZip from "jszip";
 import { describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
 
@@ -11,6 +12,7 @@ import type {
 import type { SiteBrief } from "../../shared/siteops";
 import { FRONTMIND_VISUAL_FAMILIES_V3 } from "../../shared/siteops-design";
 import {
+  TwentyFirstNativeTemplateError,
   TwentyFirstToolContractError,
   type TwentyFirstReadOnlySession,
 } from "../twenty-first-service";
@@ -20,6 +22,7 @@ import {
   nativeSourceProviderErrorCode,
   planNativeTemplateCapacityPages,
   resolveVisualSearchPlan,
+  type NativeTemplatePoolPersistenceInput,
   type TwentyFirstBoardPersistenceInput,
   type TwentyFirstProviderContext,
 } from "./twenty-first-provider";
@@ -27,6 +30,7 @@ import {
   NativeVisualSourceError,
   createNativeSourceArchive,
   normalizeTwentyFirstNativeSource,
+  prepareNativeTemplateCandidate,
   readVisualSelectionBundleArtifact,
 } from "./native-visual-source";
 import {
@@ -241,6 +245,8 @@ function providerContext(): TwentyFirstProviderContext {
       mainlandLiveDeploymentId: null,
       primaryLanguage: "zh-CN",
       canonicalHostname: null,
+      currentTaskStartedAt: now,
+      minimumKnowledgeSnapshotVersion: null,
       status: "visual_searching",
       brief,
       revision: 4,
@@ -311,30 +317,51 @@ async function preparedTemplateFixture(input: {
   version?: string | null;
   seed: number;
 }) {
-  const providerItemKey = `t:${String(input.templateId)}:${input.slug}`;
-  const source = normalizeTwentyFirstNativeSource({
-    candidate: { providerItemId: input.templateId, providerItemKey },
-    payload: {
-      componentCode: `import React from "react";export default function Page(){return <main>${input.slug}</main>}`,
-      demoCode:
-        'import React from "react";import Page from "./component";export default function Demo(){return <Page/>}',
-      dependencies: ["react@19.2.1", "react-dom@19.2.1"],
-      version: input.version ?? null,
-    },
-  });
-  const sourceArchive = await createNativeSourceArchive(source);
   const preview = await perceptuallyDistinctPng(input.seed);
-  return {
-    ...source,
-    templateId: String(input.templateId),
-    templateSlug: input.slug,
-    framework: "vite_react" as const,
-    sourceDirectory: "source" as const,
-    sourceArchive,
-    sourceArchiveSha256: sha256(sourceArchive),
-    preview,
-    previewSha256: sha256(preview),
-  };
+  const zip = new JSZip();
+  zip.file(
+    "native-template/package.json",
+    JSON.stringify({
+      private: true,
+      scripts: { dev: "vite", build: "vite build" },
+      dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+    }),
+  );
+  zip.file(
+    "native-template/index.html",
+    '<!doctype html><html><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>',
+  );
+  zip.file(
+    "native-template/src/main.tsx",
+    `import React from "react";import {createRoot} from "react-dom/client";function App(){return <main>${input.slug}</main>}createRoot(document.getElementById("root")!).render(<App/>);`,
+  );
+  const providerArchive = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  });
+  return prepareNativeTemplateCandidate({
+    templateId: input.templateId,
+    slug: input.slug,
+    version: input.version ?? null,
+    archive: providerArchive,
+    expectedArchiveSha256: sha256(providerArchive),
+    sourceSubdirectory: "native-template",
+    previewUrl: `https://cdn.21st.dev/templates/${input.slug}.png`,
+    signal: new AbortController().signal,
+    fetchRemoteAsset: async ({ url }) => ({
+      finalUrl: url,
+      mimeType: "image/png" as const,
+      buffer: preview,
+      width: 1200,
+      height: 800,
+      sha256: sha256(preview),
+      visualSignals: {
+        dominantHex: "#000000",
+        brightness: 0,
+        contrast: 0,
+      },
+    }),
+  });
 }
 
 const FAMILY_CATALOG_METADATA = [
@@ -771,7 +798,7 @@ describe("21st SiteOps provider", () => {
     ).toHaveLength(1);
   });
 
-  it("uses the complete Template catalog and preserves 27 capacity-feasible candidates after five preparation failures", async () => {
+  it("replays 32 catalog candidates -> 29 downloads -> 27 prepared candidates and freezes three complete pages", async () => {
     const row = operation();
     row.input = {
       knowledgeSnapshotId: snapshotId,
@@ -799,15 +826,25 @@ describe("21st SiteOps provider", () => {
     }));
     const withReadOnlySession = vi.fn();
     const listNativeTemplates = vi.fn(async () => templates);
-    const downloadNativeTemplate = vi.fn(async (_apiKey, input) => ({
-      templateId: input.templateId,
-      slug: input.slug,
-      version: input.version ?? null,
-      archive: new Uint8Array(Buffer.from(`zip:${input.slug}`)),
-      sha256: sha256(Buffer.from(`zip:${input.slug}`)),
-      contentType: "application/zip" as const,
-      sourceUrlOrigin: "https://21st.dev" as const,
-    }));
+    let downloadCalls = 0;
+    const downloadNativeTemplate = vi.fn(async (_apiKey, input) => {
+      downloadCalls += 1;
+      if (downloadCalls === 1) {
+        throw new TwentyFirstNativeTemplateError("download_unavailable", true);
+      }
+      if (downloadCalls <= 4) {
+        throw new TwentyFirstNativeTemplateError("download_unavailable");
+      }
+      return {
+        templateId: input.templateId,
+        slug: input.slug,
+        version: input.version ?? null,
+        archive: new Uint8Array(Buffer.from(`zip:${input.slug}`)),
+        sha256: sha256(Buffer.from(`zip:${input.slug}`)),
+        contentType: "application/zip" as const,
+        sourceUrlOrigin: "https://21st.dev" as const,
+      };
+    });
     let prepareCalls = 0;
     let activePreparations = 0;
     let maximumPreparations = 0;
@@ -817,7 +854,7 @@ describe("21st SiteOps provider", () => {
       maximumPreparations = Math.max(maximumPreparations, activePreparations);
       try {
         await new Promise((resolve) => setTimeout(resolve, 1));
-        if (call < 5) {
+        if (call < 2) {
           throw new NativeVisualSourceError("NATIVE_TEMPLATE_COMPILE_FAILED");
         }
         return await preparedTemplateFixture({
@@ -830,43 +867,111 @@ describe("21st SiteOps provider", () => {
         activePreparations -= 1;
       }
     });
+    let currentContext = providerContext();
+    const taskStartedAt = currentContext.project.currentTaskStartedAt;
     let persisted: TwentyFirstBoardPersistenceInput | null = null;
+    const persistedPages: TwentyFirstBoardPersistenceInput[] = [];
     let selectionArtifact: Buffer | null = null;
-    const handler = createTwentyFirstSiteOpsProviderHandler({
-      getDb: async () => ({ fake: "db" }),
-      loadContext: async () => providerContext(),
-      getCredential: async () => ({
-        id: credentialId,
-        version: 3,
-        fingerprint: "fingerprint",
-        apiKey: secret,
-      }),
-      client: {
-        withReadOnlySession,
-        listNativeTemplates,
-        downloadNativeTemplate,
-      },
-      prepareNativeTemplateCandidate,
-      resolveNativeTemplateShuffleKey: () => Buffer.alloc(32, 0x41),
-      persistArtifact: vi.fn(async (input) => {
-        if (input.kind === "21st-selection-bundle") {
-          selectionArtifact = Buffer.from(input.buffer);
-        }
-        return {
-          id: randomUUID(),
-          contentSha256: sha256(input.buffer),
-        } as never;
-      }),
-      persistBoard: vi.fn(async (_db, input) => {
-        persisted = input;
-        return {
-          batchId: "55555555-5555-4555-8555-555555555555",
-          candidateCount: input.mirroredCandidates.length,
-          selectionBundleHash: input.selectionBundleArtifact.contentSha256,
-        };
-      }),
-    });
+    let frozenPool: NativeTemplatePoolPersistenceInput | null = null;
+    const publishedPages = new Set<number>();
+    const artifacts = new Map<
+      string,
+      { buffer: Buffer; contentSha256: string; mimeType: string; kind: string }
+    >();
+    const getCredential = vi.fn(async () => ({
+      id: credentialId,
+      version: 3,
+      fingerprint: "fingerprint",
+      apiKey: secret,
+    }));
+    const createHandler = () =>
+      createTwentyFirstSiteOpsProviderHandler({
+        getDb: async () => ({ fake: "db" }),
+        loadContext: async () => currentContext,
+        getCredential,
+        client: {
+          withReadOnlySession,
+          listNativeTemplates,
+          downloadNativeTemplate,
+        },
+        prepareNativeTemplateCandidate,
+        resolveNativeTemplateShuffleKey: () => Buffer.alloc(32, 0x41),
+        persistArtifact: vi.fn(async (input) => {
+          const id = randomUUID();
+          const contentSha256 = sha256(input.buffer);
+          artifacts.set(id, {
+            buffer: Buffer.from(input.buffer),
+            contentSha256,
+            mimeType: input.mimeType,
+            kind: input.kind,
+          });
+          return {
+            id,
+            contentSha256,
+          } as never;
+        }),
+        loadNativeTemplatePoolState: async ({ page }) => {
+          if (!frozenPool) return null;
+          const frozenPage = frozenPool.pages.find(
+            (candidate) => candidate.pageNumber === page,
+          );
+          return {
+            poolId: frozenPool.poolId,
+            pageCount: frozenPool.pages.length,
+            availablePages: frozenPool.pages.length,
+            reservedPages: frozenPool.pages.length - publishedPages.size,
+            page:
+              frozenPage && !publishedPages.has(page)
+                ? {
+                    pageNumber: page,
+                    selectionBundleLocalAssetId:
+                      frozenPage.selectionBundleArtifact.id,
+                    selectionBundleHash:
+                      frozenPage.selectionBundleArtifact.contentSha256,
+                    items: frozenPage.items,
+                  }
+                : null,
+          };
+        },
+        persistNativeTemplatePool: vi.fn(async (_db, input) => {
+          frozenPool = input;
+          return { poolId: input.poolId, created: true };
+        }),
+        readArtifact: vi.fn(async (input) => {
+          const artifact = artifacts.get(input.localAssetId);
+          if (!artifact) return null;
+          return {
+            row: {
+              id: input.localAssetId,
+              contentSha256: artifact.contentSha256,
+              sizeBytes: artifact.buffer.length,
+              mimeType: artifact.mimeType,
+            },
+            stored: {
+              sizeBytes: artifact.buffer.length,
+              sha256: artifact.contentSha256,
+              createReadStream: () => Readable.from(artifact.buffer),
+            },
+          } as never;
+        }),
+        persistBoard: vi.fn(async (_db, input) => {
+          persisted = input;
+          persistedPages.push(input);
+          if (input.candidatePoolPage) {
+            publishedPages.add(input.candidatePoolPage.pageNumber);
+          }
+          selectionArtifact = artifacts.get(
+            input.selectionBundleArtifact.id,
+          )!.buffer;
+          return {
+            batchId: randomUUID(),
+            candidateCount: input.mirroredCandidates.length,
+            selectionBundleHash: input.selectionBundleArtifact.contentSha256,
+          };
+        }),
+      });
 
+    const handler = createHandler();
     const result = await handler({
       operation: row,
       signal: new AbortController().signal,
@@ -879,11 +984,11 @@ describe("21st SiteOps provider", () => {
         diagnostics: {
           templateMode: true,
           catalogCandidates: 32,
-          templateDownloadAttempts: 32,
-          templateDownloadsSucceeded: 32,
-          sourcePreparationAttempts: 32,
+          templateDownloadAttempts: 33,
+          templateDownloadsSucceeded: 29,
+          sourcePreparationAttempts: 29,
           sourcePrepared: 27,
-          previewFetchAttempts: 32,
+          previewFetchAttempts: 29,
           compileAttempts: 0,
           renderAttempts: 0,
           capacityCandidates: 27,
@@ -898,7 +1003,7 @@ describe("21st SiteOps provider", () => {
     expect(listNativeTemplates).toHaveBeenCalledOnce();
     expect(listNativeTemplates.mock.calls[0]![0]).toBe(secret);
     expect(listNativeTemplates.mock.calls[0]![1]).toMatchObject({
-      limit: 32,
+      limit: 60,
       excludeTemplateIds: [],
       excludeSlugs: [],
     });
@@ -908,7 +1013,7 @@ describe("21st SiteOps provider", () => {
     expect(JSON.stringify(listNativeTemplates.mock.calls)).not.toContain(
       "GEO Analytics",
     );
-    expect(downloadNativeTemplate).toHaveBeenCalledTimes(32);
+    expect(downloadNativeTemplate).toHaveBeenCalledTimes(33);
     const downloadedTemplateIds = downloadNativeTemplate.mock.calls.map(
       ([, input]) => String(input.templateId),
     );
@@ -916,7 +1021,7 @@ describe("21st SiteOps provider", () => {
     expect(downloadedTemplateIds).not.toEqual(
       Array.from({ length: 32 }, (_, index) => String(index + 1)),
     );
-    expect(prepareNativeTemplateCandidate).toHaveBeenCalledTimes(32);
+    expect(prepareNativeTemplateCandidate).toHaveBeenCalledTimes(29);
     expect(maximumPreparations).toBeLessThanOrEqual(3);
     expect(persisted!.selectionBundle).toMatchObject({
       schemaVersion: 6,
@@ -936,15 +1041,127 @@ describe("21st SiteOps provider", () => {
     );
     expect(restored.bundle.schemaVersion).toBe(6);
     expect(restored.archives.size).toBe(9);
+    expect(
+      restored.bundle.candidates.every(
+        (candidate) =>
+          candidate.styleTokens?.previewSha256 === candidate.previewSha256 &&
+          candidate.styleTokens.sourceTreeSha256 === candidate.sourceTreeSha256,
+      ),
+    ).toBe(true);
+    expect(frozenPool).not.toBeNull();
+    expect(frozenPool!.pages).toHaveLength(3);
+    expect(frozenPool!.pages.flatMap((page) => page.items)).toHaveLength(27);
+    expect(
+      new Set(
+        frozenPool!.pages.flatMap((page) =>
+          page.items.map((item) => item.previewLocalAssetId),
+        ),
+      ).size,
+    ).toBe(27);
+    expect(
+      frozenPool!.pages.every(
+        (page) =>
+          page.selectionBundleSizeBytes < 100 * 1024 * 1024 &&
+          artifacts.get(page.selectionBundleArtifact.id)?.kind ===
+            "21st-selection-bundle",
+      ),
+    ).toBe(true);
+    expect(
+      new Set(
+        frozenPool!.pages.map(
+          (page) => page.selectionBundleArtifact.contentSha256,
+        ),
+      ).size,
+    ).toBe(3);
+    expect(
+      [...artifacts.values()].filter(
+        (artifact) => artifact.kind === "21st-native-template-preview",
+      ),
+    ).toHaveLength(27);
+
+    // Reclaim after the board transaction but before operation finalization
+    // must recover the authoritative frozen capacity without touching 21st.
+    currentContext.existingBoard = {
+      batchId: randomUUID(),
+      candidateCount: 9,
+      selectionBundleHash: persisted!.selectionBundleArtifact.contentSha256,
+    };
+    await expect(
+      createHandler()({
+        operation: row,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: { availablePages: 3, reservedPages: 2 },
+    });
+    currentContext.existingBoard = null;
+
+    // Simulate a worker/process restart and a complete 21st/GitHub outage.
+    // Page two and three must be restored only from their frozen V6 ZIPs.
+    for (const page of [2, 3] as const) {
+      currentContext = providerContext();
+      currentContext.project.currentTaskStartedAt = taskStartedAt;
+      currentContext.project.status = "awaiting_visual_selection";
+      currentContext.publishedPageCount = page - 1;
+      const nextOperation = supplementalOperation(page);
+      nextOperation.id = `44444444-4444-4444-8444-44444444444${page}`;
+      nextOperation.input = {
+        ...(nextOperation.input as Record<string, unknown>),
+        workflowVersion: "2.5.0",
+      };
+      await expect(
+        createHandler()({
+          operation: nextOperation,
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toMatchObject({
+        status: "succeeded",
+        result: {
+          page,
+          candidateCount: 9,
+          availablePages: 3,
+          reservedPages: 3 - page,
+        },
+      });
+    }
+    expect(getCredential).toHaveBeenCalledOnce();
+    expect(listNativeTemplates).toHaveBeenCalledOnce();
+    expect(downloadNativeTemplate).toHaveBeenCalledTimes(33);
+    expect(
+      persistedPages.map((page) => page.candidatePoolPage?.pageNumber),
+    ).toEqual([1, 2, 3]);
+    expect(
+      new Set(
+        persistedPages.flatMap((page) =>
+          page.mirroredCandidates.map((candidate) =>
+            "providerTemplateId" in candidate
+              ? candidate.providerTemplateId
+              : candidate.sampleId,
+          ),
+        ),
+      ).size,
+    ).toBe(27);
+    expect(
+      persistedPages.every((page) =>
+        page.mirroredCandidates.every(
+          (candidate) =>
+            !("providerTemplateId" in candidate) ||
+            (candidate.styleTokens?.previewSha256 === candidate.previewSha256 &&
+              candidate.styleTokens.sourceTreeSha256 ===
+                candidate.sourceTreeSha256),
+        ),
+      ),
+    ).toBe(true);
   });
 
-  it("excludes the first eighteen published Template coordinates before creating page three", async () => {
-    const row = supplementalOperation(3);
+  it("legacy-backfills only page two from 23 remaining coordinates when 17 prepare and keeps page three closed", async () => {
+    const row = supplementalOperation(2);
     row.input = {
       ...(row.input as Record<string, unknown>),
       workflowVersion: "2.5.0",
     };
-    const templates = Array.from({ length: 64 }, (_, index) => ({
+    const templates = Array.from({ length: 32 }, (_, index) => ({
       templateId: index + 1,
       slug: `complete-template-${index + 1}`,
       name: `Template ${index + 1}`,
@@ -961,10 +1178,10 @@ describe("21st SiteOps provider", () => {
     }));
     const context = providerContext();
     context.project.status = "awaiting_visual_selection";
-    context.publishedPageCount = 2;
+    context.publishedPageCount = 1;
     context.previousReferences = {
       providerItemKeys: Array.from(
-        { length: 18 },
+        { length: 9 },
         (_, index) => `t:${index + 1}:complete-template-${index + 1}`,
       ),
       previewSha256s: [],
@@ -975,18 +1192,22 @@ describe("21st SiteOps provider", () => {
     const downloadedIds: number[] = [];
     let preparationAttempts = 0;
     let persisted: TwentyFirstBoardPersistenceInput | null = null;
+    let frozenPool: NativeTemplatePoolPersistenceInput | null = null;
+    const publishedPages = new Set<number>();
+    const listNativeTemplates = vi.fn(async () => templates);
+    const getCredential = vi.fn(async () => ({
+      id: credentialId,
+      version: 3,
+      fingerprint: "fingerprint",
+      apiKey: "21st_sk_test_secret",
+    }));
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
       loadContext: async () => context,
-      getCredential: async () => ({
-        id: credentialId,
-        version: 3,
-        fingerprint: "fingerprint",
-        apiKey: "21st_sk_test_secret",
-      }),
+      getCredential,
       client: {
         withReadOnlySession: vi.fn(),
-        listNativeTemplates: vi.fn(async () => templates),
+        listNativeTemplates,
         downloadNativeTemplate: vi.fn(async (_key, input) => {
           downloadedIds.push(Number(input.templateId));
           const archive = Buffer.from(`zip:${input.slug}`);
@@ -1004,7 +1225,7 @@ describe("21st SiteOps provider", () => {
       resolveNativeTemplateShuffleKey: () => Buffer.alloc(32, 0x42),
       prepareNativeTemplateCandidate: vi.fn(async (input) => {
         preparationAttempts += 1;
-        if (preparationAttempts <= 14) {
+        if (preparationAttempts <= 6) {
           throw new NativeVisualSourceError("NATIVE_TEMPLATE_COMPILE_FAILED");
         }
         return preparedTemplateFixture({
@@ -1018,8 +1239,40 @@ describe("21st SiteOps provider", () => {
         id: randomUUID(),
         contentSha256: sha256(input.buffer),
       })) as never,
+      loadNativeTemplatePoolState: vi.fn(async ({ page }) => {
+        if (!frozenPool) return null;
+        const frozenPage = frozenPool.pages.find(
+          (candidate) => candidate.pageNumber === page,
+        );
+        return {
+          poolId: frozenPool.poolId,
+          pageCount: frozenPool.pages.length,
+          availablePages: 2,
+          reservedPages: frozenPool.pages.filter(
+            (candidate) => !publishedPages.has(candidate.pageNumber),
+          ).length,
+          page:
+            frozenPage && !publishedPages.has(page)
+              ? {
+                  pageNumber: page,
+                  selectionBundleLocalAssetId:
+                    frozenPage.selectionBundleArtifact.id,
+                  selectionBundleHash:
+                    frozenPage.selectionBundleArtifact.contentSha256,
+                  items: frozenPage.items,
+                }
+              : null,
+        };
+      }),
+      persistNativeTemplatePool: vi.fn(async (_db, input) => {
+        frozenPool = input;
+        return { poolId: input.poolId, created: true };
+      }),
       persistBoard: vi.fn(async (_db, input) => {
         persisted = input;
+        if (input.candidatePoolPage) {
+          publishedPages.add(input.candidatePoolPage.pageNumber);
+        }
         return {
           batchId: "55555555-5555-4555-8555-555555555555",
           candidateCount: input.mirroredCandidates.length,
@@ -1032,18 +1285,45 @@ describe("21st SiteOps provider", () => {
       handler({ operation: row, signal: new AbortController().signal }),
     ).resolves.toMatchObject({
       status: "succeeded",
-      result: { page: 3, candidateCount: 9 },
+      result: {
+        page: 2,
+        candidateCount: 9,
+        availablePages: 2,
+        reservedPages: 0,
+      },
     });
-    expect(downloadedIds.length).toBeGreaterThanOrEqual(23);
-    expect(downloadedIds.every((id) => id > 18)).toBe(true);
+    expect(downloadedIds).toHaveLength(23);
+    expect(preparationAttempts).toBe(23);
+    expect(downloadedIds.every((id) => id > 9)).toBe(true);
+    expect(frozenPool?.pages).toHaveLength(1);
+    expect(frozenPool?.pages[0]?.pageNumber).toBe(2);
     expect(persisted!.selectionBundle.schemaVersion).toBe(6);
     expect(
       persisted!.mirroredCandidates.every(
         (candidate) =>
           "providerTemplateId" in candidate &&
-          Number(candidate.providerTemplateId) > 18,
+          Number(candidate.providerTemplateId) > 9,
       ),
     ).toBe(true);
+
+    const pageThree = supplementalOperation(3);
+    pageThree.input = {
+      ...(pageThree.input as Record<string, unknown>),
+      workflowVersion: "2.5.0",
+    };
+    context.publishedPageCount = 2;
+    await expect(
+      handler({
+        operation: pageThree,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "VISUAL_CANDIDATE_POOL_EXHAUSTED",
+      result: { availablePages: 2, reservedPages: 0 },
+    });
+    expect(getCredential).toHaveBeenCalledOnce();
+    expect(listNativeTemplates).toHaveBeenCalledOnce();
   });
 
   it("publishes three pages of 27 different V6 Templates even when every preview has the same perceptual hash", async () => {
@@ -1144,6 +1424,10 @@ describe("21st SiteOps provider", () => {
             ...prepared,
             preview,
             previewSha256: sha256(preview),
+            styleTokens: {
+              ...prepared.styleTokens,
+              previewSha256: sha256(preview),
+            },
           };
         }),
         persistArtifact: vi.fn(async (input) => ({

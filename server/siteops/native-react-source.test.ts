@@ -124,6 +124,58 @@ describe("native React source archive boundary", () => {
     ]);
   });
 
+  it("reports precise ZIP, package syntax, package shape, and file-type reasons", async () => {
+    const invalidZip = Buffer.from("not-a-zip", "utf8");
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive: invalidZip,
+        receipt: receipt(invalidZip, { fileCount: 1 }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+      }),
+      "NATIVE_SOURCE_ZIP_INVALID",
+    );
+
+    const invalidPackageJson = await sourceArchive({
+      mutate: (zip) => zip.file("native-site/package.json", "{invalid"),
+    });
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive: invalidPackageJson,
+        receipt: receipt(invalidPackageJson),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+      }),
+      "NATIVE_SOURCE_PACKAGE_JSON_INVALID",
+    );
+
+    const invalidPackageShape = await sourceArchive({
+      mutate: (zip) => zip.file("native-site/package.json", "[]"),
+    });
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive: invalidPackageShape,
+        receipt: receipt(invalidPackageShape),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+      }),
+      "NATIVE_SOURCE_PACKAGE_SHAPE_INVALID",
+    );
+
+    const forbiddenType = await sourceArchive({
+      mutate: (zip) => zip.file("native-site/bin/tool.exe", "binary"),
+    });
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive: forbiddenType,
+        receipt: receipt(forbiddenType, { fileCount: 5 }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+      }),
+      "NATIVE_SOURCE_FILE_TYPE_FORBIDDEN",
+    );
+  });
+
   it("rejects dependency ranges so preview and production use one exact runtime", async () => {
     const archive = await sourceArchive({
       package: {
@@ -495,5 +547,38 @@ describe("native source binary attachment boundary", () => {
       }),
       "NATIVE_SOURCE_ATTACHMENT_INVALID",
     );
+  });
+
+  it("classifies transient attachment download failures for bounded recovery", async () => {
+    const attachment = {
+      filename: FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
+      contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+      url: "https://files.example.test/source.zip",
+    };
+    await expect(
+      readNativeSourceAttachment({
+        attachment,
+        fetchPinned: vi.fn(async () => ({
+          response: new Response(null, { status: 503 }),
+          finalUrl: { origin: "https://files.example.test", path: "/source" },
+        })) as never,
+      }),
+    ).rejects.toMatchObject({
+      code: "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE",
+      retryable: true,
+      status: 503,
+    });
+    await expect(
+      readNativeSourceAttachment({
+        attachment,
+        fetchPinned: vi.fn(async () => {
+          throw new Error("connection reset");
+        }) as never,
+      }),
+    ).rejects.toMatchObject({
+      code: "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE",
+      retryable: true,
+      status: null,
+    });
   });
 });

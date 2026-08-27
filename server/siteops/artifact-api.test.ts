@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import express from "express";
 import JSZip from "jszip";
+import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const buildId = "123e4567-e89b-42d3-a456-426614174000";
@@ -27,6 +28,10 @@ vi.mock("./service", () => ({
 }));
 
 import { publicSiteOpsArtifactError, siteOpsArtifactApi } from "./artifact-api";
+import {
+  CUSTOMER_VISIBLE_STYLE_BATCH_STATUSES,
+  customerVisibleStyleBatchStatusCondition,
+} from "./visual-batch-visibility";
 
 const servers: Server[] = [];
 let distZip: Buffer;
@@ -128,6 +133,28 @@ async function startApp(options: { authenticated?: boolean } = {}) {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
+}
+
+function stylePreviewDatabase(
+  localAssetId: string | null,
+  sourceMetadata: unknown = {
+    schemaVersion: 6,
+    renderer: "twenty_first_native_template_v1",
+    previewSha256: "b".repeat(64),
+  },
+) {
+  return {
+    select: () => ({
+      from: () => ({
+        innerJoin: () => ({
+          where: () => ({
+            limit: async () =>
+              localAssetId === null ? [] : [{ localAssetId, sourceMetadata }],
+          }),
+        }),
+      }),
+    }),
+  };
 }
 
 function expectSecureOAuthCompletionPage(
@@ -400,5 +427,184 @@ describe("SiteOps private preview proxy", () => {
     expect(csp).toContain("frame-src 'none'");
     expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).toContain("base-uri 'none'");
+  });
+});
+
+describe("SiteOps visual sample preview", () => {
+  const previewAssetId = "323e4567-e89b-42d3-a456-426614174000";
+  const previewBytes = Buffer.from("durable-preview-image");
+
+  it("shares one published-or-selected predicate with observation", () => {
+    expect(CUSTOMER_VISIBLE_STYLE_BATCH_STATUSES).toEqual([
+      "published",
+      "selected",
+    ]);
+    expect(
+      new MySqlDialect().sqlToQuery(customerVisibleStyleBatchStatusCondition()),
+    ).toMatchObject({
+      params: ["published", "selected"],
+    });
+  });
+
+  it("serves a selected owner's preview after a fresh request without caching it", async () => {
+    mocks.getDb.mockResolvedValueOnce(stylePreviewDatabase(previewAssetId));
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "image/png",
+        sizeBytes: previewBytes.length,
+        contentSha256: "b".repeat(64),
+        filename: "preview.png",
+      },
+      stored: { createReadStream: () => Readable.from([previewBytes]) },
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/selected-sample`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe(
+      "private, no-store, max-age=0",
+    );
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(previewBytes);
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: "b".repeat(64),
+      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+    });
+  });
+
+  it("fails closed before reading a source-backed preview whose frozen hash is missing", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(previewAssetId, {
+        schemaVersion: 6,
+        renderer: "twenty_first_native_template_v1",
+      }),
+    );
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/hash-missing`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+  });
+
+  it("passes the frozen hash to storage and fails safely on a mismatch", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(previewAssetId, {
+        schemaVersion: 6,
+        renderer: "twenty_first_native_template_v1",
+        previewSha256: "c".repeat(64),
+      }),
+    );
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce(null);
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/hash-mismatch`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: "c".repeat(64),
+      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+    });
+  });
+
+  it("rejects a non-image asset even if storage returns it", async () => {
+    mocks.getDb.mockResolvedValueOnce(stylePreviewDatabase(previewAssetId));
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "application/zip",
+        sizeBytes: previewBytes.length,
+        contentSha256: "b".repeat(64),
+        filename: "preview.zip",
+      },
+      stored: { createReadStream: () => Readable.from([previewBytes]) },
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/wrong-mime`,
+    );
+
+    expect(response.status).toBe(404);
+  });
+
+  it("keeps legacy rows without a frozen hash readable through MIME checks", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(previewAssetId, { schemaVersion: 1 }),
+    );
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "image/png",
+        sizeBytes: previewBytes.length,
+        contentSha256: "b".repeat(64),
+        filename: "preview.png",
+      },
+      stored: { createReadStream: () => Readable.from([previewBytes]) },
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/legacy-sample`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: undefined,
+      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+    });
+  });
+
+  it.each(["superseded batch", "cross-tenant sample"])(
+    "returns 404 for a %s without reading artifact bytes",
+    async () => {
+      mocks.getDb.mockResolvedValueOnce(stylePreviewDatabase(null));
+      const origin = await startApp();
+
+      const response = await fetch(
+        `${origin}/api/site-ops/style-previews/hidden-sample`,
+      );
+
+      expect(response.status).toBe(404);
+      expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+    },
+  );
+
+  it("returns 404 before the database lookup when unauthenticated", async () => {
+    const origin = await startApp({ authenticated: false });
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/private-sample`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(mocks.getDb).not.toHaveBeenCalled();
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when an owned preview row has no durable body", async () => {
+    mocks.getDb.mockResolvedValueOnce(stylePreviewDatabase(previewAssetId));
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce(null);
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/missing-body`,
+    );
+
+    expect(response.status).toBe(404);
   });
 });

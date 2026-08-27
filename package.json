@@ -49,7 +49,8 @@
     "release-db": "tsx scripts/release-db.ts",
     "runtime:preflight": "node scripts/release-channel.mjs runtime-preflight",
     "verify:presales-file": "node dist/verify-presales-file-roundtrip.js",
-    "siteops:workflow:verify": "node scripts/package-siteops-workflow.mjs"
+    "siteops:workflow:verify": "node scripts/package-siteops-workflow.mjs",
+    "siteops:reconcile-build": "node dist/reconcile-siteops-build.js"
   },
   "dependencies": {
     "@21st-dev/cli": "1.16.0",

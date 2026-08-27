@@ -18,6 +18,7 @@
     "0062_hard_glorian": "expand",
     "0063_lean_blue_marvel": "expand",
     "0064_siteops_v1": "contract",
-    "0065_siteops_alidns_oauth": "contract"
+    "0065_siteops_alidns_oauth": "contract",
+    "0066_visual_candidate_pools": "expand"
   }
 }

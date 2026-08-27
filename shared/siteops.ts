@@ -185,14 +185,14 @@ export const SITEOPS_MATERIALIZER_V2_4 = {
     "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
   frontMindVersion: "2.4.0",
   runtimeManifestSha256:
-    "0ae65d6c67c85ba3ce92a8d693cd69a60fadbd46a3c369afb0a2ddfd0d1dd206",
+    "0aa596b2b5dd819ee0a375de61441e6f87075a21a0ffcfa694f2fcedff1890fc",
   starterVersion: "2.4.0",
   starterSha256:
     "9b1c9a41b28e64aae8531afca48592c317a32484f98a6185ea3245f37296f74b",
   componentLibraryVersion: "2.4.0",
   materializerVersion: "2.4.0",
   materializerSha256:
-    "949477cfc3428d551a85adecf91c75442a9098f89796b3bb52b7253d634be77a",
+    "1add16661e3aa092da372b669b9c4c5b0e936d043e90930a5ca0c522cb888eae",
   qaPolicyVersion: "siteops-qa-v5",
 } as const;
 
@@ -1245,6 +1245,33 @@ const visualTemplateSourcePathSchema = z
   );
 
 /**
+ * A small, host-derived style contract frozen beside a V6 candidate. The
+ * preview contributes only bounded image statistics and the inert provider
+ * archive contributes only enum-valued typography/spacing signals. No source
+ * text, CSS token, provider URL or executable coordinate crosses this
+ * boundary.
+ */
+export const visualCandidateStyleTokensV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    derivation: z.literal("normalized-preview-bounded-source-v1"),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    dominantHex: z.string().regex(/^#[a-f0-9]{6}$/u),
+    canvasTone: z.enum(["light", "dark"]),
+    contrast: z.enum(["low", "balanced", "high"]),
+    typeSystem: z.enum([
+      "display_sans",
+      "editorial_serif",
+      "technical_sans",
+      "humanist_sans",
+      "unknown",
+    ]),
+    density: z.enum(["compact", "balanced", "spacious"]),
+  })
+  .strict();
+
+/**
  * V6 stores only the immutable coordinates needed to bind a locally rendered
  * preview to the exact complete 21st template source tree. Provider download
  * URLs, license receipts and archives stay inside the server artifact
@@ -1260,6 +1287,13 @@ export const visualCandidateV6Schema = z
     author: z.string().trim().min(1).max(300).nullable(),
     previewLocalAssetId: z.string().uuid(),
     previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    /** Added additively so historical V6 bundles remain readable. */
+    previewPerceptualHash: z
+      .string()
+      .regex(/^[a-f0-9]{16}$/u)
+      .optional(),
+    /** Added additively so historical V6 bundles remain readable. */
+    styleTokens: visualCandidateStyleTokensV1Schema.optional(),
     providerTemplateId: z.string().trim().min(1).max(191),
     providerSlug: z
       .string()
@@ -1292,6 +1326,26 @@ export const visualCandidateV6Schema = z
         code: "custom",
         path: ["sourceArchivePath"],
         message: "V6 source archive path does not match candidate label",
+      });
+    }
+    if (
+      value.styleTokens &&
+      value.styleTokens.previewSha256 !== value.previewSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["styleTokens", "previewSha256"],
+        message: "V6 style tokens do not match the immutable preview",
+      });
+    }
+    if (
+      value.styleTokens &&
+      value.styleTokens.sourceTreeSha256 !== value.sourceTreeSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["styleTokens", "sourceTreeSha256"],
+        message: "V6 style tokens do not match the immutable source tree",
       });
     }
   });
@@ -1530,6 +1584,9 @@ export type VisualSelectionBundleV5 = z.infer<
 >;
 export type VisualSelectionBundleV6 = z.infer<
   typeof visualSelectionBundleV6Schema
+>;
+export type VisualCandidateStyleTokensV1 = z.infer<
+  typeof visualCandidateStyleTokensV1Schema
 >;
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;

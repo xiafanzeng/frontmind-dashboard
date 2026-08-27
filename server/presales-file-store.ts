@@ -1630,6 +1630,14 @@ export async function sweepPresalesFileStorageRetention(
      * filename is required so unrelated temporary files are never guessed at.
      */
     staleManifestTempMs?: number;
+    /**
+     * Domain-owned generated artifacts do not share the 30-day user-upload
+     * clock. The database-aware caller must prove an active domain reference;
+     * callback failures fail closed and keep the bytes for a later sweep.
+     */
+    shouldRetainFile?: (input: {
+      fileId: string;
+    }) => boolean | Promise<boolean>;
     onRetainedFile?: (input: RetainedPresalesFile) => void | Promise<void>;
     onExpiredFile?: (input: {
       fileId: string;
@@ -1704,6 +1712,17 @@ export async function sweepPresalesFileStorageRetention(
     } catch {
       result.failures += 1;
       return false;
+    }
+  };
+  const shouldRetainFile = async (fileId: string) => {
+    if (!input.shouldRetainFile) return false;
+    try {
+      return await input.shouldRetainFile({ fileId });
+    } catch {
+      // Retention is destructive. An unavailable reference authority must
+      // never be interpreted as proof that a generated artifact is orphaned.
+      result.failures += 1;
+      return true;
     }
   };
 
@@ -1879,6 +1898,7 @@ export async function sweepPresalesFileStorageRetention(
       typeof manifest.fileId === "string" &&
       `${storageKey(manifest.fileId)}.json` === name
     ) {
+      if (await shouldRetainFile(manifest.fileId)) continue;
       const retention = manifestRetention(manifest);
       const deletedAt = normalizedRetentionTimestamp(manifest.contentDeletedAt);
       if (retention.state !== "managed" || !deletedAt) {
@@ -1979,6 +1999,7 @@ export async function sweepPresalesFileStorageRetention(
     }
     result.scannedStoredManifests += 1;
     const manifestFileId = manifest.fileId;
+    if (await shouldRetainFile(manifestFileId)) continue;
     const storedPaths = pathsFor(manifestFileId);
     const [manifestStats, contentStats] = await Promise.all([
       fs.stat(entryPath).catch(() => null),

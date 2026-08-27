@@ -121,6 +121,7 @@ import {
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
+  SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import {
@@ -128,12 +129,14 @@ import {
   referenceBlueprintForVisualCandidate,
   referenceBlueprintV3ForFamily,
   referenceBlueprintV4ForFamily,
+  trustedVisualPreviewBlueprintV3,
   type SiteDesignSpecV2,
   type SiteOpsRuntimeVisualEvidenceV2,
 } from "../../shared/siteops-design";
 import {
   generateSocialPackage,
   materializeAstroSite,
+  materializeNativeTrustedFallbackSite,
   materializeProductionSiteFromSource,
   siteOpsFrozenRuntimeInputSchema,
   SiteOpsMaterializationError,
@@ -1553,6 +1556,57 @@ describe("SiteOps trusted React 19 static runtime", () => {
     });
   }, 90_000);
 
+  it("materializes a native 2.5 fallback entirely through the host renderer", async () => {
+    const input = buildInput();
+    const heroFamily = "centered_dual_cta" as const;
+    const referenceBlueprint = referenceBlueprintV3ForFamily({
+      candidateId: input.visual.selectedCandidateId,
+      providerItemKey: input.visual.providerItemKey,
+      previewLocalAssetId: "50000000-0000-4000-8000-000000000005",
+      previewSha256: input.visual.previewSha256,
+      heroFamily,
+      inspirationEvidenceIds: [input.visual.visualEvidenceSha256],
+      previewBlueprint: trustedVisualPreviewBlueprintV3(heroFamily, [
+        input.visual.taxonomy,
+      ]),
+    });
+    Object.assign(input.build, {
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_5.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_5.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_5.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_5.starterVersion,
+    });
+    input.visual.referenceBlueprint = referenceBlueprint;
+    input.designSpec.referenceBlueprint = referenceBlueprint;
+
+    const built = await materializeNativeTrustedFallbackSite({
+      ...input,
+      warningCode: "NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK",
+    });
+
+    expect(built.buildDelivery).toEqual({
+      renderMode: "trusted_fallback",
+      qaStatus: "partial",
+      warningCodes: ["NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK"],
+    });
+    const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
+    expect(source.file("frontmind-runtime-input.json")).not.toBeNull();
+    expect(source.file("frontmind-trusted-fallback.json")).not.toBeNull();
+    expect(
+      Object.keys(source.files).some((name) =>
+        /selected-21st|native-source/iu.test(name),
+      ),
+    ).toBe(false);
+    const dist = await JSZip.loadAsync(built.distZip, { checkCRC32: true });
+    expect(await dist.file("index.html")!.async("string")).toContain(
+      "星河智造",
+    );
+    expect(Object.keys(dist.files).some((name) => /\.m?js$/u.test(name))).toBe(
+      false,
+    );
+  }, 90_000);
+
   it("emits exact production discovery metadata without false hreflang", async () => {
     const built = await materializeProductionSiteFromSource({
       sourceZip: previewBuild.sourceZip,
@@ -1796,9 +1850,7 @@ describe("SiteOps trusted React 19 static runtime", () => {
       checkCRC32: true,
     });
     const css = await source.file("public/styles.css")!.async("string");
-    expect(css).toContain(
-      "color-mix(in srgb,var(--ink) 22%,transparent)",
-    );
+    expect(css).toContain("color-mix(in srgb,var(--ink) 22%,transparent)");
     expect(css).not.toContain("--accent-text:");
     expect(css).not.toContain("--inverse-surface:");
   }, 90_000);

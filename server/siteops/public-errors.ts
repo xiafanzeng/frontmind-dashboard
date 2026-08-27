@@ -1,5 +1,6 @@
 import type { SiteOpsProviderResult } from "./providers";
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
+import { siteOpsTrustedFallbackPreviewFromResult } from "./trusted-fallback";
 
 const VENDOR_NAME = /manus/iu;
 const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
@@ -138,6 +139,24 @@ export function publicSiteOpsErrorProjection(input: {
       message: FRESH_RESET_MESSAGE,
     };
   }
+  if (/^(?:NATIVE_SOURCE_|SITEOPS_NATIVE_SOURCE_)/u.test(code)) {
+    return {
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      message:
+        "返回源码未通过安全、格式或任务绑定校验；如已有成功预览将继续保留，否则可申请重置后重新开始。",
+    };
+  }
+  if (
+    /^(?:VISUAL_SELECTION_BUNDLE_MISSING|VISUAL_SELECTION_BUNDLE_INVALID|VISUAL_SELECTION_COORDINATES_MISMATCH|VISUAL_EVIDENCE_COORDINATES_MISMATCH)$/u.test(
+      code,
+    )
+  ) {
+    return {
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      message:
+        "冻结的视觉参考未通过完整性或任务绑定校验；如已有成功预览将继续保留，否则可申请重置后重新开始。",
+    };
+  }
   if (
     /^(?:BUILD_INPUT_UNSAFE|BUILD_CANONICALIZATION_FAILED|BUILD_PRIMARY_RENDER_FAILED|BUILD_FALLBACK_RENDER_FAILED|BUILD_ARTIFACT_PERSIST_FAILED|BUILD_ARTIFACT_BINDING_FAILED)$/u.test(
       code,
@@ -209,6 +228,17 @@ export function publicSiteOpsProviderResult(
     return result.message
       ? { ...result, message: sanitizeFrontMindPublicText(result.message) }
       : result;
+  }
+  if (
+    result.code === "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION" &&
+    siteOpsTrustedFallbackPreviewFromResult(result.result)?.status === "bound"
+  ) {
+    return {
+      ...result,
+      code: "FRONTMIND_BUILD_RECONCILIATION_REQUIRED",
+      message:
+        "FrontMind 基础预览已保留；自动对账窗口已结束，可由运营使用原任务编号恢复结果读取。",
+    };
   }
   const projected = publicSiteOpsErrorProjection({
     code: result.code,

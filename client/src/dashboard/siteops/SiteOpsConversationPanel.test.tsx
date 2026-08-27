@@ -110,6 +110,8 @@ function observation(
       status: "idle",
       targetPage: null,
       generatedPages: 0,
+      availablePages: 3,
+      reservedPages: 2,
       maxPages: 3,
       canGenerateMore: true,
       canSelectExisting: true,
@@ -528,7 +530,7 @@ describe("SiteOpsConversationPanel", () => {
     expect(screen.queryByText(/相同的企业资料真实渲染/u)).toBeNull();
     expect(document.body.textContent).not.toMatch(/API Key|Base|Pro|Hero/iu);
     const regenerateButton = screen.getByRole("button", {
-      name: "重新生成 9 个视觉候选",
+      name: "显示下一组 9 个视觉候选",
     });
     expect(regenerateButton).toHaveClass("siteops-primary-button");
     expect(regenerateButton).not.toHaveClass("siteops-secondary-button");
@@ -571,6 +573,8 @@ describe("SiteOpsConversationPanel", () => {
             status: "idle",
             targetPage: null,
             generatedPages: 3,
+            availablePages: 3,
+            reservedPages: 0,
             maxPages: 3,
             canGenerateMore: false,
             canSelectExisting: true,
@@ -584,7 +588,7 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByRole("heading", { name: "27 个视觉候选" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "已生成全部 27 个候选" }),
+      screen.getByRole("button", { name: "已冻结全部 27 个候选" }),
     ).toBeDisabled();
     expect(screen.getByText("27 选 1")).toBeInTheDocument();
     expect(screen.getByAltText("P3-A：第 3 组 A")).toBeInTheDocument();
@@ -601,6 +605,46 @@ describe("SiteOpsConversationPanel", () => {
       }),
     );
   });
+
+  it.each([
+    { pageCount: 1 as const, candidateCount: 9 },
+    { pageCount: 2 as const, candidateCount: 18 },
+  ])(
+    "does not promise an unfrozen future page when only $candidateCount candidates exist",
+    ({ pageCount, candidateCount }) => {
+      const pages = [visualPage(1), visualPage(2)].slice(0, pageCount);
+      render(
+        <SiteOpsConversationPanel
+          observation={observation({
+            visualCandidates: pages[pages.length - 1]!.candidates.slice(),
+            visualCandidatePages: pages.map((page) => ({
+              ...page,
+              candidates: page.candidates.slice(),
+            })),
+            visualGeneration: {
+              status: "idle",
+              targetPage: null,
+              generatedPages: pageCount,
+              availablePages: pageCount,
+              reservedPages: 0,
+              maxPages: 3,
+              canGenerateMore: false,
+              canSelectExisting: true,
+            },
+          })}
+          onAction={vi.fn()}
+        />,
+      );
+
+      expect(
+        screen.getByRole("button", {
+          name: `已冻结全部 ${candidateCount} 个候选`,
+        }),
+      ).toBeDisabled();
+      expect(screen.getByText(`${candidateCount} 选 1`)).toBeInTheDocument();
+      expect(screen.queryByText(/27 选 1/u)).toBeNull();
+    },
+  );
 
   it("keeps existing visual pages visible but locked while a supplemental page generates", () => {
     const page = visualPage(1);
@@ -702,7 +746,7 @@ describe("SiteOpsConversationPanel", () => {
     );
     expect(screen.getByRole("button", { name: "选择 P1-A" })).toBeEnabled();
     expect(
-      screen.getByRole("button", { name: "重新生成 9 个视觉候选" }),
+      screen.getByRole("button", { name: "获取并冻结下一组视觉候选" }),
     ).toBeEnabled();
   });
 
@@ -987,7 +1031,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
     const regenerateButton = screen.getByRole("button", {
-      name: "重新生成 9 个视觉候选",
+      name: "显示下一组 9 个视觉候选",
     });
     expect(regenerateButton).toBeDisabled();
     expect(regenerateButton).toHaveClass("siteops-primary-button");
@@ -1398,6 +1442,113 @@ describe("SiteOpsConversationPanel", () => {
     );
     expect(replace).toHaveBeenCalledWith(currentPreview);
     open.mockRestore();
+  });
+
+  it("keeps a recoverable first build in progress without offering a reset", () => {
+    const buildId = "33333333-3333-4333-8333-333333333333";
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "attention_required",
+          },
+          interactionState: "attention_required",
+          builds: [
+            {
+              id: buildId,
+              ordinal: 1,
+              parentBuildId: null,
+              status: "attention_required",
+              previewUrl: null,
+              sourceUrl: null,
+              buildPhase: "provider_sync_delayed",
+              recoverable: true,
+              previewWarning:
+                "AI 建站结果正在同步，系统会继续读取同一任务，不会重复创建或重复计费。",
+              needsHelp: true,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+            resetSourceBuildId: null,
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "正在同步建站结果" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/不会重复创建或重复计费/u)).toBeInTheDocument();
+    expect(screen.queryByText(/本次没有生成可安全展示的版本/u)).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "申请重置并全新开始" }),
+    ).toBeNull();
+  });
+
+  it("shows the previous preview while a recoverable revision keeps reconciling", () => {
+    const currentPreview =
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/";
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 4,
+              parentBuildId: null,
+              status: "approved",
+              previewUrl: currentPreview,
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              ordinal: 5,
+              parentBuildId: "33333333-3333-4333-8333-333333333333",
+              status: "attention_required",
+              previewUrl: null,
+              sourceUrl: null,
+              buildPhase: "source_repairing",
+              recoverable: true,
+              previewWarning:
+                "首次源码未通过安全检查，系统正在同一任务内自动修复；已选视觉参考仍会保留。",
+              needsHelp: true,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+            resetSourceBuildId: null,
+          },
+          interactionState: "attention_required",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/同一任务内自动修复/u)).toHaveTextContent(
+      "上一版成功预览仍可继续查看和使用",
+    );
+    expect(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "申请重置并全新开始" }),
+    ).toBeNull();
   });
 
   it("offers only an approved fresh reset after a hard build failure", async () => {

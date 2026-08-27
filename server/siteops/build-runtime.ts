@@ -39,6 +39,7 @@ import {
   SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
+  SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
@@ -412,6 +413,12 @@ export type MaterializeAstroSiteInput = {
   brandAsset?: TrustedSiteBrandAsset | null;
   timeoutMs?: number;
   abortSignal?: AbortSignal;
+  /** Internal-only escape hatch for a native 2.5 first build whose bound
+   * provider task cannot currently yield safe source. The supplied code is a
+   * diagnostic coordinate, never provider content. */
+  forceTrustedFallback?: {
+    warningCode: string;
+  };
 };
 
 export type SiteOpsQaReport = {
@@ -1834,8 +1841,8 @@ function buildTrustedReactSource(input: {
     files,
     "src/component-library.mjs",
     input.workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion ||
-    input.workflow.frontMindVersion ===
-      SITEOPS_MATERIALIZER_V2_3.frontMindVersion
+      input.workflow.frontMindVersion ===
+        SITEOPS_MATERIALIZER_V2_3.frontMindVersion
       ? TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE
       : TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE_V2_2,
   );
@@ -2259,7 +2266,39 @@ function buildTrustedFallbackDist(input: {
   const typedContent = isSiteOpsGeneratedContentV2(input.content)
     ? input.content
     : null;
-  const heroFamily = input.designSpec.referenceBlueprint.heroFamily;
+  const blueprint = input.designSpec.referenceBlueprint;
+  const heroFamily = blueprint.heroFamily;
+  const palette =
+    "palette" in blueprint
+      ? blueprint.palette
+      : {
+          canvas: "#ffffff",
+          ink: "#111827",
+          accent: "#0057b8",
+          muted: "#e5e7eb",
+        };
+  const typeSystem =
+    "typeSystem" in blueprint
+      ? blueprint.typeSystem
+      : blueprint.typographyStyle === "editorial"
+        ? "editorial_serif"
+        : blueprint.typographyStyle === "technical"
+          ? "technical_sans"
+          : "display_sans";
+  const fontFamily =
+    typeSystem === "editorial_serif"
+      ? 'ui-serif,Georgia,Cambria,"Times New Roman",serif'
+      : typeSystem === "technical_sans"
+        ? 'ui-monospace,"SFMono-Regular",Consolas,"Liberation Mono",monospace'
+        : typeSystem === "humanist_sans"
+          ? 'Optima,Candara,"Segoe UI",ui-sans-serif,system-ui,sans-serif'
+          : 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+  const spacing =
+    blueprint.density === "compact"
+      ? { hero: "3.5rem", content: "2rem", card: "1.1rem" }
+      : blueprint.density === "spacious"
+        ? { hero: "6rem", content: "4.5rem", card: "2rem" }
+        : { hero: "5rem", content: "3rem", card: "1.5rem" };
   const brandPath = input.brandAsset
     ? input.brandAsset.publicPath.slice("public/".length)
     : null;
@@ -2276,7 +2315,7 @@ function buildTrustedFallbackDist(input: {
     input.mode === "preview"
       ? '<meta name="robots" content="noindex,nofollow">'
       : '<meta name="robots" content="index,follow">';
-  const style = `:root{color-scheme:light;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#fff;color:#111}*{box-sizing:border-box}body{margin:0;min-width:320px;line-height:1.65}a{color:#0645ad;text-underline-offset:.18em}a:focus-visible{outline:3px solid #005fcc;outline-offset:3px}.shell{width:min(70rem,calc(100% - 2rem));margin-inline:auto}.site-header{border-bottom:2px solid #111;background:#fff}.nav{min-height:4.5rem;display:flex;align-items:center;justify-content:space-between;gap:1.5rem}.brand{display:flex;align-items:center;gap:.75rem;color:#111;font-weight:800;text-decoration:none}.brand-logo{display:block;width:auto;height:2.5rem;max-width:11rem;object-fit:contain}.nav-links{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.75rem 1.25rem}.hero{padding:5rem 0 3rem;background:#111;color:#fff}.eyebrow{font-size:.8rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.hero h1{max-width:20ch;margin:.3em 0;font-size:clamp(2.5rem,7vw,5.5rem);line-height:1}.lede{max-width:65ch;font-size:1.15rem}.content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;padding-block:3rem 5rem}.section{border:2px solid #111;padding:1.5rem}.section h2{margin-top:0;line-height:1.15}.contact{padding:3rem 0;background:#111;color:#fff}.contact a{color:#fff}.site-footer{padding:2rem 0;border-top:2px solid #111}.empty{grid-column:1/-1}.empty p{font-size:1.1rem}@media(max-width:44rem){.nav{align-items:flex-start;padding-block:1rem}.nav-links{gap:.5rem}.content{grid-template-columns:1fr}.hero{padding-top:3.5rem}}`;
+  const style = `:root{color-scheme:light;--canvas:${palette.canvas};--ink:${palette.ink};--accent:${palette.accent};--muted:${palette.muted};font-family:${fontFamily};background:var(--canvas);color:var(--ink)}*{box-sizing:border-box}body{margin:0;min-width:320px;line-height:1.65;background:var(--canvas);color:var(--ink)}a{color:var(--accent);text-underline-offset:.18em}a:focus-visible{outline:3px solid var(--accent);outline-offset:3px}.shell{width:min(70rem,calc(100% - 2rem));margin-inline:auto}.site-header{border-bottom:2px solid var(--ink);background:var(--canvas)}.nav{min-height:4.5rem;display:flex;align-items:center;justify-content:space-between;gap:1.5rem}.brand{display:flex;align-items:center;gap:.75rem;color:var(--ink);font-weight:800;text-decoration:none}.brand-logo{display:block;width:auto;height:2.5rem;max-width:11rem;object-fit:contain}.nav-links{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.75rem 1.25rem}.hero{padding:${spacing.hero} 0 ${spacing.content};background:var(--ink);color:var(--canvas)}.eyebrow{font-size:.8rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.hero h1{max-width:20ch;margin:.3em 0;font-size:clamp(2.5rem,7vw,5.5rem);line-height:1}.lede{max-width:65ch;font-size:1.15rem}.content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;padding-block:${spacing.content} 5rem}.section{border:2px solid var(--ink);padding:${spacing.card};background:var(--canvas)}.section h2{margin-top:0;line-height:1.15}.contact{padding:${spacing.content} 0;background:var(--ink);color:var(--canvas)}.contact a{color:var(--canvas)}.site-footer{padding:2rem 0;border-top:2px solid var(--ink)}.empty{grid-column:1/-1}.empty p{font-size:1.1rem}@media(max-width:44rem){.nav{align-items:flex-start;padding-block:1rem}.nav-links{gap:.5rem}.content{grid-template-columns:1fr}.hero{padding-top:3.5rem}}`;
   addTextFile(files, "styles.css", `${style}\n`);
 
   const sharedHead = (inputValue: {
@@ -2789,7 +2828,7 @@ function browserQaWarning(input: {
 }): SiteOpsQaWarning {
   return {
     phase: input.phase,
-    code: /^SITEOPS_[A-Z0-9_]+$/u.test(input.code)
+    code: /^(?:SITEOPS|NATIVE)_[A-Z0-9_]+$/u.test(input.code)
       ? input.code
       : "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
     checkId: safeQaCheckId(input.checkId, "browser-qa"),
@@ -3797,10 +3836,7 @@ async function materializeSiteWithWorkflow(
                 kind: REACT_STATIC_RENDERER,
                 reactVersion: REACT_STATIC_REACT_VERSION,
                 componentLibraryVersion: reactCoordinates!
-                  .componentLibraryVersion as
-                    | "2.2.0"
-                    | "2.3.0"
-                    | "2.4.0",
+                  .componentLibraryVersion as "2.2.0" | "2.3.0" | "2.4.0",
                 materializerVersion: reactCoordinates!.materializerVersion as
                   | "2.2.0"
                   | "2.3.0"
@@ -3908,88 +3944,112 @@ async function materializeSiteWithWorkflow(
         brandAsset: freezeSiteBrandAsset(validated.brandAsset),
       }),
   });
-  let renderMode: SiteOpsBuildDelivery["renderMode"] = "primary";
+  let renderMode: SiteOpsBuildDelivery["renderMode"] =
+    input.forceTrustedFallback ? "trusted_fallback" : "primary";
   const renderWarnings: SiteOpsQaWarning[] = [];
-  let sourceFiles: SourceFile[];
-  try {
-    sourceFiles = await materializationStage({
-      phase: "source_generation",
-      fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
-      retryClass: "host_deterministic",
-      run: () => {
-        const common = {
-          frozenRuntimeInput,
-          brief: validated.brief,
-          content: validated.generatedContent,
-          canonicalOrigin: validated.canonicalOrigin,
-          mode: input.mode,
-          brandAsset: validated.brandAsset,
-          workflow,
-        };
-        if (isReactStaticRenderer(renderer)) {
-          if (
-            (contractSeed.schemaVersion !== 3 &&
-              contractSeed.schemaVersion !== 4) ||
-            !reactDesign ||
-            !reactVisual
-          ) {
-            throw new Error("SITEOPS_REACT_V2_SOURCE_INPUT_MISSING");
-          }
-          return buildTrustedReactSource({
-            ...common,
-            contract: contractSeed,
-            visual: reactVisual,
-            designSpec: reactDesign,
-            renderer,
-          });
-        }
-        if (
-          contractSeed.schemaVersion !== 2 ||
-          !legacyDesign ||
-          !legacyVisual
-        ) {
-          throw new Error("SITEOPS_ASTRO_V1_SOURCE_INPUT_MISSING");
-        }
-        return buildTrustedAstroSource({
-          ...common,
-          contract: contractSeed,
-          visual: legacyVisual,
-          designSpec: legacyDesign,
-        });
-      },
-    });
-  } catch (error) {
-    const normalized = toSiteOpsMaterializationError({
-      error,
-      phase: "source_generation",
-      fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
-      retryClass: "host_deterministic",
-    });
-    if (
-      workflow.frontMindVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
-      !isReactStaticRenderer(renderer) ||
-      input.abortSignal?.aborted ||
-      normalized.code === "SITEOPS_MATERIALIZATION_ABORTED" ||
-      !reactDesign ||
-      contractSeed.schemaVersion !== 4
-    ) {
-      throw normalized;
-    }
-    renderMode = "trusted_fallback";
+  if (input.forceTrustedFallback) {
     renderWarnings.push(
       browserQaWarning({
         phase: "react_static_build",
-        code: normalized.code,
-        checkId: "primary-source:fallback",
+        code: input.forceTrustedFallback.warningCode,
+        checkId: "native-provider:trusted-fallback",
       }),
     );
+  }
+  let sourceFiles: SourceFile[];
+  if (input.forceTrustedFallback) {
+    if (
+      !isReactStaticRenderer(renderer) ||
+      (contractSeed.schemaVersion !== 3 && contractSeed.schemaVersion !== 4)
+    ) {
+      throw new Error("SITEOPS_TRUSTED_FALLBACK_WORKFLOW_INVALID");
+    }
     sourceFiles = buildTrustedFallbackSource({
       frozenRuntimeInput,
       contract: contractSeed,
       brandAsset: validated.brandAsset,
-      primaryFailureCode: normalized.code,
+      primaryFailureCode: input.forceTrustedFallback.warningCode,
     });
-  }
+  } else
+    try {
+      sourceFiles = await materializationStage({
+        phase: "source_generation",
+        fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
+        retryClass: "host_deterministic",
+        run: () => {
+          const common = {
+            frozenRuntimeInput,
+            brief: validated.brief,
+            content: validated.generatedContent,
+            canonicalOrigin: validated.canonicalOrigin,
+            mode: input.mode,
+            brandAsset: validated.brandAsset,
+            workflow,
+          };
+          if (isReactStaticRenderer(renderer)) {
+            if (
+              (contractSeed.schemaVersion !== 3 &&
+                contractSeed.schemaVersion !== 4) ||
+              !reactDesign ||
+              !reactVisual
+            ) {
+              throw new Error("SITEOPS_REACT_V2_SOURCE_INPUT_MISSING");
+            }
+            return buildTrustedReactSource({
+              ...common,
+              contract: contractSeed,
+              visual: reactVisual,
+              designSpec: reactDesign,
+              renderer,
+            });
+          }
+          if (
+            contractSeed.schemaVersion !== 2 ||
+            !legacyDesign ||
+            !legacyVisual
+          ) {
+            throw new Error("SITEOPS_ASTRO_V1_SOURCE_INPUT_MISSING");
+          }
+          return buildTrustedAstroSource({
+            ...common,
+            contract: contractSeed,
+            visual: legacyVisual,
+            designSpec: legacyDesign,
+          });
+        },
+      });
+    } catch (error) {
+      const normalized = toSiteOpsMaterializationError({
+        error,
+        phase: "source_generation",
+        fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
+        retryClass: "host_deterministic",
+      });
+      if (
+        workflow.frontMindVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
+        !isReactStaticRenderer(renderer) ||
+        input.abortSignal?.aborted ||
+        normalized.code === "SITEOPS_MATERIALIZATION_ABORTED" ||
+        !reactDesign ||
+        contractSeed.schemaVersion !== 4
+      ) {
+        throw normalized;
+      }
+      renderMode = "trusted_fallback";
+      renderWarnings.push(
+        browserQaWarning({
+          phase: "react_static_build",
+          code: normalized.code,
+          checkId: "primary-source:fallback",
+        }),
+      );
+      sourceFiles = buildTrustedFallbackSource({
+        frozenRuntimeInput,
+        contract: contractSeed,
+        brandAsset: validated.brandAsset,
+        primaryFailureCode: normalized.code,
+      });
+    }
   await materializationStage({
     phase: "asset_projection",
     fallbackCode: "SITEOPS_SOURCE_ASSET_ISOLATION_FAILED",
@@ -4043,107 +4103,108 @@ async function materializeSiteWithWorkflow(
         renderMode,
         warningCode: renderWarnings[0]!.code,
       });
-    } else try {
-      await materializationStage({
-        phase: "source_generation",
-        fallbackCode: "SITEOPS_SOURCE_WRITE_FAILED",
-        retryClass: "host_deterministic",
-        run: () => writeSourceRoot(buildRoot, sourceFiles),
-      });
-      buildLog = await materializationStage({
-        phase: buildPhase,
-        fallbackCode: isReactStaticRenderer(renderer)
-          ? "SITEOPS_REACT_STATIC_BUILD_FAILED"
-          : "SITEOPS_ASTRO_BUILD_FAILED",
-        retryClass: "host_deterministic",
-        run: () =>
-          isReactStaticRenderer(renderer)
-            ? runReactStaticBuild(
-                buildRoot,
-                input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
-                input.abortSignal,
-              )
-            : runAstroBuild(
-                buildRoot,
-                input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
-                input.abortSignal,
-              ),
-      });
-      const distRoot = path.join(buildRoot, "dist");
-      distFiles = await materializationStage({
-        phase: buildPhase,
-        fallbackCode: isReactStaticRenderer(renderer)
-          ? "SITEOPS_REACT_STATIC_DIST_COLLECTION_FAILED"
-          : "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
-        retryClass: "host_deterministic",
-        run: () => collectDirectory(distRoot),
-      });
-    } catch (error) {
-      const normalized = toSiteOpsMaterializationError({
-        error,
-        phase: buildPhase,
-        fallbackCode: "SITEOPS_REACT_STATIC_BUILD_FAILED",
-        retryClass: "host_deterministic",
-      });
-      if (
-        workflow.frontMindVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
-        !isReactStaticRenderer(renderer) ||
-        input.abortSignal?.aborted ||
-        normalized.code === "SITEOPS_MATERIALIZATION_ABORTED" ||
-        !reactDesign
-      ) {
-        throw normalized;
-      }
-      renderMode = "trusted_fallback";
-      renderWarnings.push(
-        browserQaWarning({
+    } else
+      try {
+        await materializationStage({
+          phase: "source_generation",
+          fallbackCode: "SITEOPS_SOURCE_WRITE_FAILED",
+          retryClass: "host_deterministic",
+          run: () => writeSourceRoot(buildRoot, sourceFiles),
+        });
+        buildLog = await materializationStage({
+          phase: buildPhase,
+          fallbackCode: isReactStaticRenderer(renderer)
+            ? "SITEOPS_REACT_STATIC_BUILD_FAILED"
+            : "SITEOPS_ASTRO_BUILD_FAILED",
+          retryClass: "host_deterministic",
+          run: () =>
+            isReactStaticRenderer(renderer)
+              ? runReactStaticBuild(
+                  buildRoot,
+                  input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
+                  input.abortSignal,
+                )
+              : runAstroBuild(
+                  buildRoot,
+                  input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
+                  input.abortSignal,
+                ),
+        });
+        const distRoot = path.join(buildRoot, "dist");
+        distFiles = await materializationStage({
+          phase: buildPhase,
+          fallbackCode: isReactStaticRenderer(renderer)
+            ? "SITEOPS_REACT_STATIC_DIST_COLLECTION_FAILED"
+            : "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
+          retryClass: "host_deterministic",
+          run: () => collectDirectory(distRoot),
+        });
+      } catch (error) {
+        const normalized = toSiteOpsMaterializationError({
+          error,
+          phase: buildPhase,
+          fallbackCode: "SITEOPS_REACT_STATIC_BUILD_FAILED",
+          retryClass: "host_deterministic",
+        });
+        if (
+          workflow.frontMindVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
+          !isReactStaticRenderer(renderer) ||
+          input.abortSignal?.aborted ||
+          normalized.code === "SITEOPS_MATERIALIZATION_ABORTED" ||
+          !reactDesign
+        ) {
+          throw normalized;
+        }
+        renderMode = "trusted_fallback";
+        renderWarnings.push(
+          browserQaWarning({
+            phase: "react_static_build",
+            code: normalized.code,
+            checkId: "primary-render:fallback",
+          }),
+        );
+        sourceFiles = [
+          ...sourceFiles,
+          {
+            path: "frontmind-trusted-fallback.json",
+            bytes: jsonBuffer({
+              schemaVersion: 1,
+              renderer: "trusted_static_fallback_v1",
+              primaryFailureCode: normalized.code,
+            }),
+          },
+        ].sort((left, right) => left.path.localeCompare(right.path));
+        await materializationStage({
+          phase: "asset_projection",
+          fallbackCode: "SITEOPS_FALLBACK_ASSET_ISOLATION_FAILED",
+          retryClass: "host_deterministic",
+          run: () =>
+            assertTrustedSourceAssetIsolation({
+              files: sourceFiles,
+              assetDecisions: validated.assetDecisions,
+              brandAsset: validated.brandAsset,
+            }),
+        });
+        distFiles = await materializationStage({
           phase: "react_static_build",
-          code: normalized.code,
-          checkId: "primary-render:fallback",
-        }),
-      );
-      sourceFiles = [
-        ...sourceFiles,
-        {
-          path: "frontmind-trusted-fallback.json",
-          bytes: jsonBuffer({
-            schemaVersion: 1,
-            renderer: "trusted_static_fallback_v1",
-            primaryFailureCode: normalized.code,
-          }),
-        },
-      ].sort((left, right) => left.path.localeCompare(right.path));
-      await materializationStage({
-        phase: "asset_projection",
-        fallbackCode: "SITEOPS_FALLBACK_ASSET_ISOLATION_FAILED",
-        retryClass: "host_deterministic",
-        run: () =>
-          assertTrustedSourceAssetIsolation({
-            files: sourceFiles,
-            assetDecisions: validated.assetDecisions,
-            brandAsset: validated.brandAsset,
-          }),
-      });
-      distFiles = await materializationStage({
-        phase: "react_static_build",
-        fallbackCode: "SITEOPS_TRUSTED_FALLBACK_RENDER_FAILED",
-        retryClass: "host_deterministic",
-        run: () =>
-          buildTrustedFallbackDist({
-            brief: validated.brief,
-            content: validated.generatedContent,
-            designSpec: reactDesign,
-            mode: input.mode,
-            canonicalOrigin: validated.canonicalOrigin,
-            brandAsset: validated.brandAsset,
-          }),
-      });
-      buildLog = jsonBuffer({
-        schemaVersion: 1,
-        renderMode,
-        warningCode: normalized.code,
-      });
-    }
+          fallbackCode: "SITEOPS_TRUSTED_FALLBACK_RENDER_FAILED",
+          retryClass: "host_deterministic",
+          run: () =>
+            buildTrustedFallbackDist({
+              brief: validated.brief,
+              content: validated.generatedContent,
+              designSpec: reactDesign,
+              mode: input.mode,
+              canonicalOrigin: validated.canonicalOrigin,
+              brandAsset: validated.brandAsset,
+            }),
+        });
+        buildLog = jsonBuffer({
+          schemaVersion: 1,
+          renderMode,
+          warningCode: normalized.code,
+        });
+      }
     const staticQa = await materializationStage({
       phase: "static_qa",
       fallbackCode: "SITEOPS_STATIC_QA_FAILED",
@@ -4166,7 +4227,8 @@ async function materializeSiteWithWorkflow(
         }),
     });
     const currentDeliveryWorkflow =
-      workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion;
+      workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion ||
+      Boolean(input.forceTrustedFallback);
     const browserQa = currentDeliveryWorkflow
       ? await materializationStage({
           phase: "browser_qa",
@@ -4222,9 +4284,8 @@ async function materializeSiteWithWorkflow(
     const qa = currentDeliveryWorkflow
       ? ({
           ...staticQa,
-          browser: (
-            browserQa as Awaited<ReturnType<typeof runBrowserQa>>
-          ).summary,
+          browser: (browserQa as Awaited<ReturnType<typeof runBrowserQa>>)
+            .summary,
           buildDelivery,
           warnings,
         } satisfies SiteOpsQaReport)
@@ -4392,6 +4453,55 @@ async function materializeSiteWithWorkflow(
 export function materializeAstroSite(input: MaterializeAstroSiteInput) {
   return materializeSiteWithWorkflow(
     input,
+    SITEOPS_WORKFLOW,
+    REACT_STATIC_RENDERER,
+  );
+}
+
+/** Builds a native-2.5 emergency preview without reading or executing the
+ * provider's source archive. This preview is deliberately absent from the
+ * production registry and cannot be deployed before a formal result arrives. */
+export function materializeNativeTrustedFallbackSite(
+  input: Omit<MaterializeAstroSiteInput, "forceTrustedFallback"> & {
+    warningCode: string;
+  },
+) {
+  const { warningCode, ...materializeInput } = input;
+  const nativeBuild = materializeInput.build;
+  if (
+    nativeBuild.workflowUpstreamVersion !==
+      SITEOPS_MATERIALIZER_V2_5.upstreamVersion ||
+    nativeBuild.workflowUpstreamHash !==
+      SITEOPS_MATERIALIZER_V2_5.upstreamSha256 ||
+    nativeBuild.workflowVersion !==
+      SITEOPS_MATERIALIZER_V2_5.frontMindVersion ||
+    (nativeBuild.workflowPackageHash !== null &&
+      nativeBuild.workflowPackageHash !==
+        SITEOPS_MATERIALIZER_V2_5.runtimeManifestSha256) ||
+    nativeBuild.starterVersion !== SITEOPS_MATERIALIZER_V2_5.starterVersion
+  ) {
+    throw new Error("SITEOPS_NATIVE_FALLBACK_WORKFLOW_COORDINATES_MISMATCH");
+  }
+
+  // The persisted build and provider task remain native 2.5. The emergency
+  // source bundle truthfully records the audited host 2.4 renderer that made
+  // it, rather than inventing a hybrid workflow which no immutable contract
+  // recognizes. The worker binds the original native coordinates separately
+  // in fallbackPreview and keeps this preview non-approvable/non-deployable.
+  const hostBuild: TrustedBuildCoordinates = {
+    ...nativeBuild,
+    workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
+    workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
+    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+    workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
+    starterVersion: SITEOPS_WORKFLOW.starterVersion,
+  };
+  return materializeSiteWithWorkflow(
+    {
+      ...materializeInput,
+      build: hostBuild,
+      forceTrustedFallback: { warningCode },
+    },
     SITEOPS_WORKFLOW,
     REACT_STATIC_RENDERER,
   );

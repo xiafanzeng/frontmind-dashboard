@@ -12,8 +12,10 @@ import sharp from "sharp";
 import { z } from "zod";
 
 import {
+  visualCandidateStyleTokensV1Schema,
   visualSelectionBundleV5Schema,
   visualSelectionBundleV6Schema,
+  type VisualCandidateStyleTokensV1,
   type VisualSelectionBundleV5,
   type VisualSelectionBundleV6,
 } from "../../shared/siteops";
@@ -205,6 +207,7 @@ export type PreparedNativeTemplateCandidate = PreparedNativeVisualCandidate & {
   framework: NativeTemplateFramework;
   sourceDirectory: typeof NATIVE_SOURCE_DIRECTORY;
   sourceFormat: "provider_archive_v1";
+  styleTokens: VisualCandidateStyleTokensV1;
 };
 
 export type NativeTemplateStaticAsset = {
@@ -3149,6 +3152,138 @@ export async function readNativeSourceArchive(bytes: Buffer) {
   return { manifest, files };
 }
 
+const MAX_STYLE_SIGNAL_SOURCE_BYTES = 2 * 1024 * 1024;
+const MAX_STYLE_SIGNAL_FILE_BYTES = 256 * 1024;
+const MAX_STYLE_SIGNAL_FILES = 64;
+
+function countMatches(text: string, pattern: RegExp) {
+  let count = 0;
+  for (const _match of text.matchAll(pattern)) {
+    count += 1;
+    if (count >= 1_000) break;
+  }
+  return count;
+}
+
+function deriveOpaqueTemplateStyleSignals(
+  records: readonly {
+    path: string;
+    bytes: Buffer;
+    symlink: boolean;
+  }[],
+  scope: {
+    sourceSubdirectory: string | null;
+    entrypoint: string;
+  },
+): Pick<VisualCandidateStyleTokensV1, "typeSystem" | "density"> {
+  const fragments: string[] = [];
+  let totalBytes = 0;
+  const entrypointDirectory = path.posix.dirname(scope.entrypoint);
+  const styleRoot =
+    entrypointDirectory !== "." &&
+    (!scope.sourceSubdirectory ||
+      entrypointDirectory === scope.sourceSubdirectory ||
+      entrypointDirectory.startsWith(`${scope.sourceSubdirectory}/`))
+      ? entrypointDirectory
+      : scope.sourceSubdirectory;
+  const candidates = records
+    .filter((record) => {
+      return (
+        !record.symlink &&
+        record.bytes.length > 0 &&
+        record.bytes.length <= MAX_STYLE_SIGNAL_FILE_BYTES &&
+        (!styleRoot ||
+          record.path === styleRoot ||
+          record.path.startsWith(`${styleRoot}/`)) &&
+        /\.(?:css|scss|sass|less|html|[cm]?[jt]sx?)$/iu.test(record.path)
+      );
+    })
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .slice(0, MAX_STYLE_SIGNAL_FILES);
+  for (const record of candidates) {
+    if (totalBytes + record.bytes.length > MAX_STYLE_SIGNAL_SOURCE_BYTES) {
+      break;
+    }
+    try {
+      fragments.push(
+        new TextDecoder("utf-8", { fatal: true })
+          .decode(record.bytes)
+          .toLowerCase(),
+      );
+      totalBytes += record.bytes.length;
+    } catch {
+      // Binary or malformed text cannot contribute a trusted style signal.
+    }
+  }
+  const text = fragments.join("\n");
+  const declarations = Array.from(
+    text.matchAll(/font-family\s*:\s*([^;{}]{1,200})/gu),
+    (match) => match[1] ?? "",
+  ).join(" ");
+  const serifDeclarations = declarations.replace(/sans-serif/gu, "");
+  const scores = {
+    editorial_serif:
+      countMatches(text, /\bfont-serif\b/gu) +
+      countMatches(
+        serifDeclarations,
+        /\b(?:serif|georgia|times(?: new roman)?|playfair|merriweather|cormorant|lora|baskerville)\b/gu,
+      ),
+    technical_sans:
+      countMatches(text, /\bfont-mono\b/gu) +
+      countMatches(
+        declarations,
+        /\b(?:monospace|mono|consolas|menlo|monaco|courier|jetbrains mono|source code pro)\b/gu,
+      ),
+    humanist_sans: countMatches(
+      declarations,
+      /\b(?:trebuchet|avenir|lato|nunito|frutiger|gill sans|humanist)\b/gu,
+    ),
+    display_sans:
+      countMatches(text, /\bfont-sans\b/gu) +
+      countMatches(
+        declarations,
+        /\b(?:sans-serif|inter|arial|helvetica|roboto|system-ui|ui-sans-serif)\b/gu,
+      ),
+  } as const;
+  const rankedTypeSystems = Object.entries(scores).sort(
+    ([leftName, leftScore], [rightName, rightScore]) =>
+      rightScore - leftScore || leftName.localeCompare(rightName),
+  ) as Array<
+    [Exclude<VisualCandidateStyleTokensV1["typeSystem"], "unknown">, number]
+  >;
+  const typeSystem =
+    (rankedTypeSystems[0]?.[1] ?? 0) > 0
+      ? rankedTypeSystems[0]![0]
+      : ("unknown" as const);
+
+  let compactScore = 0;
+  let spaciousScore = 0;
+  for (const match of text.matchAll(
+    /(?:padding(?:-(?:block|inline|top|right|bottom|left))?|gap|row-gap|column-gap)\s*:\s*(\d+(?:\.\d+)?)(px|rem)\b/gu,
+  )) {
+    const value = Number(match[1]);
+    const pixels = match[2] === "rem" ? value * 16 : value;
+    if (pixels > 0 && pixels <= 16) compactScore += 1;
+    if (pixels >= 32) spaciousScore += 1;
+  }
+  for (const match of text.matchAll(
+    /\b(?:p[xytrbl]?|gap(?:-[xy])?|space-[xy])-(\d+(?:\.\d+)?)\b/gu,
+  )) {
+    const scale = Number(match[1]);
+    if (scale > 0 && scale <= 4) compactScore += 1;
+    if (scale >= 8) spaciousScore += 1;
+  }
+  const density =
+    compactScore === 0 && spaciousScore === 0
+      ? ("balanced" as const)
+      : spaciousScore > compactScore
+        ? ("spacious" as const)
+        : compactScore > spaciousScore
+          ? ("compact" as const)
+          : ("balanced" as const);
+  return { typeSystem, density };
+}
+
 async function inspectOpaqueProviderTemplateArchive(input: {
   archive: Buffer;
   expectedSha256?: string;
@@ -3371,6 +3506,13 @@ async function inspectOpaqueProviderTemplateArchive(input: {
     providerArchive,
     providerArchiveSha256: sha256(providerArchive),
     paths: retainedLogicalPaths,
+    styleSignalFiles: fileRecords
+      .filter((record) => !record.symlink)
+      .map((record) => ({
+        path: logicalPathByArchivePath.get(record.path)!,
+        bytes: record.bytes,
+        symlink: false,
+      })),
   };
 }
 
@@ -3940,6 +4082,13 @@ export async function prepareNativeTemplateCandidate(input: {
     entrypoint: coordinate.entrypoint,
     providerArchiveSha256: inspected.providerArchiveSha256,
   });
+  const styleSignals = deriveOpaqueTemplateStyleSignals(
+    inspected.styleSignalFiles,
+    {
+      sourceSubdirectory,
+      entrypoint: coordinate.entrypoint,
+    },
+  );
   const sourceArchive = await createProviderTemplateSourceArchive({
     manifest: {
       schemaVersion: 1,
@@ -3956,12 +4105,31 @@ export async function prepareNativeTemplateCandidate(input: {
     },
     providerArchive,
   });
-  const preview = (
-    await (input.fetchRemoteAsset ?? fetchSafeVisualPreview)({
-      url: input.previewUrl,
-      signal: input.signal,
-    })
-  ).buffer;
+  const fetchedPreview = await (
+    input.fetchRemoteAsset ?? fetchSafeVisualPreview
+  )({
+    url: input.previewUrl,
+    signal: input.signal,
+  });
+  const preview = fetchedPreview.buffer;
+  const previewSha256 = sha256(preview);
+  const styleTokens = visualCandidateStyleTokensV1Schema.parse({
+    schemaVersion: 1,
+    derivation: "normalized-preview-bounded-source-v1",
+    previewSha256,
+    sourceTreeSha256,
+    dominantHex: fetchedPreview.visualSignals.dominantHex.toLowerCase(),
+    canvasTone:
+      fetchedPreview.visualSignals.brightness < 128 ? "dark" : "light",
+    contrast:
+      fetchedPreview.visualSignals.contrast >= 60
+        ? "high"
+        : fetchedPreview.visualSignals.contrast < 35
+          ? "low"
+          : "balanced",
+    typeSystem: styleSignals.typeSystem,
+    density: styleSignals.density,
+  });
   return {
     providerItemKey: `t:${templateId}:${templateSlug}`,
     providerVersion,
@@ -3980,7 +4148,8 @@ export async function prepareNativeTemplateCandidate(input: {
     sourceArchive,
     sourceArchiveSha256: sha256(sourceArchive),
     preview,
-    previewSha256: sha256(preview),
+    previewSha256,
+    styleTokens,
   };
 }
 
