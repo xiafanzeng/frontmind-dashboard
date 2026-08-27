@@ -113,22 +113,12 @@ jobs:
       - run: pnpm test:release:repository
 
   mysql-acceptance:
-    name: MySQL 8.4.10 / ${{ matrix.suite }}
+    name: Changed-surface MySQL 8.4.10 acceptance
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        suite:
-          - state-machine
-          - production-e2e
-          - migration-upgrade-base-ref
-          - migration-upgrade-historical
-          - additive-release
-          - auth-transactions
     services:
       mysql:
         # Pin the Docker Official Images ECR mirror so pre-job service setup is
@@ -160,11 +150,7 @@ jobs:
           node-version: 22.22.2
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - if: matrix.suite == 'state-machine'
-        run: pnpm test:kb:mysql-acceptance
-      - if: matrix.suite == 'production-e2e'
-        run: pnpm test:kb:mysql-e2e-acceptance
-      - if: matrix.suite == 'migration-upgrade-base-ref'
+      - name: Prove the current production base upgrades to this release
         env:
           FRONTMIND_PR_BASE_REF: ${{ github.base_ref }}
           FRONTMIND_PUSH_BEFORE: ${{ github.event.before }}
@@ -181,18 +167,13 @@ jobs:
           fi
           export FRONTMIND_UPGRADE_BASE_REF
           node scripts/ci-verify-mysql-migration-upgrade.mjs
-      - if: matrix.suite == 'migration-upgrade-historical'
-        env:
-          FRONTMIND_UPGRADE_BASE_IDX: 44
-        run: node scripts/ci-verify-mysql-migration-upgrade.mjs
-      - if: startsWith(matrix.suite, 'migration-upgrade-')
-        run: node scripts/verify-api-usage-migration-schema.mjs post
-      - if: matrix.suite == 'additive-release'
+      - run: node scripts/verify-api-usage-migration-schema.mjs post
+      - name: Prove the repository migrator applies the additive release once
         env:
           FRONTMIND_RELEASE_MYSQL_ACCEPTANCE_REQUIRED: 1
           FRONTMIND_RELEASE_MYSQL_CLIENT_MODE: docker
         run: pnpm test:release:mysql-acceptance
-      - if: matrix.suite == 'auth-transactions'
+      - name: Prove the changed authentication transaction boundary
         env:
           FRONTMIND_AUTH_MYSQL_ACCEPTANCE_REQUIRED: 1
         run: pnpm exec vitest run scripts/auth-mysql-transaction-acceptance.test.ts

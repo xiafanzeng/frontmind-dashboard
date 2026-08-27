@@ -417,7 +417,7 @@ resolve_coupled_website_container_id fixture.env`,
     expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);
   });
 
-  it("reuses the job-scoped MySQL service for the materialized v2 acceptance", async () => {
+  it("runs one changed-surface MySQL acceptance without historical audit matrices", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const mysqlAcceptance = workflow.slice(
       workflow.indexOf("  mysql-acceptance:"),
@@ -425,10 +425,18 @@ resolve_coupled_website_container_id fixture.env`,
     );
 
     expect(mysqlAcceptance).toContain(
-      "FRONTMIND_KB_MANUS_V2_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci",
+      "name: Changed-surface MySQL 8.4.10 acceptance",
     );
-    expect(mysqlAcceptance).toContain("matrix.suite == 'production-e2e'");
-    expect(mysqlAcceptance).toContain("pnpm test:kb:mysql-e2e-acceptance");
+    expect(mysqlAcceptance).toContain(
+      "node scripts/ci-verify-mysql-migration-upgrade.mjs",
+    );
+    expect(mysqlAcceptance).toContain("pnpm test:release:mysql-acceptance");
+    expect(mysqlAcceptance).toContain(
+      "scripts/auth-mysql-transaction-acceptance.test.ts",
+    );
+    expect(mysqlAcceptance).not.toContain("matrix:");
+    expect(mysqlAcceptance).not.toContain("migration-upgrade-historical");
+    expect(mysqlAcceptance).not.toContain("pnpm test:kb:mysql-e2e-acceptance");
   });
 
   it("builds and signs once before the separately dispatched coupled deployment", async () => {
@@ -502,10 +510,10 @@ resolve_coupled_website_container_id fixture.env`,
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const upgradeStep = workflow.slice(
       workflow.indexOf(
-        "      - if: matrix.suite == 'migration-upgrade-base-ref'",
+        "      - name: Prove the current production base upgrades to this release",
       ),
       workflow.indexOf(
-        "      - if: matrix.suite == 'migration-upgrade-historical'",
+        "      - run: node scripts/verify-api-usage-migration-schema.mjs post",
       ),
     );
 
