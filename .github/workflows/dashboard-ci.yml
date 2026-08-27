@@ -150,6 +150,25 @@ jobs:
           node-version: 22.22.2
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Create isolated changed-surface acceptance databases
+        run: |
+          node --input-type=module <<'NODE'
+          import mysql from "mysql2/promise";
+          const adminUrl = new URL(process.env.DATABASE_URL);
+          adminUrl.pathname = "/mysql";
+          const connection = await mysql.createConnection(adminUrl.toString());
+          for (const database of [
+            "frontmind_release_acceptance_ci",
+            "frontmind_auth_acceptance_ci",
+          ]) {
+            if (!/^[a-z0-9_]+$/u.test(database)) process.exit(1);
+            await connection.query(`DROP DATABASE IF EXISTS \`${database}\``);
+            await connection.query(
+              `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`,
+            );
+          }
+          await connection.end();
+          NODE
       - name: Prove the current production base upgrades to this release
         env:
           FRONTMIND_PR_BASE_REF: ${{ github.base_ref }}
@@ -172,10 +191,12 @@ jobs:
         env:
           FRONTMIND_RELEASE_MYSQL_ACCEPTANCE_REQUIRED: 1
           FRONTMIND_RELEASE_MYSQL_CLIENT_MODE: docker
+          FRONTMIND_RELEASE_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_release_acceptance_ci
         run: pnpm test:release:mysql-acceptance
       - name: Prove the changed authentication transaction boundary
         env:
           FRONTMIND_AUTH_MYSQL_ACCEPTANCE_REQUIRED: 1
+          FRONTMIND_AUTH_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_auth_acceptance_ci
         run: pnpm exec vitest run scripts/auth-mysql-transaction-acceptance.test.ts
 
   build-sign:

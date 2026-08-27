@@ -430,6 +430,11 @@ resolve_coupled_website_container_id fixture.env`,
     expect(mysqlAcceptance).toContain(
       "node scripts/ci-verify-mysql-migration-upgrade.mjs",
     );
+    expect(mysqlAcceptance).toContain(
+      "name: Create isolated changed-surface acceptance databases",
+    );
+    expect(mysqlAcceptance).toContain("frontmind_release_acceptance_ci");
+    expect(mysqlAcceptance).toContain("frontmind_auth_acceptance_ci");
     expect(mysqlAcceptance).toContain("pnpm test:release:mysql-acceptance");
     expect(mysqlAcceptance).toContain(
       "scripts/auth-mysql-transaction-acceptance.test.ts",
