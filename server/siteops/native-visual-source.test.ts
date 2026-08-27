@@ -377,6 +377,52 @@ describe("21st native visual source", () => {
     expect(agencyRetry.sourceArchiveSha256).toBe(agency.sourceArchiveSha256);
   });
 
+  it("freezes a complete Template and its official preview without compiling or mirroring its internals", async () => {
+    const providerArchive = await completeTemplateArchive("vite_react", {
+      consoleError: true,
+      remoteFonts: true,
+    });
+    const officialPreview = Buffer.from("official-template-preview");
+    let previewFetches = 0;
+    const prepared = await prepareNativeTemplateCandidate({
+      templateId: "inert-complete-template",
+      slug: "inert-complete-template",
+      version: "1".repeat(40),
+      archive: providerArchive,
+      expectedArchiveSha256: digest(providerArchive),
+      previewUrl:
+        "https://cdn.21st.dev/templates/inert-complete-template.png",
+      signal: new AbortController().signal,
+      fetchRemoteAsset: async ({ url }) => {
+        previewFetches += 1;
+        return {
+          finalUrl: url,
+          mimeType: "image/png" as const,
+          buffer: officialPreview,
+          width: 1200,
+          height: 800,
+          sha256: digest(officialPreview),
+          visualSignals: {
+            dominantHex: "#000000",
+            brightness: 0,
+            contrast: 0,
+          },
+        };
+      },
+      fetchRemoteStyleAsset: async () => {
+        throw new Error("candidate preparation must not mirror Template CSS");
+      },
+    });
+    expect(previewFetches).toBe(1);
+    expect(prepared).toMatchObject({
+      sourceFormat: "provider_archive_v1",
+      framework: "vite_react",
+    });
+    expect(prepared.preview.equals(officialPreview)).toBe(true);
+    const wrapper = await JSZip.loadAsync(prepared.sourceArchive);
+    expect(wrapper.file("provider-source.zip")).not.toBeNull();
+  });
+
   it("rejects unsafe opaque provider ZIP paths before freezing candidate data", async () => {
     const zip = new JSZip();
     zip.file("../escape.tsx", "export default null");
@@ -1072,178 +1118,6 @@ describe("21st native visual source", () => {
       expect((await sharp(preview).metadata()).format).toBe("png");
     },
     30_000,
-  );
-
-  browserIt(
-    "builds and screenshots Vite and static Next Templates without treating console diagnostics as fatal",
-    async () => {
-      for (const framework of ["vite_react", "next_static"] as const) {
-        const providerArchive = await completeTemplateArchive(framework, {
-          consoleError: framework === "vite_react",
-        });
-        const prepared = await prepareNativeTemplateCandidate({
-          templateId: `${framework}-candidate`,
-          slug: `${framework}-candidate`,
-          version: "v1",
-          archive: providerArchive,
-          signal: new AbortController().signal,
-        });
-        const metadata = await sharp(prepared.preview).metadata();
-        expect(prepared.framework).toBe(framework);
-        expect(metadata.format).toBe("png");
-        expect(metadata.width).toBe(1440);
-        await expect(
-          readNativeSourceArchive(prepared.sourceArchive),
-        ).resolves.toMatchObject({
-          manifest: { sourceTreeSha256: prepared.sourceTreeSha256 },
-        });
-      }
-    },
-    90_000,
-  );
-
-  browserIt(
-    "builds a Next marketing route-group through the controlled static runtime",
-    async () => {
-      const zip = new JSZip();
-      zip.file(
-        "template/package.json",
-        JSON.stringify({
-          scripts: { build: "next build", prepare: "husky" },
-          dependencies: {
-            next: "15.5.0",
-            react: "19.2.1",
-            "react-dom": "19.2.1",
-          },
-        }),
-      );
-      zip.file(
-        "template/src/app/layout.tsx",
-        "export default function Root({children}:{children:React.ReactNode}){return <div>{children}</div>}",
-      );
-      zip.file(
-        "template/src/app/(marketing)/layout.tsx",
-        "export default function Marketing({children}:{children:React.ReactNode}){return <section>{children}</section>}",
-      );
-      zip.file(
-        "template/src/app/(marketing)/page.tsx",
-        "export default function Page(){return <main><h1>Marketing route</h1></main>}",
-      );
-      const prepared = await prepareNativeTemplateCandidate({
-        templateId: "route-group-runtime",
-        slug: "route-group-runtime",
-        version: "v1",
-        archive: await zip.generateAsync({ type: "nodebuffer" }),
-        signal: new AbortController().signal,
-      });
-      expect(prepared.framework).toBe("next_static");
-      expect((await sharp(prepared.preview).metadata()).format).toBe("png");
-    },
-    60_000,
-  );
-
-  browserIt(
-    "keeps root aliases and Next font shims while localizing an official optional placeholder",
-    async () => {
-      const zip = new JSZip();
-      zip.file(
-        "template/package.json",
-        JSON.stringify({
-          scripts: { build: "next build" },
-          dependencies: {
-            next: "15.5.0",
-            react: "19.2.1",
-            "react-dom": "19.2.1",
-          },
-        }),
-      );
-      zip.file(
-        "template/app/page.tsx",
-        'import Hero from "@/components/hero"; export default function Page(){return <Hero/>}',
-      );
-      zip.file(
-        "template/app/layout.tsx",
-        'import {Inter} from "next/font/google"; import "./globals.css"; const inter=Inter({subsets:["latin"]}); export default function Layout({children}:{children:React.ReactNode}){return <main className={inter.className}>{children}</main>}',
-      );
-      zip.file(
-        "template/app/globals.css",
-        "body{margin:0}.hero{min-height:360px;padding:48px}",
-      );
-      zip.file(
-        "template/components/hero.tsx",
-        'const content={image:"https://ui.shadcn.com/placeholder.svg"}; export default function Hero(){return <section className="hero"><h1>Complete template</h1><img src={content.image} alt=""/></section>}',
-      );
-      const prepared = await prepareNativeTemplateCandidate({
-        templateId: "next-root-alias",
-        slug: "next-root-alias",
-        version: "v1",
-        archive: await zip.generateAsync({ type: "nodebuffer" }),
-        signal: AbortSignal.timeout(60_000),
-        fetchRemoteAsset: async () => {
-          throw new Error("PREVIEW_MIME_INVALID");
-        },
-      });
-      expect((await sharp(prepared.preview).metadata()).format).toBe("png");
-      const restored = await readNativeSourceArchive(prepared.sourceArchive);
-      expect(
-        restored.files.some(
-          (file) =>
-            file.path.endsWith(".svg") &&
-            file.bytes.toString("utf8").includes("#94a3b8"),
-        ),
-      ).toBe(true);
-    },
-    90_000,
-  );
-
-  browserIt(
-    "pins and mirrors remote stylesheet fonts without sending them to sharp",
-    async () => {
-      const requested: Array<{ url: string; kind: string }> = [];
-      const providerArchive = await completeTemplateArchive("vite_react", {
-        remoteFonts: true,
-      });
-      const prepared = await prepareNativeTemplateCandidate({
-        templateId: "font-mirror-runtime",
-        slug: "font-mirror-runtime",
-        version: "v1",
-        archive: providerArchive,
-        signal: new AbortController().signal,
-        fetchRemoteStyleAsset: async ({ url, kind }) => {
-          requested.push({ url, kind });
-          if (kind === "css") {
-            return {
-              buffer: Buffer.from(
-                '@font-face{font-family:Inter;src:url("https://fonts.gstatic.com/s/inter-imported.woff2") format("woff2")}',
-                "utf8",
-              ),
-              mimeType: "text/css",
-              finalUrl: url,
-            };
-          }
-          return {
-            buffer: Buffer.concat([
-              Buffer.from("wOF2", "latin1"),
-              Buffer.alloc(96),
-            ]),
-            mimeType: "font/woff2",
-            finalUrl: url,
-          };
-        },
-      });
-      expect(requested.some((item) => item.kind === "css")).toBe(true);
-      expect(requested.filter((item) => item.kind === "font").length).toBe(2);
-      const restored = await readNativeSourceArchive(prepared.sourceArchive);
-      const css = restored.files
-        .find((file) => file.path === "src/styles.css")!
-        .bytes.toString("utf8");
-      expect(css).not.toContain("https://");
-      expect(css).toContain("/frontmind-native-media/");
-      expect(
-        restored.files.filter((file) => file.path.endsWith(".woff2")),
-      ).toHaveLength(1);
-    },
-    60_000,
   );
 
   it("round-trips nine nested source archives and selects one by candidate ID", async () => {
