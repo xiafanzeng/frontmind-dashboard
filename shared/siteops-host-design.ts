@@ -6,6 +6,7 @@ import {
   type SiteBrief,
 } from "./siteops";
 import {
+  boundedSiteDesignPaletteSize,
   referenceBlueprintSchema,
   siteDesignResultV2Schema,
   type ReferenceBlueprint,
@@ -154,7 +155,7 @@ export function createHostOwnedSiteDesignResultV2(
     input.referenceBlueprint,
   );
   const taxonomy = visualTaxonomySchema.parse(input.taxonomy);
-  const paletteSize = Math.max(1, taxonomy.palette.length);
+  const paletteSize = boundedSiteDesignPaletteSize(taxonomy.palette.length);
   const title = boundedText(brief.companyName, 80) || "企业官网";
   const description =
     boundedText(brief.verifiedFacts[0]?.statement ?? "", 200) ||

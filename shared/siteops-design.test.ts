@@ -22,6 +22,7 @@ import {
   pageContentResultV1Schema,
   pageContentSpecV2Schema,
   siteDesignResultV1Schema,
+  siteDesignResultV2Schema,
   validateDesignAndContentBindings,
 } from "./siteops-design";
 
@@ -130,6 +131,87 @@ describe("SiteOps Manus design and content contracts", () => {
         },
       }),
     ).toThrow("SITEOPS_CONTENT_SLOT_SET_MISMATCH");
+  });
+
+  it("bounds a legacy empty taxonomy to one trusted neutral palette slot", () => {
+    const referenceBlueprint = referenceBlueprintV3ForFamily({
+      candidateId: "candidate-legacy-empty-palette",
+      providerItemKey: "s:frontmind:centered_dual_cta",
+      previewLocalAssetId: "00000000-0000-4000-8000-000000000089",
+      previewSha256: H("legacy-empty-palette-preview"),
+      heroFamily: "centered_dual_cta",
+      inspirationEvidenceIds: [H("legacy-empty-palette-evidence")],
+    });
+    const trustedDesign = siteDesignResultV2Schema.parse({
+      operationToken: "siteops-native-fallback:legacy-empty-palette",
+      designSpec: {
+        schemaVersion: 2,
+        referenceBlueprint,
+        layoutArchetype: "hero_led",
+        density: referenceBlueprint.density,
+        surfaceStyle: referenceBlueprint.cardStyle,
+        typeScale: "restrained",
+        imageTreatment: "none",
+        motionLevel: "subtle",
+        colorRoles: {
+          backgroundPaletteIndex: 0,
+          textPaletteIndex: 0,
+          accentPaletteIndex: 0,
+        },
+        routeCompositions: [
+          {
+            routeId: "home",
+            slots: [{ slotId: "overview", variant: "statement" }],
+          },
+        ],
+        seoPlan: {
+          siteTitle: "FrontMind",
+          description: "基于冻结视觉蓝图的可信基础预览。",
+          organizationType: "Organization",
+        },
+      },
+    }).designSpec;
+
+    expect(() =>
+      validateDesignAndContentBindings({
+        routeIds: ["home"],
+        paletteSize: 0,
+        designSpec: trustedDesign,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateDesignAndContentBindings({
+        routeIds: ["home"],
+        paletteSize: 0,
+        designSpec: {
+          ...trustedDesign,
+          colorRoles: {
+            ...trustedDesign.colorRoles,
+            accentPaletteIndex: 1,
+          },
+        },
+      }),
+    ).toThrow("SITEOPS_DESIGN_PALETTE_INDEX_INVALID");
+    expect(() =>
+      validateDesignAndContentBindings({
+        routeIds: ["home"],
+        paletteSize: 0,
+        designSpec: {
+          ...trustedDesign,
+          colorRoles: {
+            ...trustedDesign.colorRoles,
+            accentPaletteIndex: -1,
+          },
+        },
+      }),
+    ).toThrow("SITEOPS_DESIGN_PALETTE_INDEX_INVALID");
+    expect(() =>
+      validateDesignAndContentBindings({
+        routeIds: ["home"],
+        paletteSize: 0,
+        designSpec: design(),
+      }),
+    ).toThrow("SITEOPS_DESIGN_PALETTE_INDEX_INVALID");
   });
 
   it("accepts typed content records and only the host-owned news empty state", () => {

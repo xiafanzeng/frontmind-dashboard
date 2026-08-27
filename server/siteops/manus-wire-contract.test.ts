@@ -244,6 +244,51 @@ describe("SiteOps provider wire contracts", () => {
     ).toEqual([{ slotId: "overview", variant: "statement" }]);
   });
 
+  it("uses one bounded neutral coordinate for an empty historical palette", () => {
+    const wire = {
+      operationToken: "design-token-empty-palette",
+      schemaVersion: 2,
+      layoutArchetype: "hero_led",
+      heroVariant: "centered_statement",
+      density: "balanced",
+      surfaceStyle: "bordered",
+      typeScale: "restrained",
+      imageTreatment: "none",
+      motionLevel: "subtle",
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 1,
+      accentPaletteIndex: 2,
+      siteTitle: "FrontMind",
+      description: "使用宿主可信默认色的历史官网。",
+      routeSlots: [
+        { routeId: "home", slotId: "overview", variant: "statement" },
+      ],
+    };
+    expect(
+      siteDesignResultFromWire(wire, ["home"], [], 0).designSpec.colorRoles,
+    ).toEqual({
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 0,
+      accentPaletteIndex: 0,
+    });
+    expect(
+      siteDesignWireOutputSchema({
+        operationToken: wire.operationToken,
+        routeIds: ["home"],
+        paletteSize: 0,
+      }).properties.backgroundPaletteIndex,
+    ).toEqual({ type: "number", enum: [0] });
+    for (const invalidSize of [-1, 1.5, 13]) {
+      expect(() =>
+        siteDesignWireOutputSchema({
+          operationToken: wire.operationToken,
+          routeIds: ["home"],
+          paletteSize: invalidSize,
+        }),
+      ).toThrow("SITEOPS_DESIGN_PALETTE_SIZE_INVALID");
+    }
+  });
+
   it("injects the frozen Hero blueprint into SiteDesignSpecV2 and rejects provider overrides", () => {
     const blueprint = referenceBlueprintForVisualCandidate({
       candidateId: "candidate-F",

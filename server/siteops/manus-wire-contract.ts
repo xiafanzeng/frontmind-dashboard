@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { ManusV2StructuredOutputSchema } from "../manus-v2-client";
 import { canonicalJson } from "../../shared/siteops-workflow";
 import {
+  boundedSiteDesignPaletteSize,
   canonicalSiteContentEntitySlug,
   pageContentResultV2Schema,
   pageContentResultV1Schema,
@@ -84,6 +85,7 @@ export function normalizeSiteDesignWire(
   routeIds: readonly string[],
   paletteSize = 12,
 ) {
+  const paletteCardinality = boundedSiteDesignPaletteSize(paletteSize);
   const record = schemaRecord(value);
   if (!record || !Array.isArray(record.routeSlots)) return value;
   const routeRank = new Map(routeIds.map((routeId, index) => [routeId, index]));
@@ -143,10 +145,8 @@ export function normalizeSiteDesignWire(
       return [
         key,
         Number.isInteger(index) &&
-        Number.isSafeInteger(paletteSize) &&
-        paletteSize > 0 &&
-        ((index as number) < 0 || (index as number) >= paletteSize)
-          ? Math.min(fallback, paletteSize - 1)
+        ((index as number) < 0 || (index as number) >= paletteCardinality)
+          ? Math.min(fallback, paletteCardinality - 1)
           : index,
       ];
     }),
@@ -231,7 +231,7 @@ export function siteDesignWireOutputSchema(input: {
   paletteSize: number;
 }) {
   const paletteIndices = Array.from(
-    { length: Math.max(1, input.paletteSize) },
+    { length: boundedSiteDesignPaletteSize(input.paletteSize) },
     (_, index) => index,
   );
   return assertSiteOpsStructuredOutputSchema({
@@ -417,7 +417,7 @@ export function siteDesignWireV3OutputSchema(input: {
   paletteSize: number;
 }) {
   const paletteIndices = Array.from(
-    { length: Math.max(1, input.paletteSize) },
+    { length: boundedSiteDesignPaletteSize(input.paletteSize) },
     (_, index) => index,
   );
   return assertSiteOpsStructuredOutputSchema({
@@ -545,15 +545,11 @@ function canonicalPaletteRoles(
   },
   paletteSize: number,
 ) {
-  if (
-    !Number.isSafeInteger(paletteSize) ||
-    paletteSize < 1 ||
-    paletteSize > 12
-  ) {
-    throw new Error("SITEOPS_DESIGN_PALETTE_SIZE_INVALID");
-  }
+  const boundedPaletteSize = boundedSiteDesignPaletteSize(paletteSize);
   const safe = (index: number, fallback: number) =>
-    index < paletteSize ? index : Math.min(fallback, paletteSize - 1);
+    index < boundedPaletteSize
+      ? index
+      : Math.min(fallback, boundedPaletteSize - 1);
   return {
     backgroundPaletteIndex: safe(wire.backgroundPaletteIndex, 0),
     textPaletteIndex: safe(wire.textPaletteIndex, 1),

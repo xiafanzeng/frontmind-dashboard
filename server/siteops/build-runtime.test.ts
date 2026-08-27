@@ -1556,20 +1556,10 @@ describe("SiteOps trusted React 19 static runtime", () => {
     });
   }, 90_000);
 
-  it("materializes a native 2.5 fallback entirely through the host renderer", async () => {
+  it("materializes a native 2.5 fallback with a legacy empty taxonomy palette", async () => {
     const input = buildInput();
     const heroFamily = "centered_dual_cta" as const;
-    const referenceBlueprint = referenceBlueprintV3ForFamily({
-      candidateId: input.visual.selectedCandidateId,
-      providerItemKey: input.visual.providerItemKey,
-      previewLocalAssetId: "50000000-0000-4000-8000-000000000005",
-      previewSha256: input.visual.previewSha256,
-      heroFamily,
-      inspirationEvidenceIds: [input.visual.visualEvidenceSha256],
-      previewBlueprint: trustedVisualPreviewBlueprintV3(heroFamily, [
-        input.visual.taxonomy,
-      ]),
-    });
+    useV4HeroFamily(input, heroFamily, 9);
     Object.assign(input.build, {
       workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_5.upstreamVersion,
       workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_5.upstreamSha256,
@@ -1577,8 +1567,12 @@ describe("SiteOps trusted React 19 static runtime", () => {
       workflowPackageHash: SITEOPS_MATERIALIZER_V2_5.runtimeManifestSha256,
       starterVersion: SITEOPS_MATERIALIZER_V2_5.starterVersion,
     });
-    input.visual.referenceBlueprint = referenceBlueprint;
-    input.designSpec.referenceBlueprint = referenceBlueprint;
+    input.visual.taxonomy.palette = [];
+    input.designSpec.colorRoles = {
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 0,
+      accentPaletteIndex: 0,
+    };
 
     const built = await materializeNativeTrustedFallbackSite({
       ...input,

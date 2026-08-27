@@ -2346,6 +2346,20 @@ export function composeBuildContractV4(
   });
 }
 
+/** Empty historical taxonomies render through one host-owned neutral color
+ * coordinate. Keep that virtual coordinate bounded exactly like the wire
+ * schemas; malformed sizes never reach a renderer or get silently clamped. */
+export function boundedSiteDesignPaletteSize(paletteSize: number) {
+  if (
+    !Number.isSafeInteger(paletteSize) ||
+    paletteSize < 0 ||
+    paletteSize > 12
+  ) {
+    throw new Error("SITEOPS_DESIGN_PALETTE_SIZE_INVALID");
+  }
+  return Math.max(1, paletteSize);
+}
+
 export function validateDesignAndContentBindings(input: {
   routeIds: readonly string[];
   paletteSize: number;
@@ -2363,10 +2377,11 @@ export function validateDesignAndContentBindings(input: {
   ) {
     throw new Error("SITEOPS_DESIGN_ROUTE_SET_MISMATCH");
   }
+  const paletteSize = boundedSiteDesignPaletteSize(input.paletteSize);
   if (
-    input.paletteSize < 1 ||
     Object.values(input.designSpec.colorRoles).some(
-      (index) => index >= input.paletteSize,
+      (index) =>
+        !Number.isSafeInteger(index) || index < 0 || index >= paletteSize,
     )
   ) {
     throw new Error("SITEOPS_DESIGN_PALETTE_INDEX_INVALID");
