@@ -397,6 +397,7 @@ describe("siteops workflow", () => {
       providerTemplateId: `provider-template-${index + 1}`,
       providerSlug: `template-${index + 1}`,
       providerVersion: index % 2 === 0 ? `v${index + 1}` : null,
+      sourceFormat: "normalized_v1" as const,
       framework: index % 2 === 0 ? "vite_react" : "next_static",
       sourceTreeSha256: (index + 1).toString(16).repeat(64),
       sourceArchiveSha256: "fedcba987"[index]!.repeat(64),
