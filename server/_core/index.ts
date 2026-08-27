@@ -120,6 +120,11 @@ import { siteOpsArtifactApi } from "../siteops/artifact-api";
 import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
 import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
 import { startBrandQuestionUniverseWorkerScheduler } from "../brand-question-universe-worker";
+import {
+  resolveFrontMindRuntimeRole,
+  runtimeRoleRunsSiteOps,
+  runtimeRoleServesWeb,
+} from "./runtime-role";
 
 declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
@@ -140,6 +145,7 @@ const applicationBuildSha =
 const applicationImageDigest =
   process.env.FRONTMIND_IMAGE_DIGEST?.trim().toLowerCase() || null;
 const runtimeBuildRoot = path.dirname(fileURLToPath(import.meta.url));
+const runtimeRole = resolveFrontMindRuntimeRole();
 
 function assertProductionConfiguration() {
   if (process.env.NODE_ENV !== "production") return;
@@ -507,23 +513,30 @@ async function startServer() {
     throw new Error("PORT must be an integer between 1 and 65535");
   }
 
-  await startApiUsageSnapshotScheduler();
-  startDashboardImportPreflightCleanupScheduler();
-  // Start only after configuration, durable storage and database startup
-  // checks have completed. Importing a route module must never trigger
-  // provider side effects or hide a preflight failure.
-  await reconcileManagedUploadAccountDeletionFencesOnStartup();
-  await ensureManagedUploadIntentWorker();
+  if (runtimeRoleServesWeb(runtimeRole)) {
+    await startApiUsageSnapshotScheduler();
+    startDashboardImportPreflightCleanupScheduler();
+    // Start only after configuration, durable storage and database startup
+    // checks have completed. Importing a route module must never trigger
+    // provider side effects or hide a preflight failure.
+    await reconcileManagedUploadAccountDeletionFencesOnStartup();
+    await ensureManagedUploadIntentWorker();
+  }
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${port}/`);
+    console.log(`Server running on http://0.0.0.0:${port}/`, {
+      runtimeRole,
+    });
     if (process.env.NODE_ENV === "production") {
       registerSiteOpsRuntimeProviders();
+      if (runtimeRoleRunsSiteOps(runtimeRole)) {
+        startSiteOpsWorkerScheduler();
+      }
+      if (!runtimeRoleServesWeb(runtimeRole)) return;
       startDeliveryTicketRetentionScheduler();
       startConversationRetentionScheduler();
       startJenovaBrandTrackingRecoveryScheduler();
       startServiceContractLifecycleReconciliationScheduler();
       startBrandQuestionUniverseWorkerScheduler();
-      startSiteOpsWorkerScheduler();
       startFileContentRetentionScheduler({
         // Let the conversation transaction finish its initial pass before the
         // file worker reconciles newly orphaned resources.

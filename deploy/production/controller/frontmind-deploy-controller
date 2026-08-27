@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# frontmind-production-controller-version: 6
+# frontmind-production-controller-version: 7
 set -Eeuo pipefail
 umask 077
 
@@ -17,6 +17,7 @@ readonly SITEOPS_ALIDNS_OAUTH_SQL_HASH="47053769bdbf83b7b496da7ffc9f10042d746af4
 readonly SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER="frontmind-dashboard-release-db-contract-0065"
 readonly SITEOPS_ALIDNS_OAUTH_MIGRATION_RESOURCE="siteops-alidns-oauth-contract-0065"
 readonly SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTROLLER="frontmind-production-controller-v6"
+readonly DASHBOARD_SITEOPS_WORKER_CONTAINER="frontmind-dashboard-siteops-worker"
 readonly COUPLED_STACK_ARGUMENT="--coupled-stack"
 readonly COUPLED_STACK_LOCK_FILE="/run/lock/frontmind-deploy-stack.lock"
 readonly COUPLED_STACK_CAPSULE_FILE="/var/lib/frontmind-deploy/dashboard/coupled-stack-pending.json"
@@ -848,6 +849,78 @@ compose_before_deadline() {
     -f "$COMPOSE_FILE" "$@"
 }
 
+dashboard_image_supports_split_runtime() {
+  local selected_image="$1" roles
+  [[ $service == "dashboard" ]] || return 1
+  roles="$(docker image inspect --format \
+    '{{ index .Config.Labels "net.frontmind.runtime.roles" }}' \
+    "$selected_image" 2>/dev/null)" || return 1
+  [[ $roles == "web,siteops-worker" ]]
+}
+
+dashboard_siteops_worker_matches() {
+  local expected_digest="$1" details running image health project compose_service extra
+  details="$(docker inspect --format \
+    '{{.State.Running}}|{{.Config.Image}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+    "$DASHBOARD_SITEOPS_WORKER_CONTAINER" 2>/dev/null)" || return 1
+  IFS='|' read -r running image health project compose_service extra <<<"$details"
+  [[ -z $extra && $running == "true" && $health == "healthy" && \
+     $image == "${IMAGE_REPOSITORY}@${expected_digest}" && \
+     $project == "frontmind-dashboard" && $compose_service == "siteops-worker" ]] \
+    && [[ $(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      "$DASHBOARD_SITEOPS_WORKER_CONTAINER" 2>/dev/null \
+      | grep -Fxc -- 'FRONTMIND_RUNTIME_ROLE=siteops-worker') == 1 ]]
+}
+
+dashboard_siteops_worker_stopped_or_absent() {
+  local running
+  running="$(docker inspect --format '{{.State.Running}}' \
+    "$DASHBOARD_SITEOPS_WORKER_CONTAINER" 2>/dev/null)" || return 0
+  [[ $running == "false" ]]
+}
+
+application_runtime_topology_matches() {
+  local expected_digest="$1" selected_image
+  selected_image="${IMAGE_REPOSITORY}@${expected_digest}"
+  [[ $service == "dashboard" ]] || return 0
+  if dashboard_image_supports_split_runtime "$selected_image"; then
+    dashboard_siteops_worker_matches "$expected_digest"
+  else
+    dashboard_siteops_worker_stopped_or_absent
+  fi
+}
+
+stop_application_runtime() {
+  local environment_file="$1"
+  if [[ $service == "dashboard" ]]; then
+    compose "$environment_file" stop dashboard siteops-worker
+  else
+    compose "$environment_file" stop "$COMPOSE_SERVICE"
+  fi
+}
+
+start_application_runtime() {
+  local environment_file="$1" selected_image="$2" deadline="${3:-}"
+  local -a runtime_services=("$COMPOSE_SERVICE")
+  if [[ $service == "dashboard" ]]; then
+    if dashboard_image_supports_split_runtime "$selected_image"; then
+      runtime_services=(dashboard siteops-worker)
+    else
+      # Pre-split images ignore FRONTMIND_RUNTIME_ROLE. Keep their worker
+      # stopped during rollback so the legacy combined scheduler runs once.
+      compose "$environment_file" stop siteops-worker >/dev/null 2>&1 || return 1
+      runtime_services=(dashboard)
+    fi
+  fi
+  if [[ -n $deadline ]]; then
+    compose_before_deadline "$deadline" "$environment_file" \
+      up -d --no-deps --force-recreate "${runtime_services[@]}"
+  else
+    compose "$environment_file" \
+      up -d --no-deps --force-recreate "${runtime_services[@]}"
+  fi
+}
+
 ready_payload_matches_identity() {
   local payload="$1" expected_sha="$2" expected_digest="$3"
   [[ $expected_digest =~ ^sha256:[a-f0-9]{64}$ ]] || return 1
@@ -878,7 +951,8 @@ wait_until_ready() {
       ready_payload_matches_identity "$local_payload" "$expected_sha" "$expected_digest"; then
       public_payload="$(curl --fail --silent --show-error --max-time 6 "$PUBLIC_READY_URL" 2>/dev/null || true)"
       if [[ -n $public_payload ]] && \
-        ready_payload_matches_identity "$public_payload" "$expected_sha" "$expected_digest"; then
+        ready_payload_matches_identity "$public_payload" "$expected_sha" "$expected_digest" && \
+        application_runtime_topology_matches "$expected_digest"; then
         LAST_READY_PAYLOAD="$local_payload"
         return 0
       fi
@@ -907,6 +981,7 @@ INITIAL_RUNTIME_SOURCE_SHA=""
 INITIAL_RUNTIME_DIGEST=""
 INITIAL_RUNTIME_IMAGE_REFERENCE=""
 INITIAL_RUNTIME_IMAGE_ID=""
+INITIAL_RUNTIME_ROLLBACK_IMAGE=""
 
 capture_initial_runtime() {
   local environment_file="$1" container_id running active_source image_reference
@@ -938,7 +1013,8 @@ capture_initial_runtime() {
       public_payload="$(curl --fail --silent --show-error --max-time 6 \
         "$PUBLIC_READY_URL" 2>/dev/null || true)"
       if ready_payload_matches_identity \
-        "$public_payload" "$active_source" "$active_digest"; then
+        "$public_payload" "$active_source" "$active_digest" && \
+        application_runtime_topology_matches "$active_digest"; then
         INITIAL_RUNTIME_SOURCE_SHA="$active_source"
         INITIAL_RUNTIME_DIGEST="$active_digest"
         INITIAL_RUNTIME_IMAGE_REFERENCE="$image_reference"
@@ -962,6 +1038,7 @@ make_initial_runtime_env() {
     # longer resolves to the captured image.
     selected_image="$INITIAL_RUNTIME_IMAGE_ID"
   fi
+  INITIAL_RUNTIME_ROLLBACK_IMAGE="$selected_image"
   cp -- "$COMPOSE_ENV_FILE" "$target" || return 1
   printf '%s=%s\n' "$IMAGE_ENV_KEY" "$selected_image" >>"$target" || return 1
   printf 'FRONTMIND_IMAGE_DIGEST=%s\n' "$INITIAL_RUNTIME_DIGEST" >>"$target" || return 1
@@ -970,9 +1047,9 @@ make_initial_runtime_env() {
 
 restore_initial_runtime() {
   local candidate_environment="$1" deadline="$2"
-  compose "$candidate_environment" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
-  compose_before_deadline "$deadline" "$initial_runtime_env" \
-    up -d --no-deps --force-recreate "$COMPOSE_SERVICE" || return 1
+  stop_application_runtime "$candidate_environment" >/dev/null 2>&1 || true
+  start_application_runtime \
+    "$initial_runtime_env" "$INITIAL_RUNTIME_ROLLBACK_IMAGE" "$deadline" || return 1
   wait_until_ready \
     "$INITIAL_RUNTIME_SOURCE_SHA" "$INITIAL_RUNTIME_DIGEST" "$deadline"
 }
@@ -1049,8 +1126,8 @@ write_active_image_env() {
 
 roll_out() {
   local environment_file="$1" expected_sha="$2" expected_digest="$3" deadline="$4"
-  compose_before_deadline "$deadline" "$environment_file" \
-    up -d --no-deps --force-recreate "$COMPOSE_SERVICE" || return 1
+  start_application_runtime \
+    "$environment_file" "${IMAGE_REPOSITORY}@${expected_digest}" "$deadline" || return 1
   wait_until_ready "$expected_sha" "$expected_digest" "$deadline" || return 1
 }
 
@@ -1059,7 +1136,7 @@ restore_previous_application() {
   if [[ -z $deadline ]]; then
     deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
   fi
-  compose "$candidate_environment" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  stop_application_runtime "$candidate_environment" >/dev/null 2>&1 || true
   if [[ -z $rollback_digest ]]; then
     log "NO_PREVIOUS_IMAGE_AVAILABLE"
     return 1
@@ -1069,8 +1146,8 @@ restore_previous_application() {
     rm -f -- "$previous_environment" || true
     return 1
   fi
-  if ! compose_before_deadline "$deadline" "$previous_environment" \
-    up -d --no-deps --force-recreate "$COMPOSE_SERVICE"; then
+  if ! start_application_runtime "$previous_environment" \
+    "${IMAGE_REPOSITORY}@${rollback_digest}" "$deadline"; then
     rm -f -- "$previous_environment"
     return 1
   fi
@@ -1095,6 +1172,13 @@ verify_candidate() {
       rotate_service_images "$current_digest" "$previous_digest"
     fi
     die "IMAGE_SOURCE_SHA_MISMATCH"
+  fi
+  if [[ $service == "dashboard" ]] && \
+     ! dashboard_image_supports_split_runtime "$image"; then
+    if [[ $mode != "bootstrap-state" ]]; then
+      rotate_service_images "$current_digest" "$previous_digest"
+    fi
+    die "IMAGE_RUNTIME_ROLES_MISMATCH"
   fi
 }
 
@@ -1156,6 +1240,8 @@ assert_candidate_is_active() {
   expected_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
   [[ -n $running_image_id && $running_image_id == "$expected_image_id" ]] \
     || die "BOOTSTRAP_ACTIVE_IMAGE_MISMATCH"
+  application_runtime_topology_matches "$digest" \
+    || die "BOOTSTRAP_ACTIVE_RUNTIME_TOPOLOGY_MISMATCH"
 }
 
 applied_ledger_fact() {
@@ -1291,7 +1377,7 @@ quarantine_contract_0065_restore() {
   local reason="$1"
   stop_contract_0065_migration_container || true
   if [[ -n $candidate_env ]]; then
-    compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+    stop_application_runtime "$candidate_env" >/dev/null 2>&1 || true
   fi
   write_state \
     "$current_digest" "$previous_digest" "$current_source_sha" \
@@ -1317,7 +1403,7 @@ restart_contract_0065_prewrite() {
     contract_0065_prewrite_armed=0
     return 0
   fi
-  compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  stop_application_runtime "$candidate_env" >/dev/null 2>&1 || true
   write_state \
     "$current_digest" "$previous_digest" "$current_source_sha" \
     "$current_journal_hash" "$current_deployed_at" \
@@ -1341,7 +1427,7 @@ restore_contract_0065_release() {
     trap 'handle_controller_signal HUP 129' HUP
     return 1
   fi
-  compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  stop_application_runtime "$candidate_env" >/dev/null 2>&1 || true
   if ! restore_production_database "$contract_0065_backup_file"; then
     quarantine_contract_0065_restore "${reason}-database" || true
     trap 'handle_controller_signal INT 130' INT
@@ -1962,7 +2048,7 @@ restore_coupled_stack() {
     current_old_ready=1
   fi
   if (( current_old_ready == 0 )); then
-    compose "$dashboard_restore_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+    stop_application_runtime "$dashboard_restore_env" >/dev/null 2>&1 || true
     if [[ $restore_required == "true" ]]; then
       [[ -n $backup && -f $backup && ! -L $backup ]] || return 1
       restore_production_database "$backup" || return 1
@@ -1970,8 +2056,8 @@ restore_coupled_stack() {
       return 1
     fi
     deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
-    compose_before_deadline "$deadline" "$dashboard_restore_env" \
-      up -d --no-deps --force-recreate "$COMPOSE_SERVICE" || return 1
+    start_application_runtime \
+      "$dashboard_restore_env" "$old_dashboard_image" "$deadline" || return 1
     wait_until_ready "$old_dashboard_source" "$old_dashboard_digest" "$deadline" \
       || return 1
   fi
@@ -2362,7 +2448,7 @@ if [[ $service == "dashboard" ]]; then
       if [[ -n $current_digest ]]; then
         current_env="$(mktemp)"
         make_compose_env "$current_env" "${IMAGE_REPOSITORY}@${current_digest}"
-        compose "$current_env" stop "$COMPOSE_SERVICE"
+        stop_application_runtime "$current_env"
         rm -f -- "$current_env"
       fi
       backup_file="${BACKUP_DIR:-/var/backups/frontmind-dashboard}/frontmind-dashboard-$(date -u +%Y%m%dT%H%M%SZ)-${source_sha:0:12}.sql.gz"
@@ -2576,7 +2662,7 @@ rollout_deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
 candidate_ready_deadline=$((SECONDS + CANDIDATE_READY_BUDGET_SECONDS))
 if ! roll_out "$candidate_env" "$source_sha" "$digest" "$candidate_ready_deadline"; then
   log "APPLICATION_ROLLOUT_FAILED"
-  compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  stop_application_runtime "$candidate_env" >/dev/null 2>&1 || true
   if (( coupled_stack_mode == 1 )); then
     die "APPLICATION_READINESS_TIMEOUT" 75
   fi

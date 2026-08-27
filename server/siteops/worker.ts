@@ -29,6 +29,7 @@ import {
 import { siteOpsQuotaStateForProviderResult } from "./quota-service";
 import { publicSiteOpsProviderResult } from "./public-errors";
 import {
+  activateOneDeferredApprovedSiteOpsReset,
   advanceApprovedSiteOpsResetAfterDnsRollback,
   finalizeApprovedSiteOpsReset,
   parseApprovedResetUnpublishInput,
@@ -2185,6 +2186,7 @@ export async function runSiteOpsWorkerSweep(options?: { max?: number }) {
     attentionRequired: 0,
     failed: 0,
   };
+  await activateOneDeferredApprovedSiteOpsReset(db);
   await requeueOneSafeApprovedReset(db);
   for (let index = 0; index < limit; index += 1) {
     const operation = await claimOne(db);

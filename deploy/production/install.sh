@@ -7,6 +7,7 @@ readonly DEPLOY_ROOT="/opt/frontmind-deploy"
 readonly CONFIG_ROOT="/etc/frontmind-deploy"
 readonly RUNTIME_CONFIG_ROOT="/etc/frontmind"
 readonly DEPLOY_USER="frontmind-deploy"
+readonly CONTROLLER_VERSION="7"
 
 die() {
   printf '%s\n' "$1" >&2
@@ -30,6 +31,9 @@ for command in cosign curl docker flock getent gzip gunzip jq mysql mysqldump sh
   command -v "$command" >/dev/null 2>&1 || die "REQUIRED_COMMAND_MISSING:${command}"
 done
 docker compose version >/dev/null || die "DOCKER_COMPOSE_V2_REQUIRED"
+[[ $(grep -Fxc -- "# frontmind-production-controller-version: ${CONTROLLER_VERSION}" \
+  "$SCRIPT_DIR/controller/frontmind-deploy-controller" || true) == 1 ]] \
+  || die "PRODUCTION_CONTROLLER_TEMPLATE_VERSION_REJECTED"
 
 dashboard_public_key="$(read_deploy_public_key "$dashboard_public_key_file")" \
   || die "DEPLOY_PUBLIC_KEY_REJECTED:${dashboard_public_key_file}"

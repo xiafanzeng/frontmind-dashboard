@@ -4,6 +4,7 @@ import {
   newestSiteOpsObservation,
   shouldPollSiteOpsObservation,
   siteOpsClientRequestId,
+  siteOpsPollIntervalMs,
 } from "./ConnectedSiteOpsConversationPanel";
 
 describe("connected SiteOps request identity", () => {
@@ -97,5 +98,94 @@ describe("connected SiteOps request identity", () => {
     expect(newestSiteOpsObservation(submitted, scheduled)).toBe(scheduled);
     expect(newestSiteOpsObservation(scheduled, running)).toBe(running);
     expect(newestSiteOpsObservation(running, submitted)).toBe(running);
+  });
+
+  it("backs active polling off progressively and reconciles fallback at one minute", () => {
+    const active = {
+      interactionState: "building",
+      rebuildRequest: { status: null, resetPending: false },
+      visualGeneration: { status: "idle" },
+      builds: [],
+      deployments: [],
+      messages: [],
+      domainState: null,
+      socialPackages: [],
+    } as never;
+    expect(siteOpsPollIntervalMs(active, 0)).toBe(5_000);
+    expect(siteOpsPollIntervalMs(active, 60_000)).toBe(10_000);
+    expect(siteOpsPollIntervalMs(active, 5 * 60_000)).toBe(20_000);
+    expect(siteOpsPollIntervalMs(active, 30 * 60_000)).toBe(30_000);
+
+    expect(
+      siteOpsPollIntervalMs(
+        {
+          ...active,
+          builds: [
+            {
+              buildDelivery: { renderMode: "trusted_fallback" },
+              recoverable: true,
+            },
+          ],
+        } as never,
+        0,
+      ),
+    ).toBe(60_000);
+    expect(
+      siteOpsPollIntervalMs(
+        {
+          ...active,
+          builds: [
+            {
+              buildDelivery: { renderMode: "trusted_fallback" },
+              recoverable: false,
+            },
+          ],
+        } as never,
+        0,
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts equal-cursor fallback progress and rejects its late predecessor", () => {
+    const base = {
+      project: {
+        revision: 8,
+        updatedAt: "2026-08-27T04:00:00.000Z",
+      },
+      latestSequence: 12,
+      interactionState: "building",
+      rebuildRequest: {
+        status: null,
+        resetPending: false,
+        resetApplied: false,
+      },
+      visualGeneration: { status: "idle" },
+      deployments: [],
+    };
+    const validating = {
+      ...base,
+      builds: [
+        {
+          id: "build-1",
+          buildPhase: "source_validating",
+          buildDelivery: null,
+          updatedAt: "2026-08-27T04:00:05.000Z",
+        },
+      ],
+    } as never;
+    const fallback = {
+      ...base,
+      builds: [
+        {
+          id: "build-1",
+          buildPhase: "provider_sync_delayed",
+          buildDelivery: { renderMode: "trusted_fallback" },
+          updatedAt: "2026-08-27T04:00:06.000Z",
+        },
+      ],
+    } as never;
+
+    expect(newestSiteOpsObservation(validating, fallback)).toBe(fallback);
+    expect(newestSiteOpsObservation(fallback, validating)).toBe(fallback);
   });
 });

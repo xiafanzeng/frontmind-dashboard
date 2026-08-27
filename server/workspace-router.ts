@@ -101,6 +101,7 @@ import {
 } from "../shared/siteops";
 import {
   actOnSiteOps,
+  actOnSiteOpsFast,
   beginSiteOpsAliyunOAuth,
   disconnectSiteOpsAliyunConnection,
   getSiteOpsAliyunConnection,
@@ -313,6 +314,15 @@ export const workspaceRouter = router({
       .mutation(async ({ ctx, input }) => {
         try {
           return await actOnSiteOps(ctx.user, input);
+        } catch (error) {
+          toSiteOpsServiceError(error);
+        }
+      }),
+    actFast: protectedProcedure
+      .input(siteOpsActInputSchema)
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await actOnSiteOpsFast(ctx.user, input);
         } catch (error) {
           toSiteOpsServiceError(error);
         }

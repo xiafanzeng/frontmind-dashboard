@@ -249,6 +249,117 @@ const providerBuildCheckpointSchema = z.enum([
   "preview_ready",
 ]);
 
+/**
+ * Bump this coordinate whenever the deterministic archive validator changes
+ * in a way that could make a previously rejected source archive acceptable.
+ * It deliberately does not follow the application release SHA: ordinary
+ * releases must not make a known-bad provider attachment hot-loop again.
+ */
+export const NATIVE_SOURCE_VALIDATOR_VERSION =
+  "native-react-source-v1.2026-08-27" as const;
+
+const nativeRejectedCandidateV1Schema = z
+  .object({
+    taskId: z.string().min(1).max(255),
+    repairAttempt: z.number().int().min(0).max(2),
+    operationToken: z.string().min(1).max(512),
+    attachmentIdentity: z.string().min(1).max(768),
+    archiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    // Historical versions remain parseable so a validator bump revalidates
+    // the candidate once instead of invalidating the whole provider state.
+    validatorVersion: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u),
+    errorCode: z.string().regex(/^NATIVE_SOURCE_[A-Z0-9_]{1,112}$/u),
+    verdictSignature: z.string().regex(/^[a-f0-9]{64}$/u),
+    rejectedAt: z.string().datetime(),
+  })
+  .strict();
+
+type NativeRejectedCandidateV1 = z.infer<
+  typeof nativeRejectedCandidateV1Schema
+>;
+
+type NativeRejectedCandidateCoordinates = Pick<
+  NativeRejectedCandidateV1,
+  | "taskId"
+  | "repairAttempt"
+  | "operationToken"
+  | "attachmentIdentity"
+  | "archiveSha256"
+  | "validatorVersion"
+>;
+
+function nativeRejectedCandidateVerdictSignature(
+  input: Omit<NativeRejectedCandidateV1, "verdictSignature" | "rejectedAt">,
+) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        taskId: input.taskId,
+        repairAttempt: input.repairAttempt,
+        operationToken: input.operationToken,
+        attachmentIdentity: input.attachmentIdentity,
+        archiveSha256: input.archiveSha256,
+        validatorVersion: input.validatorVersion,
+        errorCode: input.errorCode,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+export function createNativeRejectedCandidateV1(input: {
+  taskId: string;
+  repairAttempt: number;
+  operationToken: string;
+  attachmentIdentity: string;
+  archiveSha256: string;
+  errorCode: string;
+  rejectedAt?: Date;
+}): NativeRejectedCandidateV1 {
+  const unsigned = {
+    taskId: input.taskId,
+    repairAttempt: input.repairAttempt,
+    operationToken: input.operationToken,
+    attachmentIdentity: input.attachmentIdentity,
+    archiveSha256: input.archiveSha256,
+    validatorVersion: NATIVE_SOURCE_VALIDATOR_VERSION,
+    errorCode: input.errorCode,
+  } as const;
+  return nativeRejectedCandidateV1Schema.parse({
+    ...unsigned,
+    verdictSignature: nativeRejectedCandidateVerdictSignature(unsigned),
+    rejectedAt: (input.rejectedAt ?? new Date()).toISOString(),
+  });
+}
+
+export function nativeRejectedCandidateMatches(
+  verdict: NativeRejectedCandidateV1 | undefined,
+  coordinates: NativeRejectedCandidateCoordinates,
+) {
+  if (!verdict) return false;
+  const parsed = nativeRejectedCandidateV1Schema.safeParse(verdict);
+  if (!parsed.success) return false;
+  const candidate = parsed.data;
+  return (
+    candidate.taskId === coordinates.taskId &&
+    candidate.repairAttempt === coordinates.repairAttempt &&
+    candidate.operationToken === coordinates.operationToken &&
+    candidate.attachmentIdentity === coordinates.attachmentIdentity &&
+    candidate.archiveSha256 === coordinates.archiveSha256 &&
+    candidate.validatorVersion === coordinates.validatorVersion &&
+    candidate.verdictSignature ===
+      nativeRejectedCandidateVerdictSignature({
+        taskId: candidate.taskId,
+        repairAttempt: candidate.repairAttempt,
+        operationToken: candidate.operationToken,
+        attachmentIdentity: candidate.attachmentIdentity,
+        archiveSha256: candidate.archiveSha256,
+        validatorVersion: candidate.validatorVersion,
+        errorCode: candidate.errorCode,
+      })
+  );
+}
+
 const providerReadFailureSchema = z
   .object({
     operation: z.string().regex(/^(?:task|file)\.[A-Za-z][A-Za-z0-9.]{0,62}$/u),
@@ -301,6 +412,7 @@ const providerStateV1Schema = z
       .string()
       .regex(/^[a-f0-9]{64}$/u)
       .optional(),
+    nativeRejectedCandidateV1: nativeRejectedCandidateV1Schema.optional(),
   })
   .strict();
 
@@ -473,6 +585,7 @@ const emptyProviderAttempts = () => ({
 });
 
 const NATIVE_SOURCE_STAGING_RETENTION_MS = 24 * 60 * 60 * 1_000;
+export const NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS = 5 * 60 * 1_000;
 
 function providerStateV2(state: ProviderState | null): ProviderStateV2 {
   if (state?.schemaVersion === 2) return state;
@@ -498,6 +611,7 @@ function providerStateV2(state: ProviderState | null): ProviderStateV2 {
     providerDraftUnavailable: state?.providerDraftUnavailable,
     nativeRepairAttempt: state?.nativeRepairAttempt,
     nativeLastErrorSignature: state?.nativeLastErrorSignature,
+    nativeRejectedCandidateV1: state?.nativeRejectedCandidateV1,
     attempts,
   });
 }
@@ -3349,7 +3463,12 @@ async function handleNativeReactSiteBuild(input: {
       : Number.NaN;
     return fallback &&
       (!Number.isFinite(reconcileUntil) || Date.now() < reconcileUntil)
-      ? pending(providerStateV2(currentState), taskId, "qa_running", 10_000)
+      ? pending(
+          providerStateV2(currentState),
+          taskId,
+          "qa_running",
+          NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
+        )
       : null;
   };
   const throwIfExistingFallbackExpired = (): void => {
@@ -4000,6 +4119,37 @@ async function handleNativeReactSiteBuild(input: {
     );
   }
   const receipt = siteSourceReceiptV1Schema.parse(receiptResolution.value);
+  const rejectedCandidate =
+    currentState?.schemaVersion === 2
+      ? currentState.nativeRejectedCandidateV1
+      : undefined;
+  if (
+    attachment &&
+    nativeRejectedCandidateMatches(rejectedCandidate, {
+      taskId,
+      repairAttempt: attempt,
+      operationToken,
+      attachmentIdentity: attachment.attachmentIdentity,
+      archiveSha256: receipt.archiveSha256,
+      validatorVersion: NATIVE_SOURCE_VALIDATOR_VERSION,
+    })
+  ) {
+    // The provider GET is intentionally still performed above so a new
+    // attachment identity or receipt hash can supersede this verdict. The
+    // exact rejected candidate, however, must never be downloaded, expanded,
+    // compiled, charged, or sent back to Manus again.
+    const fallback = await materializeTrustedFallback(
+      "repair_budget_exhausted",
+    );
+    if (fallback) return fallback;
+    throwIfExistingFallbackExpired();
+    throw new SiteOpsManusFailure(
+      rejectedCandidate!.errorCode,
+      "AI 建站返回的同一源码包已通过确定性判定为不可安全采用。",
+      "failed",
+      providerStateV2(currentState),
+    );
+  }
   if (!offlineResume) {
     if (!polled || !attachment) {
       throw new Error("SITEOPS_NATIVE_SOURCE_PROVIDER_COORDINATES_MISSING");
@@ -4223,6 +4373,41 @@ async function handleNativeReactSiteBuild(input: {
       const signature = createHash("sha256")
         .update(JSON.stringify({ code: error.code }), "utf8")
         .digest("hex");
+      const rejectionAttachmentIdentity =
+        attachment?.attachmentIdentity ??
+        (currentState?.schemaVersion === 2
+          ? currentState.nativeSourceAttachmentIdentity
+          : undefined);
+      if (
+        !error.retryable &&
+        rejectionAttachmentIdentity &&
+        error.code !== "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE" &&
+        error.code !== "NATIVE_SOURCE_ATTACHMENT_INVALID" &&
+        error.code !== "NATIVE_SOURCE_ARCHIVE_HASH_MISMATCH"
+      ) {
+        const verdict = createNativeRejectedCandidateV1({
+          taskId,
+          repairAttempt: attempt,
+          operationToken,
+          attachmentIdentity: rejectionAttachmentIdentity,
+          archiveSha256: receipt.archiveSha256,
+          errorCode: error.code,
+        });
+        currentState = transitionProviderState(currentState, {
+          stage:
+            attempt > 0 ? "native_repair_pending" : "native_source_pending",
+          taskId,
+          nativeRepairAttempt: attempt,
+          buildPhase: "source_validating",
+          nativeRejectedCandidateV1: verdict,
+        });
+        await persistOperationProgress(
+          input.db,
+          input.operation,
+          currentState,
+          taskId,
+        );
+      }
       const scheduled = await scheduleNativeRepair({
         kind: "hard_safety",
         signature,

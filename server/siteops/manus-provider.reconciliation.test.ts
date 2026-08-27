@@ -4,7 +4,11 @@ import { ManusV2ApiError } from "../manus-v2-client";
 import {
   MANUS_PROVIDER_READ_BACKOFF_MS,
   MANUS_PROVIDER_READ_RECONCILIATION_MS,
+  NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
+  NATIVE_SOURCE_VALIDATOR_VERSION,
+  createNativeRejectedCandidateV1,
   manusProviderReadRetryDelayMs,
+  nativeRejectedCandidateMatches,
   nativeSourceAttachmentIdentityConflicts,
   nativeSourceAttachmentRetryWindow,
   nativeSourceOutputAttachment,
@@ -109,6 +113,57 @@ function client(input: {
 }
 
 describe("Manus bound-task read reconciliation", () => {
+  it("reuses an authenticated deterministic rejection for the exact frozen candidate only", () => {
+    const coordinates = {
+      taskId,
+      repairAttempt: 2,
+      operationToken,
+      attachmentIdentity: "attachment-1:attachment:0",
+      archiveSha256: "a".repeat(64),
+      validatorVersion: NATIVE_SOURCE_VALIDATOR_VERSION,
+    } as const;
+    const verdict = createNativeRejectedCandidateV1({
+      ...coordinates,
+      errorCode: "NATIVE_SOURCE_PACKAGE_JSON_INVALID",
+      rejectedAt: new Date("2026-08-27T14:00:00.000Z"),
+    });
+
+    for (let sweep = 0; sweep < 20; sweep += 1) {
+      expect(nativeRejectedCandidateMatches(verdict, coordinates)).toBe(true);
+    }
+    expect(NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS).toBe(5 * 60_000);
+    expect(
+      nativeRejectedCandidateMatches(verdict, {
+        ...coordinates,
+        attachmentIdentity: "attachment-2:attachment:0",
+      }),
+    ).toBe(false);
+    expect(
+      nativeRejectedCandidateMatches(verdict, {
+        ...coordinates,
+        archiveSha256: "b".repeat(64),
+      }),
+    ).toBe(false);
+    expect(
+      nativeRejectedCandidateMatches(verdict, {
+        ...coordinates,
+        repairAttempt: 1,
+      }),
+    ).toBe(false);
+    expect(
+      nativeRejectedCandidateMatches(verdict, {
+        ...coordinates,
+        validatorVersion: "native-react-source-v2",
+      }),
+    ).toBe(false);
+    expect(
+      nativeRejectedCandidateMatches(
+        { ...verdict, verdictSignature: "0".repeat(64) },
+        coordinates,
+      ),
+    ).toBe(false);
+  });
+
   it("opens trusted fallback only at the bounded root-build thresholds", () => {
     const providerReadFailureSince = new Date(1_000).toISOString();
     expect(

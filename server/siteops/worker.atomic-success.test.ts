@@ -9,6 +9,7 @@ const dependencies = vi.hoisted(() => ({
   finalizeApprovedReset: vi.fn(async () => ({
     status: "not_applicable" as const,
   })),
+  activateDeferredReset: vi.fn(async () => ({ status: "idle" as const })),
   safeNoExposure: vi.fn(async () => false),
   parseSafeNoExposureProof: vi.fn(() => null),
 }));
@@ -22,6 +23,7 @@ vi.mock("../twenty-first-service", () => ({
     dependencies.finalizeCredentialRevocations,
 }));
 vi.mock("./rebuild-ticket", () => ({
+  activateOneDeferredApprovedSiteOpsReset: dependencies.activateDeferredReset,
   completeSiteOpsRebuildTicket: dependencies.completeRebuildTicket,
   parseApprovedResetUnpublishInput: dependencies.parseApprovedReset,
   finalizeApprovedSiteOpsReset: dependencies.finalizeApprovedReset,
@@ -317,6 +319,9 @@ beforeEach(() => {
   dependencies.finalizeApprovedReset
     .mockReset()
     .mockResolvedValue({ status: "not_applicable" });
+  dependencies.activateDeferredReset
+    .mockReset()
+    .mockResolvedValue({ status: "idle" });
   dependencies.safeNoExposure.mockReset().mockResolvedValue(false);
   dependencies.parseSafeNoExposureProof.mockReset().mockReturnValue(null);
 });
@@ -369,6 +374,7 @@ describe("SiteOps React/QA terminal transaction", () => {
       attentionRequired: 0,
     });
 
+    expect(dependencies.activateDeferredReset).toHaveBeenCalledWith(fixture.db);
     expect(provider).not.toHaveBeenCalled();
     expect(fixture.operation).toMatchObject({
       status: "succeeded",

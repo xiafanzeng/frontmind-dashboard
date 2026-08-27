@@ -26,6 +26,8 @@ import {
   requireTwentyFirstTemplateAdmission,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
+  runSiteOpsObservationQueries,
+  runSiteOpsObservationSingleFlight,
   siteBriefFromSnapshot,
   siteOpsServiceErrorFromQuota,
   siteOpsVisualSelectionRecovery,
@@ -426,6 +428,130 @@ describe("SiteOps core contracts", () => {
       status: "failed",
       completedAt: "2026-08-22T00:04:00.000Z",
     });
+  });
+
+  it("ends the customer build timeline when a trusted fallback is bound", () => {
+    const artifactBinding = (
+      id: string,
+      mimeType: "application/json" | "application/zip",
+    ) => ({
+      id,
+      sha256: "a".repeat(64),
+      bytes: 100,
+      mimeType,
+    });
+    const steps = projectSiteOpsExecutionSteps({
+      operations: [
+        {
+          id: "operation-fallback",
+          buildId: "10000000-0000-4000-8000-000000000001",
+          kind: "site_build",
+          status: "running",
+          startedAt: new Date("2026-08-27T04:00:00.000Z"),
+          completedAt: null,
+          createdAt: new Date("2026-08-27T04:00:00.000Z"),
+          result: {
+            fallbackPreview: {
+              status: "bound",
+              trigger: "repair_budget_exhausted",
+              createdAt: "2026-08-27T04:05:00.000Z",
+              reconcileUntilAt: "2026-08-28T04:05:00.000Z",
+              buildId: "10000000-0000-4000-8000-000000000001",
+              taskId: "manus-task",
+              operationToken:
+                "siteops-native-fallback:20000000-0000-4000-8000-000000000002",
+              selectedPreviewSha256: "b".repeat(64),
+              selectedSourceTreeSha256: "c".repeat(64),
+              artifactBindings: {
+                contract: artifactBinding(
+                  "30000000-0000-4000-8000-000000000003",
+                  "application/json",
+                ),
+                source: artifactBinding(
+                  "40000000-0000-4000-8000-000000000004",
+                  "application/zip",
+                ),
+                dist: artifactBinding(
+                  "50000000-0000-4000-8000-000000000005",
+                  "application/zip",
+                ),
+                qa: artifactBinding(
+                  "60000000-0000-4000-8000-000000000006",
+                  "application/zip",
+                ),
+                provenance: artifactBinding(
+                  "70000000-0000-4000-8000-000000000007",
+                  "application/json",
+                ),
+              },
+              buildDelivery: {
+                renderMode: "trusted_fallback",
+                qaStatus: "partial",
+                warningCodes: ["SITEOPS_TRUSTED_FALLBACK"],
+              },
+            },
+          },
+        },
+      ],
+      timelineMessages: [
+        {
+          id: "qa-start",
+          sentAt: new Date("2026-08-27T04:04:00.000Z"),
+          metadata: {
+            siteOps: {
+              subjectId: "operation-fallback",
+              payload: { stage: "qa_running" },
+            },
+          },
+        },
+      ],
+    });
+
+    expect(steps.at(-1)).toMatchObject({
+      stage: "qa_running",
+      status: "succeeded",
+      completedAt: "2026-08-27T04:05:00.000Z",
+    });
+  });
+
+  it("caps observation projection work at four concurrent queries", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const results = await runSiteOpsObservationQueries(
+      Array.from({ length: 11 }, (_, index) => async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+        return index;
+      }),
+    );
+
+    expect(maxActive).toBe(4);
+    expect(results).toEqual(Array.from({ length: 11 }, (_, index) => index));
+  });
+
+  it("coalesces concurrent observation projections for the same key", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const task = async () => {
+      calls += 1;
+      await gate;
+      return { revision: 9 };
+    };
+
+    const first = runSiteOpsObservationSingleFlight("project:9", task);
+    const second = runSiteOpsObservationSingleFlight("project:9", task);
+    expect(calls).toBe(1);
+    release();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { revision: 9 },
+      { revision: 9 },
+    ]);
+    expect(calls).toBe(1);
   });
 
   it("uses one total-duration row for a historical build without stage events", () => {

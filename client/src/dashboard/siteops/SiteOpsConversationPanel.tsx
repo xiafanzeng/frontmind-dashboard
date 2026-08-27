@@ -52,6 +52,8 @@ export type SiteOpsConversationPanelProps = {
   loading?: boolean;
   refreshing?: boolean;
   error?: string | null;
+  notice?: string | null;
+  interactionPending?: boolean;
   onRefresh?: () => Promise<void> | void;
   onAction?: (input: SiteOpsActionContext) => Promise<void> | void;
   onBeginAliyun?: () => Promise<{
@@ -590,6 +592,8 @@ export default function SiteOpsConversationPanel({
   loading = false,
   refreshing = false,
   error = null,
+  notice = null,
+  interactionPending = false,
   onRefresh,
   onAction,
   onBeginAliyun,
@@ -1097,7 +1101,10 @@ export default function SiteOpsConversationPanel({
   const aiBuilderConfigured =
     observation.serviceReadiness.website.status === "configured";
   const interactionLocked = Boolean(
-    busyAction || !onAction || observation.rebuildRequest.resetPending,
+    busyAction ||
+      interactionPending ||
+      !onAction ||
+      observation.rebuildRequest.resetPending,
   );
   const visualGeneration = observation.visualGeneration ?? {
     status: "idle" as const,
@@ -1317,6 +1324,12 @@ export default function SiteOpsConversationPanel({
         <div className="siteops-notice warning" role="status">
           <AlertCircle size={18} aria-hidden="true" />
           <span>{upstreamMessage}</span>
+        </div>
+      )}
+      {notice && (
+        <div className="siteops-notice warning" role="status">
+          <Clock3 size={18} aria-hidden="true" />
+          <span>{notice}</span>
         </div>
       )}
       {(error || localError) && (

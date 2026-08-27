@@ -200,6 +200,7 @@ async function harness(options: HarnessOptions = {}) {
   const log = path.join(root, "commands.log");
   const planCounter = path.join(root, "plan-counter");
   const rolloutCounter = path.join(root, "rollout-counter");
+  const workerState = path.join(root, "siteops-worker-running");
   const contractContainer = path.join(root, "contract-container.json");
   const migrationStarted = path.join(root, "migration-started");
   const migrationTail = path.join(root, "migration-tail");
@@ -377,6 +378,28 @@ if [[ "\${1:-}" == login ]]; then
   exit 0
 fi
 if [[ "$args" == *" image inspect "*"org.opencontainers.image.revision"* ]]; then echo "$TEST_SOURCE_SHA"; exit 0; fi
+if [[ "$args" == *" image inspect "*"net.frontmind.runtime.roles"* ]]; then
+  if [[ "$args" == *"$TEST_CANDIDATE_IMAGE"* || \
+        "$args" == *"$TEST_ALTERNATE_SPLIT_IMAGE"* ]]; then
+    echo "web,siteops-worker"
+  else
+    echo ""
+  fi
+  exit 0
+fi
+if [[ "$args" == *" inspect "*"$TEST_SITEOPS_WORKER_CONTAINER"* ]]; then
+  [[ -f "$TEST_WORKER_STATE" ]] || exit 1
+  if [[ "$args" == *"{{range .Config.Env}}"* ]]; then
+    printf '%s\n' 'FRONTMIND_RUNTIME_ROLE=siteops-worker'
+  elif [[ "$args" == *"com.docker.compose.project"* ]]; then
+    printf 'true|%s|healthy|frontmind-dashboard|siteops-worker\n' "$TEST_CANDIDATE_IMAGE"
+  elif [[ "$args" == *"{{.State.Running}}"* ]]; then
+    printf '%s\n' 'true'
+  else
+    exit 1
+  fi
+  exit 0
+fi
 if [[ "$args" == *" inspect "*"org.opencontainers.image.revision"* ]]; then echo "$TEST_ACTIVE_SOURCE_SHA"; exit 0; fi
 if [[ "$args" == *" image inspect "*"{{.Id}}"* ]]; then echo "sha256:${"9".repeat(64)}"; exit 0; fi
 if [[ "$args" == *" inspect "*"{{.State.Running}}"* ]]; then echo "true"; exit 0; fi
@@ -398,6 +421,10 @@ if [[ "$args" == *" up -d "* ]]; then
      && "$((rollout_count + 1))" -eq "$TEST_COMPOSE_UP_FAILURE_AT" ]]; then
     exit 79
   fi
+  [[ "$args" != *" siteops-worker"* ]] || : >"$TEST_WORKER_STATE"
+fi
+if [[ "$args" == *" stop "*"siteops-worker"* ]]; then
+  rm -f "$TEST_WORKER_STATE"
 fi
 if [[ "$args" == *" release-db-plan plan --json "* ]]; then
   printf '%s\n' "plan-config \${DOCKER_CONFIG:-unset}" >>"$TEST_LOG"
@@ -601,9 +628,12 @@ fi
     TEST_LOG: log,
     TEST_SERVICE: service,
     TEST_REPOSITORY: repository,
+    TEST_ALTERNATE_SPLIT_IMAGE: `${repository}@sha256:${"1".repeat(64)}`,
     TEST_PLAN_SEQUENCE: planSequence.join(","),
     TEST_PLAN_COUNTER: planCounter,
     TEST_ROLLOUT_COUNTER: rolloutCounter,
+    TEST_WORKER_STATE: workerState,
+    TEST_SITEOPS_WORKER_CONTAINER: "frontmind-dashboard-siteops-worker",
     TEST_FORCED_INITIAL_TAKEOVER: forced && !bootstrapped ? "1" : "0",
     TEST_READY_SOURCE_SHA: readySourceSha,
     TEST_READY_IMAGE_DIGEST: readyImageDigest,
@@ -651,6 +681,7 @@ fi
     backupDir,
     registryAuthRoot,
     log,
+    workerState,
     state: path.join(stateDir, "state.json"),
     registryToken,
     image: candidateImage,
@@ -742,6 +773,12 @@ describe("deploy controller shell contract", () => {
     expect(commands).toContain("release-db-plan plan --json");
     expect(commands).toContain("plan-config unset");
     expect((commands.match(/^docker .* up -d /gmu) || []).length).toBe(1);
+    expect(commands).toContain(
+      "up -d --no-deps --force-recreate dashboard siteops-worker",
+    );
+    expect(commands).toContain(
+      "inspect --format {{.State.Running}}|{{.Config.Image}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}|{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}} frontmind-dashboard-siteops-worker",
+    );
     expect(commands).not.toContain("release-db-migrate migrate");
     expect(commands).not.toContain("mysqldump");
     expect(commands).not.toContain("DROP DATABASE");
@@ -860,6 +897,14 @@ describe("deploy controller shell contract", () => {
     const commands = await readFile(test.log, "utf8");
     expect((commands.match(/^docker .* up -d /gmu) || []).length).toBe(2);
     expect(commands).toContain(" stop dashboard");
+    expect(commands).toContain(" stop dashboard siteops-worker");
+    expect(commands).toContain(" stop siteops-worker");
+    expect(commands).toContain(
+      "up -d --no-deps --force-recreate dashboard siteops-worker",
+    );
+    expect(commands).toContain(
+      "up -d --no-deps --force-recreate dashboard\n",
+    );
     expect(commands).not.toContain("mysqldump");
     expect(commands).not.toContain("release-db-migrate migrate");
     await expect(readFile(test.state, "utf8")).rejects.toMatchObject({
@@ -903,6 +948,7 @@ describe("deploy controller shell contract", () => {
     );
     expect(await readFile(test.log, "utf8")).not.toContain("cosign verify");
 
+    await writeFile(test.workerState, "running\n");
     const first = test.bootstrap();
     expect(first.status, first.stderr).toBe(0);
     expect(first.stderr).toContain("BOOTSTRAP_STATE_SUCCESS");

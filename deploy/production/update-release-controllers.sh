@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly CONTROLLER_VERSION="6"
+readonly CONTROLLER_VERSION="7"
 readonly VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"
 readonly CONTROLLER_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-controller"
 readonly FORCED_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-forced-command"
@@ -48,6 +48,10 @@ validate_controller() {
     && grep -Fq -- 'COUPLED_STACK_RECOVERY_MUST_FINISH_BEFORE_INCIDENT_ACKNOWLEDGEMENT' "$target" \
     && grep -Fq -- 'siteops_alidns_oauth_contract_plan_matches' "$target" \
     && grep -Fq -- 'contract-0065-migration-started' "$target" \
+    && grep -Fq -- 'dashboard_image_supports_split_runtime' "$target" \
+    && grep -Fq -- 'dashboard_siteops_worker_matches' "$target" \
+    && grep -Fq -- 'start_application_runtime' "$target" \
+    && grep -Fq -- 'stop_application_runtime' "$target" \
     && grep -Fq -- '60b3ba7ba8fb92bbb2ecc2a62db1c13f549f26cc375d44eb2ee218459e50bc5f' "$target" \
     && grep -Fq -- '00c5395ab580f7dddef1ad743445561943b9fc28c0858a3c72eea5417cb7c52f' "$target" \
     && grep -Fq -- 'e71230f0691ddd2a7d3d7b1a19d069775720ff999b445e86f60be902137a17db' "$target" \

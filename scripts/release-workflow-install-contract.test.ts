@@ -74,15 +74,33 @@ describe("release workflow source-ordering contracts", () => {
     expect(browserInstall).toBeLessThan(fullTest);
   });
 
-  it("pins independent external DNS only for the production Dashboard app", async () => {
-    const compose = await readFile(dashboardCompose, "utf8");
+  it("pins independent external DNS and isolates the production Dashboard web and worker roles", async () => {
+    const [compose, dockerfile] = await Promise.all([
+      readFile(dashboardCompose, "utf8"),
+      readFile(dashboardDockerfile, "utf8"),
+    ]);
 
-    expect(compose.match(/^    dns:\s*$/gmu)).toHaveLength(1);
-    expect(compose.match(/^    dns_opt:\s*$/gmu)).toHaveLength(1);
+    expect(compose.match(/^    dns:\s*$/gmu)).toHaveLength(2);
+    expect(compose.match(/^    dns_opt:\s*$/gmu)).toHaveLength(2);
     expect(compose).toContain("      - 1.1.1.1");
     expect(compose).toContain("      - 8.8.8.8");
     expect(compose).toContain("      - timeout:2");
     expect(compose).toContain("      - attempts:2");
+    expect(compose).toContain("  siteops-worker:");
+    expect(compose).toContain("FRONTMIND_RUNTIME_ROLE: web");
+    expect(compose).toContain("FRONTMIND_RUNTIME_ROLE: siteops-worker");
+    expect(compose).toContain("container_name: frontmind-dashboard-siteops-worker");
+    const worker = compose.slice(
+      compose.indexOf("  siteops-worker:"),
+      compose.indexOf("  release-db-plan:"),
+    );
+    expect(worker).not.toContain("ports:");
+    expect(worker).toContain('PORT: "3001"');
+    expect(worker).toContain("      database: {}");
+    expect(worker).not.toContain("      applications:");
+    expect(dockerfile).toContain(
+      'net.frontmind.runtime.roles="web,siteops-worker"',
+    );
   });
 
   it("conditionally closes the production incident-repair CLI artifact chain", async () => {
@@ -167,10 +185,12 @@ describe("release workflow source-ordering contracts", () => {
     expect(updater).toContain(
       'VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"',
     );
-    expect(updater).toContain('readonly CONTROLLER_VERSION="6"');
-    expect(releaseManual).toContain("production-owned v6 controller");
-    expect(releaseManual).toContain("--apply-version=6");
-    expect(releaseManual).not.toMatch(/--apply-version=[0-5](?:\D|$)/u);
+    expect(updater).toContain('readonly CONTROLLER_VERSION="7"');
+    expect(releaseManual).toContain("production-owned v7 controller");
+    expect(releaseManual).toContain("--apply-version=7");
+    expect(releaseManual).not.toMatch(/--apply-version=[0-6](?:\D|$)/u);
+    expect(updater).toContain("dashboard_image_supports_split_runtime");
+    expect(updater).toContain("dashboard_siteops_worker_matches");
     expect(updater).toContain("PRODUCTION_CONTROLLER_UPDATE_ROLLED_BACK");
     expect(updater).toContain("project-business-owner");
     expect(updater).toContain(

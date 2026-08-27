@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNull, max, or } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  like,
+  max,
+  or,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
   deliveryProjectAssignments,
@@ -39,6 +49,46 @@ const RESET_PRE_MUTATION_RETRY_CODES = new Set([
   "PROVIDER_NOT_CONFIGURED",
   "ALIYUN_REAUTHORIZATION_REQUIRED",
 ]);
+const ACTIVE_SITE_OPERATION_STATUSES = [
+  "queued",
+  "running",
+  "outcome_unknown",
+] as const;
+const ACTIVE_DEPLOYMENT_STATUSES = [
+  "reserved",
+  "deploying",
+  "verifying",
+] as const;
+const ACTIVE_DNS_RECORD_STATUSES = [
+  "applying",
+  "propagating",
+  "outcome_unknown",
+] as const;
+
+function localResetRetirableOperation(input: {
+  kind: string;
+  provider: string | null;
+}) {
+  return (
+    (input.kind === "visual_search" && input.provider === "21st") ||
+    ((input.kind === "site_build" ||
+      input.kind === "build_revision" ||
+      input.kind === "social_package") &&
+      input.provider === "manus")
+  );
+}
+
+function knownAliyunWriteOperation(input: {
+  kind: string;
+  provider: string | null;
+}) {
+  return (
+    (input.provider === "aliyun_esa" &&
+      ["deploy", "rollback", "dns_apply"].includes(input.kind)) ||
+    (input.provider === "aliyun_alidns" &&
+      ["domain_sync", "dns_apply", "dns_rollback"].includes(input.kind))
+  );
+}
 
 type SiteOpsRebuildNoteV1 = {
   schemaVersion: 1;
@@ -81,6 +131,25 @@ type SiteOpsRebuildNoteV4 = {
   unpublishOperationId?: string;
 };
 
+/**
+ * An approval that crossed an already-started Aliyun write boundary. V5 is
+ * deliberately not a frozen reset coordinate: the original operation must
+ * finish read-only reconciliation first, then the worker snapshots the latest
+ * live head/domain and atomically upgrades this note to V4.
+ */
+type SiteOpsRebuildNoteV5 = {
+  schemaVersion: 5;
+  kind: typeof REBUILD_NOTE_KIND;
+  projectId: string;
+  sourceBuildId: string | null;
+  knowledgeSnapshotId: string | null;
+  resetIntent: typeof APPROVED_RESET_UNPUBLISH;
+  resetApprovedAt: string;
+  minimumKnowledgeSnapshotVersion: number;
+  resetActivationState: "awaiting_external_reconciliation";
+  awaitingExternalOperationIds: string[];
+};
+
 const completedFreshRootResetOperationResultV2Schema = z
   .object({
     schemaVersion: z.literal(2),
@@ -116,7 +185,8 @@ type SiteOpsRebuildNote =
   | SiteOpsRebuildNoteV1
   | SiteOpsRebuildNoteV2
   | SiteOpsRebuildNoteV3
-  | SiteOpsRebuildNoteV4;
+  | SiteOpsRebuildNoteV4
+  | SiteOpsRebuildNoteV5;
 
 export const approvedResetUnpublishInputSchema = z
   .object({
@@ -197,16 +267,16 @@ function parseSiteOpsRebuildNote(
     const parsed = JSON.parse(value) as Record<string, unknown>;
     if (
       parsed.kind !== REBUILD_NOTE_KIND ||
-      ![1, 2, 3, 4].includes(Number(parsed.schemaVersion)) ||
+      ![1, 2, 3, 4, 5].includes(Number(parsed.schemaVersion)) ||
       typeof parsed.projectId !== "string" ||
       (typeof parsed.sourceBuildId !== "string" &&
         !(
-          [3, 4].includes(Number(parsed.schemaVersion)) &&
+          [3, 4, 5].includes(Number(parsed.schemaVersion)) &&
           parsed.sourceBuildId === null
         )) ||
       (typeof parsed.knowledgeSnapshotId !== "string" &&
         !(
-          [3, 4].includes(Number(parsed.schemaVersion)) &&
+          [3, 4, 5].includes(Number(parsed.schemaVersion)) &&
           parsed.knowledgeSnapshotId === null
         ))
     ) {
@@ -256,6 +326,32 @@ function parseSiteOpsRebuildNote(
       }
       return parsed as SiteOpsRebuildNoteV4;
     }
+    if (parsed.schemaVersion === 5) {
+      const awaitingExternalOperationIds = Array.isArray(
+        parsed.awaitingExternalOperationIds,
+      )
+        ? parsed.awaitingExternalOperationIds
+        : [];
+      if (
+        parsed.resetIntent !== APPROVED_RESET_UNPUBLISH ||
+        typeof parsed.resetApprovedAt !== "string" ||
+        !Number.isInteger(parsed.minimumKnowledgeSnapshotVersion) ||
+        Number(parsed.minimumKnowledgeSnapshotVersion) < 1 ||
+        parsed.resetActivationState !== "awaiting_external_reconciliation" ||
+        awaitingExternalOperationIds.length < 1 ||
+        awaitingExternalOperationIds.length > 64 ||
+        awaitingExternalOperationIds.some(
+          (operationId) =>
+            typeof operationId !== "string" ||
+            !z.string().uuid().safeParse(operationId).success,
+        ) ||
+        new Set(awaitingExternalOperationIds).size !==
+          awaitingExternalOperationIds.length
+      ) {
+        return null;
+      }
+      return parsed as SiteOpsRebuildNoteV5;
+    }
     return parsed as SiteOpsRebuildNoteV1;
   } catch {
     return null;
@@ -274,7 +370,11 @@ export function siteOpsRebuildResetApplied(value: string | null | undefined) {
 
 export function siteOpsRebuildResetPending(value: string | null | undefined) {
   const note = parseSiteOpsRebuildNote(value);
-  return Boolean(note && note.schemaVersion === 4 && !note.resetAppliedAt);
+  return Boolean(
+    note &&
+      ((note.schemaVersion === 4 && !note.resetAppliedAt) ||
+        note.schemaVersion === 5),
+  );
 }
 
 export type SiteOpsRebuildResetState =
@@ -316,9 +416,10 @@ export function siteOpsRebuildResetOperationId(
 }
 
 /**
- * Projects only a small, customer-safe reset control state. The exact V4
- * ticket coordinate and its pinned operation must agree before any provider
- * status is trusted; raw provider errors and identifiers are never returned.
+ * Projects only a small, customer-safe reset control state. V5 exposes only
+ * its durable queued approval; once upgraded, the exact V4 ticket coordinate
+ * and pinned operation must agree before any provider status is trusted. Raw
+ * provider errors and identifiers are never returned.
  */
 export function projectSiteOpsRebuildReset(input: {
   ticketId: string;
@@ -344,9 +445,17 @@ export function projectSiteOpsRebuildReset(input: {
     | undefined;
 }): SiteOpsRebuildResetProjection {
   const note = parseSiteOpsRebuildNote(input.internalNote);
-  if (!note || note.schemaVersion !== 4) {
+  if (!note) {
     return EMPTY_SITEOPS_REBUILD_RESET_PROJECTION;
   }
+  if (note.schemaVersion === 5) {
+    return {
+      siteRebuildResetState: "queued",
+      siteRebuildResetIssue: null,
+      siteRebuildCanRecheck: false,
+    };
+  }
+  if (note.schemaVersion !== 4) return EMPTY_SITEOPS_REBUILD_RESET_PROJECTION;
   const operation = input.operation;
   const reset = operation
     ? parseApprovedResetFromOperationInput(operation.input)
@@ -465,7 +574,7 @@ export function siteOpsRebuildMinimumSnapshotVersion(
   value: string | null | undefined,
 ) {
   const note = parseSiteOpsRebuildNote(value);
-  return note?.schemaVersion === 4
+  return note?.schemaVersion === 4 || note?.schemaVersion === 5
     ? note.minimumKnowledgeSnapshotVersion
     : null;
 }
@@ -567,6 +676,7 @@ export function siteOpsRebuildResubmissionProjection(input: {
   if (
     !note ||
     note.schemaVersion === 1 ||
+    note.schemaVersion === 5 ||
     !note.resetAppliedAt ||
     !note.resetAppliedProjectRevision
   ) {
@@ -992,6 +1102,121 @@ export async function createSiteOpsRebuildTicket(
   };
 }
 
+async function queueApprovedResetFromLatestCoordinates(
+  tx: any,
+  input: {
+    ticketId: string;
+    project: typeof siteProjects.$inferSelect;
+    sourceBuildId: string | null;
+    knowledgeSnapshotId: string | null;
+    resetApprovedAt: string;
+    minimumKnowledgeSnapshotVersion: number;
+    now: Date;
+  },
+) {
+  const resetOperationId = randomUUID();
+  const resetInput = approvedResetUnpublishInputSchema.parse({
+    schemaVersion: 1,
+    intent: APPROVED_RESET_UNPUBLISH,
+    rebuildTicketId: input.ticketId,
+    expectedProjectRevision: input.project.revision,
+    expectedCurrentBuildId: input.project.currentBuildId ?? null,
+    expectedKnowledgeSnapshotId:
+      input.project.currentKnowledgeSnapshotId ?? null,
+    expectedGlobalLiveDeploymentId:
+      input.project.globalLiveDeploymentId ?? null,
+    expectedMainlandLiveDeploymentId:
+      input.project.mainlandLiveDeploymentId ?? null,
+    expectedCanonicalHostname: input.project.canonicalHostname ?? null,
+  });
+  const profileRows = await tx
+    .select({ domainRevision: workspaceSiteProfiles.domainRevision })
+    .from(workspaceSiteProfiles)
+    .where(eq(workspaceSiteProfiles.userId, input.project.userId))
+    .limit(1);
+  const currentDomainRevision = profileRows[0]?.domainRevision ?? null;
+  const rollbackRows = currentDomainRevision
+    ? await tx
+        .select({ id: siteDnsRecords.id })
+        .from(siteDnsRecords)
+        .where(
+          and(
+            eq(siteDnsRecords.projectId, input.project.id),
+            eq(siteDnsRecords.userId, input.project.userId),
+            eq(siteDnsRecords.domainRevision, currentDomainRevision),
+          ),
+        )
+        .limit(1)
+    : [];
+  const connectionRows =
+    rollbackRows.length > 0
+      ? await tx
+          .select({ id: siteProviderConnections.id })
+          .from(siteProviderConnections)
+          .where(
+            and(
+              eq(siteProviderConnections.projectId, input.project.id),
+              eq(siteProviderConnections.userId, input.project.userId),
+              eq(siteProviderConnections.provider, "aliyun_cn"),
+              eq(siteProviderConnections.status, "active"),
+            ),
+          )
+          .limit(1)
+      : [];
+  if (rollbackRows.length > 0 && !connectionRows[0]) {
+    throw new SiteOpsRebuildTicketError(
+      "IN_FLIGHT_OPERATION",
+      "旧官网仍有 FrontMind 管理的 DNS 记录，请先重新连接阿里云后再继续重置。",
+    );
+  }
+  const resetOperationInput = connectionRows[0]
+    ? {
+        connectionId: connectionRows[0].id,
+        domainRevision: currentDomainRevision!,
+        dnsIntent: "rollback" as const,
+        approvedReset: resetInput,
+      }
+    : resetInput;
+  const resetOperationKind = connectionRows[0]
+    ? ("dns_rollback" as const)
+    : ("rollback" as const);
+  const resetOperationProvider = connectionRows[0]
+    ? ("aliyun_alidns" as const)
+    : ("aliyun_esa" as const);
+  const resetInputHash = createHash("sha256")
+    .update(JSON.stringify(resetOperationInput), "utf8")
+    .digest("hex");
+  await tx.insert(siteOperations).values({
+    id: resetOperationId,
+    projectId: input.project.id,
+    userId: input.project.userId,
+    conversationTurnId: null,
+    buildId: input.sourceBuildId,
+    kind: resetOperationKind,
+    status: "queued",
+    clientRequestId: `site-rebuild-unpublish:${input.ticketId}:${input.project.revision}`,
+    inputHash: resetInputHash,
+    input: resetOperationInput,
+    provider: resetOperationProvider,
+    attempt: 0,
+    createdAt: input.now,
+    updatedAt: input.now,
+  });
+  const upgradedNote: SiteOpsRebuildNoteV4 = {
+    schemaVersion: 4,
+    kind: REBUILD_NOTE_KIND,
+    projectId: input.project.id,
+    sourceBuildId: input.sourceBuildId,
+    knowledgeSnapshotId: input.knowledgeSnapshotId,
+    resetIntent: APPROVED_RESET_UNPUBLISH,
+    resetOperationId,
+    resetApprovedAt: input.resetApprovedAt,
+    resetExpectedProjectRevision: input.project.revision,
+    minimumKnowledgeSnapshotVersion: input.minimumKnowledgeSnapshotVersion,
+  };
+  return { resetOperationId, upgradedNote };
+}
+
 export async function approveSiteOpsRebuildTicket(
   tx: any,
   input: {
@@ -1008,7 +1233,7 @@ export async function approveSiteOpsRebuildTicket(
   const targetProjectId = siteOpsRebuildProjectId(input.ticket.targetPage);
   if (
     !existingNote ||
-    ([3, 4].includes(existingNote.schemaVersion)
+    ([3, 4, 5].includes(existingNote.schemaVersion)
       ? targetProjectId !== existingNote.projectId &&
         targetBuildId !== existingNote.sourceBuildId
       : targetBuildId !== existingNote.sourceBuildId)
@@ -1058,9 +1283,10 @@ export async function approveSiteOpsRebuildTicket(
     );
   }
   if (existingNote.schemaVersion !== 3) {
-    if (existingNote.schemaVersion === 4) {
-      // V4 is already project-scoped and carries its own immutable approval
-      // coordinate. The operation/finalizer below performs the strict CAS.
+    if (existingNote.schemaVersion === 4 || existingNote.schemaVersion === 5) {
+      // V4/V5 are already project-scoped. V4 carries the immutable reset
+      // coordinate; V5 carries the earlier approval while an existing Aliyun
+      // write finishes read-only reconciliation.
     } else if (
       !currentBuild ||
       currentBuild.id !== existingNote.sourceBuildId ||
@@ -1072,6 +1298,18 @@ export async function approveSiteOpsRebuildTicket(
         "原官网版本已变化或不再满足重制条件。",
       );
     }
+  }
+  if (existingNote.schemaVersion === 5) {
+    return {
+      projectId: project.id,
+      sourceBuildId: existingNote.sourceBuildId,
+      resetApplied: true as const,
+      resetPending: true as const,
+      resetOperationId: null,
+      resetAppliedProjectRevision: project.revision,
+      pendingReplay: true as const,
+      internalNote: JSON.stringify(existingNote),
+    };
   }
   if (
     existingNote.schemaVersion === 4 &&
@@ -1273,11 +1511,7 @@ export async function approveSiteOpsRebuildTicket(
         .where(
           and(
             eq(siteOperations.projectId, project.id),
-            inArray(siteOperations.status, [
-              "queued",
-              "running",
-              "outcome_unknown",
-            ]),
+            inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
           ),
         )
         .for("update"),
@@ -1290,32 +1524,27 @@ export async function approveSiteOpsRebuildTicket(
         .where(
           and(
             eq(siteDeployments.projectId, project.id),
-            inArray(siteDeployments.status, [
-              "reserved",
-              "deploying",
-              "verifying",
-            ]),
+            inArray(siteDeployments.status, ACTIVE_DEPLOYMENT_STATUSES),
           ),
         )
-        .limit(1),
+        .limit(1)
+        .for("update"),
       tx
         .select({ id: siteDnsRecords.id })
         .from(siteDnsRecords)
         .where(
           and(
             eq(siteDnsRecords.projectId, project.id),
-            inArray(siteDnsRecords.status, [
-              "applying",
-              "propagating",
-              "outcome_unknown",
-            ]),
+            inArray(siteDnsRecords.status, ACTIVE_DNS_RECORD_STATUSES),
           ),
         )
-        .limit(1),
+        .limit(1)
+        .for("update"),
     ]);
   const now = input.now;
   const typedActiveOperationRows = activeOperationRows as Array<{
     id: string;
+    kind: string;
     provider: string | null;
     status: string;
     attempt: number;
@@ -1323,25 +1552,35 @@ export async function approveSiteOpsRebuildTicket(
     providerOperationId: string | null;
     providerTaskId: string | null;
   }>;
-  const localOperationRows = typedActiveOperationRows.filter(
-    (row) => row.provider === "21st" || row.provider === "manus",
-  );
-  const localCancelableRows = localOperationRows.filter(
-    (row) =>
-      row.status === "queued" &&
-      Number(row.attempt ?? 0) === 0 &&
-      row.result == null &&
-      row.providerOperationId == null &&
-      row.providerTaskId == null,
+  const localCancelableRows = typedActiveOperationRows.filter((row) =>
+    localResetRetirableOperation(row),
   );
   const cancelableIds = new Set(localCancelableRows.map((row) => row.id));
+  const externalReconciliationRows = typedActiveOperationRows.filter(
+    (row) => !cancelableIds.has(row.id) && knownAliyunWriteOperation(row),
+  );
+  const externalReconciliationIds = new Set(
+    externalReconciliationRows.map((row) => row.id),
+  );
   const blockedOperationRows = typedActiveOperationRows.filter(
-    (row) => !cancelableIds.has(row.id),
+    (row) =>
+      !cancelableIds.has(row.id) && !externalReconciliationIds.has(row.id),
+  );
+  const activeDeploymentUnbound = activeDeploymentRows.some(
+    (deployment: { operationId: string | null }) =>
+      !deployment.operationId ||
+      !externalReconciliationIds.has(deployment.operationId),
+  );
+  const hasActiveDnsReconciliation = externalReconciliationRows.some(
+    (row) =>
+      row.kind === "domain_sync" ||
+      row.kind === "dns_apply" ||
+      row.kind === "dns_rollback",
   );
   if (
     blockedOperationRows.length > 0 ||
-    activeDeploymentRows.length > 0 ||
-    activeDnsRows.length > 0
+    activeDeploymentUnbound ||
+    (activeDnsRows.length > 0 && !hasActiveDnsReconciliation)
   ) {
     throw new SiteOpsRebuildTicketError(
       "IN_FLIGHT_OPERATION",
@@ -1366,12 +1605,21 @@ export async function approveSiteOpsRebuildTicket(
       .where(
         and(
           inArray(siteOperations.id, localOperationIds),
-          inArray(siteOperations.provider, ["21st", "manus"]),
-          eq(siteOperations.status, "queued"),
-          eq(siteOperations.attempt, 0),
-          isNull(siteOperations.result),
-          isNull(siteOperations.providerOperationId),
-          isNull(siteOperations.providerTaskId),
+          inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
+          or(
+            and(
+              eq(siteOperations.kind, "visual_search"),
+              eq(siteOperations.provider, "21st"),
+            ),
+            and(
+              inArray(siteOperations.kind, [
+                "site_build",
+                "build_revision",
+                "social_package",
+              ]),
+              eq(siteOperations.provider, "manus"),
+            ),
+          ),
         ),
       );
     if (affectedRows(cancelled) !== localOperationIds.length) {
@@ -1384,7 +1632,6 @@ export async function approveSiteOpsRebuildTicket(
       .update(siteBuilds)
       .set({
         status: "cancelled",
-        quotaState: "released",
         errorCode: "SITEOPS_RESET_APPROVED",
         errorMessage: "官网重置已获批准，旧生成任务已停止。",
         updatedAt: now,
@@ -1404,121 +1651,85 @@ export async function approveSiteOpsRebuildTicket(
         ),
       );
     await tx
+      .update(siteBuilds)
+      .set({ quotaState: "released", updatedAt: now })
+      .where(
+        and(
+          eq(siteBuilds.projectId, project.id),
+          eq(siteBuilds.userId, project.userId),
+          eq(siteBuilds.quotaState, "reserved"),
+        ),
+      );
+    await tx
       .update(socialPackages)
       .set({
         status: "cancelled",
-        quotaState: "released",
         errorCode: "SITEOPS_RESET_APPROVED",
         errorMessage: "官网重置已获批准，旧生成任务已停止。",
         updatedAt: now,
       })
-      .where(inArray(socialPackages.operationId, localOperationIds));
+      .where(
+        and(
+          inArray(socialPackages.operationId, localOperationIds),
+          inArray(socialPackages.status, ["queued", "building"]),
+        ),
+      );
+    await tx
+      .update(socialPackages)
+      .set({ quotaState: "released", updatedAt: now })
+      .where(
+        and(
+          inArray(socialPackages.operationId, localOperationIds),
+          eq(socialPackages.quotaState, "reserved"),
+        ),
+      );
   }
   // V4 keeps a positive compatibility coordinate, but reset no longer creates
   // a runtime snapshot floor. The customer's active ZIP/hash/version remains
   // reusable; only the old build, visual and provider-task lineage is retired.
   const minimumKnowledgeSnapshotVersion = 1;
   const preservedBuildId = project.currentBuildId ?? existingNote.sourceBuildId;
-  const resetOperationId = randomUUID();
-  const resetInput = approvedResetUnpublishInputSchema.parse({
-    schemaVersion: 1,
-    intent: APPROVED_RESET_UNPUBLISH,
-    rebuildTicketId: input.ticket.id,
-    expectedProjectRevision: project.revision,
-    expectedCurrentBuildId: project.currentBuildId ?? null,
-    expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId ?? null,
-    expectedGlobalLiveDeploymentId: project.globalLiveDeploymentId ?? null,
-    expectedMainlandLiveDeploymentId: project.mainlandLiveDeploymentId ?? null,
-    expectedCanonicalHostname: project.canonicalHostname ?? null,
-  });
-  const profileRows = await tx
-    .select({ domainRevision: workspaceSiteProfiles.domainRevision })
-    .from(workspaceSiteProfiles)
-    .where(eq(workspaceSiteProfiles.userId, project.userId))
-    .limit(1);
-  const currentDomainRevision = profileRows[0]?.domainRevision ?? null;
-  const rollbackRows = currentDomainRevision
-    ? await tx
-        .select({ id: siteDnsRecords.id })
-        .from(siteDnsRecords)
-        .where(
-          and(
-            eq(siteDnsRecords.projectId, project.id),
-            eq(siteDnsRecords.userId, project.userId),
-            eq(siteDnsRecords.domainRevision, currentDomainRevision),
-          ),
-        )
-        .limit(1)
-    : [];
-  const connectionRows =
-    rollbackRows.length > 0
-      ? await tx
-          .select({ id: siteProviderConnections.id })
-          .from(siteProviderConnections)
-          .where(
-            and(
-              eq(siteProviderConnections.projectId, project.id),
-              eq(siteProviderConnections.userId, project.userId),
-              eq(siteProviderConnections.provider, "aliyun_cn"),
-              eq(siteProviderConnections.status, "active"),
-            ),
-          )
-          .limit(1)
-      : [];
-  if (rollbackRows.length > 0 && !connectionRows[0]) {
-    throw new SiteOpsRebuildTicketError(
-      "IN_FLIGHT_OPERATION",
-      "旧官网仍有 FrontMind 管理的 DNS 记录，请先重新连接阿里云后再批准重置。",
-    );
+  if (externalReconciliationRows.length > 0) {
+    const deferredNote: SiteOpsRebuildNoteV5 = {
+      schemaVersion: 5,
+      kind: REBUILD_NOTE_KIND,
+      projectId: project.id,
+      sourceBuildId: preservedBuildId,
+      knowledgeSnapshotId:
+        project.currentKnowledgeSnapshotId ??
+        currentBuild?.knowledgeSnapshotId ??
+        existingNote.knowledgeSnapshotId,
+      resetIntent: APPROVED_RESET_UNPUBLISH,
+      resetApprovedAt: now.toISOString(),
+      minimumKnowledgeSnapshotVersion,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: externalReconciliationRows.map(
+        (row) => row.id,
+      ),
+    };
+    return {
+      projectId: project.id,
+      sourceBuildId: preservedBuildId,
+      resetApplied: true as const,
+      resetPending: true as const,
+      resetOperationId: null,
+      resetAppliedProjectRevision: project.revision,
+      internalNote: JSON.stringify(deferredNote),
+    };
   }
-  const resetOperationInput = connectionRows[0]
-    ? {
-        connectionId: connectionRows[0].id,
-        domainRevision: currentDomainRevision!,
-        dnsIntent: "rollback" as const,
-        approvedReset: resetInput,
-      }
-    : resetInput;
-  const resetOperationKind = connectionRows[0]
-    ? ("dns_rollback" as const)
-    : ("rollback" as const);
-  const resetOperationProvider = connectionRows[0]
-    ? ("aliyun_alidns" as const)
-    : ("aliyun_esa" as const);
-  const resetInputHash = createHash("sha256")
-    .update(JSON.stringify(resetOperationInput), "utf8")
-    .digest("hex");
-  await tx.insert(siteOperations).values({
-    id: resetOperationId,
-    projectId: project.id,
-    userId: project.userId,
-    conversationTurnId: null,
-    buildId: preservedBuildId,
-    kind: resetOperationKind,
-    status: "queued",
-    clientRequestId: `site-rebuild-unpublish:${input.ticket.id}:${project.revision}`,
-    inputHash: resetInputHash,
-    input: resetOperationInput,
-    provider: resetOperationProvider,
-    attempt: 0,
-    createdAt: now,
-    updatedAt: now,
-  });
-  const upgradedNote: SiteOpsRebuildNoteV4 = {
-    schemaVersion: 4,
-    kind: REBUILD_NOTE_KIND,
-    projectId: project.id,
-    sourceBuildId: preservedBuildId,
-    knowledgeSnapshotId:
-      project.currentKnowledgeSnapshotId ??
-      currentBuild?.knowledgeSnapshotId ??
-      existingNote.knowledgeSnapshotId,
-    resetIntent: APPROVED_RESET_UNPUBLISH,
-    resetOperationId,
-    resetApprovedAt: now.toISOString(),
-    resetExpectedProjectRevision: project.revision,
-    minimumKnowledgeSnapshotVersion,
-  };
+  const { resetOperationId, upgradedNote } =
+    await queueApprovedResetFromLatestCoordinates(tx, {
+      ticketId: input.ticket.id,
+      project,
+      sourceBuildId: preservedBuildId,
+      knowledgeSnapshotId:
+        project.currentKnowledgeSnapshotId ??
+        currentBuild?.knowledgeSnapshotId ??
+        existingNote.knowledgeSnapshotId,
+      resetApprovedAt: now.toISOString(),
+      minimumKnowledgeSnapshotVersion,
+      now,
+    });
   return {
     projectId: project.id,
     sourceBuildId: preservedBuildId,
@@ -1542,6 +1753,230 @@ function affectedRows(result: unknown) {
 
 function nullableCoordinate(column: any, value: string | null) {
   return value === null ? isNull(column) : eq(column, value);
+}
+
+export async function activateDeferredApprovedSiteOpsReset(
+  tx: any,
+  input: { ticketId: string; now: Date },
+) {
+  const ticketRows = await tx
+    .select()
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.id, input.ticketId),
+        eq(deliveryTickets.operation, "site_rebuild"),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const ticket = ticketRows[0];
+  const note = parseSiteOpsRebuildNote(ticket?.internalNote);
+  if (
+    !ticket ||
+    !["scheduled", "in_progress"].includes(ticket.status) ||
+    !note ||
+    note.schemaVersion !== 5
+  ) {
+    return { status: "not_applicable" as const };
+  }
+  const projectRows = await tx
+    .select()
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.id, note.projectId),
+        eq(siteProjects.userId, ticket.userId),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const project = projectRows[0];
+  if (!project) return { status: "blocked" as const };
+
+  const reconciledOperationRows = (await tx
+    .select({
+      id: siteOperations.id,
+      projectId: siteOperations.projectId,
+      userId: siteOperations.userId,
+      kind: siteOperations.kind,
+      provider: siteOperations.provider,
+      status: siteOperations.status,
+      completedAt: siteOperations.completedAt,
+    })
+    .from(siteOperations)
+    .where(inArray(siteOperations.id, note.awaitingExternalOperationIds))
+    .for("update")) as Array<{
+    id: string;
+    projectId: string;
+    userId: number;
+    kind: string;
+    provider: string | null;
+    status: string;
+    completedAt: Date | null;
+  }>;
+  const reconciledById = new Map(
+    reconciledOperationRows.map((operation) => [operation.id, operation]),
+  );
+  const originalBoundaryValid = note.awaitingExternalOperationIds.every(
+    (operationId) => {
+      const operation = reconciledById.get(operationId);
+      return Boolean(
+        operation &&
+          operation.projectId === project.id &&
+          operation.userId === project.userId &&
+          knownAliyunWriteOperation(operation),
+      );
+    },
+  );
+  if (!originalBoundaryValid) return { status: "blocked" as const };
+  if (
+    reconciledOperationRows.some((operation) =>
+      ACTIVE_SITE_OPERATION_STATUSES.includes(operation.status as never),
+    )
+  ) {
+    return { status: "awaiting_external_reconciliation" as const };
+  }
+
+  // Catch provider-created successors as well as the originally recorded
+  // operation IDs. The reset gate prevents customer actions from creating a
+  // new lineage while V5 is pending, so any exact known Aliyun operation here
+  // still belongs to the approved external reconciliation boundary.
+  const activeOperationRows = (await tx
+    .select({
+      id: siteOperations.id,
+      kind: siteOperations.kind,
+      provider: siteOperations.provider,
+      status: siteOperations.status,
+    })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, project.id),
+        inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
+      ),
+    )
+    .for("update")) as Array<{
+    id: string;
+    kind: string;
+    provider: string | null;
+    status: string;
+  }>;
+  if (
+    activeOperationRows.some(
+      (operation) => !knownAliyunWriteOperation(operation),
+    )
+  ) {
+    return { status: "blocked" as const };
+  }
+  if (activeOperationRows.length > 0) {
+    return { status: "awaiting_external_reconciliation" as const };
+  }
+  const [activeDeploymentRows, activeDnsRows] = await Promise.all([
+    tx
+      .select({ id: siteDeployments.id })
+      .from(siteDeployments)
+      .where(
+        and(
+          eq(siteDeployments.projectId, project.id),
+          inArray(siteDeployments.status, ACTIVE_DEPLOYMENT_STATUSES),
+        ),
+      )
+      .limit(1)
+      .for("update"),
+    tx
+      .select({ id: siteDnsRecords.id })
+      .from(siteDnsRecords)
+      .where(
+        and(
+          eq(siteDnsRecords.projectId, project.id),
+          inArray(siteDnsRecords.status, ACTIVE_DNS_RECORD_STATUSES),
+        ),
+      )
+      .limit(1)
+      .for("update"),
+  ]);
+  if (activeDeploymentRows.length > 0 || activeDnsRows.length > 0) {
+    return { status: "awaiting_external_reconciliation" as const };
+  }
+
+  const sourceBuildId = project.currentBuildId ?? note.sourceBuildId;
+  const { resetOperationId, upgradedNote } =
+    await queueApprovedResetFromLatestCoordinates(tx, {
+      ticketId: ticket.id,
+      project,
+      sourceBuildId,
+      knowledgeSnapshotId:
+        project.currentKnowledgeSnapshotId ?? note.knowledgeSnapshotId,
+      resetApprovedAt: note.resetApprovedAt,
+      minimumKnowledgeSnapshotVersion: note.minimumKnowledgeSnapshotVersion,
+      now: input.now,
+    });
+  const updated = await tx
+    .update(deliveryTickets)
+    .set({
+      internalNote: JSON.stringify(upgradedNote),
+      revision: ticket.revision + 1,
+      publicSummary:
+        "官网重置已获批准，原发布或 DNS 操作已完成对账，正在安全下线旧官网。",
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(deliveryTickets.id, ticket.id),
+        eq(deliveryTickets.revision, ticket.revision),
+      ),
+    );
+  if (affectedRows(updated) !== 1) {
+    throw new Error("SITEOPS_DEFERRED_RESET_ACTIVATION_CAS_CONFLICT");
+  }
+  return {
+    status: "activated" as const,
+    resetOperationId,
+    resetExpectedProjectRevision: project.revision,
+    internalNote: JSON.stringify(upgradedNote),
+  };
+}
+
+export async function activateOneDeferredApprovedSiteOpsReset(
+  db: any,
+  now = new Date(),
+) {
+  const candidates = await db
+    .select({
+      id: deliveryTickets.id,
+      internalNote: deliveryTickets.internalNote,
+    })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.operation, "site_rebuild"),
+        inArray(deliveryTickets.status, ["scheduled", "in_progress"]),
+        like(deliveryTickets.internalNote, '%"schemaVersion":5%'),
+      ),
+    )
+    .orderBy(deliveryTickets.updatedAt)
+    .limit(128);
+  for (const candidate of candidates) {
+    if (parseSiteOpsRebuildNote(candidate.internalNote)?.schemaVersion !== 5) {
+      continue;
+    }
+    try {
+      const result = await db.transaction((tx: any) =>
+        activateDeferredApprovedSiteOpsReset(tx, {
+          ticketId: candidate.id,
+          now,
+        }),
+      );
+      if (result.status === "activated") return result;
+    } catch (error) {
+      if (!(error instanceof SiteOpsRebuildTicketError)) throw error;
+      // A missing active DNS credential is recoverable configuration state.
+      // Keep the durable approval pending; never recreate or cancel the
+      // provider operation merely because activation could not proceed yet.
+    }
+  }
+  return { status: "idle" as const };
 }
 
 export async function advanceApprovedSiteOpsResetAfterDnsRollback(

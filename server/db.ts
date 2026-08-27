@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/mysql2";
 import { createPool } from "mysql2";
 import { InsertUser, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import { resolveFrontMindRuntimeRole } from "./_core/runtime-role";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -13,6 +14,13 @@ export async function getDb() {
       const pool = createPool({
         uri: process.env.DATABASE_URL,
         timezone: "Z",
+        // The SiteOps process performs bounded, long-running projections and
+        // must never consume the public web process' whole connection budget.
+        connectionLimit:
+          resolveFrontMindRuntimeRole() === "siteops-worker" ? 3 : 10,
+        waitForConnections: true,
+        queueLimit:
+          resolveFrontMindRuntimeRole() === "siteops-worker" ? 24 : 96,
       });
       pool.on("connection", (connection) => {
         connection.query("SET SESSION time_zone = '+00:00'", (error) => {

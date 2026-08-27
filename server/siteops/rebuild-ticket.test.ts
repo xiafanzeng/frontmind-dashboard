@@ -16,6 +16,7 @@ import {
   workspaceSiteProfiles,
 } from "../../drizzle/schema";
 import {
+  activateDeferredApprovedSiteOpsReset,
   approveSiteOpsRebuildTicket,
   finalizeApprovedSiteOpsReset,
   loadSiteOpsRebuildRequest,
@@ -221,6 +222,35 @@ describe("SiteOps rebuild reset public projection", () => {
       }),
     ).toEqual({
       siteRebuildResetState: null,
+      siteRebuildResetIssue: null,
+      siteRebuildCanRecheck: false,
+    });
+  });
+
+  it("projects a deferred approved Aliyun boundary as queued without a reset operation", () => {
+    const deferredNote = JSON.stringify({
+      schemaVersion: 5,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: null,
+      knowledgeSnapshotId: null,
+      resetIntent: "approved_reset_unpublish",
+      resetApprovedAt: "2026-08-26T01:00:00.000Z",
+      minimumKnowledgeSnapshotVersion: 1,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: ["90000000-0000-4000-8000-000000000009"],
+    });
+    expect(siteOpsRebuildResetPending(deferredNote)).toBe(true);
+    expect(siteOpsRebuildResetOperationId(deferredNote)).toBeNull();
+    expect(
+      projectSiteOpsRebuildReset({
+        ticketId,
+        userId: 42,
+        internalNote: deferredNote,
+        operation: null,
+      }),
+    ).toEqual({
+      siteRebuildResetState: "queued",
       siteRebuildResetIssue: null,
       siteRebuildCanRecheck: false,
     });
@@ -538,11 +568,16 @@ function rebuildNoteV1() {
 
 function fixture(options?: {
   activeOperation?: boolean | Record<string, unknown>;
+  activeOperations?: Array<Record<string, unknown>>;
+  reconciledOperations?: Array<Record<string, unknown>>;
+  activeDeployment?: Record<string, unknown>;
+  activeDns?: boolean;
   internalNote?: string;
   projectOverrides?: Record<string, unknown>;
   targetPage?: string;
   ticketStatus?: string;
   resetOperation?: Record<string, unknown>;
+  cancelCasFails?: boolean;
 }) {
   const initialGlobalLiveDeploymentId = "50000000-0000-4000-8000-000000000005";
   const project = {
@@ -611,7 +646,11 @@ function fixture(options?: {
     if (table === siteBuilds) return [build];
     if (table === deliveryTickets) return [ticket];
     if (table === siteOperations) {
+      if (fields && "completedAt" in fields) {
+        return options?.reconciledOperations ?? [];
+      }
       if (options?.resetOperation) return [options.resetOperation];
+      if (options?.activeOperations) return options.activeOperations;
       return options?.activeOperation
         ? [
             {
@@ -644,9 +683,13 @@ function fixture(options?: {
               verification: { priorCheck: "passed" },
             },
           ]
-        : [];
+        : options?.activeDeployment
+          ? [options.activeDeployment]
+          : [];
     }
-    if (table === siteDnsRecords) return [];
+    if (table === siteDnsRecords) {
+      return options?.activeDns ? [{ id: "active-dns-record" }] : [];
+    }
     if (table === visualCandidatePools) {
       return [{ id: "70000000-0000-4000-8000-000000000007" }];
     }
@@ -688,6 +731,13 @@ function fixture(options?: {
           if (table === siteProjects) Object.assign(project, values);
           if (table === deliveryTickets) Object.assign(ticket, values);
           if (table === workspaceSiteProfiles) Object.assign(profile, values);
+          if (
+            options?.cancelCasFails &&
+            table === siteOperations &&
+            values.status === "cancelled"
+          ) {
+            return [{ affectedRows: 0 }];
+          }
           return [{ affectedRows: 1 }];
         },
       }),
@@ -1092,15 +1142,21 @@ describe("site rebuild reset approval", () => {
           table: siteBuilds,
           values: expect.objectContaining({
             status: "cancelled",
-            quotaState: "released",
           }),
+        }),
+        expect.objectContaining({
+          table: siteBuilds,
+          values: expect.objectContaining({ quotaState: "released" }),
         }),
         expect.objectContaining({
           table: socialPackages,
           values: expect.objectContaining({
             status: "cancelled",
-            quotaState: "released",
           }),
+        }),
+        expect.objectContaining({
+          table: socialPackages,
+          values: expect.objectContaining({ quotaState: "released" }),
         }),
       ]),
     );
@@ -1118,14 +1174,63 @@ describe("site rebuild reset approval", () => {
   });
 
   it.each([
-    { status: "running" },
-    { status: "outcome_unknown" },
-    { status: "queued", providerTaskId: "manus-task-already-created" },
-    { status: "queued", attempt: 1 },
+    { kind: "site_build", provider: "manus", status: "running" },
+    { kind: "build_revision", provider: "manus", status: "outcome_unknown" },
+    {
+      kind: "site_build",
+      provider: "manus",
+      status: "queued",
+      providerTaskId: "manus-task-already-created",
+      result: { preserved: true },
+    },
+    {
+      kind: "social_package",
+      provider: "manus",
+      status: "queued",
+      attempt: 1,
+    },
+    {
+      kind: "visual_search",
+      provider: "21st",
+      status: "outcome_unknown",
+      providerOperationId: "twenty-first-coordinate",
+    },
+  ])(
+    "retires local lineage without discarding provider audit coordinates: $kind/$status",
+    async (activeOperation) => {
+      const state = fixture({ activeOperation });
+
+      await expect(
+        approveSiteOpsRebuildTicket(state.tx, {
+          ticket: state.ticket,
+          actorUserId: 1,
+          now: new Date("2026-08-24T08:00:00.000Z"),
+        }),
+      ).resolves.toMatchObject({ resetApplied: true, resetPending: true });
+      const cancellation = state.updates.find(
+        (entry) =>
+          entry.table === siteOperations && entry.values.status === "cancelled",
+      );
+      expect(cancellation?.values).toMatchObject({
+        status: "cancelled",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        errorCode: "SITEOPS_RESET_APPROVED",
+        completedAt: expect.any(Date),
+      });
+      expect(cancellation?.values).not.toHaveProperty("result");
+      expect(cancellation?.values).not.toHaveProperty("providerTaskId");
+      expect(cancellation?.values).not.toHaveProperty("providerOperationId");
+    },
+  );
+
+  it.each([
     { status: "queued", provider: null },
     { status: "queued", provider: "unexpected-provider" },
+    { status: "queued", provider: "21st", kind: "site_build" },
+    { status: "queued", provider: "manus", kind: "visual_search" },
   ])(
-    "waits for a local task beyond its external boundary: $status",
+    "fails safe for an unknown local lineage: $provider/$kind",
     async (activeOperation) => {
       const state = fixture({ activeOperation });
 
@@ -1141,13 +1246,131 @@ describe("site rebuild reset approval", () => {
     },
   );
 
-  it("waits for the original AliDNS operation before approving reset", async () => {
+  it("aborts reset approval when a leased worker wins the cancellation CAS", async () => {
+    const state = fixture({ activeOperation: true, cancelCasFails: true });
+
+    await expect(
+      approveSiteOpsRebuildTicket(state.tx, {
+        ticket: state.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T08:00:00.000Z"),
+      }),
+    ).rejects.toMatchObject({ code: "IN_FLIGHT_OPERATION" });
+    expect(state.inserts).toHaveLength(0);
+    expect(
+      state.updates.some(
+        (entry) => entry.table === siteBuilds || entry.table === socialPackages,
+      ),
+    ).toBe(false);
+  });
+
+  it("approves immediately while preserving an active AliDNS operation for read-only reconciliation", async () => {
+    const externalOperationId = "80000000-0000-4000-8000-000000000008";
     const state = fixture({
       activeOperation: {
+        id: externalOperationId,
         provider: "aliyun_alidns",
         kind: "dns_apply",
         status: "outcome_unknown",
         attempt: 1,
+      },
+      activeDns: true,
+    });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(result).toMatchObject({
+      resetPending: true,
+      resetOperationId: null,
+    });
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      schemaVersion: 5,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: [externalOperationId],
+    });
+    expect(state.updates).toHaveLength(0);
+    expect(state.inserts).toHaveLength(0);
+  });
+
+  it("idempotently replays the durable deferred approval without a second approval or reset task", async () => {
+    const externalOperationId = "80500000-0000-4000-8000-000000000008";
+    const first = fixture({
+      activeOperation: {
+        id: externalOperationId,
+        provider: "aliyun_alidns",
+        kind: "dns_apply",
+        status: "running",
+        attempt: 1,
+      },
+    });
+    const approval = await approveSiteOpsRebuildTicket(first.tx, {
+      ticket: first.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+    const replay = fixture({
+      internalNote: approval!.internalNote,
+      ticketStatus: "in_progress",
+    });
+
+    await expect(
+      approveSiteOpsRebuildTicket(replay.tx, {
+        ticket: replay.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T08:01:00.000Z"),
+      }),
+    ).resolves.toMatchObject({
+      resetPending: true,
+      resetOperationId: null,
+      pendingReplay: true,
+    });
+    expect(replay.updates).toHaveLength(0);
+    expect(replay.inserts).toHaveLength(0);
+  });
+
+  it("approves during an exact active ESA deployment without cancelling it", async () => {
+    const externalOperationId = "81000000-0000-4000-8000-000000000008";
+    const state = fixture({
+      activeOperation: {
+        id: externalOperationId,
+        provider: "aliyun_esa",
+        kind: "deploy",
+        status: "running",
+        attempt: 1,
+      },
+      activeDeployment: {
+        id: "82000000-0000-4000-8000-000000000008",
+        operationId: externalOperationId,
+      },
+    });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(result).toMatchObject({
+      resetPending: true,
+      resetOperationId: null,
+    });
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      schemaVersion: 5,
+      awaitingExternalOperationIds: [externalOperationId],
+    });
+    expect(state.updates).toHaveLength(0);
+    expect(state.inserts).toHaveLength(0);
+  });
+
+  it("fails safe for an active deployment that is not bound to an exact known Aliyun operation", async () => {
+    const state = fixture({
+      activeDeployment: {
+        id: "82500000-0000-4000-8000-000000000008",
+        operationId: "82600000-0000-4000-8000-000000000008",
       },
     });
 
@@ -1160,6 +1383,269 @@ describe("site rebuild reset approval", () => {
     ).rejects.toMatchObject({ code: "IN_FLIGHT_OPERATION" });
     expect(state.updates).toHaveLength(0);
     expect(state.inserts).toHaveLength(0);
+  });
+
+  it("still retires local generation lineage while an Aliyun write drains", async () => {
+    const localOperationId = "83000000-0000-4000-8000-000000000008";
+    const externalOperationId = "84000000-0000-4000-8000-000000000008";
+    const state = fixture({
+      activeOperations: [
+        {
+          id: localOperationId,
+          provider: "manus",
+          kind: "site_build",
+          status: "running",
+          attempt: 2,
+          result: { providerTaskId: "preserved" },
+          providerOperationId: null,
+          providerTaskId: "manus-task-preserved",
+        },
+        {
+          id: externalOperationId,
+          provider: "aliyun_esa",
+          kind: "deploy",
+          status: "running",
+          attempt: 1,
+          result: null,
+          providerOperationId: "esa-operation-preserved",
+          providerTaskId: null,
+        },
+      ],
+      activeDeployment: {
+        id: "85000000-0000-4000-8000-000000000008",
+        operationId: externalOperationId,
+      },
+    });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      schemaVersion: 5,
+      awaitingExternalOperationIds: [externalOperationId],
+    });
+    const cancellation = state.updates.find(
+      (entry) => entry.table === siteOperations,
+    );
+    expect(cancellation?.values).toMatchObject({
+      status: "cancelled",
+      errorCode: "SITEOPS_RESET_APPROVED",
+    });
+    expect(cancellation?.values).not.toHaveProperty("result");
+    expect(cancellation?.values).not.toHaveProperty("providerOperationId");
+    expect(state.inserts).toHaveLength(0);
+  });
+
+  it("automatically freezes the latest live coordinates after the approved external operation reconciles", async () => {
+    const externalOperationId = "86000000-0000-4000-8000-000000000008";
+    const approvalState = fixture({
+      activeOperation: {
+        id: externalOperationId,
+        provider: "aliyun_esa",
+        kind: "deploy",
+        status: "running",
+        attempt: 1,
+      },
+      activeDeployment: {
+        id: "87000000-0000-4000-8000-000000000008",
+        operationId: externalOperationId,
+      },
+    });
+    const approval = await approveSiteOpsRebuildTicket(approvalState.tx, {
+      ticket: approvalState.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+    const latestBuildId = "88000000-0000-4000-8000-000000000008";
+    const latestSnapshotId = "89000000-0000-4000-8000-000000000008";
+    const latestDeploymentId = "8a000000-0000-4000-8000-000000000008";
+    const state = fixture({
+      internalNote: approval!.internalNote,
+      ticketStatus: "in_progress",
+      projectOverrides: {
+        revision: 19,
+        currentBuildId: latestBuildId,
+        currentKnowledgeSnapshotId: latestSnapshotId,
+        globalLiveDeploymentId: latestDeploymentId,
+        canonicalHostname: "latest.example.com",
+      },
+      reconciledOperations: [
+        {
+          id: externalOperationId,
+          projectId,
+          userId: 9,
+          provider: "aliyun_esa",
+          kind: "deploy",
+          status: "succeeded",
+          completedAt: new Date("2026-08-24T08:04:00.000Z"),
+        },
+      ],
+    });
+
+    const activated = await activateDeferredApprovedSiteOpsReset(state.tx, {
+      ticketId,
+      now: new Date("2026-08-24T08:05:00.000Z"),
+    });
+
+    expect(activated).toMatchObject({
+      status: "activated",
+      resetExpectedProjectRevision: 19,
+    });
+    const queuedReset = state.inserts.find(
+      (entry) => entry.table === siteOperations,
+    )?.values;
+    expect(queuedReset).toMatchObject({
+      buildId: latestBuildId,
+      kind: "rollback",
+      provider: "aliyun_esa",
+      status: "queued",
+      input: {
+        schemaVersion: 1,
+        intent: "approved_reset_unpublish",
+        rebuildTicketId: ticketId,
+        expectedProjectRevision: 19,
+        expectedCurrentBuildId: latestBuildId,
+        expectedKnowledgeSnapshotId: latestSnapshotId,
+        expectedGlobalLiveDeploymentId: latestDeploymentId,
+        expectedMainlandLiveDeploymentId: null,
+        expectedCanonicalHostname: "latest.example.com",
+      },
+    });
+    expect(JSON.parse(state.ticket.internalNote)).toMatchObject({
+      schemaVersion: 4,
+      resetApprovedAt: "2026-08-24T08:00:00.000Z",
+      resetExpectedProjectRevision: 19,
+      sourceBuildId: latestBuildId,
+      knowledgeSnapshotId: latestSnapshotId,
+    });
+    expect(
+      state.updates.some(
+        (entry) =>
+          entry.table === siteOperations && entry.values.status === "cancelled",
+      ),
+    ).toBe(false);
+
+    await expect(
+      activateDeferredApprovedSiteOpsReset(state.tx, {
+        ticketId,
+        now: new Date("2026-08-24T08:06:00.000Z"),
+      }),
+    ).resolves.toEqual({ status: "not_applicable" });
+    expect(
+      state.inserts.filter((entry) => entry.table === siteOperations),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      name: "the original operation is still outcome-unknown",
+      reconciledStatus: "outcome_unknown",
+      activeDns: false,
+    },
+    {
+      name: "the provider operation is terminal but its DNS row is still propagating",
+      reconciledStatus: "succeeded",
+      activeDns: true,
+    },
+  ])(
+    "keeps the approved reset queued while $name",
+    async ({ reconciledStatus, activeDns }) => {
+      const externalOperationId = "8b000000-0000-4000-8000-000000000008";
+      const deferredNote = JSON.stringify({
+        schemaVersion: 5,
+        kind: "frontmind.siteops-rebuild.v1",
+        projectId,
+        sourceBuildId: buildId,
+        knowledgeSnapshotId: snapshotId,
+        resetIntent: "approved_reset_unpublish",
+        resetApprovedAt: "2026-08-24T08:00:00.000Z",
+        minimumKnowledgeSnapshotVersion: 1,
+        resetActivationState: "awaiting_external_reconciliation",
+        awaitingExternalOperationIds: [externalOperationId],
+      });
+      const state = fixture({
+        internalNote: deferredNote,
+        ticketStatus: "in_progress",
+        activeDns,
+        reconciledOperations: [
+          {
+            id: externalOperationId,
+            projectId,
+            userId: 9,
+            provider: "aliyun_alidns",
+            kind: "dns_apply",
+            status: reconciledStatus,
+            completedAt:
+              reconciledStatus === "succeeded"
+                ? new Date("2026-08-24T08:04:00.000Z")
+                : null,
+          },
+        ],
+      });
+
+      await expect(
+        activateDeferredApprovedSiteOpsReset(state.tx, {
+          ticketId,
+          now: new Date("2026-08-24T08:05:00.000Z"),
+        }),
+      ).resolves.toEqual({ status: "awaiting_external_reconciliation" });
+      expect(state.inserts).toHaveLength(0);
+      expect(state.updates).toHaveLength(0);
+      expect(JSON.parse(state.ticket.internalNote)).toMatchObject({
+        schemaVersion: 5,
+      });
+    },
+  );
+
+  it("fails safe if an unrecognized active provider appears before deferred activation", async () => {
+    const externalOperationId = "8c000000-0000-4000-8000-000000000008";
+    const deferredNote = JSON.stringify({
+      schemaVersion: 5,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: buildId,
+      knowledgeSnapshotId: snapshotId,
+      resetIntent: "approved_reset_unpublish",
+      resetApprovedAt: "2026-08-24T08:00:00.000Z",
+      minimumKnowledgeSnapshotVersion: 1,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: [externalOperationId],
+    });
+    const state = fixture({
+      internalNote: deferredNote,
+      ticketStatus: "in_progress",
+      reconciledOperations: [
+        {
+          id: externalOperationId,
+          projectId,
+          userId: 9,
+          provider: "aliyun_esa",
+          kind: "deploy",
+          status: "succeeded",
+          completedAt: new Date("2026-08-24T08:04:00.000Z"),
+        },
+      ],
+      activeOperations: [
+        {
+          id: "8d000000-0000-4000-8000-000000000008",
+          provider: "unknown-provider",
+          kind: "deploy",
+          status: "running",
+        },
+      ],
+    });
+
+    await expect(
+      activateDeferredApprovedSiteOpsReset(state.tx, {
+        ticketId,
+        now: new Date("2026-08-24T08:05:00.000Z"),
+      }),
+    ).resolves.toEqual({ status: "blocked" });
+    expect(state.inserts).toHaveLength(0);
+    expect(state.updates).toHaveLength(0);
   });
 
   it("atomically clears live heads and build lineage while preserving the active knowledge snapshot", async () => {

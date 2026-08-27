@@ -58,7 +58,8 @@ ENV NODE_ENV=production \
 
 LABEL org.opencontainers.image.source="https://github.com/xiafanzeng/frontmind-dashboard" \
       org.opencontainers.image.revision="${SOURCE_SHA}" \
-      org.opencontainers.image.version="${IMAGE_VERSION}"
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      net.frontmind.runtime.roles="web,siteops-worker"
 
 WORKDIR /app
 

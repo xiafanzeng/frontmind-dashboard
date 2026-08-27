@@ -58,8 +58,10 @@ import {
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
+  siteOpsInteractionStateSchema,
   siteOpsObservationV1Schema,
   type SiteOpsExecutionStep,
+  type SiteOpsObservationV1,
 } from "../../shared/siteops-contract";
 import {
   referenceBlueprintForVisualCandidate,
@@ -135,6 +137,20 @@ export class SiteOpsServiceError extends Error {
     this.name = "SiteOpsServiceError";
   }
 }
+
+export const siteOpsActionAckV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    accepted: z.literal(true),
+    clientRequestId: z.string().trim().min(8).max(128),
+    operationId: z.string().uuid().nullable(),
+    projectRevision: z.number().int().positive(),
+    latestSequence: z.number().int().nonnegative(),
+    interactionState: siteOpsInteractionStateSchema,
+  })
+  .strict();
+
+export type SiteOpsActionAckV1 = z.infer<typeof siteOpsActionAckV1Schema>;
 
 export function siteOpsServiceErrorFromQuota(error: SiteOpsQuotaError) {
   return new SiteOpsServiceError(
@@ -1019,46 +1035,46 @@ async function loadServiceReadiness(
   executor: any,
   input: { projectId: string; userId: number },
 ) {
-  const [platformCredentials, aiBuilderCredentials, connections] =
-    await Promise.all([
-      executor
-        .select({ slot: presalesApiCredentials.slot })
-        .from(presalesApiCredentials)
-        .where(
-          and(
-            inArray(presalesApiCredentials.slot, [
-              "site_builder_21st",
-              "siteops_aliyun_oauth",
-            ]),
-            eq(presalesApiCredentials.status, "active"),
-            eq(presalesApiCredentials.validationStatus, "verified"),
-          ),
-        ),
-      executor
-        .select({ id: apiCredentials.id })
-        .from(apiCredentials)
-        .where(
-          and(
-            eq(apiCredentials.userId, input.userId),
-            eq(apiCredentials.status, "active"),
-            eq(apiCredentials.validationStatus, "verified"),
-            isNotNull(apiCredentials.verifiedAt),
-            isNull(apiCredentials.deletedAt),
-          ),
-        )
-        .orderBy(desc(apiCredentials.version))
-        .limit(1),
-      executor
-        .select({ status: siteProviderConnections.status })
-        .from(siteProviderConnections)
-        .where(
-          and(
-            eq(siteProviderConnections.projectId, input.projectId),
-            eq(siteProviderConnections.provider, "aliyun_cn"),
-          ),
-        )
-        .limit(1),
-    ]);
+  // Readiness is part of the larger observation projection. Keep these three
+  // small lookups sequential so the outer four-query wave remains the actual
+  // upper bound on database work for one observation.
+  const platformCredentials = await executor
+    .select({ slot: presalesApiCredentials.slot })
+    .from(presalesApiCredentials)
+    .where(
+      and(
+        inArray(presalesApiCredentials.slot, [
+          "site_builder_21st",
+          "siteops_aliyun_oauth",
+        ]),
+        eq(presalesApiCredentials.status, "active"),
+        eq(presalesApiCredentials.validationStatus, "verified"),
+      ),
+    );
+  const aiBuilderCredentials = await executor
+    .select({ id: apiCredentials.id })
+    .from(apiCredentials)
+    .where(
+      and(
+        eq(apiCredentials.userId, input.userId),
+        eq(apiCredentials.status, "active"),
+        eq(apiCredentials.validationStatus, "verified"),
+        isNotNull(apiCredentials.verifiedAt),
+        isNull(apiCredentials.deletedAt),
+      ),
+    )
+    .orderBy(desc(apiCredentials.version))
+    .limit(1);
+  const connections = await executor
+    .select({ status: siteProviderConnections.status })
+    .from(siteProviderConnections)
+    .where(
+      and(
+        eq(siteProviderConnections.projectId, input.projectId),
+        eq(siteProviderConnections.provider, "aliyun_cn"),
+      ),
+    )
+    .limit(1);
   const hasTwentyFirstCredential = platformCredentials.some(
     (row: { slot: string }) => row.slot === "site_builder_21st",
   );
@@ -1449,6 +1465,7 @@ export function projectSiteOpsExecutionSteps(input: {
     buildId: string | null;
     kind: string;
     status: string;
+    result?: Record<string, unknown> | null;
     startedAt: Date | null;
     completedAt: Date | null;
     createdAt: Date;
@@ -1494,6 +1511,16 @@ export function projectSiteOpsExecutionSteps(input: {
       | "site_build"
       | "build_revision"
       | "deploy";
+    const fallbackMarker = siteOpsTrustedFallbackPreviewFromResult(
+      operation.result,
+    );
+    const trustedFallback =
+      fallbackMarker?.status === "bound" ? fallbackMarker : null;
+    const fallbackCompletedAt = trustedFallback
+      ? new Date(trustedFallback.createdAt)
+      : null;
+    const timelineCompletedAt = operation.completedAt ?? fallbackCompletedAt;
+    const timelineStatus = trustedFallback ? "succeeded" : operation.status;
     if (operationKind === "visual_search") {
       const startedAt = operation.startedAt ?? operation.createdAt;
       return [
@@ -1503,9 +1530,9 @@ export function projectSiteOpsExecutionSteps(input: {
           buildId: null,
           stage: "visual_searching" as const,
           label: SITEOPS_EXECUTION_STAGE_LABELS.visual_searching,
-          status: publicExecutionStatus(operation.status),
+          status: publicExecutionStatus(timelineStatus),
           startedAt: startedAt.toISOString(),
-          completedAt: operation.completedAt?.toISOString() ?? null,
+          completedAt: timelineCompletedAt?.toISOString() ?? null,
         },
       ];
     }
@@ -1523,13 +1550,17 @@ export function projectSiteOpsExecutionSteps(input: {
           operationKind,
           buildId: operation.buildId,
           stage:
-            operation.status === "succeeded"
+            timelineStatus === "succeeded"
               ? ("completed" as const)
               : ("preparing" as const),
-          label: operation.status === "succeeded" ? "官网制作" : "官网制作中",
-          status: publicExecutionStatus(operation.status),
+          label: trustedFallback
+            ? "官网基础预览"
+            : timelineStatus === "succeeded"
+              ? "官网制作"
+              : "官网制作中",
+          status: publicExecutionStatus(timelineStatus),
           startedAt: startedAt.toISOString(),
-          completedAt: operation.completedAt?.toISOString() ?? null,
+          completedAt: timelineCompletedAt?.toISOString() ?? null,
         },
       ];
     }
@@ -1559,8 +1590,8 @@ export function projectSiteOpsExecutionSteps(input: {
       const next = ordered[index + 1];
       const completedAt =
         next?.startedAt ??
-        (operation.completedAt && operation.status !== "running"
-          ? operation.completedAt
+        (timelineCompletedAt && timelineStatus !== "running"
+          ? timelineCompletedAt
           : null);
       return {
         id: `${operation.id}:${event.stage}`,
@@ -1570,7 +1601,7 @@ export function projectSiteOpsExecutionSteps(input: {
         label: SITEOPS_EXECUTION_STAGE_LABELS[event.stage],
         status: next
           ? ("succeeded" as const)
-          : publicExecutionStatus(operation.status),
+          : publicExecutionStatus(timelineStatus),
         startedAt: event.startedAt.toISOString(),
         completedAt: completedAt?.toISOString() ?? null,
       };
@@ -1826,7 +1857,57 @@ export function projectSiteOpsCurrentResetCycle<
   } as SiteOpsResetCycleProjectedRows<Input>;
 }
 
-async function projectObservation(
+const siteOpsObservationFlights = new Map<string, Promise<unknown>>();
+
+export async function runSiteOpsObservationQueries(
+  tasks: ReadonlyArray<() => Promise<unknown>>,
+  concurrency = 4,
+) {
+  const width = Math.max(1, Math.min(4, Math.trunc(concurrency)));
+  const results: unknown[] = [];
+  for (let offset = 0; offset < tasks.length; offset += width) {
+    const wave = tasks.slice(offset, offset + width);
+    results.push(...(await Promise.all(wave.map((task) => task()))));
+  }
+  return results;
+}
+
+export function siteOpsObservationFlightKey(input: {
+  userId: number;
+  project: Pick<
+    typeof siteProjects.$inferSelect,
+    "id" | "revision" | "currentTaskStartedAt"
+  >;
+  afterSequence?: number;
+}) {
+  return [
+    input.userId,
+    input.project.id,
+    input.project.revision,
+    input.project.currentTaskStartedAt.toISOString(),
+    input.afterSequence ?? "full",
+  ].join(":");
+}
+
+export async function runSiteOpsObservationSingleFlight<T>(
+  key: string,
+  task: () => Promise<T>,
+) {
+  const existing = siteOpsObservationFlights.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const flight = task();
+  siteOpsObservationFlights.set(key, flight);
+  try {
+    return await flight;
+  } finally {
+    if (siteOpsObservationFlights.get(key) === flight) {
+      siteOpsObservationFlights.delete(key);
+    }
+  }
+}
+
+async function projectObservationOnce(
   executor: any,
   input: {
     userId: number;
@@ -1862,192 +1943,206 @@ async function projectObservation(
     activeAliyunOperationRows,
     currentVisualPoolRows,
     rebuildRequest,
-  ] = await Promise.all([
-    executor
-      .select()
-      .from(messages)
-      .where(messagePredicate)
-      .orderBy(asc(messages.sequence))
-      .limit(500),
-    executor
-      .select({
-        id: messages.id,
-        metadata: messages.metadata,
-        sentAt: messages.sentAt,
-      })
-      .from(messages)
-      .where(
-        and(
-          eq(messages.conversationId, input.project.conversationId),
-          isNull(messages.deletedAt),
-          gte(messages.sentAt, input.project.currentTaskStartedAt),
-        ),
-      )
-      .orderBy(asc(messages.sequence))
-      .limit(500),
-    executor
-      .select()
-      .from(siteBuilds)
-      .where(
-        and(
-          eq(siteBuilds.projectId, input.project.id),
-          eq(siteBuilds.userId, input.userId),
-          gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
-        ),
-      )
-      .orderBy(desc(siteBuilds.ordinal))
-      .limit(50),
-    executor
-      .select()
-      .from(siteDeployments)
-      .where(
-        and(
-          eq(siteDeployments.projectId, input.project.id),
-          eq(siteDeployments.userId, input.userId),
-          gte(siteDeployments.createdAt, input.project.currentTaskStartedAt),
-        ),
-      )
-      .orderBy(desc(siteDeployments.createdAt))
-      .limit(50),
-    executor
-      .select()
-      .from(socialPackages)
-      .where(
-        and(
-          eq(socialPackages.projectId, input.project.id),
-          eq(socialPackages.userId, input.userId),
-          gte(socialPackages.createdAt, input.project.currentTaskStartedAt),
-        ),
-      )
-      .orderBy(desc(socialPackages.createdAt))
-      .limit(50),
-    loadServiceReadiness(executor, {
-      projectId: input.project.id,
-      userId: input.userId,
-    }),
-    executor
-      .select()
-      .from(knowledgeBaseSnapshots)
-      .where(
-        and(
-          eq(knowledgeBaseSnapshots.userId, input.userId),
-          eq(knowledgeBaseSnapshots.status, "active"),
-          gte(
-            knowledgeBaseSnapshots.version,
-            input.project.minimumKnowledgeSnapshotVersion ?? 1,
+  ] = (await runSiteOpsObservationQueries([
+    () =>
+      executor
+        .select()
+        .from(messages)
+        .where(messagePredicate)
+        .orderBy(asc(messages.sequence))
+        .limit(500),
+    () =>
+      executor
+        .select({
+          id: messages.id,
+          metadata: messages.metadata,
+          sentAt: messages.sentAt,
+        })
+        .from(messages)
+        .where(
+          and(
+            eq(messages.conversationId, input.project.conversationId),
+            isNull(messages.deletedAt),
+            gte(messages.sentAt, input.project.currentTaskStartedAt),
           ),
-        ),
-      )
-      .orderBy(desc(knowledgeBaseSnapshots.version))
-      .limit(200),
-    executor
-      .select()
-      .from(websiteStyleSampleBatches)
-      .where(
-        and(
-          eq(websiteStyleSampleBatches.userId, input.userId),
-          eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
-          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-          gte(
-            websiteStyleSampleBatches.createdAt,
-            input.project.currentTaskStartedAt,
+        )
+        .orderBy(asc(messages.sequence))
+        .limit(500),
+    () =>
+      executor
+        .select()
+        .from(siteBuilds)
+        .where(
+          and(
+            eq(siteBuilds.projectId, input.project.id),
+            eq(siteBuilds.userId, input.userId),
+            gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
           ),
-          customerVisibleStyleBatchStatusCondition(),
-        ),
-      )
-      .orderBy(desc(websiteStyleSampleBatches.ordinal))
-      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES + 1),
-    executor
-      .select({
-        id: siteOperations.id,
-        buildId: siteOperations.buildId,
-        kind: siteOperations.kind,
-        status: siteOperations.status,
-        input: siteOperations.input,
-        provider: siteOperations.provider,
-        providerTaskId: siteOperations.providerTaskId,
-        result: siteOperations.result,
-        errorCode: siteOperations.errorCode,
-        startedAt: siteOperations.startedAt,
-        completedAt: siteOperations.completedAt,
-        createdAt: siteOperations.createdAt,
-        updatedAt: siteOperations.updatedAt,
-      })
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.userId),
-          gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
-          inArray(siteOperations.kind, [
-            "visual_search",
-            "site_build",
-            "build_revision",
-            "deploy",
-          ]),
-        ),
-      )
-      .orderBy(desc(siteOperations.createdAt))
-      .limit(50),
-    executor
-      .select()
-      .from(siteProviderConnections)
-      .where(
-        and(
-          eq(siteProviderConnections.projectId, input.project.id),
-          eq(siteProviderConnections.userId, input.userId),
-          eq(siteProviderConnections.provider, "aliyun_cn"),
-        ),
-      )
-      .limit(1),
-    executor
-      .select()
-      .from(workspaceSiteProfiles)
-      .where(eq(workspaceSiteProfiles.userId, input.userId))
-      .limit(1),
-    executor
-      .select({ id: siteOperations.id })
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.userId),
-          inArray(siteOperations.provider, ["aliyun_esa", "aliyun_alidns"]),
-          inArray(siteOperations.status, [
-            "queued",
-            "running",
-            "outcome_unknown",
-          ]),
-        ),
-      )
-      .limit(1),
-    executor
-      .select({ id: visualCandidatePools.id })
-      .from(visualCandidatePools)
-      .where(
-        and(
-          eq(visualCandidatePools.projectId, input.project.id),
-          eq(visualCandidatePools.userId, input.userId),
-          eq(
-            visualCandidatePools.taskStartedAt,
-            input.project.currentTaskStartedAt,
+        )
+        .orderBy(desc(siteBuilds.ordinal))
+        .limit(50),
+    () =>
+      executor
+        .select()
+        .from(siteDeployments)
+        .where(
+          and(
+            eq(siteDeployments.projectId, input.project.id),
+            eq(siteDeployments.userId, input.userId),
+            gte(siteDeployments.createdAt, input.project.currentTaskStartedAt),
           ),
-          inArray(visualCandidatePools.status, ["active", "selected"]),
+        )
+        .orderBy(desc(siteDeployments.createdAt))
+        .limit(50),
+    () =>
+      executor
+        .select()
+        .from(socialPackages)
+        .where(
+          and(
+            eq(socialPackages.projectId, input.project.id),
+            eq(socialPackages.userId, input.userId),
+            gte(socialPackages.createdAt, input.project.currentTaskStartedAt),
+          ),
+        )
+        .orderBy(desc(socialPackages.createdAt))
+        .limit(50),
+    () =>
+      loadServiceReadiness(executor, {
+        projectId: input.project.id,
+        userId: input.userId,
+      }),
+    () =>
+      executor
+        .select()
+        .from(knowledgeBaseSnapshots)
+        .where(
+          and(
+            eq(knowledgeBaseSnapshots.userId, input.userId),
+            eq(knowledgeBaseSnapshots.status, "active"),
+            gte(
+              knowledgeBaseSnapshots.version,
+              input.project.minimumKnowledgeSnapshotVersion ?? 1,
+            ),
+          ),
+        )
+        .orderBy(desc(knowledgeBaseSnapshots.version))
+        .limit(200),
+    () =>
+      executor
+        .select()
+        .from(websiteStyleSampleBatches)
+        .where(
+          and(
+            eq(websiteStyleSampleBatches.userId, input.userId),
+            eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+            eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+            gte(
+              websiteStyleSampleBatches.createdAt,
+              input.project.currentTaskStartedAt,
+            ),
+            customerVisibleStyleBatchStatusCondition(),
+          ),
+        )
+        .orderBy(desc(websiteStyleSampleBatches.ordinal))
+        .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES + 1),
+    () =>
+      executor
+        .select({
+          id: siteOperations.id,
+          buildId: siteOperations.buildId,
+          kind: siteOperations.kind,
+          status: siteOperations.status,
+          input: siteOperations.input,
+          provider: siteOperations.provider,
+          providerTaskId: siteOperations.providerTaskId,
+          result: siteOperations.result,
+          errorCode: siteOperations.errorCode,
+          startedAt: siteOperations.startedAt,
+          completedAt: siteOperations.completedAt,
+          createdAt: siteOperations.createdAt,
+          updatedAt: siteOperations.updatedAt,
+        })
+        .from(siteOperations)
+        .where(
+          and(
+            eq(siteOperations.projectId, input.project.id),
+            eq(siteOperations.userId, input.userId),
+            gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
+            inArray(siteOperations.kind, [
+              "visual_search",
+              "site_build",
+              "build_revision",
+              "deploy",
+            ]),
+          ),
+        )
+        .orderBy(desc(siteOperations.createdAt))
+        .limit(50),
+    () =>
+      executor
+        .select()
+        .from(siteProviderConnections)
+        .where(
+          and(
+            eq(siteProviderConnections.projectId, input.project.id),
+            eq(siteProviderConnections.userId, input.userId),
+            eq(siteProviderConnections.provider, "aliyun_cn"),
+          ),
+        )
+        .limit(1),
+    () =>
+      executor
+        .select()
+        .from(workspaceSiteProfiles)
+        .where(eq(workspaceSiteProfiles.userId, input.userId))
+        .limit(1),
+    () =>
+      executor
+        .select({ id: siteOperations.id })
+        .from(siteOperations)
+        .where(
+          and(
+            eq(siteOperations.projectId, input.project.id),
+            eq(siteOperations.userId, input.userId),
+            inArray(siteOperations.provider, ["aliyun_esa", "aliyun_alidns"]),
+            inArray(siteOperations.status, [
+              "queued",
+              "running",
+              "outcome_unknown",
+            ]),
+          ),
+        )
+        .limit(1),
+    () =>
+      executor
+        .select({ id: visualCandidatePools.id })
+        .from(visualCandidatePools)
+        .where(
+          and(
+            eq(visualCandidatePools.projectId, input.project.id),
+            eq(visualCandidatePools.userId, input.userId),
+            eq(
+              visualCandidatePools.taskStartedAt,
+              input.project.currentTaskStartedAt,
+            ),
+            inArray(visualCandidatePools.status, ["active", "selected"]),
+          ),
+        )
+        .orderBy(desc(visualCandidatePools.createdAt))
+        .limit(1),
+    () =>
+      loadSiteOpsRebuildRequest(executor, {
+        userId: input.userId,
+        projectId: input.project.id,
+        currentBuildId: input.project.currentBuildId,
+        hasWorkflowProgress: Boolean(
+          input.project.currentBuildId ||
+            input.project.currentKnowledgeSnapshotId ||
+            input.project.status !== "draft",
         ),
-      )
-      .orderBy(desc(visualCandidatePools.createdAt))
-      .limit(1),
-    loadSiteOpsRebuildRequest(executor, {
-      userId: input.userId,
-      projectId: input.project.id,
-      currentBuildId: input.project.currentBuildId,
-      hasWorkflowProgress: Boolean(
-        input.project.currentBuildId ||
-          input.project.currentKnowledgeSnapshotId ||
-          input.project.status !== "draft",
-      ),
-    }),
-  ]);
+      }),
+  ])) as any[];
 
   const {
     messageRows,
@@ -2453,6 +2548,20 @@ async function projectObservation(
     ),
   };
   return siteOpsObservationV1Schema.parse(observation);
+}
+
+async function projectObservation(
+  executor: any,
+  input: {
+    userId: number;
+    project: typeof siteProjects.$inferSelect;
+    afterSequence?: number;
+  },
+) {
+  const key = siteOpsObservationFlightKey(input);
+  return runSiteOpsObservationSingleFlight(key, () =>
+    projectObservationOnce(executor, input),
+  );
 }
 
 export async function openSiteOps(actor: AuthenticatedUser) {
@@ -4964,7 +5073,70 @@ async function handleDomainSync(
     .where(eq(siteProjects.id, input.project.id));
 }
 
-export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
+async function projectSiteOpsActionAck(
+  executor: any,
+  input: {
+    actorId: number;
+    projectId: string;
+    conversationId: string;
+    clientRequestId: string;
+  },
+): Promise<SiteOpsActionAckV1> {
+  const [projectRows, operationRows, sequenceRows] = await Promise.all([
+    executor
+      .select({
+        revision: siteProjects.revision,
+        status: siteProjects.status,
+      })
+      .from(siteProjects)
+      .where(
+        and(
+          eq(siteProjects.id, input.projectId),
+          eq(siteProjects.userId, input.actorId),
+        ),
+      )
+      .limit(1),
+    executor
+      .select({ id: siteOperations.id })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.projectId),
+          eq(siteOperations.userId, input.actorId),
+          eq(siteOperations.clientRequestId, input.clientRequestId),
+        ),
+      )
+      .limit(1),
+    executor
+      .select({ sequence: max(messages.sequence) })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, input.conversationId),
+          isNull(messages.deletedAt),
+        ),
+      ),
+  ]);
+  const project = projectRows[0];
+  if (!project) {
+    throw new SiteOpsServiceError("NOT_FOUND", "AI 建站会话不存在。", 404);
+  }
+  return siteOpsActionAckV1Schema.parse({
+    schemaVersion: 1,
+    accepted: true,
+    clientRequestId: input.clientRequestId,
+    operationId: operationRows[0]?.id ?? null,
+    projectRevision: project.revision,
+    latestSequence: Number(sequenceRows[0]?.sequence ?? 0),
+    interactionState:
+      project.status === "draft" ? "select_snapshot" : project.status,
+  });
+}
+
+export async function actOnSiteOpsFast(
+  actor: AuthenticatedUser,
+  value: unknown,
+) {
   assertEnabled();
   assertCustomer(actor);
   const input = siteOpsActInputSchema.parse(value);
@@ -4981,7 +5153,7 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         )
       : undefined;
   const db = await requireDb();
-  await db.transaction(async (tx: any) => {
+  return db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
       tx,
       actor.id,
@@ -5015,7 +5187,50 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         ),
       )
       .limit(1);
-    if (isSiteOpsOperationReplay(existing[0], requestHash)) return;
+    const existingTurns = await tx
+      .select({
+        id: conversationTurns.id,
+        requestHash: conversationTurns.requestHash,
+        metadata: conversationTurns.metadata,
+      })
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.conversationId, project.conversationId),
+          eq(conversationTurns.clientRequestId, input.clientRequestId),
+        ),
+      )
+      .limit(1);
+    const existingTurn = existingTurns[0];
+    const operationReplay = isSiteOpsOperationReplay(existing[0], requestHash);
+    const turnReplay = isSiteOpsOperationReplay(
+      existingTurn ? { inputHash: existingTurn.requestHash ?? "" } : undefined,
+      requestHash,
+    );
+    if (operationReplay || turnReplay) {
+      const storedAck = siteOpsActionAckV1Schema.safeParse(
+        existingTurn?.metadata?.actFastAck,
+      );
+      if (storedAck.success) return storedAck.data;
+      const replayAck = await projectSiteOpsActionAck(tx, {
+        actorId: actor.id,
+        projectId: project.id,
+        conversationId: project.conversationId,
+        clientRequestId: input.clientRequestId,
+      });
+      if (existingTurn) {
+        await tx
+          .update(conversationTurns)
+          .set({
+            metadata: {
+              ...(existingTurn.metadata ?? {}),
+              actFastAck: replayAck,
+            },
+          })
+          .where(eq(conversationTurns.id, existingTurn.id));
+      }
+      return replayAck;
+    }
     if (project.revision !== input.expectedRevision) {
       throw new SiteOpsServiceError(
         "REVISION_CONFLICT",
@@ -5159,6 +5374,28 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         });
         break;
     }
+    const ack = await projectSiteOpsActionAck(tx, {
+      actorId: actor.id,
+      projectId: project.id,
+      conversationId: project.conversationId,
+      clientRequestId: input.clientRequestId,
+    });
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: {
+          executionKind: "site_ops",
+          action: input.action,
+          actFastAck: ack,
+        },
+      })
+      .where(eq(conversationTurns.id, turnId));
+    return ack;
   });
+}
+
+export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
+  const input = siteOpsActInputSchema.parse(value);
+  await actOnSiteOpsFast(actor, input);
   return observeSiteOps(actor, { conversationId: input.conversationId });
 }

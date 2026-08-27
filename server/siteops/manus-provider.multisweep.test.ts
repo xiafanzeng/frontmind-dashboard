@@ -27,6 +27,8 @@ vi.mock("./remote-preview", () => ({
 }));
 
 import {
+  NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
+  createNativeRejectedCandidateV1,
   createManusSiteOpsProviderHandler,
   nativeTemplateCoordinateDirective,
 } from "./manus-provider";
@@ -1249,6 +1251,45 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     client.listAllMessages.mockResolvedValue(formalEvents);
     failDistOnce = true;
 
+    remotePreview.fetchPinnedPublicHttps.mockClear();
+    const rejectedCandidateState = {
+      ...boundFallbackState,
+      nativeRejectedCandidateV1: createNativeRejectedCandidateV1({
+        taskId,
+        repairAttempt: 0,
+        operationToken,
+        attachmentIdentity: "native-source:attachment:0",
+        archiveSha256: finalSourceSha256,
+        errorCode: "NATIVE_SOURCE_PACKAGE_JSON_INVALID",
+        rejectedAt: new Date("2026-08-27T14:00:00.000Z"),
+      }),
+    };
+    for (let sweep = 0; sweep < 20; sweep += 1) {
+      await expect(
+        handler({
+          operation: operationWithState(
+            baseOperation,
+            taskId,
+            rejectedCandidateState,
+          ) as never,
+          signal: new AbortController().signal,
+          assertLeaseActive,
+        }),
+      ).resolves.toMatchObject({
+        status: "pending",
+        providerTaskId: taskId,
+        nextPollMs: NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
+        result: {
+          nativeRejectedCandidateV1: {
+            archiveSha256: finalSourceSha256,
+          },
+        },
+      });
+    }
+    expect(remotePreview.fetchPinnedPublicHttps).not.toHaveBeenCalled();
+    expect(materializeNativeSite).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
+
     const transientDownload = await handler({
       operation: operationWithState(
         baseOperation,
@@ -1261,7 +1302,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     expect(transientDownload).toMatchObject({
       status: "pending",
       providerTaskId: taskId,
-      nextPollMs: 10_000,
+      nextPollMs: NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
       result: {
         stage: "native_source_pending",
         nativeSourceReadFailureCount: 5,
