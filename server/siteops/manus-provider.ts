@@ -41,7 +41,10 @@ import {
   managedAgentProfileModel,
   managedAgentProfileSchema,
 } from "../../shared/manus-agent-profile";
-import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
+import {
+  canonicalJson,
+  createVisualEvidenceV1,
+} from "../../shared/siteops-workflow";
 import {
   canonicalSiteOpsSha256,
   composeBuildContractV2,
@@ -1834,6 +1837,63 @@ function nativeSourceOutputAttachment(
 
 type NativeSelection = Awaited<ReturnType<typeof selectedNativeSourceArchive>>;
 
+const nativeTemplateCoordinateV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sourceFormat: z.literal("provider_archive_v1"),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceSubdirectory: z.string().trim().min(1).max(240).nullable(),
+    framework: z.enum(["vite_react", "next_static"]),
+    entrypoint: z.string().trim().min(1).max(500),
+    providerArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
+const FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME =
+  "frontmind-selected-template-coordinate-v1.json";
+
+/**
+ * Bind a selected Marketplace template to its exact entrypoint without
+ * mutating the untouched Provider archive. This matters for registry repos
+ * that contain several templates at one immutable commit.
+ */
+export function nativeTemplateCoordinateDirective(source: NativeSelection) {
+  if (
+    source.bundle.schemaVersion !== 6 ||
+    !("sourceFormat" in source.candidate) ||
+    source.candidate.sourceFormat !== "provider_archive_v1" ||
+    !("sourceFormat" in source.manifest) ||
+    source.manifest.sourceFormat !== "provider_archive_v1"
+  ) {
+    return null;
+  }
+  const manifest = nativeTemplateCoordinateV1Schema.parse({
+    schemaVersion: 1,
+    sourceFormat: "provider_archive_v1",
+    providerTemplateId: source.manifest.providerTemplateId,
+    providerSlug: source.manifest.providerSlug,
+    providerVersion: source.manifest.providerVersion,
+    sourceSubdirectory: source.manifest.sourceSubdirectory,
+    framework: source.manifest.framework,
+    entrypoint: source.manifest.entrypoint,
+    providerArchiveSha256: source.manifest.providerArchiveSha256,
+    sourceTreeSha256: source.manifest.sourceTreeSha256,
+  });
+  const bytes = Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
+  return {
+    manifest,
+    promptInstruction: `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是所选完整 Template 的唯一执行坐标。必须只使用其中指定的 providerSlug、sourceSubdirectory 和 entrypoint；即使源码 ZIP 同时包含同一仓库的其他模板，也必须全部忽略，不得自行选择相邻模板或仓库默认首页。`,
+    attachment: {
+      filename: FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME,
+      mime_type: "application/json",
+      file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+    } as const,
+  };
+}
+
 function nativeSourceInputAttachment(source: NativeSelection) {
   if (source.bundle.schemaVersion === 6) {
     assertVisualSelectionBundleV6SourceArchiveSize(source.archiveBytes);
@@ -1874,6 +1934,7 @@ function nativeSourcePrompt(input: {
   operationToken: string;
   baseSourceSha256: string;
   hasCustomerFeedback?: boolean;
+  templateCoordinateInstruction?: string;
   repair?: {
     attempt: number;
     kind: "compile" | "hard_safety";
@@ -1902,6 +1963,8 @@ function nativeSourcePrompt(input: {
     `${TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT}
 
 frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZIP 是唯一视觉与组件基线。不得采用附件之外的企业事实、媒体、依赖或外部资源。
+
+${input.templateCoordinateInstruction ?? ""}
 
 ${input.hasCustomerFeedback ? "本次客户修改要求位于 frontmind-customer-feedback-v1.json；只能在知识事实和原生样式边界内落实。" : ""}
 
@@ -1959,6 +2022,9 @@ async function handleNativeReactSiteBuild(input: {
     supportEvidenceSha256s: [],
     taxonomy: input.taxonomy,
   });
+  const templateCoordinate = nativeTemplateCoordinateDirective(
+    input.nativeSelection,
+  );
   const sourceAttachments = (token: string) => [
     ...siteOpsSourceDossierAttachments({
       operationToken: token,
@@ -1973,6 +2039,7 @@ async function handleNativeReactSiteBuild(input: {
       documents: input.documents,
     }),
     nativeSourceInputAttachment(input.nativeSelection),
+    ...(templateCoordinate ? [templateCoordinate.attachment] : []),
     ...nativeBrandAttachment(input.brandAsset),
     ...(input.input.feedback
       ? [siteOpsCustomerFeedbackAttachment(input.input.feedback)]
@@ -2007,6 +2074,8 @@ async function handleNativeReactSiteBuild(input: {
             operationToken,
             baseSourceSha256,
             hasCustomerFeedback: Boolean(input.input.feedback),
+            templateCoordinateInstruction:
+              templateCoordinate?.promptInstruction,
           }),
           attachments: sourceAttachments(operationToken),
           locale: input.brief.primaryLanguage,
@@ -2118,6 +2187,7 @@ async function handleNativeReactSiteBuild(input: {
           operationToken: nextToken,
           baseSourceSha256,
           hasCustomerFeedback: Boolean(input.input.feedback),
+          templateCoordinateInstruction: templateCoordinate?.promptInstruction,
           repair: {
             attempt: nextAttempt,
             kind: repairInput.kind,

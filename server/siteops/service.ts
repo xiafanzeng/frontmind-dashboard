@@ -2758,7 +2758,7 @@ export function requireTwentyFirstTemplateAdmission(
         ? "当前 21st 账号没有完整 Template 下载权限，请联系 FrontMind 管理员更新。"
         : status.nativeTemplateReadiness === "compiler_unavailable"
           ? "完整 Template 构建环境尚未就绪，请联系 FrontMind 管理员处理。"
-          : "完整 Template 目录或下载权限尚未就绪，请联系 FrontMind 管理员更新。",
+          : "21st 完整 Template 目录暂时不可用，请稍后重试。",
       409,
     );
   }

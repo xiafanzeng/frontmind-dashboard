@@ -26,7 +26,10 @@ vi.mock("./remote-preview", () => ({
   fetchPinnedPublicHttps: remotePreview.fetchPinnedPublicHttps,
 }));
 
-import { createManusSiteOpsProviderHandler } from "./manus-provider";
+import {
+  createManusSiteOpsProviderHandler,
+  nativeTemplateCoordinateDirective,
+} from "./manus-provider";
 import { SiteOpsMaterializationError } from "./materialization-error";
 import { ManusV2ApiError } from "../manus-v2-client";
 import {
@@ -37,6 +40,74 @@ import {
 
 const sha256 = (value: Buffer | string) =>
   createHash("sha256").update(value).digest("hex");
+
+describe("native Template coordinates", () => {
+  it("binds shared-repository Hirael templates to distinct canonical Manus coordinates", () => {
+    const sharedArchiveSha256 = sha256("shared-hirael-repository");
+    const selection = (slug: string, sourceSubdirectory: string) =>
+      ({
+        bundle: { schemaVersion: 6 },
+        candidate: { sourceFormat: "provider_archive_v1" },
+        manifest: {
+          sourceFormat: "provider_archive_v1",
+          providerTemplateId: `hirael/${slug}`,
+          providerSlug: slug,
+          providerVersion: "0123456789abcdef0123456789abcdef01234567",
+          sourceSubdirectory,
+          framework: "next_static",
+          entrypoint: `${sourceSubdirectory}/app/page.tsx`,
+          providerArchiveSha256: sharedArchiveSha256,
+          sourceTreeSha256: sha256(`hirael:${slug}:${sourceSubdirectory}`),
+        },
+      }) as never;
+
+    const commerce = nativeTemplateCoordinateDirective(
+      selection("hirael-commerce", "registry/templates/commerce"),
+    );
+    const studio = nativeTemplateCoordinateDirective(
+      selection("hirael-studio", "registry/templates/studio"),
+    );
+    expect(commerce).not.toBeNull();
+    expect(studio).not.toBeNull();
+
+    const decode = (directive: NonNullable<typeof commerce>) => {
+      const encoded = directive.attachment.file_data.split(",", 2)[1]!;
+      const text = Buffer.from(encoded, "base64").toString("utf8");
+      expect(text.endsWith("\n")).toBe(true);
+      return { text, value: JSON.parse(text) as Record<string, unknown> };
+    };
+    const commerceCoordinate = decode(commerce!);
+    const studioCoordinate = decode(studio!);
+    expect(commerceCoordinate.value).toMatchObject({
+      schemaVersion: 1,
+      sourceFormat: "provider_archive_v1",
+      providerSlug: "hirael-commerce",
+      sourceSubdirectory: "registry/templates/commerce",
+      entrypoint: "registry/templates/commerce/app/page.tsx",
+      providerArchiveSha256: sharedArchiveSha256,
+    });
+    expect(studioCoordinate.value).toMatchObject({
+      providerSlug: "hirael-studio",
+      sourceSubdirectory: "registry/templates/studio",
+      entrypoint: "registry/templates/studio/app/page.tsx",
+      providerArchiveSha256: sharedArchiveSha256,
+    });
+    expect(commerceCoordinate.text).not.toBe(studioCoordinate.text);
+    expect(commerce!.promptInstruction).toContain(
+      "必须只使用其中指定的 providerSlug、sourceSubdirectory 和 entrypoint",
+    );
+    expect(commerce!.promptInstruction).toContain("其他模板");
+  });
+
+  it("does not attach a Template coordinate for historical normalized sources", () => {
+    expect(
+      nativeTemplateCoordinateDirective({
+        bundle: { schemaVersion: 5 },
+        candidate: { sourceFormat: "normalized_v1" },
+      } as never),
+    ).toBeNull();
+  });
+});
 
 function operationWithState(
   operation: typeof baseOperation,

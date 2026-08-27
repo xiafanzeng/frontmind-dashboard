@@ -757,7 +757,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/无需重置/u)).toBeInTheDocument();
     expect(
-      screen.getByText(/未能凑齐 9 个可安全构建的完整官网模板/u),
+      screen.getByText(/未能凑齐 9 个互不重复的完整官网源码模板/u),
     ).toBeInTheDocument();
     const retryButton = screen.getByRole("button", {
       name: "重新生成 9 个视觉候选",

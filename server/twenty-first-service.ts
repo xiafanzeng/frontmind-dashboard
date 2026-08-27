@@ -33,6 +33,7 @@ import {
 export const TWENTY_FIRST_CREDENTIAL_SLOT = "site_builder_21st";
 export const TWENTY_FIRST_MCP_ENDPOINT = "https://21st.dev/api/mcp";
 export const TWENTY_FIRST_API_ORIGIN = "https://21st.dev";
+export const TWENTY_FIRST_CODELOAD_ORIGIN = "https://codeload.github.com";
 
 const TWENTY_FIRST_REQUEST_TIMEOUT_MS = 12_000;
 const TWENTY_FIRST_TOTAL_TIMEOUT_MS = 90_000;
@@ -42,29 +43,19 @@ const TWENTY_FIRST_MAX_RETRY_AFTER_MS = 2_000;
 const TWENTY_FIRST_MAX_HTTP_RETRIES = 1;
 const TWENTY_FIRST_MAX_TOOL_PAGES = 3;
 const TWENTY_FIRST_MAX_TOOLS = 100;
-// Discovery may be wider than one operation's 32-item build window so page 2
-// and page 3 can exclude already-published templates before truncation.
-const TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT = 64;
+const TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT = 60;
+const TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT = 32;
 const TWENTY_FIRST_TEMPLATE_JSON_MAX_BYTES = 256_000;
-// Match the official pinned CLI's bounded download contract. The raw archive
-// is never persisted: the native runtime immediately applies the stricter
-// 48 MiB expanded-tree and 24 MiB normalized-source limits before a candidate
-// can be compiled or stored.
+// Bound each immutable Marketplace source download. Candidate generation
+// treats the archive as inert data, validates its ZIP envelope, and stores it
+// inside the selected V6 artifact; provider code is not executed here.
 const TWENTY_FIRST_TEMPLATE_ARCHIVE_MAX_BYTES = 50 * 1024 * 1024;
 const TWENTY_FIRST_TEMPLATE_DIRECT_TIMEOUT_MS = 30_000;
-const TWENTY_FIRST_TEMPLATE_CLI_VERSION = "1.16.0";
 // Saving a credential performs the full live Template probe and seeds this
 // cache. Keep status reads from repeatedly spending the provider's metered
 // search allowance; generation still revalidates catalog and download access.
 const TWENTY_FIRST_STATUS_REVALIDATION_TTL_MS = 6 * 60 * 60_000;
-const TWENTY_FIRST_TEMPLATE_ACCESS_CACHE_TTL_MS = 2 * 60_000;
-const TWENTY_FIRST_TEMPLATE_ACCESS_CACHE_MAX = 256;
-const TWENTY_FIRST_TEMPLATE_CATALOG_QUERIES = [
-  "complete website template",
-  "responsive business website template",
-  "modern landing page website template",
-  "professional website template",
-] as const;
+const TWENTY_FIRST_MARKETPLACE_CATALOG_PATH = "/api/trpc/templates.list";
 
 export type TwentyFirstCapabilities = {
   search: boolean;
@@ -118,6 +109,12 @@ export type TwentyFirstNativeTemplateSummary = {
   verified: boolean;
   includedWithPlan: boolean;
   sortRank: number;
+  previewUrl: string;
+  sourceOwner: string;
+  sourceRepo: string;
+  sourceCommitSha: string;
+  sourceSubdirectory: string | null;
+  sourceLicense: "MIT" | "Apache-2.0";
 };
 
 export type TwentyFirstNativeTemplateArchive = {
@@ -127,7 +124,8 @@ export type TwentyFirstNativeTemplateArchive = {
   archive: Uint8Array;
   sha256: string;
   contentType: "application/zip";
-  sourceUrlOrigin: typeof TWENTY_FIRST_API_ORIGIN;
+  sourceUrlOrigin: typeof TWENTY_FIRST_CODELOAD_ORIGIN;
+  sourceSubdirectory: string | null;
 };
 
 export type TwentyFirstNativeTemplateFailureCategory =
@@ -1014,14 +1012,25 @@ function firstRecordValue(
   return undefined;
 }
 
+type TwentyFirstLegacyNativeTemplateSummary = Pick<
+  TwentyFirstNativeTemplateSummary,
+  | "templateId"
+  | "slug"
+  | "name"
+  | "version"
+  | "verified"
+  | "includedWithPlan"
+  | "sortRank"
+>;
+
 export function projectTwentyFirstNativeTemplateSummaries(
   value: unknown,
   startRank = 0,
   options: { templateFilteredSearch?: boolean } = {},
-): TwentyFirstNativeTemplateSummary[] {
+): TwentyFirstLegacyNativeTemplateSummary[] {
   const projection = resultsProjection(value);
   if (!projection) return [];
-  const summaries: TwentyFirstNativeTemplateSummary[] = [];
+  const summaries: TwentyFirstLegacyNativeTemplateSummary[] = [];
   for (const item of projection.results) {
     const record = payloadRecord(item);
     if (!record) continue;
@@ -1078,60 +1087,149 @@ export function projectTwentyFirstNativeTemplateSummaries(
   return summaries;
 }
 
-type TwentyFirstTemplateAccess = {
-  isUnlocked: boolean;
-  verified: boolean;
-  includedWithPlan: boolean;
-  name: string | null;
-};
-
-function projectTemplateAccess(value: unknown): TwentyFirstTemplateAccess {
-  const record = payloadRecord(value);
-  if (!record || typeof record.isUnlocked !== "boolean") {
-    throw new TwentyFirstNativeTemplateError("catalog_unavailable");
-  }
-  return {
-    isUnlocked: record.isUnlocked,
-    verified: record.verified === true,
-    includedWithPlan:
-      firstRecordValue(record, [
-        "includedWithPlan",
-        "isIncludedWithPlan",
-        "included_with_plan",
-      ]) === true,
-    name: safeTemplateText(record.name, 200),
-  };
+function safeGithubOwner(value: unknown) {
+  const owner = safeTemplateText(value, 39);
+  return owner && /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/iu.test(owner)
+    ? owner
+    : null;
 }
 
-function projectTemplateDownloadDescriptor(value: unknown) {
-  const record = payloadRecord(value);
-  const rawUrl = record ? safeTemplateText(record.url, 8_192) : null;
-  if (!record || !rawUrl) {
-    throw new TwentyFirstNativeTemplateError("download_unavailable");
-  }
-  let url: URL;
-  try {
-    url = new URL(assertSafeExternalUrl(rawUrl));
-  } catch {
-    throw new TwentyFirstNativeTemplateError("download_unavailable");
-  }
+function safeGithubRepo(value: unknown) {
+  const repo = safeTemplateText(value, 100);
+  return repo &&
+    /^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$/iu.test(repo) &&
+    !repo.includes("..")
+    ? repo
+    : null;
+}
+
+function safeGithubCommitSha(value: unknown) {
+  const commit = safeTemplateText(value, 40);
+  return commit && /^[a-f0-9]{40}$/iu.test(commit)
+    ? commit.toLocaleLowerCase("en-US")
+    : null;
+}
+
+function safeSourceSubdirectory(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const path = safeTemplateText(value, 1_024);
   if (
-    url.protocol !== "https:" ||
-    url.username ||
-    url.password ||
-    (url.port && url.port !== "443")
+    !path ||
+    path.startsWith("/") ||
+    path.endsWith("/") ||
+    path.includes("\\")
   ) {
-    throw new TwentyFirstNativeTemplateError("download_unavailable");
+    return undefined;
   }
-  url.hash = "";
-  const version = safeTemplateVersion(record.version);
-  if (!version) {
-    throw new TwentyFirstNativeTemplateError("download_unavailable");
+  const segments = path.split("/");
+  return segments.every(
+    (segment) =>
+      segment !== "." &&
+      segment !== ".." &&
+      /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/iu.test(segment),
+  )
+    ? path
+    : undefined;
+}
+
+function safeMarketplacePreviewUrl(value: unknown) {
+  const raw = safeTemplateText(value, 8_192);
+  if (!raw) return null;
+  try {
+    const url = new URL(assertSafeExternalUrl(raw));
+    const hostname = url.hostname.toLocaleLowerCase("en-US");
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      (url.port && url.port !== "443") ||
+      (hostname !== "21st.dev" && !hostname.endsWith(".21st.dev"))
+    ) {
+      return null;
+    }
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
   }
-  return {
-    url: url.toString(),
-    version,
-  };
+}
+
+function marketplaceItemsProjection(value: unknown) {
+  const root = payloadRecord(value);
+  const result = root ? payloadRecord(root.result) : null;
+  const data = result ? payloadRecord(result.data) : null;
+  const json = data ? payloadRecord(data.json) : null;
+  return json && Array.isArray(json.items) ? json.items : null;
+}
+
+/** Strictly projects the first-party Marketplace `templates.list` contract. */
+export function projectTwentyFirstMarketplaceTemplateSummaries(
+  value: unknown,
+): TwentyFirstNativeTemplateSummary[] {
+  const items = marketplaceItemsProjection(value);
+  if (!items) throw new TwentyFirstNativeTemplateError("catalog_unavailable");
+  const summaries: TwentyFirstNativeTemplateSummary[] = [];
+  const seenIds = new Set<string>();
+  const seenSlugs = new Set<string>();
+  for (const item of items.slice(0, TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT)) {
+    const record = payloadRecord(item);
+    const source = record ? payloadRecord(record.source) : null;
+    if (
+      !record ||
+      !source ||
+      record.hosting !== "hosted" ||
+      record.verified !== true
+    ) {
+      continue;
+    }
+    const templateId = safeProviderItemId(record.id);
+    const slug = safeTemplateSlug(record.template_slug);
+    const name = safeTemplateText(record.name, 200);
+    const previewUrl = safeMarketplacePreviewUrl(record.preview_url);
+    const sourceOwner = safeGithubOwner(source.owner);
+    const sourceRepo = safeGithubRepo(source.repo);
+    const sourceCommitSha = safeGithubCommitSha(source.commitSha);
+    const sourceSubdirectory = safeSourceSubdirectory(source.subdir);
+    const sourceLicense =
+      source.license === "MIT" || source.license === "Apache-2.0"
+        ? source.license
+        : null;
+    if (
+      templateId === null ||
+      !slug ||
+      !name ||
+      !previewUrl ||
+      !sourceOwner ||
+      !sourceRepo ||
+      !sourceCommitSha ||
+      sourceSubdirectory === undefined ||
+      !sourceLicense
+    ) {
+      continue;
+    }
+    const idKey = `${typeof templateId}:${String(templateId)}`;
+    const slugKey = slug.toLocaleLowerCase("en-US");
+    if (seenIds.has(idKey) || seenSlugs.has(slugKey)) continue;
+    seenIds.add(idKey);
+    seenSlugs.add(slugKey);
+    summaries.push({
+      templateId,
+      slug,
+      name,
+      version: sourceCommitSha,
+      verified: true,
+      includedWithPlan: true,
+      sortRank: summaries.length,
+      previewUrl,
+      sourceOwner,
+      sourceRepo,
+      sourceCommitSha,
+      sourceSubdirectory,
+      sourceLicense,
+    });
+    if (summaries.length >= TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT) break;
+  }
+  return summaries;
 }
 
 function hasZipLocalFileHeader(value: Uint8Array) {
@@ -1148,22 +1246,17 @@ function hasZipLocalFileHeader(value: Uint8Array) {
  * A local-only readiness probe for the exact Template build toolchain. It does
  * not execute provider code, install packages or open the network. The
  * injectable client option keeps unit tests deterministic while production
- * validates the pinned CLI contract, controlled Vite compiler and Chromium.
- * Vite itself is resolved without importing it into the long-lived Dashboard
+ * validates the controlled Vite compiler. Browser rendering is an operation
+ * concern and deliberately does not gate catalog/download readiness. Vite is
+ * resolved without importing it into the long-lived Dashboard
  * server: the isolated native-template compiler imports that exact resolved
  * entrypoint inside its credential-free child process.
  */
 export async function probeTwentyFirstTemplateCompilerEnvironment() {
   try {
     const require = createRequire(import.meta.url);
-    const cli = require("@21st-dev/cli/package.json") as { version?: unknown };
-    if (cli.version !== TWENTY_FIRST_TEMPLATE_CLI_VERSION) return false;
     const viteEntrypoint = require.resolve("vite");
     await access(viteEntrypoint, fsConstants.R_OK);
-    const { chromium } = await import("playwright");
-    const executablePath = chromium.executablePath();
-    if (!executablePath) return false;
-    await access(executablePath, fsConstants.R_OK | fsConstants.X_OK);
     return true;
   } catch {
     return false;
@@ -1388,9 +1481,9 @@ export function assertTwentyFirstJsonDepth(
  * never invokes a mutating or generative provider tool.
  */
 export class TwentyFirstClient {
-  private readonly templateAccessCache = new Map<
+  private readonly nativeTemplateCatalog = new Map<
     string,
-    { access: TwentyFirstTemplateAccess; expiresAt: number }
+    TwentyFirstNativeTemplateSummary
   >();
 
   constructor(
@@ -1474,12 +1567,25 @@ export class TwentyFirstClient {
     return tools;
   }
 
-  private async requestTemplateJson(input: {
-    apiKey: string;
-    path: string;
-    signal: AbortSignal;
-    failureCategory: TwentyFirstNativeTemplateFailureCategory;
-  }) {
+  private nativeTemplateCacheKey(
+    templateId: TwentyFirstProviderItemId,
+    slug: string,
+  ) {
+    return `${typeof templateId}:${String(templateId)}:${slug.toLocaleLowerCase("en-US")}`;
+  }
+
+  private rememberNativeTemplates(
+    templates: readonly TwentyFirstNativeTemplateSummary[],
+  ) {
+    for (const template of templates) {
+      this.nativeTemplateCatalog.set(
+        this.nativeTemplateCacheKey(template.templateId, template.slug),
+        template,
+      );
+    }
+  }
+
+  private async requestMarketplaceCatalog(signal: AbortSignal) {
     const request = createBoundedFetch(
       this.options.fetchImpl ?? fetch,
       this.options.timeoutMs ?? TWENTY_FIRST_REQUEST_TIMEOUT_MS,
@@ -1490,287 +1596,74 @@ export class TwentyFirstClient {
         sleep: this.options.sleep,
       },
     );
+    const url = new URL(
+      TWENTY_FIRST_MARKETPLACE_CATALOG_PATH,
+      TWENTY_FIRST_API_ORIGIN,
+    );
+    url.searchParams.set(
+      "input",
+      JSON.stringify({
+        json: {
+          lane: "included",
+          sortBy: "recommended",
+          limit: TWENTY_FIRST_TEMPLATE_CATALOG_LIMIT,
+        },
+      }),
+    );
     let response: Response;
     try {
-      response = await request(new URL(input.path, TWENTY_FIRST_API_ORIGIN), {
+      response = await request(url, {
         method: "GET",
-        headers: { authorization: `Bearer ${input.apiKey}` },
+        headers: { accept: "application/json" },
         redirect: "error",
-        signal: input.signal,
+        signal,
       });
     } catch {
-      throw new TwentyFirstNativeTemplateError(input.failureCategory);
+      throw new TwentyFirstNativeTemplateError("catalog_unavailable");
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined);
-      if (response.status === 401) {
-        throw new AuthServiceError(
-          "INVALID_CREDENTIAL",
-          "21st API Key 无效或已被撤销",
-        );
-      }
-      throw new TwentyFirstNativeTemplateError(
-        response.status === 403 ? "plan_ineligible" : input.failureCategory,
-      );
+      throw new TwentyFirstNativeTemplateError("catalog_unavailable");
     }
     try {
       const value = (await response.json()) as unknown;
       assertTwentyFirstJsonDepth(value);
-      return value;
+      const templates = projectTwentyFirstMarketplaceTemplateSummaries(value);
+      if (templates.length === 0) {
+        throw new TwentyFirstNativeTemplateError("catalog_unavailable");
+      }
+      this.nativeTemplateCatalog.clear();
+      this.rememberNativeTemplates(templates);
+      return templates;
     } catch {
-      throw new TwentyFirstNativeTemplateError(input.failureCategory);
-    }
-  }
-
-  private async templateAccess(input: {
-    apiKey: string;
-    slug: string;
-    signal: AbortSignal;
-  }) {
-    const cacheKey = `${createHash("sha256").update(input.apiKey).digest("hex")}:${input.slug}`;
-    const cached = this.templateAccessCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return cached.access;
-    if (cached) this.templateAccessCache.delete(cacheKey);
-    const access = projectTemplateAccess(
-      await this.requestTemplateJson({
-        apiKey: input.apiKey,
-        path: `/api/templates/${encodeURIComponent(input.slug)}/purchase`,
-        signal: input.signal,
-        failureCategory: "catalog_unavailable",
-      }),
-    );
-    if (
-      this.templateAccessCache.size >= TWENTY_FIRST_TEMPLATE_ACCESS_CACHE_MAX
-    ) {
-      const oldest = this.templateAccessCache.keys().next().value;
-      if (typeof oldest === "string") this.templateAccessCache.delete(oldest);
-    }
-    this.templateAccessCache.set(cacheKey, {
-      access,
-      expiresAt: Date.now() + TWENTY_FIRST_TEMPLATE_ACCESS_CACHE_TTL_MS,
-    });
-    return access;
-  }
-
-  private async templateDownloadDescriptor(input: {
-    apiKey: string;
-    slug: string;
-    signal: AbortSignal;
-  }) {
-    return projectTemplateDownloadDescriptor(
-      await this.requestTemplateJson({
-        apiKey: input.apiKey,
-        path: `/api/templates/${encodeURIComponent(input.slug)}/download?json=1`,
-        signal: input.signal,
-        failureCategory: "download_unavailable",
-      }),
-    );
-  }
-
-  private async collectNativeTemplates(input: {
-    apiKey: string;
-    signal: AbortSignal;
-    limit: number;
-    search: (request: TwentyFirstSearchRequest) => Promise<unknown>;
-    effectiveSearchLimit: number;
-    preferredTemplateSort?: "popular";
-    excludedTemplateIds?: ReadonlySet<string>;
-    excludedSlugs?: ReadonlySet<string>;
-  }) {
-    const discovered: TwentyFirstNativeTemplateSummary[] = [];
-    const seen = new Set<string>();
-    let successfulSearches = 0;
-    for (const query of TWENTY_FIRST_TEMPLATE_CATALOG_QUERIES) {
-      let payload: unknown;
-      try {
-        payload = await input.search({
-          query,
-          type: "template",
-          limit: input.effectiveSearchLimit,
-          ...(input.preferredTemplateSort
-            ? { sort: input.preferredTemplateSort }
-            : {}),
-        });
-        successfulSearches += 1;
-      } catch {
-        continue;
-      }
-      for (const summary of projectTwentyFirstNativeTemplateSummaries(
-        payload,
-        discovered.length,
-        { templateFilteredSearch: true },
-      )) {
-        if (
-          input.excludedTemplateIds?.has(String(summary.templateId)) ||
-          input.excludedSlugs?.has(summary.slug.toLocaleLowerCase("en-US"))
-        ) {
-          continue;
-        }
-        if (discovered.length >= TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT) break;
-        const idCoordinate = `${typeof summary.templateId}:${String(summary.templateId)}`;
-        const slugCoordinate = summary.slug.toLocaleLowerCase("en-US");
-        if (seen.has(idCoordinate) || seen.has(`slug:${slugCoordinate}`)) {
-          continue;
-        }
-        seen.add(idCoordinate);
-        seen.add(`slug:${slugCoordinate}`);
-        discovered.push(summary);
-      }
-      // Read every fixed catalog window unless the hard discovery cap is full.
-      // A readiness probe cannot stop at the first non-empty window because it
-      // may contain only locked or otherwise unusable Templates while a later
-      // provider-ranked window contains the first downloadable one.
-      if (discovered.length >= TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT) {
-        break;
-      }
-    }
-    if (successfulSearches === 0 || discovered.length === 0) {
       throw new TwentyFirstNativeTemplateError("catalog_unavailable");
     }
+  }
 
-    // Access checks are deliberately progressive. We retain at most the first
-    // 64 provider-ranked coordinates, issue at most three reads concurrently,
-    // and stop as soon as the requested number of unlocked Templates is known.
-    // limit=1 therefore performs only as many purchase-status reads as needed
-    // to find the first downloadable item in the merged catalog.
-    const catalog = discovered.slice(0, TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT);
-    const eligible: TwentyFirstNativeTemplateSummary[] = [];
-    let cursor = 0;
-    let sawPlanIneligible = false;
-    while (cursor < catalog.length && eligible.length < input.limit) {
-      const remaining = input.limit - eligible.length;
-      const batchSize = Math.min(3, remaining, catalog.length - cursor);
-      const batch = catalog.slice(cursor, cursor + batchSize);
-      cursor += batchSize;
-      const outcomes = await Promise.all(
-        batch.map(async (summary) => {
-          try {
-            const access = await this.templateAccess({
-              apiKey: input.apiKey,
-              slug: summary.slug,
-              signal: input.signal,
-            });
-            const verified = summary.verified || access.verified;
-            if (!access.isUnlocked) {
-              sawPlanIneligible = true;
-              return null;
-            }
-            // The official CLI treats isUnlocked as the download entitlement
-            // boundary. verified and includedWithPlan are optional catalog
-            // metadata and may be absent from an otherwise authorized response.
-            return {
-              ...summary,
-              name: access.name ?? summary.name,
-              verified,
-              includedWithPlan: access.includedWithPlan,
-            } satisfies TwentyFirstNativeTemplateSummary;
-          } catch (error) {
-            // A single locked/plan-ineligible Template is a catalog item to
-            // skip, not a credential-wide failure. Check the subclass before
-            // AuthServiceError so its safe category is not rethrown by the
-            // parent-class branch.
-            if (error instanceof TwentyFirstNativeTemplateError) {
-              if (error.category === "plan_ineligible") {
-                sawPlanIneligible = true;
-              }
-              return null;
-            }
-            if (error instanceof AuthServiceError) throw error;
-            return null;
-          }
-        }),
-      );
-      for (const summary of outcomes) {
-        if (summary) eligible.push(summary);
-      }
-    }
-    if (eligible.length > 0) {
-      return eligible
-        .slice(0, input.limit)
-        .map((summary, sortRank) => ({ ...summary, sortRank }));
-    }
-    throw new TwentyFirstNativeTemplateError(
-      sawPlanIneligible ? "plan_ineligible" : "catalog_unavailable",
-    );
+  private nativeTemplateSourceUrl(template: TwentyFirstNativeTemplateSummary) {
+    return `${TWENTY_FIRST_CODELOAD_ORIGIN}/${encodeURIComponent(template.sourceOwner)}/${encodeURIComponent(template.sourceRepo)}/zip/${template.sourceCommitSha}`;
   }
 
   private async probeNativeTemplateReadiness(input: {
-    apiKey: string;
-    client: Client;
     totalSignal: AbortSignal;
-    search: TwentyFirstAdvertisedTool;
   }): Promise<TwentyFirstNativeTemplateReadiness> {
-    const searchLimitKey = findToolInputKey(input.search, [
-      "limit",
-      "take",
-      "pageSize",
-      "page_size",
-    ]);
-    const effectiveSearchLimit = searchLimitKey
-      ? boundedSearchLimit(
-          input.search.inputSchema.properties?.[searchLimitKey],
-          18,
-        )
-      : 18;
-    const search = async (request: TwentyFirstSearchRequest) => {
-      const args = buildTwentyFirstToolArguments({
-        operation: "search",
-        tool: input.search,
-        value: request.query,
-        limit: request.limit,
-        searchType: request.type,
-        searchOptions: { tag: request.tag, sort: request.sort },
-      });
-      const result = await input.client.callTool(
-        { name: input.search.name, arguments: args },
-        undefined,
-        this.requestOptions(input.totalSignal),
-      );
-      assertTwentyFirstJsonDepth(result);
-      if (result.isError === true) {
-        throw new TwentyFirstNativeTemplateError("catalog_unavailable");
-      }
-      return projectTwentyFirstToolPayload(
-        result as Record<string, unknown>,
-        "search",
-      );
-    };
     try {
-      const templates = await this.collectNativeTemplates({
-        apiKey: input.apiKey,
-        signal: input.totalSignal,
-        limit: 1,
-        search,
-        effectiveSearchLimit,
-        preferredTemplateSort: preferredTemplateSortForTool(input.search),
-      });
-      const descriptor = await this.templateDownloadDescriptor({
-        apiKey: input.apiKey,
-        slug: templates[0]!.slug,
-        signal: input.totalSignal,
-      });
-      const expectedVersion = templates[0]!.version;
-      if (
-        expectedVersion !== null &&
-        descriptor.version !== null &&
-        descriptor.version !== expectedVersion
-      ) {
-        return "download_unavailable";
-      }
+      const templates = await this.requestMarketplaceCatalog(input.totalSignal);
+      const template = templates[0]!;
       const prefix = await (
         this.options.templateBinaryFetch ?? defaultTemplateBinaryFetch
       )({
-        url: descriptor.url,
+        url: this.nativeTemplateSourceUrl(template),
         mode: "probe",
         signal: input.totalSignal,
         maxBytes: 4_096,
       });
       if (!hasZipLocalFileHeader(prefix)) return "download_unavailable";
-      const compilerReady = await (
-        this.options.templateCompilerProbe ??
-        probeTwentyFirstTemplateCompilerEnvironment
-      )();
-      return compilerReady ? "ready" : "compiler_unavailable";
+      // Catalog readiness means that the immutable Template source can be
+      // fetched as data. It must not depend on Vite or Chromium: candidate
+      // generation does not execute provider source, and the selected output
+      // is compiled only after Manus returns it through the hard-safety gate.
+      return "ready";
     } catch (error) {
       if (error instanceof TwentyFirstNativeTemplateError) {
         return error.category;
@@ -1924,10 +1817,7 @@ export class TwentyFirstClient {
         getComponent,
       );
       const nativeTemplateReadiness = await this.probeNativeTemplateReadiness({
-        apiKey: value,
-        client,
         totalSignal,
-        search,
       });
       const optionalCapability = (name: string) => {
         const tool = byName.get(name);
@@ -1959,9 +1849,9 @@ export class TwentyFirstClient {
   }
 
   /**
-   * Lists only complete Templates available to the current account. Search is
-   * driven by fixed, non-customer catalog queries; entitlement is confirmed by
-   * the same read-only purchase-status endpoint used by the official CLI.
+   * Lists verified, hosted Templates from 21st's first-party Marketplace
+   * directory. The request is fixed to the included/recommended lane and never
+   * contains customer, Brief or knowledge-base text.
    */
   async listNativeTemplates(
     apiKey: string,
@@ -1972,7 +1862,7 @@ export class TwentyFirstClient {
       excludeSlugs?: readonly string[];
     } = {},
   ): Promise<TwentyFirstNativeTemplateSummary[]> {
-    const value = validateTwentyFirstApiKeyInput(apiKey);
+    validateTwentyFirstApiKeyInput(apiKey);
     const requestedLimit =
       options.limit ?? TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT;
     if (
@@ -2004,34 +1894,36 @@ export class TwentyFirstClient {
         .map((value) => value.toLocaleLowerCase("en-US"))
         .slice(0, TWENTY_FIRST_TEMPLATE_DISCOVERY_LIMIT),
     );
-    return this.withReadOnlySession(
-      value,
-      async (session) =>
-        this.collectNativeTemplates({
-          apiKey: value,
-          signal,
-          limit,
-          effectiveSearchLimit: session.effectiveSearchLimit ?? 18,
-          preferredTemplateSort: session.preferredTemplateSort,
-          excludedTemplateIds,
-          excludedSlugs,
-          search: session.search,
-        }),
-      { signal },
+    const catalog = await this.requestMarketplaceCatalog(signal);
+    const filtered = catalog.filter(
+      (template) =>
+        !excludedTemplateIds.has(String(template.templateId)) &&
+        !excludedSlugs.has(template.slug.toLocaleLowerCase("en-US")),
     );
+    if (filtered.length === 0) {
+      throw new TwentyFirstNativeTemplateError("catalog_unavailable");
+    }
+    return filtered
+      .slice(0, limit)
+      .map((template, sortRank) => ({ ...template, sortRank }));
   }
 
-  /** Downloads the immutable raw ZIP through the official Template channel. */
+  /** Downloads an immutable Marketplace source archive at its exact commit. */
   async downloadNativeTemplate(
     apiKey: string,
     input: {
       templateId: TwentyFirstProviderItemId;
       slug: string;
       version?: string | null;
+      sourceOwner?: string;
+      sourceRepo?: string;
+      sourceCommitSha?: string;
+      sourceSubdirectory?: string | null;
+      sourceLicense?: "MIT" | "Apache-2.0";
       signal?: AbortSignal;
     },
   ): Promise<TwentyFirstNativeTemplateArchive> {
-    const value = validateTwentyFirstApiKeyInput(apiKey);
+    validateTwentyFirstApiKeyInput(apiKey);
     const templateId = safeProviderItemId(input.templateId);
     const slug = safeTemplateSlug(input.slug);
     const expectedVersion =
@@ -2053,16 +1945,33 @@ export class TwentyFirstClient {
     const signal = input.signal
       ? AbortSignal.any([input.signal, timeoutSignal])
       : timeoutSignal;
-    const access = await this.templateAccess({ apiKey: value, slug, signal });
-    if (!access.isUnlocked) {
-      throw new TwentyFirstNativeTemplateError("plan_ineligible");
+    const cacheKey = this.nativeTemplateCacheKey(templateId, slug);
+    let template = this.nativeTemplateCatalog.get(cacheKey);
+    if (!template) {
+      const catalog = await this.requestMarketplaceCatalog(signal);
+      template = catalog.find(
+        (candidate) =>
+          String(candidate.templateId) === String(templateId) &&
+          candidate.slug === slug,
+      );
     }
-    const descriptor = await this.templateDownloadDescriptor({
-      apiKey: value,
-      slug,
-      signal,
-    });
-    if (expectedVersion !== null && descriptor.version !== expectedVersion) {
+    const inputSubdirectory = safeSourceSubdirectory(input.sourceSubdirectory);
+    if (
+      !template ||
+      (expectedVersion !== null &&
+        template.sourceCommitSha !== expectedVersion) ||
+      (input.sourceOwner !== undefined &&
+        safeGithubOwner(input.sourceOwner) !== template.sourceOwner) ||
+      (input.sourceRepo !== undefined &&
+        safeGithubRepo(input.sourceRepo) !== template.sourceRepo) ||
+      (input.sourceCommitSha !== undefined &&
+        safeGithubCommitSha(input.sourceCommitSha) !==
+          template.sourceCommitSha) ||
+      (input.sourceSubdirectory !== undefined &&
+        inputSubdirectory !== template.sourceSubdirectory) ||
+      (input.sourceLicense !== undefined &&
+        input.sourceLicense !== template.sourceLicense)
+    ) {
       throw new TwentyFirstNativeTemplateError("download_unavailable");
     }
     let archive: Uint8Array;
@@ -2070,7 +1979,7 @@ export class TwentyFirstClient {
       archive = await (
         this.options.templateBinaryFetch ?? defaultTemplateBinaryFetch
       )({
-        url: descriptor.url,
+        url: this.nativeTemplateSourceUrl(template),
         mode: "full",
         signal,
         maxBytes: TWENTY_FIRST_TEMPLATE_ARCHIVE_MAX_BYTES,
@@ -2089,11 +1998,12 @@ export class TwentyFirstClient {
     return {
       templateId,
       slug,
-      version: descriptor.version,
+      version: template.sourceCommitSha,
       archive,
       sha256: createHash("sha256").update(archive).digest("hex"),
       contentType: "application/zip",
-      sourceUrlOrigin: TWENTY_FIRST_API_ORIGIN,
+      sourceUrlOrigin: TWENTY_FIRST_CODELOAD_ORIGIN,
+      sourceSubdirectory: template.sourceSubdirectory,
     };
   }
 

@@ -1268,6 +1268,9 @@ export const visualCandidateV6Schema = z
       .max(191)
       .regex(/^[a-zA-Z0-9]+(?:[._\/-][a-zA-Z0-9]+)*$/u),
     providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceFormat: z
+      .enum(["normalized_v1", "provider_archive_v1"])
+      .default("normalized_v1"),
     framework: z.enum(["vite_react", "next_static"]),
     sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),

@@ -193,6 +193,7 @@ type NativeTemplateBoardCandidate = {
   previewLocalAssetId: string;
   previewSha256: string;
   previewPerceptualHash: string;
+  sourceFormat: PreparedNativeTemplateCandidate["sourceFormat"];
   framework: PreparedNativeTemplateCandidate["framework"];
   sourceTreeSha256: string;
   sourceArchiveSha256: string;
@@ -268,6 +269,13 @@ export type VisualSearchDiagnostics = {
   compileSucceeded: number;
   renderAttempts: number;
   renderSucceeded: number;
+  capacityCandidates: number;
+  capacityRequired: number;
+  capacityPages: number;
+  capacitySelected: number;
+  capacityRejectedOversize: number;
+  capacitySolverNodes: number;
+  capacitySolverExhausted: boolean;
   publishedCount: number;
   templateRejectedByReason: Partial<
     Record<SiteOpsNativeTemplateFailureCategory, number>
@@ -493,6 +501,13 @@ function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
     compileSucceeded: 0,
     renderAttempts: 0,
     renderSucceeded: 0,
+    capacityCandidates: 0,
+    capacityRequired: 0,
+    capacityPages: 0,
+    capacitySelected: 0,
+    capacityRejectedOversize: 0,
+    capacitySolverNodes: 0,
+    capacitySolverExhausted: false,
     publishedCount: 0,
     templateRejectedByReason: {},
     templateFailureCategory: null,
@@ -695,8 +710,7 @@ const NATIVE_TEMPLATE_FAILURE_CONTRACT = {
   },
   insufficient_live_templates: {
     code: "NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT",
-    message:
-      "本次实时目录中未能凑齐 9 个可安全构建的完整 Template，请稍后重试。",
+    message: "本次实时目录中未能凑齐 9 个完整 Template 源码候选，请稍后重试。",
   },
 } as const satisfies Record<
   SiteOpsNativeTemplateFailureCategory,
@@ -747,34 +761,6 @@ function publicTemplateRuntimeCategory(
     case "deadline_exhausted":
       return "deadline_exhausted";
   }
-}
-
-function terminalNativeTemplateFailureCategory(
-  diagnostics: VisualSearchDiagnostics,
-  signal: AbortSignal,
-): SiteOpsNativeTemplateFailureCategory {
-  if (signal.aborted) return "deadline_exhausted";
-  const priority: readonly SiteOpsNativeTemplateFailureCategory[] = [
-    "deadline_exhausted",
-    "browser_unavailable",
-    "render_failed",
-    "dependency_unsupported",
-    "compile_failed",
-    "entitlement_required",
-    "download_failed",
-  ];
-  const ranked = priority
-    .map((category, priorityIndex) => ({
-      category,
-      priorityIndex,
-      count: diagnostics.templateRejectedByReason[category] ?? 0,
-    }))
-    .filter((entry) => entry.count > 0)
-    .sort(
-      (left, right) =>
-        right.count - left.count || left.priorityIndex - right.priorityIndex,
-    );
-  return ranked[0]?.category ?? "insufficient_live_templates";
 }
 
 function cleanText(value: unknown, fallback: string, maxLength: number) {
@@ -2941,6 +2927,9 @@ const NATIVE_TEMPLATE_BATCH_CONCURRENCY = 3;
 const NATIVE_TEMPLATE_CATALOG_TIMEOUT_MS = 45_000;
 const NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS = 30_000;
 const NATIVE_TEMPLATE_PREPARE_TIMEOUT_MS = 120_000;
+const NATIVE_TEMPLATE_PAGE_ARCHIVE_BUDGET_BYTES =
+  VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES - 1024 * 1024;
+const NATIVE_TEMPLATE_CAPACITY_SOLVER_NODE_BUDGET = 250_000;
 const NATIVE_TEMPLATE_SHUFFLE_SALT = Buffer.from(
   "frontmind-siteops-native-template-shuffle-salt-v1",
   "utf8",
@@ -3024,11 +3013,275 @@ function deterministicallyShuffleTemplates(input: {
     .map(({ template }) => template);
 }
 
+export type NativeTemplateCapacityCandidate = {
+  key: string;
+  archiveBytes: number;
+  priorityIndex: number;
+};
+
+export type NativeTemplateCapacityPlan = {
+  feasible: boolean;
+  bins: NativeTemplateCapacityCandidate[][];
+  current: NativeTemplateCapacityCandidate[];
+  required: number;
+  usable: number;
+  rejectedOversize: number;
+  solverNodes: number;
+  solverExhausted: boolean;
+};
+
+function partitionNativeTemplateCapacity(input: {
+  candidates: readonly NativeTemplateCapacityCandidate[];
+  pageCount: number;
+  pageSize: number;
+  maxPageBytes: number;
+  nodeBudget: number;
+}) {
+  const ordered = [...input.candidates].sort(
+    (left, right) =>
+      right.archiveBytes - left.archiveBytes ||
+      left.priorityIndex - right.priorityIndex ||
+      left.key.localeCompare(right.key),
+  );
+  if (
+    ordered.length !== input.pageCount * input.pageSize ||
+    ordered.some((candidate) => candidate.archiveBytes > input.maxPageBytes) ||
+    ordered.reduce((total, candidate) => total + candidate.archiveBytes, 0) >
+      input.pageCount * input.maxPageBytes
+  ) {
+    return { bins: null, solverNodes: 0, solverExhausted: false } as const;
+  }
+
+  const greedyBins = Array.from({ length: input.pageCount }, () => ({
+    bytes: 0,
+    candidates: [] as NativeTemplateCapacityCandidate[],
+  }));
+  let greedyFeasible = true;
+  for (const candidate of ordered) {
+    const target = greedyBins
+      .map((bin, index) => ({ bin, index }))
+      .filter(
+        ({ bin }) =>
+          bin.candidates.length < input.pageSize &&
+          bin.bytes + candidate.archiveBytes <= input.maxPageBytes,
+      )
+      .sort(
+        (left, right) =>
+          left.bin.bytes - right.bin.bytes ||
+          left.bin.candidates.length - right.bin.candidates.length ||
+          left.index - right.index,
+      )[0];
+    if (!target) {
+      greedyFeasible = false;
+      break;
+    }
+    target.bin.candidates.push(candidate);
+    target.bin.bytes += candidate.archiveBytes;
+  }
+  if (
+    greedyFeasible &&
+    greedyBins.every((bin) => bin.candidates.length === input.pageSize)
+  ) {
+    return {
+      bins: greedyBins.map((bin) =>
+        bin.candidates.sort(
+          (left, right) =>
+            left.priorityIndex - right.priorityIndex ||
+            left.key.localeCompare(right.key),
+        ),
+      ),
+      solverNodes: 0,
+      solverExhausted: false,
+    } as const;
+  }
+
+  const bins = Array.from({ length: input.pageCount }, () => ({
+    bytes: 0,
+    candidates: [] as NativeTemplateCapacityCandidate[],
+  }));
+  const memo = new Set<string>();
+  let solverNodes = 0;
+  let solverExhausted = false;
+  const visit = (candidateIndex: number): boolean => {
+    solverNodes += 1;
+    if (solverNodes > input.nodeBudget) {
+      solverExhausted = true;
+      return false;
+    }
+    if (candidateIndex === ordered.length) {
+      return bins.every((bin) => bin.candidates.length === input.pageSize);
+    }
+    const remainingBytes = ordered
+      .slice(candidateIndex)
+      .reduce((total, candidate) => total + candidate.archiveBytes, 0);
+    const remainingCapacity = bins.reduce(
+      (total, bin) => total + input.maxPageBytes - bin.bytes,
+      0,
+    );
+    if (remainingBytes > remainingCapacity) return false;
+    const state = `${candidateIndex}|${bins
+      .map((bin) => `${bin.candidates.length}:${bin.bytes}`)
+      .sort()
+      .join("|")}`;
+    if (memo.has(state)) return false;
+    memo.add(state);
+
+    const candidate = ordered[candidateIndex]!;
+    const binOrder = bins
+      .map((bin, index) => ({ bin, index }))
+      .sort(
+        (left, right) =>
+          left.bin.bytes - right.bin.bytes ||
+          left.bin.candidates.length - right.bin.candidates.length ||
+          left.index - right.index,
+      );
+    const symmetricStates = new Set<string>();
+    for (const { bin } of binOrder) {
+      const symmetricState = `${bin.candidates.length}:${bin.bytes}`;
+      if (symmetricStates.has(symmetricState)) continue;
+      symmetricStates.add(symmetricState);
+      if (
+        bin.candidates.length >= input.pageSize ||
+        bin.bytes + candidate.archiveBytes > input.maxPageBytes
+      ) {
+        continue;
+      }
+      bin.candidates.push(candidate);
+      bin.bytes += candidate.archiveBytes;
+      if (visit(candidateIndex + 1)) return true;
+      bin.bytes -= candidate.archiveBytes;
+      bin.candidates.pop();
+      if (solverExhausted) return false;
+    }
+    return false;
+  };
+  if (!visit(0)) {
+    return { bins: null, solverNodes, solverExhausted } as const;
+  }
+  return {
+    bins: bins.map((bin) =>
+      bin.candidates.sort(
+        (left, right) =>
+          left.priorityIndex - right.priorityIndex ||
+          left.key.localeCompare(right.key),
+      ),
+    ),
+    solverNodes,
+    solverExhausted,
+  } as const;
+}
+
+/**
+ * Selects the current V6 page only from a partition that leaves every later
+ * page with nine archives below the immutable selection-bundle byte limit.
+ * Candidate order is already HMAC-randomized; capacity affects it only when
+ * that preferred prefix cannot be partitioned.
+ */
+export function planNativeTemplateCapacityPages(input: {
+  candidates: readonly NativeTemplateCapacityCandidate[];
+  pageCount: number;
+  pageSize?: number;
+  maxPageBytes?: number;
+  currentBinIndex?: number;
+  nodeBudget?: number;
+}): NativeTemplateCapacityPlan {
+  const pageSize = input.pageSize ?? SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+  const maxPageBytes =
+    input.maxPageBytes ?? NATIVE_TEMPLATE_PAGE_ARCHIVE_BUDGET_BYTES;
+  const required = input.pageCount * pageSize;
+  const unique = new Map<string, NativeTemplateCapacityCandidate>();
+  let rejectedOversize = 0;
+  for (const candidate of input.candidates) {
+    if (unique.has(candidate.key)) continue;
+    const archiveBytes = Math.max(0, Math.trunc(candidate.archiveBytes));
+    if (archiveBytes > maxPageBytes) {
+      rejectedOversize += 1;
+      continue;
+    }
+    unique.set(candidate.key, { ...candidate, archiveBytes });
+  }
+  const usable = [...unique.values()].sort(
+    (left, right) =>
+      left.priorityIndex - right.priorityIndex ||
+      left.key.localeCompare(right.key),
+  );
+  const failed = (inputValues: {
+    solverNodes: number;
+    solverExhausted: boolean;
+  }): NativeTemplateCapacityPlan => ({
+    feasible: false,
+    bins: [],
+    current: [],
+    required,
+    usable: usable.length,
+    rejectedOversize,
+    ...inputValues,
+  });
+  if (usable.length < required || input.pageCount < 1 || pageSize < 1) {
+    return failed({ solverNodes: 0, solverExhausted: false });
+  }
+
+  const nodeBudget =
+    input.nodeBudget ?? NATIVE_TEMPLATE_CAPACITY_SOLVER_NODE_BUDGET;
+  let solverNodes = 0;
+  let solverExhausted = false;
+  const preferred = usable.slice(0, required);
+  let partition = partitionNativeTemplateCapacity({
+    candidates: preferred,
+    pageCount: input.pageCount,
+    pageSize,
+    maxPageBytes,
+    nodeBudget,
+  });
+  solverNodes += partition.solverNodes;
+  solverExhausted ||= partition.solverExhausted;
+
+  if (!partition.bins) {
+    const capacityFirst = [...usable]
+      .sort(
+        (left, right) =>
+          left.archiveBytes - right.archiveBytes ||
+          left.priorityIndex - right.priorityIndex ||
+          left.key.localeCompare(right.key),
+      )
+      .slice(0, required);
+    if (
+      capacityFirst.some(
+        (candidate, index) => candidate.key !== preferred[index]?.key,
+      )
+    ) {
+      partition = partitionNativeTemplateCapacity({
+        candidates: capacityFirst,
+        pageCount: input.pageCount,
+        pageSize,
+        maxPageBytes,
+        nodeBudget: Math.max(1, nodeBudget - solverNodes),
+      });
+      solverNodes += partition.solverNodes;
+      solverExhausted ||= partition.solverExhausted;
+    }
+  }
+  if (!partition.bins) return failed({ solverNodes, solverExhausted });
+
+  const currentBinIndex =
+    Math.abs(Math.trunc(input.currentBinIndex ?? 0)) % partition.bins.length;
+  return {
+    feasible: true,
+    bins: partition.bins,
+    current: partition.bins[currentBinIndex]!,
+    required,
+    usable: usable.length,
+    rejectedOversize,
+    solverNodes,
+    solverExhausted,
+  };
+}
+
 function logSafeNativeTemplateStage(input: {
   event:
     | "template_catalog"
     | "template_download"
-    | "template_build"
+    | "template_prepare"
     | "template_page_published";
   operationId: string;
   projectId: string;
@@ -3046,10 +3299,20 @@ function logSafeNativeTemplateStage(input: {
     templateDownloadsSucceeded: input.diagnostics.templateDownloadsSucceeded,
     dependencyResolutionAttempts:
       input.diagnostics.dependencyResolutionAttempts,
+    sourcePreparationAttempts: input.diagnostics.sourcePreparationAttempts,
+    sourcePrepared: input.diagnostics.sourcePrepared,
+    previewFetchAttempts: input.diagnostics.previewFetchAttempts,
     compileAttempts: input.diagnostics.compileAttempts,
     compileSucceeded: input.diagnostics.compileSucceeded,
     renderAttempts: input.diagnostics.renderAttempts,
     renderSucceeded: input.diagnostics.renderSucceeded,
+    capacityCandidates: input.diagnostics.capacityCandidates,
+    capacityRequired: input.diagnostics.capacityRequired,
+    capacityPages: input.diagnostics.capacityPages,
+    capacitySelected: input.diagnostics.capacitySelected,
+    capacityRejectedOversize: input.diagnostics.capacityRejectedOversize,
+    capacitySolverNodes: input.diagnostics.capacitySolverNodes,
+    capacitySolverExhausted: input.diagnostics.capacitySolverExhausted,
     publishedCount: input.diagnostics.publishedCount,
     failureCategory: input.diagnostics.templateFailureCategory,
     failureCounts: input.diagnostics.templateRejectedByReason,
@@ -3114,9 +3377,6 @@ async function runNativeTemplateVisualSearch(input: {
   const priorPreviewHashes = new Set(
     input.context.previousReferences?.nativePreviewSha256s ?? [],
   );
-  const priorPerceptualHashes = new Set(
-    input.context.previousReferences?.perceptualHashes ?? [],
-  );
 
   let catalog: TwentyFirstNativeTemplateSummary[];
   try {
@@ -3142,10 +3402,9 @@ async function runNativeTemplateVisualSearch(input: {
   const catalogTemplateIds = new Set<string>();
   const catalogSlugs = new Set<string>();
   for (const template of catalog) {
-    // listNativeTemplates has already confirmed the official isUnlocked
-    // entitlement boundary. The provider does not consistently return the
-    // optional verified/includedWithPlan catalog flags, so they must not
-    // discard an otherwise downloadable Template here.
+    // listNativeTemplates has already projected only verified, hosted,
+    // immutable Marketplace source coordinates with an allowed OSS license.
+    // Customer knowledge never participates in this catalog or its ordering.
     const key = nativeTemplateProviderKey(template);
     const templateId = String(template.templateId);
     if (
@@ -3188,21 +3447,24 @@ async function runNativeTemplateVisualSearch(input: {
     page: input.searchPlan.page,
     attempt: input.operation.attempt,
   });
-  const accepted: Array<{
+  const orderedPriority = new Map(
+    ordered.map((summary, priorityIndex) => [
+      nativeTemplateProviderKey(summary),
+      priorityIndex,
+    ]),
+  );
+  const available: Array<{
     summary: TwentyFirstNativeTemplateSummary;
     prepared: PreparedNativeTemplateCandidate;
     perceptualHash: string;
   }> = [];
-  const acceptedProviderKeys = new Set<string>();
-  const acceptedSourceTrees = new Set(priorSourceTrees);
-  const acceptedPreviewHashes = new Set(priorPreviewHashes);
-  const acceptedPerceptualHashes = new Set(priorPerceptualHashes);
-  let acceptedArchiveBytes = 0;
+  const availableProviderKeys = new Set<string>();
+  const availableSourceTrees = new Set(priorSourceTrees);
+  const availablePreviewHashes = new Set(priorPreviewHashes);
 
   for (
     let offset = 0;
-    offset < ordered.length &&
-    accepted.length < SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+    offset < ordered.length;
     offset += NATIVE_TEMPLATE_BATCH_CONCURRENCY
   ) {
     if (input.signal.aborted) {
@@ -3223,6 +3485,11 @@ async function runNativeTemplateVisualSearch(input: {
             templateId: summary.templateId,
             slug: summary.slug,
             version: summary.version,
+            sourceOwner: summary.sourceOwner,
+            sourceRepo: summary.sourceRepo,
+            sourceCommitSha: summary.sourceCommitSha,
+            sourceSubdirectory: summary.sourceSubdirectory,
+            sourceLicense: summary.sourceLicense,
             signal: AbortSignal.any([
               input.signal,
               AbortSignal.timeout(NATIVE_TEMPLATE_DOWNLOAD_TIMEOUT_MS),
@@ -3237,9 +3504,8 @@ async function runNativeTemplateVisualSearch(input: {
           return null;
         }
 
-        input.diagnostics.dependencyResolutionAttempts += 1;
-        input.diagnostics.compileAttempts += 1;
-        input.diagnostics.renderAttempts += 1;
+        input.diagnostics.sourcePreparationAttempts += 1;
+        input.diagnostics.previewFetchAttempts += 1;
         try {
           const prepared = await input.prepareCandidate({
             templateId: archive.templateId,
@@ -3247,15 +3513,16 @@ async function runNativeTemplateVisualSearch(input: {
             version: archive.version,
             archive: archive.archive,
             expectedArchiveSha256: archive.sha256,
+            sourceSubdirectory: summary.sourceSubdirectory,
+            previewUrl: summary.previewUrl,
             signal: AbortSignal.any([
               input.signal,
               AbortSignal.timeout(NATIVE_TEMPLATE_PREPARE_TIMEOUT_MS),
             ]),
             fetchRemoteAsset: input.fetchPreview,
           });
-          input.diagnostics.compileSucceeded += 1;
+          input.diagnostics.sourcePrepared += 1;
           const perceptualHash = await perceptualHash64(prepared.preview);
-          input.diagnostics.renderSucceeded += 1;
           return { summary, prepared, perceptualHash };
         } catch (error) {
           const runtimeCategory = input.signal.aborted
@@ -3273,24 +3540,16 @@ async function runNativeTemplateVisualSearch(input: {
       if (!result) continue;
       const providerKey = nativeTemplateProviderKey(result.summary);
       if (
-        acceptedProviderKeys.has(providerKey) ||
-        acceptedSourceTrees.has(result.prepared.sourceTreeSha256) ||
-        acceptedPreviewHashes.has(result.prepared.previewSha256) ||
-        acceptedArchiveBytes + result.prepared.sourceArchive.length >
-          VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES - 1024 * 1024 ||
-        [...acceptedPerceptualHashes].some(
-          (hash) => perceptualHashDistance(hash, result.perceptualHash) < 6,
-        )
+        availableProviderKeys.has(providerKey) ||
+        availableSourceTrees.has(result.prepared.sourceTreeSha256) ||
+        availablePreviewHashes.has(result.prepared.previewSha256)
       ) {
         continue;
       }
-      acceptedProviderKeys.add(providerKey);
-      acceptedSourceTrees.add(result.prepared.sourceTreeSha256);
-      acceptedPreviewHashes.add(result.prepared.previewSha256);
-      acceptedPerceptualHashes.add(result.perceptualHash);
-      acceptedArchiveBytes += result.prepared.sourceArchive.length;
-      accepted.push(result);
-      if (accepted.length === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE) break;
+      availableProviderKeys.add(providerKey);
+      availableSourceTrees.add(result.prepared.sourceTreeSha256);
+      availablePreviewHashes.add(result.prepared.previewSha256);
+      available.push(result);
     }
   }
 
@@ -3303,22 +3562,64 @@ async function runNativeTemplateVisualSearch(input: {
     latencyMs: Date.now() - startedAt,
   });
   logSafeNativeTemplateStage({
-    event: "template_build",
+    event: "template_prepare",
     operationId: input.operation.id,
     projectId: input.operation.projectId,
     page: input.searchPlan.page,
     diagnostics: input.diagnostics,
     latencyMs: Date.now() - startedAt,
   });
-  if (accepted.length !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE) {
-    const category = terminalNativeTemplateFailureCategory(
-      input.diagnostics,
-      input.signal,
-    );
-    // Every attempted template is already counted at its rejection boundary.
-    // Preserve the actual terminal cause without inventing one more rejection.
-    input.diagnostics.templateFailureCategory = category;
-    throw nativeTemplateProviderFailure(category);
+  const pagesRemaining =
+    SITEOPS_VISUAL_CANDIDATE_MAX_PAGES - input.searchPlan.page + 1;
+  const binDigest = createHmac("sha256", input.shuffleKey)
+    .update("frontmind:siteops:21st-template-v6:capacity-bin")
+    .update("\0")
+    .update(input.context.project.id)
+    .update("\0")
+    .update(input.operation.id)
+    .update("\0")
+    .update(String(input.searchPlan.page))
+    .update("\0")
+    .update(String(input.operation.attempt))
+    .digest();
+  const capacityPlan = planNativeTemplateCapacityPages({
+    candidates: available.map(({ summary, prepared }) => {
+      const key = nativeTemplateProviderKey(summary);
+      return {
+        key,
+        archiveBytes: prepared.sourceArchive.length,
+        priorityIndex: orderedPriority.get(key) ?? Number.MAX_SAFE_INTEGER,
+      };
+    }),
+    pageCount: pagesRemaining,
+    currentBinIndex: binDigest.readUInt32BE(0) % pagesRemaining,
+  });
+  input.diagnostics.capacityCandidates = capacityPlan.usable;
+  input.diagnostics.capacityRequired = capacityPlan.required;
+  input.diagnostics.capacityPages = pagesRemaining;
+  input.diagnostics.capacitySelected = capacityPlan.current.length;
+  input.diagnostics.capacityRejectedOversize = capacityPlan.rejectedOversize;
+  input.diagnostics.capacitySolverNodes = capacityPlan.solverNodes;
+  input.diagnostics.capacitySolverExhausted = capacityPlan.solverExhausted;
+  if (!capacityPlan.feasible) {
+    rejectNativeTemplate(input.diagnostics, "insufficient_live_templates");
+    throw nativeTemplateProviderFailure("insufficient_live_templates");
+  }
+  const availableByKey = new Map(
+    available.map((candidate) => [
+      nativeTemplateProviderKey(candidate.summary),
+      candidate,
+    ]),
+  );
+  const accepted = capacityPlan.current.map((candidate) =>
+    availableByKey.get(candidate.key),
+  );
+  if (
+    accepted.length !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE ||
+    accepted.some((candidate) => !candidate)
+  ) {
+    rejectNativeTemplate(input.diagnostics, "insufficient_live_templates");
+    throw nativeTemplateProviderFailure("insufficient_live_templates");
   }
 
   await assertCommitLeaseActive(input.assertLeaseActive);
@@ -3356,6 +3657,7 @@ async function runNativeTemplateVisualSearch(input: {
       previewLocalAssetId: previewAsset.id,
       previewSha256: prepared.previewSha256,
       previewPerceptualHash: perceptualHash,
+      sourceFormat: prepared.sourceFormat,
       framework: prepared.framework,
       sourceTreeSha256: prepared.sourceTreeSha256,
       sourceArchiveSha256: prepared.sourceArchiveSha256,
@@ -3391,6 +3693,7 @@ async function runNativeTemplateVisualSearch(input: {
       providerTemplateId: candidate.providerTemplateId,
       providerSlug: candidate.providerSlug,
       providerVersion: candidate.providerVersion,
+      sourceFormat: candidate.sourceFormat,
       framework: candidate.framework,
       sourceTreeSha256: candidate.sourceTreeSha256,
       sourceArchiveSha256: candidate.sourceArchiveSha256,
@@ -3440,16 +3743,13 @@ async function runNativeTemplateVisualSearch(input: {
   });
   input.diagnostics.normalizedUnique = input.diagnostics.catalogCandidates;
   input.diagnostics.shortlistCount = input.diagnostics.catalogCandidates;
-  input.diagnostics.mirrorAttempted = input.diagnostics.renderAttempts;
-  input.diagnostics.mirrorAttempts = input.diagnostics.renderAttempts;
-  input.diagnostics.mirrorSucceeded = input.diagnostics.renderSucceeded;
+  input.diagnostics.mirrorAttempted = input.diagnostics.previewFetchAttempts;
+  input.diagnostics.mirrorAttempts = input.diagnostics.previewFetchAttempts;
+  input.diagnostics.mirrorSucceeded = input.diagnostics.sourcePrepared;
   input.diagnostics.sourceFetchAttempts =
     input.diagnostics.templateDownloadAttempts;
   input.diagnostics.sourceFetchSucceeded =
     input.diagnostics.templateDownloadsSucceeded;
-  input.diagnostics.sourcePreparationAttempts =
-    input.diagnostics.compileAttempts;
-  input.diagnostics.sourcePrepared = input.diagnostics.compileSucceeded;
   input.diagnostics.publishedCount = nativeCandidates.length;
   input.diagnostics.templateFailureCategory = null;
   input.diagnostics.terminalReason = "complete";
@@ -3473,7 +3773,7 @@ async function runNativeTemplateVisualSearch(input: {
       actual: {
         searched: input.diagnostics.catalogCandidates,
         shortlisted: input.diagnostics.catalogCandidates,
-        mirrored: input.diagnostics.renderSucceeded,
+        mirrored: input.diagnostics.sourcePrepared,
         presented: nativeCandidates.length,
       },
       diagnostics: input.diagnostics,

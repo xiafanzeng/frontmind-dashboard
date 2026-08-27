@@ -434,7 +434,7 @@ function visualGenerationFailureCopy(
       case "deadline_exhausted":
         return "本次实时模板生成超过安全时间限制。";
       case "insufficient_live_templates":
-        return "本次实时目录未能凑齐 9 个可安全构建的完整官网模板。";
+        return "本次实时目录未能凑齐 9 个互不重复的完整官网源码模板。";
       default:
         return hasExistingCandidates
           ? "本次未能生成完整的新一组。"

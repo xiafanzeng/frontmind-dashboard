@@ -46,7 +46,7 @@ export const VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE = "application/zip" as const;
 export const VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES = 100 * 1024 * 1024;
 export const NATIVE_VISUAL_SOURCE_ARCHIVE_MAX_BYTES = 24 * 1024 * 1024;
 export const VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES =
-  20 * 1024 * 1024;
+  52 * 1024 * 1024;
 export const NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES = 50 * 1024 * 1024;
 
 const NATIVE_SOURCE_DIRECTORY = "source";
@@ -54,6 +54,9 @@ const NATIVE_SOURCE_MANIFEST_PATH = "frontmind-native-source-v1.json";
 const NATIVE_SOURCE_MANIFEST_ARCHIVE_PATH = `${NATIVE_SOURCE_DIRECTORY}/${NATIVE_SOURCE_MANIFEST_PATH}`;
 const V5_SELECTION_MANIFEST_PATH = "visual-selection-v5.json";
 const V6_SELECTION_MANIFEST_PATH = "visual-selection-v6.json";
+const V6_PROVIDER_SOURCE_MANIFEST_PATH =
+  "frontmind-provider-template-source-v1.json";
+const V6_PROVIDER_SOURCE_ARCHIVE_PATH = "provider-source.zip";
 const MAX_SOURCE_FILES = 512;
 const MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_TOTAL_BYTES = 48 * 1024 * 1024;
@@ -65,6 +68,8 @@ const MAX_REMOTE_STYLESHEET_BYTES = 256 * 1024;
 const MAX_REMOTE_FONT_BYTES = 3 * 1024 * 1024;
 const MAX_REMOTE_STYLE_ASSET_BYTES = 12 * 1024 * 1024;
 const MAX_TEMPLATE_ARCHIVE_ENTRIES = 4096;
+const MAX_OPAQUE_TEMPLATE_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_OPAQUE_TEMPLATE_EXPANDED_BYTES = 192 * 1024 * 1024;
 const FIXED_ZIP_DATE = new Date("1980-01-01T00:00:00.000Z");
 const CONTROLLED_HTML_ENTRYPOINT = "index.html";
 const CONTROLLED_APP_ENTRYPOINT = "src/main.tsx";
@@ -133,6 +138,31 @@ const nativeSourceManifestV1Schema = z
   })
   .strict();
 
+const providerTemplateSourceManifestV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sourceFormat: z.literal("provider_archive_v1"),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z
+      .string()
+      .trim()
+      .min(1)
+      .max(191)
+      .regex(/^[a-zA-Z0-9]+(?:[._\/-][a-zA-Z0-9]+)*$/u),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceSubdirectory: z.string().trim().min(1).max(240).nullable(),
+    framework: z.enum(["vite_react", "next_static"]),
+    sourceDirectory: z.literal(NATIVE_SOURCE_DIRECTORY),
+    entrypoint: sourcePathSchema,
+    providerArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
+type ProviderTemplateSourceManifestV1 = z.infer<
+  typeof providerTemplateSourceManifestV1Schema
+>;
+
 export type NativeSourceManifestV1 = z.infer<
   typeof nativeSourceManifestV1Schema
 >;
@@ -174,6 +204,7 @@ export type PreparedNativeTemplateCandidate = PreparedNativeVisualCandidate & {
   templateSlug: string;
   framework: NativeTemplateFramework;
   sourceDirectory: typeof NATIVE_SOURCE_DIRECTORY;
+  sourceFormat: "provider_archive_v1";
 };
 
 export type NativeTemplateStaticAsset = {
@@ -1621,6 +1652,7 @@ const VITE_APP_ENTRYPOINTS = [
 const NEXT_STATIC_MODULE_REWRITES = new Map([
   ["next", "@/frontmind-next/types"],
   ["next/image", "@/frontmind-next/image"],
+  ["next/dynamic", "@/frontmind-next/dynamic"],
   ["next/link", "@/frontmind-next/link"],
   ["next/head", "@/frontmind-next/head"],
   ["next/navigation", "@/frontmind-next/navigation"],
@@ -1905,7 +1937,23 @@ function staticTailwindV3Config(files: ReadonlyMap<string, Buffer>) {
   return record;
 }
 
-async function extractNativeTemplateFiles(archive: Buffer) {
+function normalizedTemplateRootHint(value: string | null | undefined) {
+  if (value === null || value === undefined || value === "") return null;
+  const normalized = safeTemplateArchivePath(value);
+  if (
+    !normalized ||
+    normalized !== value.replaceAll("\\", "/").replace(/^\.\//u, "") ||
+    normalized.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+  }
+  return normalized;
+}
+
+async function extractNativeTemplateFiles(
+  archive: Buffer,
+  sourceSubdirectory?: string | null,
+) {
   if (
     archive.length < 1 ||
     archive.length > NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES
@@ -1935,7 +1983,8 @@ async function extractNativeTemplateFiles(archive: Buffer) {
     }
     if (!entry.dir) safeEntries.push({ entry, path: safePath });
   }
-  const packagePaths = safeEntries
+  const rootHint = normalizedTemplateRootHint(sourceSubdirectory);
+  const allPackagePaths = safeEntries
     .map(({ path: filename }) => filename)
     .filter(
       (filename) =>
@@ -1946,6 +1995,17 @@ async function extractNativeTemplateFiles(archive: Buffer) {
       const depth = left.split("/").length - right.split("/").length;
       return depth || left.localeCompare(right);
     });
+  const hintedSuffix = rootHint ? `/${rootHint}/package.json` : null;
+  const packagePaths = hintedSuffix
+    ? allPackagePaths.filter(
+        (filename) =>
+          filename === `${rootHint}/package.json` ||
+          filename.endsWith(hintedSuffix),
+      )
+    : allPackagePaths;
+  if (rootHint && packagePaths.length !== 1) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+  }
   if (packagePaths.length === 0) {
     throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
   }
@@ -2059,6 +2119,33 @@ async function extractNativeTemplateFiles(archive: Buffer) {
     failures[0] ??
     new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID")
   );
+}
+
+/**
+ * Some verified Marketplace entries are individual templates inside a
+ * registry repository rather than the repository homepage. 21st exposes the
+ * immutable repository coordinate and a slug, while the repository itself is
+ * the authoritative manifest for the template path. Resolve only the exact,
+ * unique content-defined convention
+ * `registry/<registry>/templates/<name>/<name>.tsx`; never guess an arbitrary
+ * file from the slug.
+ */
+function findRegistryTemplateEntrypoint(
+  files: ReadonlyMap<string, Buffer>,
+  templateSlug: string,
+) {
+  const matches = [...files.keys()].filter((filename) => {
+    const matched =
+      /^registry\/([a-z0-9._-]+)\/templates\/([a-z0-9._-]+)\/\2\.(?:tsx|jsx)$/iu.exec(
+        filename,
+      );
+    if (!matched) return false;
+    const registry = matched[1]!.toLocaleLowerCase("en-US");
+    const template = matched[2]!.toLocaleLowerCase("en-US");
+    const slug = templateSlug.toLocaleLowerCase("en-US");
+    return slug === template || slug === `${registry}-${template}`;
+  });
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 function findViteEntrypoint(files: ReadonlyMap<string, Buffer>) {
@@ -2339,6 +2426,13 @@ function nextStaticShimFiles(input: {
       ),
     },
     {
+      path: "src/frontmind-next/dynamic.tsx",
+      bytes: Buffer.from(
+        'import React from "react";\ntype Loader=()=>Promise<unknown>;\nexport default function dynamic(loader:Loader,options?:{loading?:React.ComponentType}){const Lazy=React.lazy(async()=>{const loaded:any=await loader();return {default:loaded?.default??loaded}});return function DynamicComponent(props:Record<string,unknown>){const fallback=options?.loading?React.createElement(options.loading):null;return <React.Suspense fallback={fallback}><Lazy {...props}/></React.Suspense>}}\n',
+        "utf8",
+      ),
+    },
+    {
       path: "src/frontmind-next/link.tsx",
       bytes: Buffer.from(
         'import React from "react";\nexport default function Link(props:React.AnchorHTMLAttributes<HTMLAnchorElement>){return <a {...props} />}\n',
@@ -2419,6 +2513,7 @@ export async function normalizeTwentyFirstNativeTemplateArchive(input: {
   version: string | null;
   archive: Uint8Array;
   expectedArchiveSha256?: string;
+  sourceSubdirectory?: string | null;
 }): Promise<
   NormalizedTwentyFirstNativeSource & {
     templateId: string;
@@ -2442,7 +2537,10 @@ export async function normalizeTwentyFirstNativeTemplateArchive(input: {
   ) {
     throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_HASH_MISMATCH");
   }
-  let templateFiles = await extractNativeTemplateFiles(archive);
+  let templateFiles = await extractNativeTemplateFiles(
+    archive,
+    input.sourceSubdirectory,
+  );
   const manifest = packageManifestFromTemplateFiles(templateFiles);
   assertTemplatePackageIsInert(manifest);
   if (
@@ -2452,7 +2550,12 @@ export async function normalizeTwentyFirstNativeTemplateArchive(input: {
   ) {
     throw new NativeVisualSourceError("NATIVE_TEMPLATE_DEPENDENCY_UNSUPPORTED");
   }
-  const nextEntrypoint = findNextStaticEntrypoint(templateFiles);
+  const registryTemplateEntrypoint = findRegistryTemplateEntrypoint(
+    templateFiles,
+    templateSlug,
+  );
+  const nextEntrypoint =
+    registryTemplateEntrypoint ?? findNextStaticEntrypoint(templateFiles);
   const framework: NativeTemplateFramework = nextEntrypoint
     ? "next_static"
     : "vite_react";
@@ -2460,13 +2563,21 @@ export async function normalizeTwentyFirstNativeTemplateArchive(input: {
   let demoEntrypoint: string;
   if (framework === "next_static") {
     entrypoint = nextEntrypoint!;
-    const originalLayoutEntrypoints = nextStaticLayoutEntrypoints(
-      templateFiles,
-      entrypoint,
-    );
+    // A registry template is already a complete visual root. Wrapping it in
+    // the registry website's documentation layout would show the marketplace
+    // shell instead of the selected template.
+    const originalLayoutEntrypoints = registryTemplateEntrypoint
+      ? []
+      : nextStaticLayoutEntrypoints(templateFiles, entrypoint);
+    const registryGlobalStyles = registryTemplateEntrypoint
+      ? ["app/globals.css", "src/app/globals.css"].filter((filename) =>
+          templateFiles.has(filename),
+        )
+      : [];
     templateFiles = nextStaticRuntimeClosure(templateFiles, [
       entrypoint,
       ...originalLayoutEntrypoints,
+      ...registryGlobalStyles,
     ]);
     const fontNames = nextFontNames(templateFiles);
     templateFiles = rewriteNextStaticImports(templateFiles);
@@ -3038,6 +3149,412 @@ export async function readNativeSourceArchive(bytes: Buffer) {
   return { manifest, files };
 }
 
+async function inspectOpaqueProviderTemplateArchive(input: {
+  archive: Buffer;
+  expectedSha256?: string;
+}) {
+  const { archive } = input;
+  if (
+    archive.length < 1 ||
+    archive.length > NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES ||
+    (input.expectedSha256 !== undefined &&
+      sha256(archive) !== input.expectedSha256)
+  ) {
+    throw new NativeVisualSourceError(
+      input.expectedSha256 === undefined
+        ? "NATIVE_TEMPLATE_ARCHIVE_INVALID"
+        : "NATIVE_TEMPLATE_ARCHIVE_HASH_MISMATCH",
+    );
+  }
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(archive, {
+      checkCRC32: true,
+      createFolders: false,
+    });
+  } catch (error) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID", error);
+  }
+  const entries = Object.values(zip.files) as BoundedZipEntry[];
+  if (entries.length < 1 || entries.length > MAX_TEMPLATE_ARCHIVE_ENTRIES) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  const records: Array<{
+    entry: BoundedZipEntry;
+    path: string;
+    bytes: Buffer | null;
+    symlink: boolean;
+  }> = [];
+  const seen = new Set<string>();
+  let expandedBytes = 0;
+  for (const entry of entries) {
+    const rawPath = entry.unsafeOriginalName ?? entry.name;
+    const withoutDirectoryMarker = rawPath.replace(/\/$/u, "");
+    const safePath = safeTemplateArchivePath(withoutDirectoryMarker);
+    if (!safePath || rawPath !== entry.name || seen.has(safePath)) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+    }
+    seen.add(safePath);
+    if (entry.dir) {
+      records.push({ entry, path: safePath, bytes: null, symlink: false });
+      continue;
+    }
+    const declared = Number(entry._data?.uncompressedSize ?? 0);
+    if (
+      !Number.isFinite(declared) ||
+      declared < 0 ||
+      declared > MAX_OPAQUE_TEMPLATE_FILE_BYTES ||
+      expandedBytes + declared > MAX_OPAQUE_TEMPLATE_EXPANDED_BYTES
+    ) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+    }
+    const file = Buffer.from(await entry.async("uint8array"));
+    if (
+      file.byteLength > MAX_OPAQUE_TEMPLATE_FILE_BYTES ||
+      (declared > 0 && file.byteLength !== declared)
+    ) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+    }
+    expandedBytes += file.byteLength;
+    if (expandedBytes > MAX_OPAQUE_TEMPLATE_EXPANDED_BYTES) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+    }
+    records.push({
+      entry,
+      path: safePath,
+      bytes: file,
+      symlink: zipEntryIsSymlink(entry),
+    });
+  }
+  const fileRecords = records
+    .filter((record) => record.bytes !== null)
+    .map((record) => ({ ...record, bytes: record.bytes! }));
+  const paths = fileRecords.map((record) => record.path);
+  if (paths.length < 1) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+  }
+  const firstSegments = new Set(
+    paths.map((filename) => filename.split("/")[0]),
+  );
+  const sharedArchiveRoot =
+    firstSegments.size === 1 &&
+    paths.every((filename) => filename.includes("/"))
+      ? [...firstSegments][0]!
+      : null;
+  const logicalPathFor = (filename: string) =>
+    sharedArchiveRoot && filename.startsWith(`${sharedArchiveRoot}/`)
+      ? filename.slice(sharedArchiveRoot.length + 1)
+      : filename;
+  const logicalPaths = paths.map(logicalPathFor);
+  const logicalPathByArchivePath = new Map(
+    records
+      .map((record) => [record.path, logicalPathFor(record.path)] as const)
+      .filter(([, logicalPath]) => Boolean(logicalPath)),
+  );
+  const archivePathByLogicalPath = new Map(
+    [...logicalPathByArchivePath].map(([archivePath, logicalPath]) => [
+      logicalPath,
+      archivePath,
+    ]),
+  );
+  const documentationNamePattern =
+    /^(?:AGENTS|CLAUDE|CONTRIBUTING|CODE_OF_CONDUCT|README|SECURITY)(?:\.(?:md|mdx|txt))$/iu;
+  const runtimeOrConfigurationPathPattern =
+    /(?:^|\/)(?:app|assets?|components?|fonts?|images?|pages|public|registry|src|static|styles?)(?:\/|$)|(?:^|\/)(?:Dockerfile|docker-compose(?:\.[a-z0-9_-]+)?\.ya?ml|package\.json|pnpm-workspace\.yaml|turbo\.json|vercel\.json|(?:bun|npm|pnpm|yarn)\.lock|package-lock\.json|yarn\.lock|tsconfig(?:\.[a-z0-9_-]+)?\.json|(?:eslint|next|postcss|prettier|tailwind|vite)\.config\.[cm]?[jt]s|\.env(?:\.[a-z0-9_-]+)?)(?:$|\/)|\.(?:[cm]?[jt]sx?|css|html|json|svg|png|jpe?g|webp|avif|gif|ico|woff2?|eot|otf|ttf|mp3|mp4|ogg|wav|webm)$/iu;
+  const referenceTextPathPattern =
+    /\.(?:[cm]?[jt]sx?|css|html|json|ya?ml|toml)$/iu;
+  const symlinks = fileRecords.filter((record) => record.symlink);
+  for (const symlink of symlinks) {
+    const logicalPath = logicalPathByArchivePath.get(symlink.path)!;
+    const basename = path.posix.basename(logicalPath);
+    if (
+      !documentationNamePattern.test(basename) ||
+      runtimeOrConfigurationPathPattern.test(logicalPath)
+    ) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+    }
+    let target: string;
+    try {
+      target = new TextDecoder("utf-8", { fatal: true })
+        .decode(symlink.bytes)
+        .trim();
+    } catch (error) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE", error);
+    }
+    const targetSegments = target.split("/");
+    if (
+      !target ||
+      Buffer.byteLength(target, "utf8") > 240 ||
+      target.startsWith("/") ||
+      target.includes("\\") ||
+      target.includes("\0") ||
+      targetSegments.some(
+        (segment) => !segment || segment === "." || segment === "..",
+      )
+    ) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+    }
+    const resolvedLogicalPath = path.posix.normalize(
+      path.posix.join(path.posix.dirname(logicalPath), target),
+    );
+    const resolvedBasename = path.posix.basename(resolvedLogicalPath);
+    if (
+      !documentationNamePattern.test(resolvedBasename) ||
+      runtimeOrConfigurationPathPattern.test(resolvedLogicalPath)
+    ) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+    }
+    const targetArchivePath = archivePathByLogicalPath.get(resolvedLogicalPath);
+    let targetRecord: (typeof records)[number] | undefined;
+    if (targetArchivePath) {
+      targetRecord = records.find(
+        (record) => record.path === targetArchivePath,
+      );
+      if (
+        !targetRecord ||
+        targetRecord.bytes === null ||
+        targetRecord.symlink
+      ) {
+        throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+      }
+    }
+    const referenceNeedles = [
+      logicalPath,
+      basename,
+      ...(targetRecord ? [] : [resolvedLogicalPath, resolvedBasename]),
+    ];
+    for (const record of fileRecords) {
+      if (
+        record.symlink ||
+        !referenceTextPathPattern.test(
+          logicalPathByArchivePath.get(record.path)!,
+        )
+      ) {
+        continue;
+      }
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(record.bytes);
+      } catch {
+        continue;
+      }
+      if (referenceNeedles.some((needle) => text.includes(needle))) {
+        throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+      }
+    }
+  }
+  let providerArchive = archive;
+  if (symlinks.length > 0) {
+    const repacked = new JSZip();
+    for (const record of fileRecords
+      .filter((candidate) => !candidate.symlink)
+      .sort((left, right) => left.path.localeCompare(right.path))) {
+      repacked.file(record.path, record.bytes, zipFileOptions());
+    }
+    providerArchive = await repacked.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+      compressionOptions: { level: 9 },
+      platform: "UNIX",
+    });
+    if (
+      providerArchive.length < 1 ||
+      providerArchive.length > NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES
+    ) {
+      throw new NativeVisualSourceError("NATIVE_TEMPLATE_ARCHIVE_INVALID");
+    }
+  }
+  const retainedLogicalPaths = fileRecords
+    .filter((record) => !record.symlink)
+    .map((record) => logicalPathByArchivePath.get(record.path)!);
+  return {
+    providerArchive,
+    providerArchiveSha256: sha256(providerArchive),
+    paths: retainedLogicalPaths,
+  };
+}
+
+function opaqueTemplateEntrypoint(input: {
+  paths: readonly string[];
+  slug: string;
+  sourceSubdirectory?: string | null;
+}) {
+  const pathMap = new Map(
+    input.paths.map((filename) => [filename, Buffer.alloc(0)]),
+  );
+  const registryEntrypoint = findRegistryTemplateEntrypoint(
+    pathMap,
+    input.slug,
+  );
+  if (registryEntrypoint) {
+    return {
+      framework: "next_static" as const,
+      entrypoint: registryEntrypoint,
+    };
+  }
+  const sourceSubdirectory = normalizedTemplateRootHint(
+    input.sourceSubdirectory,
+  );
+  const scoped = sourceSubdirectory
+    ? input.paths.filter(
+        (filename) =>
+          filename === sourceSubdirectory ||
+          filename.startsWith(`${sourceSubdirectory}/`),
+      )
+    : [...input.paths];
+  const choose = (suffixes: readonly string[]) => {
+    for (const suffix of suffixes) {
+      const matched = scoped
+        .filter(
+          (filename) => filename === suffix || filename.endsWith(`/${suffix}`),
+        )
+        .sort(
+          (left, right) =>
+            left.split("/").length - right.split("/").length ||
+            left.localeCompare(right),
+        )[0];
+      if (matched) return matched;
+    }
+    return null;
+  };
+  const nextEntrypoint = choose([
+    "app/page.tsx",
+    "app/page.jsx",
+    "src/app/page.tsx",
+    "src/app/page.jsx",
+    "pages/index.tsx",
+    "pages/index.jsx",
+    "src/pages/index.tsx",
+    "src/pages/index.jsx",
+  ]);
+  if (nextEntrypoint) {
+    return { framework: "next_static" as const, entrypoint: nextEntrypoint };
+  }
+  const viteEntrypoint = choose([
+    "src/main.tsx",
+    "src/main.jsx",
+    "src/App.tsx",
+    "src/App.jsx",
+  ]);
+  return {
+    framework: "vite_react" as const,
+    // This is an immutable selection coordinate, not an instruction to execute
+    // the archive during candidate generation. Manus receives the entire ZIP
+    // and returns the normalized, buildable source through the existing hard
+    // safety/compile boundary.
+    entrypoint: viteEntrypoint ?? "package.json",
+  };
+}
+
+async function createProviderTemplateSourceArchive(input: {
+  manifest: ProviderTemplateSourceManifestV1;
+  providerArchive: Buffer;
+}) {
+  const manifest = providerTemplateSourceManifestV1Schema.parse(input.manifest);
+  if (sha256(input.providerArchive) !== manifest.providerArchiveSha256) {
+    throw new NativeVisualSourceError("V6_PROVIDER_ARCHIVE_HASH_MISMATCH");
+  }
+  const zip = new JSZip();
+  zip.file(
+    V6_PROVIDER_SOURCE_MANIFEST_PATH,
+    canonicalJson(manifest),
+    zipFileOptions(),
+  );
+  zip.file(V6_PROVIDER_SOURCE_ARCHIVE_PATH, input.providerArchive, {
+    ...zipFileOptions(),
+    compression: "STORE",
+  });
+  const bytes = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 },
+    platform: "UNIX",
+  });
+  assertVisualSelectionBundleV6SourceArchiveSize(bytes);
+  return bytes;
+}
+
+async function readProviderTemplateSourceArchive(bytes: Buffer) {
+  assertVisualSelectionBundleV6SourceArchiveSize(bytes);
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(bytes, {
+      checkCRC32: true,
+      createFolders: false,
+    });
+  } catch (error) {
+    throw new NativeVisualSourceError(
+      "V6_PROVIDER_SOURCE_ARCHIVE_INVALID",
+      error,
+    );
+  }
+  const entries = Object.values(zip.files) as BoundedZipEntry[];
+  const expected = new Set([
+    V6_PROVIDER_SOURCE_MANIFEST_PATH,
+    V6_PROVIDER_SOURCE_ARCHIVE_PATH,
+  ]);
+  if (
+    entries.length !== expected.size ||
+    entries.some(
+      (entry) =>
+        entry.dir ||
+        zipEntryIsSymlink(entry) ||
+        (entry.unsafeOriginalName ?? entry.name) !== entry.name ||
+        !expected.has(entry.name),
+    )
+  ) {
+    throw new NativeVisualSourceError("V6_PROVIDER_SOURCE_ARCHIVE_INVALID");
+  }
+  const manifestEntry = zip.file(V6_PROVIDER_SOURCE_MANIFEST_PATH);
+  const providerEntry = zip.file(V6_PROVIDER_SOURCE_ARCHIVE_PATH);
+  if (!manifestEntry || !providerEntry) {
+    throw new NativeVisualSourceError("V6_PROVIDER_SOURCE_ARCHIVE_INVALID");
+  }
+  const manifestText = await manifestEntry.async("string");
+  if (Buffer.byteLength(manifestText, "utf8") > 32_000) {
+    throw new NativeVisualSourceError("V6_PROVIDER_SOURCE_MANIFEST_INVALID");
+  }
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(manifestText);
+  } catch (error) {
+    throw new NativeVisualSourceError(
+      "V6_PROVIDER_SOURCE_MANIFEST_INVALID",
+      error,
+    );
+  }
+  const manifest = providerTemplateSourceManifestV1Schema.parse(manifestValue);
+  const declared = Number(
+    (providerEntry as BoundedZipEntry)._data?.uncompressedSize ?? 0,
+  );
+  if (
+    Number.isFinite(declared) &&
+    declared > NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES
+  ) {
+    throw new NativeVisualSourceError("V6_PROVIDER_SOURCE_ARCHIVE_INVALID");
+  }
+  const providerArchive = await providerEntry.async("nodebuffer");
+  const inspected = await inspectOpaqueProviderTemplateArchive({
+    archive: providerArchive,
+    expectedSha256: manifest.providerArchiveSha256,
+  });
+  const expectedSourceTreeSha256 = canonicalSha256({
+    schemaVersion: 1,
+    sourceFormat: manifest.sourceFormat,
+    providerTemplateId: manifest.providerTemplateId,
+    providerSlug: manifest.providerSlug,
+    providerVersion: manifest.providerVersion,
+    sourceSubdirectory: manifest.sourceSubdirectory,
+    framework: manifest.framework,
+    entrypoint: manifest.entrypoint,
+    providerArchiveSha256: inspected.providerArchiveSha256,
+  });
+  if (expectedSourceTreeSha256 !== manifest.sourceTreeSha256) {
+    throw new NativeVisualSourceError("V6_PROVIDER_SOURCE_COORDINATE_MISMATCH");
+  }
+  return { manifest, providerArchive };
+}
+
 async function serveDirectory(root: string) {
   const server = createServer(async (request, response) => {
     try {
@@ -3364,48 +3881,102 @@ export async function prepareNativeVisualCandidate(input: {
   };
 }
 
-/** Worker-facing V6 candidate boundary. It consumes the complete Template ZIP
- * returned by the Provider adapter and emits the same immutable source archive
- * accepted by selectedNativeSourceArchive, Manus intake and the final native
- * materializer. Temporary build and Chromium state is cleaned by the shared
- * preview runtime on every terminal path. */
+/** Worker-facing V6 catalog boundary. Complete Provider archives are inert
+ * candidate data: validate and bind the immutable ZIP coordinate, but do not
+ * normalize, install, execute or compile it. The official Marketplace preview
+ * is the choice image. Once selected, the untouched Provider ZIP is sent to
+ * Manus; only Manus' returned site source crosses the existing hard safety and
+ * compile boundary. */
 export async function prepareNativeTemplateCandidate(input: {
   templateId: string | number;
   slug: string;
   version: string | null;
   archive: Uint8Array;
   expectedArchiveSha256?: string;
+  sourceSubdirectory?: string | null;
+  previewUrl?: string | null;
   signal: AbortSignal;
   fetchRemoteAsset?: typeof fetchSafeVisualPreview;
   fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
 }): Promise<PreparedNativeTemplateCandidate> {
   if (input.signal.aborted) throw input.signal.reason;
-  const normalized = await normalizeTwentyFirstNativeTemplateArchive({
-    templateId: input.templateId,
-    slug: input.slug,
-    version: input.version,
-    archive: input.archive,
-    expectedArchiveSha256: input.expectedArchiveSha256,
+  if (!input.previewUrl) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_PREVIEW_UNAVAILABLE");
+  }
+  const templateId = cleanTemplateCoordinate(
+    input.templateId,
+    "NATIVE_TEMPLATE_ID_INVALID",
+  );
+  const templateSlug = cleanTemplateCoordinate(
+    input.slug,
+    "NATIVE_TEMPLATE_SLUG_INVALID",
+  );
+  const providerVersion = cleanVersion(input.version);
+  if (input.version !== null && !providerVersion) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_VERSION_INVALID");
+  }
+  const downloadedProviderArchive = Buffer.from(input.archive);
+  const inspected = await inspectOpaqueProviderTemplateArchive({
+    archive: downloadedProviderArchive,
+    expectedSha256: input.expectedArchiveSha256,
   });
-  const source = await mirrorNativeStaticMedia({
-    source: normalized,
-    signal: input.signal,
-    fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
-    fetchRemoteStyleAsset:
-      input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
+  const providerArchive = inspected.providerArchive;
+  const sourceSubdirectory = normalizedTemplateRootHint(
+    input.sourceSubdirectory,
+  );
+  const coordinate = opaqueTemplateEntrypoint({
+    paths: inspected.paths,
+    slug: templateSlug,
+    sourceSubdirectory,
   });
-  const sourceArchive = await createNativeSourceArchive(source);
-  assertVisualSelectionBundleV6SourceArchiveSize(sourceArchive);
-  const preview = await renderNativeReactSourcePreview({
-    sourceArchive,
-    signal: input.signal,
+  const sourceTreeSha256 = canonicalSha256({
+    schemaVersion: 1,
+    sourceFormat: "provider_archive_v1",
+    providerTemplateId: templateId,
+    providerSlug: templateSlug,
+    providerVersion,
+    sourceSubdirectory,
+    framework: coordinate.framework,
+    entrypoint: coordinate.entrypoint,
+    providerArchiveSha256: inspected.providerArchiveSha256,
   });
+  const sourceArchive = await createProviderTemplateSourceArchive({
+    manifest: {
+      schemaVersion: 1,
+      sourceFormat: "provider_archive_v1",
+      providerTemplateId: templateId,
+      providerSlug: templateSlug,
+      providerVersion,
+      sourceSubdirectory,
+      framework: coordinate.framework,
+      sourceDirectory: NATIVE_SOURCE_DIRECTORY,
+      entrypoint: coordinate.entrypoint,
+      providerArchiveSha256: inspected.providerArchiveSha256,
+      sourceTreeSha256,
+    },
+    providerArchive,
+  });
+  const preview = (
+    await (input.fetchRemoteAsset ?? fetchSafeVisualPreview)({
+      url: input.previewUrl,
+      signal: input.signal,
+    })
+  ).buffer;
   return {
-    ...source,
-    templateId: normalized.templateId,
-    templateSlug: normalized.templateSlug,
-    framework: normalized.framework,
-    sourceDirectory: normalized.sourceDirectory,
+    providerItemKey: `t:${templateId}:${templateSlug}`,
+    providerVersion,
+    entrypoint: coordinate.entrypoint,
+    demoEntrypoint: coordinate.entrypoint,
+    dependencies: [],
+    htmlEntrypoint: CONTROLLED_HTML_ENTRYPOINT,
+    appEntrypoint: CONTROLLED_APP_ENTRYPOINT,
+    files: [],
+    sourceTreeSha256,
+    templateId,
+    templateSlug,
+    framework: coordinate.framework,
+    sourceDirectory: NATIVE_SOURCE_DIRECTORY,
+    sourceFormat: "provider_archive_v1",
     sourceArchive,
     sourceArchiveSha256: sha256(sourceArchive),
     preview,
@@ -3458,11 +4029,28 @@ function expectedV6ProviderItemKey(candidate: {
   return `t:${candidate.providerTemplateId}:${candidate.providerSlug}`;
 }
 
-function assertV6SourceCoordinates(input: {
+async function inspectV6SourceCoordinates(input: {
   candidate: VisualSelectionBundleV6["candidates"][number];
-  source: Awaited<ReturnType<typeof readNativeSourceArchive>>;
+  archive: Buffer;
 }) {
-  const { candidate, source } = input;
+  const { candidate, archive } = input;
+  if (candidate.sourceFormat === "provider_archive_v1") {
+    const source = await readProviderTemplateSourceArchive(archive);
+    const { manifest } = source;
+    if (
+      manifest.providerTemplateId !== candidate.providerTemplateId ||
+      manifest.providerSlug !== candidate.providerSlug ||
+      manifest.providerVersion !== candidate.providerVersion ||
+      manifest.framework !== candidate.framework ||
+      manifest.sourceDirectory !== candidate.sourceDirectory ||
+      manifest.entrypoint !== candidate.entrypoint ||
+      manifest.sourceTreeSha256 !== candidate.sourceTreeSha256
+    ) {
+      throw new NativeVisualSourceError("V6_SOURCE_COORDINATE_MISMATCH");
+    }
+    return { sourceFormat: "provider_archive_v1" as const, ...source };
+  }
+  const source = await readNativeSourceArchive(archive);
   const nextStaticEntrypoint =
     /^(?:src\/)?app\/(?:\([a-zA-Z0-9_-]+\)\/)*page\.[cm]?[jt]sx?$/u.test(
       candidate.entrypoint,
@@ -3481,6 +4069,7 @@ function assertV6SourceCoordinates(input: {
   ) {
     throw new NativeVisualSourceError("V6_SOURCE_COORDINATE_MISMATCH");
   }
+  return { sourceFormat: "normalized_v1" as const, ...source };
 }
 
 export async function createVisualSelectionBundleV6Artifact(input: {
@@ -3498,8 +4087,7 @@ export async function createVisualSelectionBundleV6Artifact(input: {
       throw new NativeVisualSourceError("V6_SOURCE_ARCHIVE_HASH_MISMATCH");
     }
     assertVisualSelectionBundleV6SourceArchiveSize(archive);
-    const source = await readNativeSourceArchive(archive);
-    assertV6SourceCoordinates({ candidate, source });
+    await inspectV6SourceCoordinates({ candidate, archive });
     zip.file(candidate.sourceArchivePath, archive, {
       ...zipFileOptions(),
       compression: "STORE",
@@ -3605,13 +4193,13 @@ export async function readVisualSelectionBundleArtifact(bytes: Buffer) {
           : "V5_SOURCE_ARCHIVE_HASH_MISMATCH",
       );
     }
-    const source = await readNativeSourceArchive(archive);
     if (bundle.schemaVersion === 6) {
       if (!("providerTemplateId" in candidate)) {
         throw new NativeVisualSourceError("VISUAL_SOURCE_COORDINATE_MISMATCH");
       }
-      assertV6SourceCoordinates({ candidate, source });
+      await inspectV6SourceCoordinates({ candidate, archive });
     } else {
+      const source = await readNativeSourceArchive(archive);
       if (!("providerItemKey" in candidate)) {
         throw new NativeVisualSourceError("VISUAL_SOURCE_COORDINATE_MISMATCH");
       }
@@ -3639,12 +4227,33 @@ export async function selectedNativeSourceArchive(input: {
   );
   if (!candidate)
     throw new NativeVisualSourceError("VISUAL_SELECTED_CANDIDATE_MISSING");
-  const archiveBytes = artifact.archives.get(candidate.id)!;
-  const source = await readNativeSourceArchive(archiveBytes);
+  const frozenArchiveBytes = artifact.archives.get(candidate.id)!;
+  if (
+    artifact.bundle.schemaVersion === 6 &&
+    "sourceFormat" in candidate &&
+    candidate.sourceFormat === "provider_archive_v1"
+  ) {
+    const source = await inspectV6SourceCoordinates({
+      candidate,
+      archive: frozenArchiveBytes,
+    });
+    if (source.sourceFormat !== "provider_archive_v1") {
+      throw new NativeVisualSourceError("V6_SOURCE_FORMAT_MISMATCH");
+    }
+    return {
+      bundle: artifact.bundle,
+      candidate,
+      archiveBytes: source.providerArchive,
+      archiveSha256: source.manifest.providerArchiveSha256,
+      manifest: source.manifest,
+      files: [] as NativeSourceFile[],
+    };
+  }
+  const source = await readNativeSourceArchive(frozenArchiveBytes);
   return {
     bundle: artifact.bundle,
     candidate,
-    archiveBytes,
+    archiveBytes: frozenArchiveBytes,
     archiveSha256: candidate.sourceArchiveSha256,
     manifest: source.manifest,
     files: source.files,

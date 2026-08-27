@@ -18,6 +18,7 @@ import {
   createTwentyFirstSiteOpsProviderHandler,
   nativeTemplateProviderErrorCode,
   nativeSourceProviderErrorCode,
+  planNativeTemplateCapacityPages,
   resolveVisualSearchPlan,
   type TwentyFirstBoardPersistenceInput,
   type TwentyFirstProviderContext,
@@ -66,6 +67,75 @@ it("keeps complete-template catalog, build and render provider codes distinct", 
   expect(nativeTemplateProviderErrorCode("browser_unavailable")).toBe(
     "NATIVE_TEMPLATE_BROWSER_UNAVAILABLE",
   );
+});
+
+it("capacity-balances the 135373697-byte randomized V6 pool without failing on an oversized first nine", () => {
+  const pageLimit = 99 * 1024 * 1024;
+  const largeArchiveBytes = 13_143_190;
+  const candidates = [
+    ...Array.from({ length: 9 }, (_, index) => ({
+      key: `large-${index}`,
+      archiveBytes: largeArchiveBytes,
+      priorityIndex: index,
+    })),
+    ...Array.from({ length: 18 }, (_, index) => ({
+      key: `small-${index}`,
+      archiveBytes: index === 17 ? 949_165 : 949_166,
+      priorityIndex: index + 9,
+    })),
+  ];
+  expect(
+    candidates
+      .slice(0, 9)
+      .reduce((total, candidate) => total + candidate.archiveBytes, 0),
+  ).toBe(118_288_710);
+  expect(
+    candidates.reduce((total, candidate) => total + candidate.archiveBytes, 0),
+  ).toBe(135_373_697);
+
+  const plan = planNativeTemplateCapacityPages({
+    candidates,
+    pageCount: 3,
+    maxPageBytes: pageLimit,
+    currentBinIndex: 1,
+  });
+  expect(plan).toMatchObject({
+    feasible: true,
+    required: 27,
+    usable: 27,
+    rejectedOversize: 0,
+  });
+  expect(plan.bins).toHaveLength(3);
+  expect(plan.current).toHaveLength(9);
+  expect(new Set(plan.bins.flat().map((candidate) => candidate.key)).size).toBe(
+    27,
+  );
+  for (const bin of plan.bins) {
+    expect(bin).toHaveLength(9);
+    expect(
+      bin.reduce((total, candidate) => total + candidate.archiveBytes, 0),
+    ).toBeLessThan(pageLimit);
+  }
+
+  const remaining = plan.bins
+    .filter((bin) => bin !== plan.current)
+    .flat()
+    .map((candidate, priorityIndex) => ({ ...candidate, priorityIndex }));
+  const nextPlan = planNativeTemplateCapacityPages({
+    candidates: remaining,
+    pageCount: 2,
+    maxPageBytes: pageLimit,
+  });
+  expect(nextPlan.feasible).toBe(true);
+  expect(nextPlan.bins).toHaveLength(2);
+  expect(
+    nextPlan.bins.every(
+      (bin) =>
+        bin.length === 9 &&
+        bin.reduce((total, candidate) => total + candidate.archiveBytes, 0) <
+          pageLimit,
+    ),
+  ).toBe(true);
 });
 
 function operation(): SiteOperation {
@@ -701,7 +771,7 @@ describe("21st SiteOps provider", () => {
     ).toHaveLength(1);
   });
 
-  it("uses only the complete Template catalog and continues past eight build failures to publish a V6 board", async () => {
+  it("uses the complete Template catalog and preserves 27 capacity-feasible candidates after five preparation failures", async () => {
     const row = operation();
     row.input = {
       knowledgeSnapshotId: snapshotId,
@@ -720,6 +790,12 @@ describe("21st SiteOps provider", () => {
       verified: false,
       includedWithPlan: false,
       sortRank: index,
+      previewUrl: `https://cdn.21st.dev/templates/complete-${index + 1}.png`,
+      sourceOwner: "frontmind-fixtures",
+      sourceRepo: `template-${index + 1}`,
+      sourceCommitSha: (index + 1).toString(16).padStart(40, "0"),
+      sourceSubdirectory: null,
+      sourceLicense: "MIT" as const,
     }));
     const withReadOnlySession = vi.fn();
     const listNativeTemplates = vi.fn(async () => templates);
@@ -741,7 +817,7 @@ describe("21st SiteOps provider", () => {
       maximumPreparations = Math.max(maximumPreparations, activePreparations);
       try {
         await new Promise((resolve) => setTimeout(resolve, 1));
-        if (call < 8) {
+        if (call < 5) {
           throw new NativeVisualSourceError("NATIVE_TEMPLATE_COMPILE_FAILED");
         }
         return await preparedTemplateFixture({
@@ -803,10 +879,17 @@ describe("21st SiteOps provider", () => {
         diagnostics: {
           templateMode: true,
           catalogCandidates: 32,
-          templateDownloadAttempts: 18,
-          templateDownloadsSucceeded: 18,
-          compileAttempts: 18,
-          compileSucceeded: 10,
+          templateDownloadAttempts: 32,
+          templateDownloadsSucceeded: 32,
+          sourcePreparationAttempts: 32,
+          sourcePrepared: 27,
+          previewFetchAttempts: 32,
+          compileAttempts: 0,
+          renderAttempts: 0,
+          capacityCandidates: 27,
+          capacityRequired: 27,
+          capacityPages: 3,
+          capacitySelected: 9,
           publishedCount: 9,
         },
       },
@@ -825,8 +908,15 @@ describe("21st SiteOps provider", () => {
     expect(JSON.stringify(listNativeTemplates.mock.calls)).not.toContain(
       "GEO Analytics",
     );
-    expect(downloadNativeTemplate).toHaveBeenCalledTimes(18);
-    expect(prepareNativeTemplateCandidate).toHaveBeenCalledTimes(18);
+    expect(downloadNativeTemplate).toHaveBeenCalledTimes(32);
+    const downloadedTemplateIds = downloadNativeTemplate.mock.calls.map(
+      ([, input]) => String(input.templateId),
+    );
+    expect(new Set(downloadedTemplateIds).size).toBe(32);
+    expect(downloadedTemplateIds).not.toEqual(
+      Array.from({ length: 32 }, (_, index) => String(index + 1)),
+    );
+    expect(prepareNativeTemplateCandidate).toHaveBeenCalledTimes(32);
     expect(maximumPreparations).toBeLessThanOrEqual(3);
     expect(persisted!.selectionBundle).toMatchObject({
       schemaVersion: 6,
@@ -862,6 +952,12 @@ describe("21st SiteOps provider", () => {
       verified: true,
       includedWithPlan: true,
       sortRank: index,
+      previewUrl: `https://cdn.21st.dev/templates/page-${index + 1}.png`,
+      sourceOwner: "frontmind-fixtures",
+      sourceRepo: `template-${index + 1}`,
+      sourceCommitSha: (index + 1).toString(16).padStart(40, "0"),
+      sourceSubdirectory: null,
+      sourceLicense: "MIT" as const,
     }));
     const context = providerContext();
     context.project.status = "awaiting_visual_selection";
@@ -950,6 +1046,180 @@ describe("21st SiteOps provider", () => {
     ).toBe(true);
   });
 
+  it("publishes three pages of 27 different V6 Templates even when every preview has the same perceptual hash", async () => {
+    const templates = Array.from({ length: 32 }, (_, index) => ({
+      templateId: index + 1,
+      slug: `random-template-${index + 1}`,
+      name: `Random Template ${index + 1}`,
+      version: (index + 1).toString(16).padStart(40, "0"),
+      verified: true,
+      includedWithPlan: true,
+      sortRank: index,
+      previewUrl: `https://cdn.21st.dev/templates/random-${index + 1}.png`,
+      sourceOwner: "frontmind-fixtures",
+      sourceRepo: `random-template-${index + 1}`,
+      sourceCommitSha: (index + 1).toString(16).padStart(40, "0"),
+      sourceSubdirectory: null,
+      sourceLicense: "MIT" as const,
+    }));
+    const commonPreview = await perceptuallyDistinctPng(909);
+    const previous = {
+      providerItemKeys: [] as string[],
+      previewSha256s: [] as string[],
+      perceptualHashes: [] as string[],
+      sourceTreeSha256s: [] as string[],
+      nativePreviewSha256s: [] as string[],
+      providerTemplateIds: [] as string[],
+      providerTemplateSlugs: [] as string[],
+    };
+    const published: Array<{
+      providerTemplateId: string;
+      providerSlug: string;
+      providerItemKey: string;
+      sourceTreeSha256: string;
+      previewSha256: string;
+      previewPerceptualHash: string;
+    }> = [];
+
+    for (const page of [1, 2, 3] as const) {
+      const context = providerContext();
+      context.project.status =
+        page === 1 ? "visual_searching" : "awaiting_visual_selection";
+      context.publishedPageCount = page - 1;
+      context.previousReferences = {
+        providerItemKeys: [...previous.providerItemKeys],
+        previewSha256s: [...previous.previewSha256s],
+        perceptualHashes: [...previous.perceptualHashes],
+        sourceTreeSha256s: [...previous.sourceTreeSha256s],
+        nativePreviewSha256s: [...previous.nativePreviewSha256s],
+        providerTemplateIds: [...previous.providerTemplateIds],
+        providerTemplateSlugs: [...previous.providerTemplateSlugs],
+      };
+      const row =
+        page === 1 ? initialV2Operation(4) : supplementalOperation(page, 4);
+      row.id = `44444444-4444-4444-8444-44444444444${page}`;
+      row.input = {
+        ...(row.input as Record<string, unknown>),
+        workflowVersion: "2.5.0",
+      };
+      let persisted: TwentyFirstBoardPersistenceInput | null = null;
+      const handler = createTwentyFirstSiteOpsProviderHandler({
+        getDb: async () => ({ fake: "db" }),
+        loadContext: async () => context,
+        getCredential: async () => ({
+          id: credentialId,
+          version: 3,
+          fingerprint: "fingerprint",
+          apiKey: "21st_sk_test_secret",
+        }),
+        client: {
+          withReadOnlySession: vi.fn(),
+          listNativeTemplates: vi.fn(async () => templates),
+          downloadNativeTemplate: vi.fn(async (_key, input) => {
+            const archive = Buffer.from(`zip:${input.slug}`);
+            return {
+              templateId: input.templateId,
+              slug: input.slug,
+              version: input.version ?? null,
+              archive: new Uint8Array(archive),
+              sha256: sha256(archive),
+              contentType: "application/zip" as const,
+              sourceUrlOrigin: "https://21st.dev" as const,
+            };
+          }),
+        },
+        resolveNativeTemplateShuffleKey: () => Buffer.alloc(32, 0x50 + page),
+        prepareNativeTemplateCandidate: vi.fn(async (input) => {
+          const prepared = await preparedTemplateFixture({
+            templateId: input.templateId,
+            slug: input.slug,
+            version: input.version,
+            seed: 909,
+          });
+          const preview = Buffer.concat([
+            commonPreview,
+            Buffer.from(`:${String(input.templateId)}`),
+          ]);
+          return {
+            ...prepared,
+            preview,
+            previewSha256: sha256(preview),
+          };
+        }),
+        persistArtifact: vi.fn(async (input) => ({
+          id: randomUUID(),
+          contentSha256: sha256(input.buffer),
+        })) as never,
+        persistBoard: vi.fn(async (_db, input) => {
+          persisted = input;
+          return {
+            batchId: randomUUID(),
+            candidateCount: input.mirroredCandidates.length,
+            selectionBundleHash: input.selectionBundleArtifact.contentSha256,
+          };
+        }),
+      });
+
+      await expect(
+        handler({ operation: row, signal: new AbortController().signal }),
+      ).resolves.toMatchObject({
+        status: "succeeded",
+        result: { page, candidateCount: 9 },
+      });
+      const pageCandidates = persisted!.mirroredCandidates.flatMap(
+        (candidate) =>
+          "providerTemplateId" in candidate
+            ? [
+                {
+                  providerTemplateId: candidate.providerTemplateId,
+                  providerSlug: candidate.providerSlug,
+                  providerItemKey: candidate.providerItemKey,
+                  sourceTreeSha256: candidate.sourceTreeSha256,
+                  previewSha256: candidate.previewSha256,
+                  previewPerceptualHash: candidate.previewPerceptualHash,
+                },
+              ]
+            : [],
+      );
+      expect(pageCandidates).toHaveLength(9);
+      published.push(...pageCandidates);
+      previous.providerItemKeys.push(
+        ...pageCandidates.map((candidate) => candidate.providerItemKey),
+      );
+      previous.perceptualHashes.push(
+        ...pageCandidates.map((candidate) => candidate.previewPerceptualHash),
+      );
+      previous.sourceTreeSha256s.push(
+        ...pageCandidates.map((candidate) => candidate.sourceTreeSha256),
+      );
+      previous.nativePreviewSha256s.push(
+        ...pageCandidates.map((candidate) => candidate.previewSha256),
+      );
+      previous.providerTemplateIds.push(
+        ...pageCandidates.map((candidate) => candidate.providerTemplateId),
+      );
+      previous.providerTemplateSlugs.push(
+        ...pageCandidates.map((candidate) => candidate.providerSlug),
+      );
+    }
+
+    expect(published).toHaveLength(27);
+    expect(new Set(published.map((item) => item.providerTemplateId)).size).toBe(
+      27,
+    );
+    expect(new Set(published.map((item) => item.providerSlug)).size).toBe(27);
+    expect(new Set(published.map((item) => item.providerItemKey)).size).toBe(
+      27,
+    );
+    expect(new Set(published.map((item) => item.sourceTreeSha256)).size).toBe(
+      27,
+    );
+    expect(new Set(published.map((item) => item.previewSha256)).size).toBe(27);
+    expect(
+      new Set(published.map((item) => item.previewPerceptualHash)).size,
+    ).toBe(1);
+  });
+
   it("returns the aggregate live-template pool error without calling get_component", async () => {
     const row = operation();
     row.input = {
@@ -966,6 +1236,12 @@ describe("21st SiteOps provider", () => {
       verified: true,
       includedWithPlan: false,
       sortRank: index,
+      previewUrl: `https://cdn.21st.dev/templates/failure-${index + 1}.png`,
+      sourceOwner: "frontmind-fixtures",
+      sourceRepo: `template-${index + 1}`,
+      sourceCommitSha: (index + 1).toString(16).padStart(40, "0"),
+      sourceSubdirectory: null,
+      sourceLicense: "MIT" as const,
     }));
     const withReadOnlySession = vi.fn();
     const persistBoard = vi.fn();
@@ -1003,14 +1279,17 @@ describe("21st SiteOps provider", () => {
       handler({ operation: row, signal: new AbortController().signal }),
     ).resolves.toMatchObject({
       status: "attention_required",
-      code: "NATIVE_TEMPLATE_COMPILE_UNAVAILABLE",
+      code: "NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT",
       result: {
         templateMode: true,
         catalogCandidates: 12,
         templateDownloadAttempts: 12,
-        compileAttempts: 12,
+        sourcePreparationAttempts: 12,
+        compileAttempts: 0,
         publishedCount: 0,
-        templateFailureCategory: "compile_failed",
+        capacityCandidates: 0,
+        capacityRequired: 27,
+        templateFailureCategory: "insufficient_live_templates",
       },
     });
     expect(withReadOnlySession).not.toHaveBeenCalled();

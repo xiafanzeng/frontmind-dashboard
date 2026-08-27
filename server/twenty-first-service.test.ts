@@ -19,6 +19,7 @@ import {
   encryptTwentyFirstApiKey,
   hasActiveTwentyFirstConsumers,
   probeTwentyFirstTemplateCompilerEnvironment,
+  projectTwentyFirstMarketplaceTemplateSummaries,
   projectTwentyFirstToolPayload,
   projectTwentyFirstNativeTemplateSummaries,
   replaceTwentyFirstApiCredential,
@@ -210,11 +211,37 @@ function createTemplateMcpFetch(input: {
     verified: boolean;
     includedWithPlan: boolean;
   };
+  marketplaceItems?: Array<Record<string, unknown>>;
+  marketplaceStatus?: number;
+  marketplacePayload?: unknown;
 }) {
   const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
   const httpCalls: Array<{ url: string; authorization: string | null }> = [];
   const fetchImpl = vi.fn(async (rawUrl: string | URL, init?: RequestInit) => {
     const url = new URL(String(rawUrl));
+    if (url.pathname === "/api/trpc/templates.list") {
+      httpCalls.push({
+        url: url.toString(),
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      return new Response(
+        JSON.stringify(
+          input.marketplacePayload ?? {
+            result: {
+              data: {
+                json: {
+                  items: input.marketplaceItems ?? [marketplaceTemplateItem()],
+                },
+              },
+            },
+          },
+        ),
+        {
+          status: input.marketplaceStatus ?? 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
     if (url.pathname.startsWith("/api/templates/")) {
       httpCalls.push({
         url: url.toString(),
@@ -331,6 +358,28 @@ function createTemplateMcpFetch(input: {
   return { calls, httpCalls, fetchImpl };
 }
 
+function marketplaceTemplateItem(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id: 41,
+    template_slug: "verified-starter",
+    name: "Verified starter",
+    hosting: "hosted",
+    verified: true,
+    preview_url:
+      "https://cdn.21st.dev/user_test/templates/verified-starter/preview.png",
+    source: {
+      owner: "frontmind-test",
+      repo: "verified-starter",
+      subdir: "template",
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      license: "MIT",
+    },
+    ...overrides,
+  };
+}
+
 function createNativeProbeFetch(input: {
   usageResult?: Record<string, unknown>;
   searchResult: Record<string, unknown>;
@@ -436,22 +485,14 @@ describe("TwentyFirstClient", () => {
       nativeTemplateReadiness: "ready",
       server: { name: "21st-test", version: "1.0.0" },
     });
-    expect(calls).toHaveLength(4);
-    expect(
-      calls.every(
-        (call) =>
-          call.name === "search" &&
-          call.arguments.type === "template" &&
-          call.arguments.sort === "popular",
-      ),
-    ).toBe(true);
-    expect(calls.map((call) => call.name)).not.toContain("get_component");
-    expect(httpCalls).toHaveLength(2);
-    expect(
-      httpCalls.every(
-        (call) => call.authorization === "Bearer 21st_sk_test_secret",
-      ),
-    ).toBe(true);
+    expect(calls).toEqual([]);
+    expect(httpCalls).toHaveLength(1);
+    expect(httpCalls[0]?.authorization).toBeNull();
+    const catalogUrl = new URL(httpCalls[0]!.url);
+    expect(catalogUrl.pathname).toBe("/api/trpc/templates.list");
+    expect(JSON.parse(catalogUrl.searchParams.get("input")!)).toEqual({
+      json: { lane: "included", sortBy: "recommended", limit: 60 },
+    });
     expect(
       httpCalls.every((call) => !call.url.includes("21st_sk_test_secret")),
     ).toBe(true);
@@ -460,13 +501,13 @@ describe("TwentyFirstClient", () => {
     );
   });
 
-  it("validates the pinned CLI 1.16 compiler and Chromium environment", async () => {
+  it("validates the local source normalization compiler without requiring Chromium", async () => {
     await expect(probeTwentyFirstTemplateCompilerEnvironment()).resolves.toBe(
       true,
     );
   });
 
-  it("reports compiler_unavailable after a valid Template ZIP probe", async () => {
+  it("does not make the local compiler a Template catalog readiness gate", async () => {
     const { fetchImpl } = createTemplateMcpFetch({});
     const templateBinaryFetch = vi.fn(async () =>
       Uint8Array.from([0x50, 0x4b, 0x03, 0x04]),
@@ -479,7 +520,7 @@ describe("TwentyFirstClient", () => {
         templateCompilerProbe: async () => false,
       }).inspectCapabilities("21st_sk_test_secret"),
     ).resolves.toMatchObject({
-      nativeTemplateReadiness: "compiler_unavailable",
+      nativeTemplateReadiness: "ready",
     });
   });
 
@@ -1204,382 +1245,151 @@ describe("TwentyFirstClient", () => {
     ]);
   });
 
-  it("lists only provider-verified and account-unlocked Templates without calling get_component", async () => {
-    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
-      verified: true,
-      results: [
-        {
-          id: 41,
-          slug: "verified-starter",
-          name: "Verified starter",
-          type: "template",
-          verified: true,
-          version: "7",
+  it("strictly projects hosted verified included Templates and immutable source coordinates", () => {
+    const valid = marketplaceTemplateItem();
+    const duplicateId = marketplaceTemplateItem({
+      template_slug: "duplicate-id",
+    });
+    const duplicateSlug = marketplaceTemplateItem({ id: 42 });
+    const rejected = [
+      marketplaceTemplateItem({ id: 50, hosting: "external" }),
+      marketplaceTemplateItem({ id: 51, verified: false }),
+      marketplaceTemplateItem({
+        id: 52,
+        source: {
+          owner: "frontmind-test",
+          repo: "unsafe",
+          subdir: "../secret",
+          commitSha: "0123456789abcdef0123456789abcdef01234567",
+          license: "MIT",
         },
-      ],
-    });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await expect(
-      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toEqual([
-      expect.objectContaining({
+      }),
+      marketplaceTemplateItem({
+        id: 53,
+        source: {
+          owner: "frontmind-test",
+          repo: "unsafe",
+          subdir: null,
+          commitSha: "branch-main",
+          license: "MIT",
+        },
+      }),
+      marketplaceTemplateItem({
+        id: 54,
+        preview_url: "http://127.0.0.1/preview.png",
+      }),
+      marketplaceTemplateItem({
+        id: 55,
+        source: {
+          owner: "frontmind-test",
+          repo: "unsafe",
+          subdir: null,
+          commitSha: "0123456789abcdef0123456789abcdef01234567",
+          license: "GPL-3.0",
+        },
+      }),
+    ];
+    expect(
+      projectTwentyFirstMarketplaceTemplateSummaries({
+        result: {
+          data: {
+            json: { items: [valid, duplicateId, duplicateSlug, ...rejected] },
+          },
+        },
+      }),
+    ).toEqual([
+      {
         templateId: 41,
         slug: "verified-starter",
+        name: "Verified starter",
+        version: "0123456789abcdef0123456789abcdef01234567",
         verified: true,
         includedWithPlan: true,
-      }),
+        sortRank: 0,
+        previewUrl:
+          "https://cdn.21st.dev/user_test/templates/verified-starter/preview.png",
+        sourceOwner: "frontmind-test",
+        sourceRepo: "verified-starter",
+        sourceCommitSha: "0123456789abcdef0123456789abcdef01234567",
+        sourceSubdirectory: "template",
+        sourceLicense: "MIT",
+      },
     ]);
-    expect(calls).toHaveLength(4);
-    expect(
-      calls.every(
-        (call) =>
-          call.name === "search" &&
-          call.arguments.type === "template" &&
-          call.arguments.sort === "popular",
-      ),
-    ).toBe(true);
-    expect(calls.map((call) => call.name)).not.toContain("get_component");
-    expect(httpCalls).toHaveLength(1);
   });
 
-  it("accepts an explicitly plan-included unlocked Template without inventing verification", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({
-      verified: false,
-      includedWithPlan: true,
-      results: [
-        {
-          id: 41,
-          slug: "unverified-starter",
-          type: "template",
-          verified: false,
+  it("requests only the official included/recommended directory and returns at most thirty-two entries", async () => {
+    const marketplaceItems = Array.from({ length: 40 }, (_, index) =>
+      marketplaceTemplateItem({
+        id: index + 1,
+        template_slug: `template-${index + 1}`,
+        name: `Template ${index + 1}`,
+        source: {
+          owner: "frontmind-test",
+          repo: `template-${index + 1}`,
+          subdir: null,
+          commitSha: index.toString(16).padStart(40, "0"),
+          license: index % 2 === 0 ? "MIT" : "Apache-2.0",
         },
-      ],
-    });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await expect(
-      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toEqual([
-      expect.objectContaining({
-        verified: false,
-        includedWithPlan: true,
-      }),
-    ]);
-  });
-
-  it("accepts an officially unlocked item when optional catalog flags are absent", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({
-      verified: false,
-      omitIncludedWithPlan: true,
-      results: [
-        {
-          id: 41,
-          slug: "unverified-starter",
-          type: "template",
-          verified: false,
-        },
-      ],
-    });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await expect(
-      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toEqual([
-      expect.objectContaining({
-        verified: false,
-        includedWithPlan: false,
-      }),
-    ]);
-  });
-
-  it("does not equate an individually unlocked Template with plan inclusion", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({
-      verified: true,
-      includedWithPlan: false,
-    });
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toEqual([
-      expect.objectContaining({
-        verified: true,
-        includedWithPlan: false,
-      }),
-    ]);
-  });
-
-  it("requires tools/list to explicitly enumerate template/page search", async () => {
-    const { calls, fetchImpl } = createTemplateMcpFetch({
-      advertiseTemplateType: false,
-    });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await expect(
-      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).rejects.toMatchObject({ category: "catalog_unavailable" });
-    expect(calls).toEqual([]);
-  });
-
-  it("hard-caps discovery and stops progressive access checks at limit one", async () => {
-    const results = Array.from({ length: 70 }, (_, index) => ({
-      id: index + 1,
-      slug: `template-${index + 1}`,
-      type: "template",
-      verified: true,
-    }));
-    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({ results });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await expect(
-      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toHaveLength(1);
-    expect(calls).toHaveLength(1);
-    expect(
-      httpCalls.filter((call) => call.url.endsWith("/purchase")),
-    ).toHaveLength(1);
-  });
-
-  it("continues fixed catalog discovery when the first readiness query is empty", async () => {
-    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
-      resultsBySearch: [
-        [],
-        [
-          {
-            id: 41,
-            slug: "verified-starter",
-            name: "Verified starter",
-            type: "template",
-            verified: true,
-            version: "7",
-          },
-        ],
-      ],
-    });
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toEqual([
-      expect.objectContaining({
-        templateId: 41,
-        slug: "verified-starter",
-      }),
-    ]);
-    expect(calls).toHaveLength(4);
-    expect(
-      httpCalls.filter((call) => call.url.endsWith("/purchase")),
-    ).toHaveLength(1);
-  });
-
-  it("continues past a locked first window to the next downloadable Template", async () => {
-    const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
-      resultsBySearch: [
-        [
-          {
-            id: 1,
-            slug: "locked-template",
-            type: "template",
-          },
-        ],
-        [
-          {
-            id: 2,
-            slug: "downloadable-template",
-            type: "template",
-          },
-        ],
-      ],
-      purchaseAccess: (slug) => ({
-        isUnlocked: slug === "downloadable-template",
-        verified: false,
-        includedWithPlan: false,
-      }),
-    });
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).resolves.toEqual([
-      expect.objectContaining({
-        templateId: 2,
-        slug: "downloadable-template",
-      }),
-    ]);
-    expect(calls).toHaveLength(4);
-    expect(
-      httpCalls.filter((call) => call.url.endsWith("/purchase")),
-    ).toHaveLength(2);
-  });
-
-  it("classifies locked Templates without optional catalog flags as plan_ineligible", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({
-      unlocked: false,
-      verified: false,
-      omitIncludedWithPlan: true,
-    });
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).rejects.toMatchObject({ category: "plan_ineligible" });
-  });
-
-  it("discovers beyond locked popular results before returning thirty-two eligible Templates", async () => {
-    const resultsBySearch = Array.from({ length: 4 }, (_, queryIndex) =>
-      Array.from({ length: 18 }, (_, resultIndex) => {
-        const ordinal = queryIndex * 18 + resultIndex + 1;
-        return {
-          id: ordinal,
-          slug: `template-${ordinal}`,
-          type: "template",
-          verified: true,
-        };
       }),
     );
     const { calls, httpCalls, fetchImpl } = createTemplateMcpFetch({
-      resultsBySearch,
-      purchaseAccess: (slug) => {
-        const ordinal = Number(slug.replace("template-", ""));
-        return {
-          isUnlocked: ordinal > 32,
-          verified: true,
-          includedWithPlan: ordinal > 32,
-        };
-      },
+      marketplaceItems,
     });
-
     const templates = await new TwentyFirstClient({
       fetchImpl: fetchImpl as unknown as typeof fetch,
       timeoutMs: 1_000,
     }).listNativeTemplates("21st_sk_test_secret", { limit: 32 });
-
-    expect(calls).toHaveLength(4);
     expect(templates).toHaveLength(32);
-    expect(templates[0]).toMatchObject({
-      templateId: 33,
-      slug: "template-33",
+    expect(calls).toEqual([]);
+    expect(httpCalls).toHaveLength(1);
+    expect(httpCalls[0]?.authorization).toBeNull();
+    const catalogUrl = new URL(httpCalls[0]!.url);
+    expect(catalogUrl.pathname).toBe("/api/trpc/templates.list");
+    expect(JSON.parse(catalogUrl.searchParams.get("input")!)).toEqual({
+      json: { lane: "included", sortBy: "recommended", limit: 60 },
     });
-    expect(templates.at(-1)).toMatchObject({
-      templateId: 64,
-      slug: "template-64",
-    });
-    expect(
-      httpCalls.filter((call) => call.url.endsWith("/purchase")),
-    ).toHaveLength(64);
+    expect(httpCalls[0]!.url).not.toContain("popular");
+    expect(httpCalls[0]!.url).not.toContain("21st_sk_test_secret");
   });
 
-  it("excludes prior Template IDs and slugs before spending entitlement reads", async () => {
-    const { httpCalls, fetchImpl } = createTemplateMcpFetch({
-      results: [
-        { id: 1, slug: "already-by-id", type: "template", verified: true },
-        { id: 2, slug: "already-by-slug", type: "template", verified: true },
-        { id: 3, slug: "fresh-template", type: "template", verified: true },
+  it("applies prior-page exclusions after strict catalog projection", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({
+      marketplaceItems: [
+        marketplaceTemplateItem({ id: 1, template_slug: "already-by-id" }),
+        marketplaceTemplateItem({ id: 2, template_slug: "already-by-slug" }),
+        marketplaceTemplateItem({ id: 3, template_slug: "fresh-template" }),
       ],
     });
-    const result = await new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    }).listNativeTemplates("21st_sk_test_secret", {
-      limit: 1,
-      excludeTemplateIds: ["1"],
-      excludeSlugs: ["already-by-slug"],
-    });
-    expect(result).toEqual([
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).listNativeTemplates("21st_sk_test_secret", {
+        limit: 1,
+        excludeTemplateIds: ["1"],
+        excludeSlugs: ["already-by-slug"],
+      }),
+    ).resolves.toEqual([
       expect.objectContaining({ templateId: 3, slug: "fresh-template" }),
     ]);
-    expect(
-      httpCalls.filter((call) => call.url.endsWith("/purchase")),
-    ).toHaveLength(1);
-    expect(httpCalls[0]?.url).toContain("fresh-template");
   });
 
-  it("classifies a Template entitlement 403 as plan_ineligible", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({ purchaseStatus: 403 });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await expect(
-      client.listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).rejects.toMatchObject({ category: "plan_ineligible" });
+  it("fails closed for an empty or malformed Marketplace directory", async () => {
+    for (const marketplacePayload of [
+      { result: { data: { json: { items: [] } } } },
+      { result: { data: { json: { templates: [] } } } },
+    ]) {
+      await expect(
+        new TwentyFirstClient({
+          fetchImpl: createTemplateMcpFetch({ marketplacePayload })
+            .fetchImpl as unknown as typeof fetch,
+          timeoutMs: 1_000,
+        }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
+      ).rejects.toMatchObject({ category: "catalog_unavailable" });
+    }
   });
 
-  it("classifies a Template endpoint 401 as an invalid credential", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({ purchaseStatus: 401 });
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-      }).listNativeTemplates("21st_sk_test_secret", { limit: 1 }),
-    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
-  });
-
-  it("omits popular sorting unless tools/list explicitly advertises it", async () => {
-    const { calls, fetchImpl } = createTemplateMcpFetch({
-      advertisePopular: false,
-    });
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-    });
-    await client.listNativeTemplates("21st_sk_test_secret", { limit: 1 });
-    expect(calls).toHaveLength(4);
-    expect(
-      calls.every(
-        (call) =>
-          call.name === "search" &&
-          call.arguments.type === "template" &&
-          !("sort" in call.arguments),
-      ),
-    ).toBe(true);
-  });
-
-  it("returns nine unlocked Templates from the default catalog when popular sorting is unavailable", async () => {
-    const { calls, fetchImpl } = createTemplateMcpFetch({
-      advertisePopular: false,
-      results: Array.from({ length: 12 }, (_, index) => ({
-        id: index + 1,
-        slug: `default-template-${index + 1}`,
-        type: "template",
-        verified: false,
-      })),
-      verified: false,
-      omitIncludedWithPlan: true,
-    });
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-      }).listNativeTemplates("21st_sk_test_secret", { limit: 9 }),
-    ).resolves.toHaveLength(9);
-    expect(calls).toHaveLength(4);
-    expect(
-      calls.every(
-        (call) =>
-          call.name === "search" &&
-          call.arguments.type === "template" &&
-          !("sort" in call.arguments),
-      ),
-    ).toBe(true);
-  });
-
-  it("downloads a version-bound raw ZIP without putting the key in URLs", async () => {
+  it("downloads an exact codeload commit ZIP without sending the API key", async () => {
     const { httpCalls, fetchImpl } = createTemplateMcpFetch({});
     const archive = Uint8Array.from([
       0x50, 0x4b, 0x03, 0x04, 0x66, 0x72, 0x6f, 0x6e, 0x74,
@@ -1593,29 +1403,35 @@ describe("TwentyFirstClient", () => {
     const result = await client.downloadNativeTemplate("21st_sk_test_secret", {
       templateId: 41,
       slug: "verified-starter",
-      version: "7",
+      version: "0123456789abcdef0123456789abcdef01234567",
+      sourceOwner: "frontmind-test",
+      sourceRepo: "verified-starter",
+      sourceCommitSha: "0123456789abcdef0123456789abcdef01234567",
+      sourceSubdirectory: "template",
+      sourceLicense: "MIT",
     });
     expect(result).toMatchObject({
       templateId: 41,
       slug: "verified-starter",
-      version: "7",
+      version: "0123456789abcdef0123456789abcdef01234567",
       contentType: "application/zip",
       sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      sourceUrlOrigin: "https://codeload.github.com",
+      sourceSubdirectory: "template",
     });
     expect(result.archive).toEqual(archive);
     expect(templateBinaryFetch).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "full",
         maxBytes: 50 * 1024 * 1024,
+        url: "https://codeload.github.com/frontmind-test/verified-starter/zip/0123456789abcdef0123456789abcdef01234567",
       }),
     );
-    expect(httpCalls).toHaveLength(2);
-    expect(
-      httpCalls.every((call) => !call.url.includes("21st_sk_test_secret")),
-    ).toBe(true);
+    expect(httpCalls).toHaveLength(1);
+    expect(httpCalls[0]?.authorization).toBeNull();
   });
 
-  it("reuses the bounded catalog entitlement proof during the same operation", async () => {
+  it("reuses the strict catalog source proof during the same operation", async () => {
     const { httpCalls, fetchImpl } = createTemplateMcpFetch({});
     const archive = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x01]);
     const client = new TwentyFirstClient({
@@ -1630,38 +1446,17 @@ describe("TwentyFirstClient", () => {
       templateId: listed[0]!.templateId,
       slug: listed[0]!.slug,
       version: listed[0]!.version,
+      sourceOwner: listed[0]!.sourceOwner,
+      sourceRepo: listed[0]!.sourceRepo,
+      sourceCommitSha: listed[0]!.sourceCommitSha,
+      sourceSubdirectory: listed[0]!.sourceSubdirectory,
+      sourceLicense: listed[0]!.sourceLicense,
     });
-    expect(
-      httpCalls.filter((call) => call.url.endsWith("/purchase")),
-    ).toHaveLength(1);
-    expect(
-      httpCalls.filter((call) => call.url.includes("/download?json=1")),
-    ).toHaveLength(1);
+    expect(httpCalls).toHaveLength(1);
   });
 
-  it("downloads an officially unlocked Template without optional catalog flags", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({
-      verified: false,
-      omitIncludedWithPlan: true,
-    });
-    const archive = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x01]);
-    const templateBinaryFetch = vi.fn(async () => archive);
-    await expect(
-      new TwentyFirstClient({
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 1_000,
-        templateBinaryFetch,
-      }).downloadNativeTemplate("21st_sk_test_secret", {
-        templateId: 41,
-        slug: "unverified-starter",
-        version: "7",
-      }),
-    ).resolves.toMatchObject({ archive });
-    expect(templateBinaryFetch).toHaveBeenCalledTimes(1);
-  });
-
-  it("requires an immutable provider version in the download descriptor", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({ omitDownloadVersion: true });
+  it("rejects caller source coordinates that differ from the catalog proof", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({});
     const templateBinaryFetch = vi.fn();
     await expect(
       new TwentyFirstClient({
@@ -1671,14 +1466,19 @@ describe("TwentyFirstClient", () => {
       }).downloadNativeTemplate("21st_sk_test_secret", {
         templateId: 41,
         slug: "verified-starter",
-        version: "7",
+        version: "0123456789abcdef0123456789abcdef01234567",
+        sourceOwner: "attacker",
+        sourceRepo: "different-repo",
+        sourceCommitSha: "ffffffffffffffffffffffffffffffffffffffff",
+        sourceSubdirectory: null,
+        sourceLicense: "Apache-2.0",
       }),
     ).rejects.toMatchObject({ category: "download_unavailable" });
     expect(templateBinaryFetch).not.toHaveBeenCalled();
   });
 
-  it("rejects a download descriptor that rotated away from the selected version", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({ downloadVersion: "8" });
+  it("rejects a selected version that is not the immutable catalog commit", async () => {
+    const { fetchImpl } = createTemplateMcpFetch({});
     const templateBinaryFetch = vi.fn();
     await expect(
       new TwentyFirstClient({
@@ -1688,7 +1488,7 @@ describe("TwentyFirstClient", () => {
       }).downloadNativeTemplate("21st_sk_test_secret", {
         templateId: 41,
         slug: "verified-starter",
-        version: "7",
+        version: "ffffffffffffffffffffffffffffffffffffffff",
       }),
     ).rejects.toMatchObject({ category: "download_unavailable" });
     expect(templateBinaryFetch).not.toHaveBeenCalled();
@@ -1707,29 +1507,9 @@ describe("TwentyFirstClient", () => {
       client.downloadNativeTemplate("21st_sk_test_secret", {
         templateId: 41,
         slug: "verified-starter",
-        version: "7",
+        version: "0123456789abcdef0123456789abcdef01234567",
       }),
     ).rejects.toMatchObject({ category: "download_unavailable" });
-  });
-
-  it("fails closed on an unsafe signed Template URL before fetching bytes", async () => {
-    const { fetchImpl } = createTemplateMcpFetch({
-      downloadUrl: "http://127.0.0.1/private.zip",
-    });
-    const templateBinaryFetch = vi.fn();
-    const client = new TwentyFirstClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-      templateBinaryFetch,
-    });
-    await expect(
-      client.downloadNativeTemplate("21st_sk_test_secret", {
-        templateId: 41,
-        slug: "verified-starter",
-        version: "7",
-      }),
-    ).rejects.toBeInstanceOf(TwentyFirstNativeTemplateError);
-    expect(templateBinaryFetch).not.toHaveBeenCalled();
   });
 
   it("classifies locked, missing and unknown get_component responses without reflecting text", () => {
