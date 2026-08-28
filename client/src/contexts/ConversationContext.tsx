@@ -47,6 +47,7 @@ import {
   stripKnowledgeBaseReferenceAppendix,
 } from "@shared/knowledge-base-output";
 import { uniquifyOrderedIds } from "@shared/ordered-id";
+import type { GeneralChatDispatchMetadata } from "@shared/frontmind-general-chat-dispatch";
 import {
   dispatchKnowledgeBaseProgressUpdated,
   reconcileKnowledgeBaseObservation,
@@ -64,8 +65,10 @@ export function conversationSyncErrorMessage(error: unknown): string {
     /failed to fetch|networkerror|network request failed|load failed/iu.test(
       message,
     )
-    ? "会话同步暂时中断，连接恢复后将自动重试。"
-    : message;
+    ? "会话尚未同步，消息和附件已保留。请重试，请勿重复发送。"
+    : message === CONVERSATION_HYDRATION_SUPERSEDED_MESSAGE
+      ? message
+      : "会话尚未同步，消息和附件已保留。请重试，请勿重复发送。";
 }
 
 const CONVERSATION_HYDRATION_SUPERSEDED_MESSAGE =
@@ -147,6 +150,17 @@ export interface LocalMessage {
     leafId?: string | null;
     serverOwned?: boolean;
   };
+  /** Server-authored durable projection of an ordinary Agent event. */
+  generalChat?: {
+    schemaVersion: 1;
+    kind: "assistant_projection";
+    turnId: string;
+    agentTaskId: string;
+    providerEventId: string;
+    serverOwned: true;
+  };
+  /** Browser-owned retry identity until Dashboard returns a task DTO. */
+  generalChatDispatch?: GeneralChatDispatchMetadata;
 }
 
 export interface KnowledgeBaseClientNotice {
@@ -208,7 +222,7 @@ export interface Conversation {
   title: string;
   messages: LocalMessage[];
   /** Server-derived boundary for provider tasks owned outside ordinary chat. */
-  executionKind?: "response_logic";
+  executionKind?: "general_chat_v2" | "response_logic";
   taskId?: string; // Upstream task ID
   previousResponseId?: string;
   status:
@@ -265,6 +279,10 @@ export function repairConversationMessageIds(
 
 export function isServerOwnedKnowledgeBaseMessage(message: LocalMessage) {
   return message.knowledgeBase?.serverOwned === true;
+}
+
+export function isServerOwnedGeneralChatMessage(message: LocalMessage) {
+  return message.generalChat?.serverOwned === true;
 }
 
 function hasServerOwnedKnowledgeBaseMessages(conversation: Conversation) {
@@ -392,7 +410,7 @@ type Action =
         taskId?: string;
         taskUrl?: string;
         previousResponseId?: string;
-        executionKind?: "response_logic";
+        executionKind?: "general_chat_v2" | "response_logic";
         clearTaskPointer?: boolean;
         startedAt?: number;
         completedAt?: number;
@@ -402,6 +420,10 @@ type Action =
   | {
       type: "UPDATE_ASSISTANT_MESSAGES";
       payload: { conversationId: string; messages: LocalMessage[] };
+    }
+  | {
+      type: "SETTLE_GENERAL_CHAT_DISPATCH";
+      payload: { conversationId: string; clientRequestId: string };
     }
   | {
       type: "MARK_KNOWLEDGE_BASE";
@@ -547,6 +569,32 @@ function conversationReducer(
         }),
       };
     }
+    case "SETTLE_GENERAL_CHAT_DISPATCH": {
+      return {
+        ...state,
+        conversations: state.conversations.map((conversation) => {
+          if (conversation.id !== action.payload.conversationId) {
+            return conversation;
+          }
+          let changed = false;
+          const messages = conversation.messages.map((message) => {
+            if (
+              message.generalChatDispatch?.clientRequestId !==
+              action.payload.clientRequestId
+            ) {
+              return message;
+            }
+            changed = true;
+            const { generalChatDispatch: _pendingDispatch, ...settled } =
+              message;
+            return settled;
+          });
+          return changed
+            ? { ...conversation, messages, updatedAt: Date.now() }
+            : conversation;
+        }),
+      };
+    }
     case "MARK_KNOWLEDGE_BASE": {
       return {
         ...state,
@@ -662,6 +710,12 @@ function conversationReducer(
             (message) => message.id === action.payload.messageId,
           );
           if (target && isServerOwnedKnowledgeBaseMessage(target)) return c;
+          if (
+            target?.role === "user" &&
+            target.generalChatDispatch?.kind === "pending_user"
+          ) {
+            return c;
+          }
           return {
             ...c,
             messages: c.messages.filter(
@@ -1473,6 +1527,7 @@ export function prepareConversationForCloud(
   const browserOwnedMessages = repairedMessages.filter(
     (message) =>
       !isServerOwnedKnowledgeBaseMessage(message) &&
+      !isServerOwnedGeneralChatMessage(message) &&
       !(
         message.knowledgeBase?.kind === "pending_user" &&
         message.knowledgeBase.serverOwned !== true
@@ -1506,6 +1561,76 @@ export function prepareConversationForCloud(
       ),
     })),
   };
+}
+
+/**
+ * A cloud read must never erase a local snapshot that has not received an
+ * ACK. Merge by stable message/output identity while allowing a server-owned
+ * ordinary projection to replace its optimistic polling copy.
+ */
+export function mergeDirtyConversationHydration(
+  local: Conversation,
+  remote: Conversation,
+): Conversation {
+  const messages = [...local.messages];
+  const idToIndex = new Map(
+    messages.map((message, index) => [message.id, index]),
+  );
+  const outputToIndex = new Map(
+    messages.flatMap((message, index) =>
+      message.upstreamOutputId
+        ? ([[message.upstreamOutputId, index]] as const)
+        : [],
+    ),
+  );
+
+  for (const remoteMessage of remote.messages) {
+    const existingIndex =
+      idToIndex.get(remoteMessage.id) ??
+      (remoteMessage.upstreamOutputId
+        ? outputToIndex.get(remoteMessage.upstreamOutputId)
+        : undefined);
+    if (existingIndex === undefined) {
+      idToIndex.set(remoteMessage.id, messages.length);
+      if (remoteMessage.upstreamOutputId) {
+        outputToIndex.set(remoteMessage.upstreamOutputId, messages.length);
+      }
+      messages.push(remoteMessage);
+    } else if (isServerOwnedGeneralChatMessage(remoteMessage)) {
+      messages[existingIndex] = remoteMessage;
+      idToIndex.set(remoteMessage.id, existingIndex);
+      if (remoteMessage.upstreamOutputId) {
+        outputToIndex.set(remoteMessage.upstreamOutputId, existingIndex);
+      }
+    }
+  }
+
+  return {
+    ...remote,
+    messages: repairConversationMessageIds(messages),
+    title: local.title,
+    status: local.status,
+    executionKind: local.executionKind ?? remote.executionKind,
+    taskId: local.taskId ?? remote.taskId,
+    previousResponseId: local.previousResponseId ?? remote.previousResponseId,
+    startedAt: local.startedAt ?? remote.startedAt,
+    completedAt: local.completedAt ?? remote.completedAt,
+    lastKnownOutputLength:
+      local.lastKnownOutputLength ?? remote.lastKnownOutputLength,
+    updatedAt: Math.max(local.updatedAt, remote.updatedAt),
+  };
+}
+
+export function remoteMissingLocalConversations(
+  local: readonly Conversation[],
+  remoteIds: ReadonlySet<string>,
+  initial: boolean,
+  isDirty: (id: string) => boolean,
+) {
+  return local.filter(
+    (conversation) =>
+      !remoteIds.has(conversation.id) && (initial || isDirty(conversation.id)),
+  );
 }
 
 function normalizeConversation(conversation: Conversation): Conversation {
@@ -1929,6 +2054,10 @@ interface ConversationContextType {
   }) => string;
   setActive: (id: string) => void;
   addMessage: (conversationId: string, message: LocalMessage) => void;
+  settleGeneralChatDispatch: (
+    conversationId: string,
+    clientRequestId: string,
+  ) => void;
   updateStatus: (
     conversationId: string,
     status: Conversation["status"],
@@ -1936,7 +2065,7 @@ interface ConversationContextType {
       taskId?: string;
       taskUrl?: string;
       previousResponseId?: string;
-      executionKind?: "response_logic";
+      executionKind?: "general_chat_v2" | "response_logic";
       clearTaskPointer?: boolean;
       startedAt?: number;
       completedAt?: number;
@@ -1969,6 +2098,8 @@ interface ConversationContextType {
     primaryConversationId?: string,
   ) => string[];
   deleteMessage: (conversationId: string, messageId: string) => void;
+  /** Persist the latest local snapshot before dispatching dependent work. */
+  flushConversation: (conversationId: string) => Promise<boolean>;
   refreshConversations: () => Promise<void>;
   /** Re-read cloud history after an authoritative reset/local discard. */
   refreshConversationsAfterDiscard: () => Promise<void>;
@@ -2057,20 +2188,9 @@ export function ConversationProvider({
           "UNAUTHORIZED",
         ].includes(code ?? "");
       },
-      onPermanentError: (error, operation) => {
-        if (
-          getTrpcErrorCode(error) === "NOT_FOUND" &&
-          operation.kind === "snapshot"
-        ) {
-          const nextState = conversationReducer(stateRef.current, {
-            type: "DELETE_CONVERSATION",
-            payload: operation.conversation.id,
-          });
-          stateRef.current = nextState;
-          dispatch({ type: "LOAD_STATE", payload: nextState });
-          setSyncError(null);
-        }
-      },
+      // A write rejection is not authoritative deletion evidence. The queue
+      // retains the operation as blocked/dirty for an explicit retry.
+      onPermanentError: () => undefined,
       debounceMs: 50,
     });
   }
@@ -2325,25 +2445,28 @@ export function ConversationProvider({
               !locallyDiscardedConversationIdsRef.current.has(remote.id),
           )
           .map(normalizeConversation)
-          .map((remote) =>
-            mergeKnowledgeBaseHydration(
-              stateRef.current.conversations.find(
-                (local) => local.id === remote.id,
-              ),
-              remote,
-            ),
-          );
-        // The workspace is already visible while its first conversation query
-        // is in flight. Preserve brand-new local conversations created during
-        // that short window, then persist them once hydration succeeds.
+          .map((remote) => {
+            const local = stateRef.current.conversations.find(
+              (candidate) => candidate.id === remote.id,
+            );
+            const merged = mergeKnowledgeBaseHydration(local, remote);
+            return local && syncQueueRef.current!.isDirty(remote.id)
+              ? mergeDirtyConversationHydration(local, merged)
+              : merged;
+          });
+        // A list response may have started before the latest local write. Keep
+        // every remote-missing dirty conversation on both initial and later
+        // hydrations; a stale list is never authority to erase unacknowledged
+        // messages or attachments.
         const remoteIds = new Set(
           remoteConversations.map((conversation) => conversation.id),
         );
-        const optimisticConversations = initial
-          ? stateRef.current.conversations.filter(
-              (conversation) => !remoteIds.has(conversation.id),
-            )
-          : [];
+        const optimisticConversations = remoteMissingLocalConversations(
+          stateRef.current.conversations,
+          remoteIds,
+          initial,
+          (conversationId) => syncQueueRef.current!.isDirty(conversationId),
+        );
         const conversations = [
           ...optimisticConversations,
           ...remoteConversations,
@@ -2358,11 +2481,13 @@ export function ConversationProvider({
         setSyncError(null);
         setHydrated(true);
         canSyncRef.current = true;
-        for (const conversation of optimisticConversations) {
-          syncQueueRef.current!.enqueueSnapshot(
-            prepareConversationForCloud(conversation),
-            true,
-          );
+        if (initial) {
+          for (const conversation of optimisticConversations) {
+            syncQueueRef.current!.enqueueSnapshot(
+              prepareConversationForCloud(conversation),
+              true,
+            );
+          }
         }
       } catch (error: unknown) {
         if (
@@ -2413,8 +2538,10 @@ export function ConversationProvider({
   }, [auth.loading, hydrateForUser, projectAssignmentId, replaceState, userId]);
 
   useEffect(() => {
-    canSyncRef.current = hydrated && userId !== null && syncError === null;
-  }, [hydrated, syncError, userId]);
+    // A previous rejection must not turn off the outbox. Newer local snapshots
+    // still enqueue and can replace/retry the blocked operation.
+    canSyncRef.current = hydrated && userId !== null;
+  }, [hydrated, userId]);
 
   useEffect(() => {
     let timer: number | undefined;
@@ -2520,6 +2647,19 @@ export function ConversationProvider({
     [commit],
   );
 
+  const settleGeneralChatDispatch = useCallback(
+    (conversationId: string, clientRequestId: string) => {
+      commit(
+        {
+          type: "SETTLE_GENERAL_CHAT_DISPATCH",
+          payload: { conversationId, clientRequestId },
+        },
+        [conversationId],
+      );
+    },
+    [commit],
+  );
+
   const updateStatus = useCallback(
     (
       conversationId: string,
@@ -2528,7 +2668,7 @@ export function ConversationProvider({
         taskId?: string;
         taskUrl?: string;
         previousResponseId?: string;
-        executionKind?: "response_logic";
+        executionKind?: "general_chat_v2" | "response_logic";
         clearTaskPointer?: boolean;
         startedAt?: number;
         completedAt?: number;
@@ -2650,7 +2790,7 @@ export function ConversationProvider({
   const refreshConversations = useCallback(async () => {
     const expectedUserId = accountIdRef.current;
     if (expectedUserId === null) return;
-    if (!hydrated || !canSyncRef.current) {
+    if (!hydrated) {
       await hydrateForUser(expectedUserId, !hydrated);
       return;
     }
@@ -2658,6 +2798,11 @@ export function ConversationProvider({
     if (!flushed) return;
     await hydrateForUser(expectedUserId, false);
   }, [hydrateForUser, hydrated]);
+
+  const flushConversation = useCallback(async (conversationId: string) => {
+    if (!canSyncRef.current) return false;
+    return syncQueueRef.current!.flushConversation(conversationId);
+  }, []);
 
   const refreshConversationsAfterDiscard = useCallback(async () => {
     const expectedUserId = accountIdRef.current;
@@ -2717,6 +2862,7 @@ export function ConversationProvider({
         createConversation,
         setActive,
         addMessage,
+        settleGeneralChatDispatch,
         updateStatus,
         updateAssistantMessages,
         registerKnowledgeBaseConversation,
@@ -2730,6 +2876,7 @@ export function ConversationProvider({
         discardConversationLocally,
         discardKnowledgeBaseConversationsLocally,
         deleteMessage,
+        flushConversation,
         refreshConversations,
         refreshConversationsAfterDiscard,
         clearSyncError,

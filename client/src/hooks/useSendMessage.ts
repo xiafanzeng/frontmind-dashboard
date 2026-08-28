@@ -19,8 +19,10 @@ import {
   fileToBase64,
   creditEventBus,
   sanitizeBrandText,
+  buildPromptText,
   RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX,
   type ContentItem,
+  type GeneralAgentModelProfile,
   type KnowledgeBaseAttachmentManifestItem,
   type Message,
   type ResponseLogicTaskContext,
@@ -28,6 +30,7 @@ import {
   type TaskResponse,
   type UploadRetentionReceipt,
 } from "@/lib/frontmind-api";
+import type { GeneralChatDispatchMetadata } from "@shared/frontmind-general-chat-dispatch";
 import {
   useConversation,
   type Attachment,
@@ -311,11 +314,57 @@ type FrozenKnowledgeBaseAttemptEnvelope = {
   };
 };
 
+type FrozenGeneralChatDispatchEnvelope = {
+  messageId: string;
+  inputSignature: string;
+  contentItems: ContentItem[];
+  attachments: Attachment[];
+  preparedUploads: PreparedUploadFiles;
+  dispatch: GeneralChatDispatchMetadata;
+};
+
+type DurableGeneralChatRetry = {
+  message: LocalMessage;
+  dispatch: GeneralChatDispatchMetadata;
+};
+
+function normalizedGeneralAgentProfile(
+  value: string | undefined,
+): GeneralAgentModelProfile {
+  return value === "frontmind-lite" ||
+    value === "frontmind-base" ||
+    value === "frontmind-pro"
+    ? value
+    : "frontmind-pro";
+}
+
+function contentItemsForDurableGeneralChatRetry(
+  retry: DurableGeneralChatRetry,
+): ContentItem[] {
+  const attachmentByFileId = new Map(
+    (retry.message.attachments ?? []).flatMap((attachment) =>
+      attachment.fileId ? [[attachment.fileId, attachment] as const] : [],
+    ),
+  );
+  return [
+    { type: "input_text", text: retry.dispatch.providerPrompt },
+    ...retry.dispatch.localAssetIds.map((fileId) => {
+      const attachment = attachmentByFileId.get(fileId);
+      return {
+        type: "input_file" as const,
+        file_id: fileId,
+        filename: attachment?.name ?? "file",
+      };
+    }),
+  ];
+}
+
 export function useSendMessage() {
   const {
     state,
     activeConversation,
     addMessage,
+    settleGeneralChatDispatch,
     updateStatus,
     updateAssistantMessages,
     updateTitle,
@@ -324,6 +373,7 @@ export function useSendMessage() {
     wakeKnowledgeBaseConversation,
     commitKnowledgeBaseObservation,
     rollbackPendingKnowledgeBaseTurn,
+    flushConversation,
   } = useConversation();
 
   // Use a ref to track whether polling should continue.
@@ -332,6 +382,9 @@ export function useSendMessage() {
   const sendInFlightRef = useRef(false);
   const activeConvRef = useRef(activeConversation);
   activeConvRef.current = activeConversation;
+  const pendingGeneralChatDispatchRef = useRef(
+    new Map<string, FrozenGeneralChatDispatchEnvelope>(),
+  );
 
   // Store context functions in refs so polling closures always use the latest versions
   const updateStatusRef = useRef(updateStatus);
@@ -698,6 +751,8 @@ export function useSendMessage() {
         knowledgeBaseExpectedPresentationKey?: string;
         submissionKind?: "message" | "logo";
         responseLogicContext?: ResponseLogicTaskContext;
+        /** Internal: reconstructed from a persisted pending user message. */
+        generalChatRetry?: DurableGeneralChatRetry;
       },
     ) => {
       if (sendInFlightRef.current) {
@@ -713,6 +768,10 @@ export function useSendMessage() {
       try {
         const isKnowledgeBaseSubmission =
           options?.syncKnowledgeBaseSnapshot === true;
+        const durableGeneralChatRetry =
+          !isKnowledgeBaseSubmission && !options?.responseLogicContext
+            ? options?.generalChatRetry
+            : undefined;
         if (
           !isKnowledgeBaseSubmission &&
           !(await requireCurrentFrontMindBuild(text))
@@ -721,7 +780,8 @@ export function useSendMessage() {
           return false;
         }
         const retryConfig = options?.retryConfig || defaultRetryConfig;
-        const agentProfile = options?.agentProfile;
+        const agentProfile =
+          durableGeneralChatRetry?.message.modelName ?? options?.agentProfile;
 
         // Ensure we have an active conversation
         let convId = activeConvRef.current?.id;
@@ -739,6 +799,43 @@ export function useSendMessage() {
             : null;
 
         const knowledgeBaseSubmissionText = text;
+        const generalChatInputSignature = JSON.stringify({
+          text: text.trim(),
+          files: files.map((file) => ({
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            lastModified: file.lastModified,
+          })),
+        });
+        const pendingGeneralChatDispatch =
+          !isKnowledgeBaseSubmission && !options?.responseLogicContext
+            ? pendingGeneralChatDispatchRef.current.get(convId)
+            : undefined;
+        const durableGeneralChatEnvelope = durableGeneralChatRetry
+          ? {
+              messageId: durableGeneralChatRetry.dispatch.clientRequestId,
+              inputSignature: generalChatInputSignature,
+              contentItems: contentItemsForDurableGeneralChatRetry(
+                durableGeneralChatRetry,
+              ),
+              attachments: (
+                durableGeneralChatRetry.message.attachments ?? []
+              ).map((attachment) => ({ ...attachment })),
+              preparedUploads: {
+                files: [],
+                didZipLargeImages: false,
+                zippedImages: [],
+              },
+              dispatch: durableGeneralChatRetry.dispatch,
+            }
+          : undefined;
+        const reusableGeneralChatEnvelope =
+          durableGeneralChatEnvelope ??
+          (pendingGeneralChatDispatch?.inputSignature ===
+          generalChatInputSignature
+            ? pendingGeneralChatDispatch
+            : undefined);
         const knowledgeBaseClientRequestId = options?.syncKnowledgeBaseSnapshot
           ? (resumedKnowledgeBaseAttachmentAttempt?.clientRequestId ??
             (typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -761,8 +858,16 @@ export function useSendMessage() {
         }
 
         // Build content items
-        const contentItems: ContentItem[] = [];
-        const attachments: Attachment[] = [];
+        const contentItems: ContentItem[] = reusableGeneralChatEnvelope
+          ? reusableGeneralChatEnvelope.contentItems.map((item) => ({
+              ...item,
+            }))
+          : [];
+        const attachments: Attachment[] = reusableGeneralChatEnvelope
+          ? reusableGeneralChatEnvelope.attachments.map((attachment) => ({
+              ...attachment,
+            }))
+          : [];
 
         try {
           // This guard is intentionally repeated after preparation below. The
@@ -780,7 +885,10 @@ export function useSendMessage() {
         }
 
         // Add text
-        if (knowledgeBaseSubmissionText.trim()) {
+        if (
+          !reusableGeneralChatEnvelope &&
+          knowledgeBaseSubmissionText.trim()
+        ) {
           contentItems.push({
             type: "input_text",
             text: knowledgeBaseSubmissionText.trim(),
@@ -789,21 +897,23 @@ export function useSendMessage() {
 
         let preparedUploads: PreparedUploadFiles;
         try {
-          preparedUploads = resumedKnowledgeBaseAttachmentAttempt
-            ? {
-                files: [...resumedKnowledgeBaseAttachmentAttempt.files]
-                  .sort((left, right) => left.ordinal - right.ordinal)
-                  .map(({ file }) => ({ file })),
-                didZipLargeImages: false,
-                zippedImages: [],
-              }
-            : options?.syncKnowledgeBaseSnapshot
+          preparedUploads = reusableGeneralChatEnvelope
+            ? reusableGeneralChatEnvelope.preparedUploads
+            : resumedKnowledgeBaseAttachmentAttempt
               ? {
-                  files: files.map((file) => ({ file })),
+                  files: [...resumedKnowledgeBaseAttachmentAttempt.files]
+                    .sort((left, right) => left.ordinal - right.ordinal)
+                    .map(({ file }) => ({ file })),
                   didZipLargeImages: false,
                   zippedImages: [],
                 }
-              : await prepareUploadFiles(files);
+              : options?.syncKnowledgeBaseSnapshot
+                ? {
+                    files: files.map((file) => ({ file })),
+                    didZipLargeImages: false,
+                    zippedImages: [],
+                  }
+                : await prepareUploadFiles(files);
         } catch (err: any) {
           toast.error("图片 ZIP 打包失败", {
             description:
@@ -828,7 +938,7 @@ export function useSendMessage() {
           return false;
         }
 
-        if (preparedUploads.didZipLargeImages) {
+        if (!reusableGeneralChatEnvelope && preparedUploads.didZipLargeImages) {
           contentItems.push({ type: "input_text", text: ZIP_REFERENCE_PROMPT });
           toast.info("超高像素图片已无损打包为 ZIP", {
             description:
@@ -1072,7 +1182,7 @@ export function useSendMessage() {
         // Process files with progress tracking. All attachments are sent as files,
         // including images, to avoid the direct oversized image visual path.
         const totalFiles = preparedUploads.files.length;
-        if (totalFiles > 0) {
+        if (totalFiles > 0 && !reusableGeneralChatEnvelope) {
           setUploadProgress({
             currentFileIndex: 0,
             totalFiles,
@@ -1083,7 +1193,11 @@ export function useSendMessage() {
           });
         }
 
-        for (let i = 0; i < preparedUploads.files.length; i++) {
+        for (
+          let i = 0;
+          i < (reusableGeneralChatEnvelope ? 0 : preparedUploads.files.length);
+          i++
+        ) {
           const prepared = preparedUploads.files[i];
           const file = prepared.file;
           const attemptFile =
@@ -1420,12 +1534,50 @@ export function useSendMessage() {
         }
 
         // Add user message to conversation
+        const reuseGeneralChatMessageId =
+          reusableGeneralChatEnvelope?.messageId;
+        const ordinaryOriginalLocalTaskId =
+          reusableGeneralChatEnvelope !== undefined
+            ? reusableGeneralChatEnvelope.dispatch.localTaskId
+            : (conv?.previousResponseId ?? conv?.taskId ?? null);
+        const generalChatDispatch =
+          !isKnowledgeBaseSubmission && !options?.responseLogicContext
+            ? (reusableGeneralChatEnvelope?.dispatch ?? {
+                schemaVersion: 1 as const,
+                kind: "pending_user" as const,
+                clientRequestId:
+                  reuseGeneralChatMessageId ??
+                  `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                providerPrompt: buildPromptText([
+                  { role: "user", content: contentItems },
+                ]),
+                localAssetIds: [
+                  ...new Set(
+                    contentItems.flatMap((item) =>
+                      item.type === "input_file" && item.file_id
+                        ? [item.file_id]
+                        : [],
+                    ),
+                  ),
+                ].sort(),
+                localTaskId: ordinaryOriginalLocalTaskId,
+                modelProfile:
+                  ordinaryOriginalLocalTaskId === null
+                    ? normalizedGeneralAgentProfile(agentProfile)
+                    : null,
+              })
+            : undefined;
         const userMessage: LocalMessage = {
-          id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id:
+            generalChatDispatch?.clientRequestId ??
+            reuseGeneralChatMessageId ??
+            `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           role: "user",
-          content: knowledgeBaseSubmissionText.trim(),
+          content:
+            durableGeneralChatRetry?.message.content ??
+            knowledgeBaseSubmissionText.trim(),
           attachments: attachments.length > 0 ? attachments : undefined,
-          timestamp: Date.now(),
+          timestamp: durableGeneralChatRetry?.message.timestamp ?? Date.now(),
           ...(!isKnowledgeBaseSubmission && agentProfile
             ? { modelName: agentProfile }
             : {}),
@@ -1437,17 +1589,37 @@ export function useSendMessage() {
                 },
               }
             : {}),
+          ...(generalChatDispatch ? { generalChatDispatch } : {}),
         };
 
         const pendingMessageAlreadyExists = Boolean(
-          knowledgeBaseClientRequestId &&
+          reuseGeneralChatMessageId ||
             activeConvRef.current?.messages.some(
               (message) =>
                 message.role === "user" &&
-                message.knowledgeBase?.clientRequestId ===
-                  knowledgeBaseClientRequestId,
+                (message.id === userMessage.id ||
+                  (knowledgeBaseClientRequestId &&
+                    message.knowledgeBase?.clientRequestId ===
+                      knowledgeBaseClientRequestId)),
             ),
         );
+        if (!isKnowledgeBaseSubmission && !options?.responseLogicContext) {
+          pendingGeneralChatDispatchRef.current.set(
+            convId,
+            reusableGeneralChatEnvelope ?? {
+              messageId: userMessage.id,
+              inputSignature: generalChatInputSignature,
+              contentItems: contentItems.map((item) => ({ ...item })),
+              attachments: attachments.map((attachment) => ({ ...attachment })),
+              preparedUploads,
+              dispatch: generalChatDispatch!,
+            },
+          );
+          // Mark the identity domain before the first user/attachment snapshot.
+          updateStatus(convId, conv?.status ?? "idle", {
+            executionKind: "general_chat_v2",
+          });
+        }
         if (!pendingMessageAlreadyExists) {
           addMessage(convId, userMessage);
         }
@@ -1461,6 +1633,16 @@ export function useSendMessage() {
               ? `文件: ${files[0].name.slice(0, 6)}`
               : "新内容流程");
           updateTitle(convId, title);
+        }
+
+        if (!isKnowledgeBaseSubmission && !options?.responseLogicContext) {
+          const snapshotAcknowledged = await flushConversation(convId);
+          if (!snapshotAcknowledged) {
+            toast.error("会话尚未同步", {
+              description: "消息和附件已保留。请重试，请勿重复发送。",
+            });
+            return false;
+          }
         }
 
         const responseStartedAt = Date.now();
@@ -1487,18 +1669,15 @@ export function useSendMessage() {
             clientRequestId: userMessage.id,
           };
 
-          if (conv?.previousResponseId) {
-            taskOptions.previousResponseId = conv.previousResponseId;
+          if (generalChatDispatch?.localTaskId) {
+            taskOptions.previousResponseId = generalChatDispatch.localTaskId;
           }
 
           // A general-Agent model is selected only when a new local task is
           // created. Continuations keep the immutable server-side operation
           // profile and never send a model override.
-          if (!conv?.previousResponseId && agentProfile) {
-            taskOptions.modelProfile = agentProfile as
-              | "frontmind-lite"
-              | "frontmind-base"
-              | "frontmind-pro";
+          if (generalChatDispatch?.modelProfile) {
+            taskOptions.modelProfile = generalChatDispatch.modelProfile;
           }
 
           console.log("[SendMessage] Creating task", {
@@ -1557,6 +1736,14 @@ export function useSendMessage() {
             });
           } else {
             response = await createTask(input, taskOptions);
+          }
+
+          if (!isKnowledgeBaseSubmission && !options?.responseLogicContext) {
+            // Any task DTO proves Dashboard owns this request, including a
+            // terminal failure DTO. Transport/outcome-unknown errors never
+            // reach this branch and retain the durable pending marker.
+            settleGeneralChatDispatch(convId, userMessage.id);
+            pendingGeneralChatDispatchRef.current.delete(convId);
           }
 
           setRetryCount(0);
@@ -1645,8 +1832,12 @@ export function useSendMessage() {
             effectiveStatus === "completed" || effectiveStatus === "error";
 
           updateStatus(convId, effectiveStatus as any, {
-            taskId: response.id,
-            previousResponseId: response.id,
+            ...(response.clearTaskPointer
+              ? { clearTaskPointer: true }
+              : {
+                  taskId: response.id,
+                  previousResponseId: response.id,
+                }),
             startedAt: responseStartedAt,
             ...(initialStatusIsTerminal
               ? { lastKnownOutputLength: totalInitialOutputLength }
@@ -1960,6 +2151,14 @@ export function useSendMessage() {
             }
             return false;
           }
+          if (
+            !isKnowledgeBaseSubmission &&
+            !options?.responseLogicContext &&
+            err?.dispatchSettled === true
+          ) {
+            settleGeneralChatDispatch(convId, userMessage.id);
+            pendingGeneralChatDispatchRef.current.delete(convId);
+          }
           updateStatus(convId, "error", {
             startedAt: responseStartedAt,
             completedAt: Date.now(),
@@ -1984,6 +2183,7 @@ export function useSendMessage() {
     },
     [
       addMessage,
+      settleGeneralChatDispatch,
       updateStatus,
       updateAssistantMessages,
       updateTitle,
@@ -1994,6 +2194,7 @@ export function useSendMessage() {
       wakeKnowledgeBaseConversation,
       commitKnowledgeBaseObservation,
       rollbackPendingKnowledgeBaseTurn,
+      flushConversation,
       replaceKnowledgeBaseAttachmentAttempt,
       updateKnowledgeBaseAttachmentAttempt,
     ],
@@ -2029,10 +2230,19 @@ export function useSendMessage() {
     setIsRetrying(true);
     setRetryCount((c) => c + 1);
 
-    const lastUserMsg = [...conv.messages]
+    const pendingUserMsg = [...conv.messages]
       .reverse()
-      .find((m) => m.role === "user");
-    if (!lastUserMsg) return;
+      .find(
+        (message) =>
+          message.role === "user" && Boolean(message.generalChatDispatch),
+      );
+    const lastUserMsg =
+      pendingUserMsg ??
+      [...conv.messages].reverse().find((message) => message.role === "user");
+    if (!lastUserMsg) {
+      setIsRetrying(false);
+      return;
+    }
 
     const files =
       (lastUserMsg.attachments?.map((a) => a.file).filter(Boolean) as File[]) ||
@@ -2041,7 +2251,19 @@ export function useSendMessage() {
     toast.info("正在重试上次请求...");
 
     try {
-      await sendMessage(lastUserMsg.content, files);
+      await sendMessage(lastUserMsg.content, pendingUserMsg ? [] : files, {
+        ...(lastUserMsg.modelName
+          ? { agentProfile: lastUserMsg.modelName }
+          : {}),
+        ...(pendingUserMsg?.generalChatDispatch
+          ? {
+              generalChatRetry: {
+                message: pendingUserMsg,
+                dispatch: pendingUserMsg.generalChatDispatch,
+              },
+            }
+          : {}),
+      });
     } finally {
       setIsRetrying(false);
     }

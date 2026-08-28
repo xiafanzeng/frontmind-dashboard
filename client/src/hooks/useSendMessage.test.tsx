@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   fileToBase64: vi.fn(),
   creditEmit: vi.fn(),
   addMessage: vi.fn(),
+  settleGeneralChatDispatch: vi.fn(),
   updateStatus: vi.fn(),
   updateAssistantMessages: vi.fn(),
   updateTitle: vi.fn(),
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => ({
   wakeKnowledgeBaseConversation: vi.fn(),
   commitKnowledgeBaseObservation: vi.fn(),
   rollbackPendingKnowledgeBaseTurn: vi.fn(),
+  flushConversation: vi.fn(),
   parseOutputMessages: vi.fn(),
   sanitizeKnowledgeBaseOutputMessages: vi.fn((messages: any[]) => messages),
   useConversation: vi.fn(),
@@ -63,6 +65,16 @@ vi.mock("@/lib/frontmind-api", () => ({
     emit: mocks.creditEmit,
   },
   sanitizeBrandText: (value: string) => value.replace(/Manus/gi, "FrontMind"),
+  buildPromptText: (input: any[]) =>
+    input
+      .flatMap((message) =>
+        typeof message.content === "string"
+          ? [message.content]
+          : message.content.flatMap((item: any) =>
+              item.type === "input_text" && item.text ? [item.text] : [],
+            ),
+      )
+      .join("\n"),
 }));
 
 vi.mock("@/lib/attachment-files", () => ({
@@ -98,6 +110,7 @@ function mockConversationContext(overrides = {}) {
     state: { conversations: [] },
     activeConversation: null,
     addMessage: mocks.addMessage,
+    settleGeneralChatDispatch: mocks.settleGeneralChatDispatch,
     updateStatus: mocks.updateStatus,
     updateAssistantMessages: mocks.updateAssistantMessages,
     updateTitle: mocks.updateTitle,
@@ -106,6 +119,7 @@ function mockConversationContext(overrides = {}) {
     wakeKnowledgeBaseConversation: mocks.wakeKnowledgeBaseConversation,
     commitKnowledgeBaseObservation: mocks.commitKnowledgeBaseObservation,
     rollbackPendingKnowledgeBaseTurn: mocks.rollbackPendingKnowledgeBaseTurn,
+    flushConversation: mocks.flushConversation,
     ...overrides,
   };
 }
@@ -284,6 +298,7 @@ describe("useSendMessage", () => {
       (file: File) => file.type || "application/octet-stream",
     );
     mocks.createConversation.mockReturnValue("test-conv-id");
+    mocks.flushConversation.mockResolvedValue(true);
     mocks.parseOutputMessages.mockReturnValue([]);
     mocks.useConversation.mockReturnValue(mockConversationContext());
     mocks.prepareUploadFiles.mockImplementation(async (files: File[]) => ({
@@ -312,6 +327,437 @@ describe("useSendMessage", () => {
   it("should return uploadProgress as null initially", () => {
     const { result } = renderHook(() => useSendMessage());
     expect(result.current.uploadProgress).toBeNull();
+  });
+
+  it("does not dispatch an ordinary task until the conversation snapshot is acknowledged", async () => {
+    mocks.flushConversation.mockResolvedValueOnce(false);
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-ack",
+          title: "新内容流程",
+          messages: [],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    let sent = true;
+    await act(async () => {
+      sent = await result.current.sendMessage("先保存再派发", []);
+    });
+
+    expect(sent).toBe(false);
+    expect(mocks.flushConversation).toHaveBeenCalledWith("ordinary-ack");
+    expect(mocks.updateStatus).toHaveBeenCalledWith("ordinary-ack", "idle", {
+      executionKind: "general_chat_v2",
+    });
+    expect(mocks.createTask).not.toHaveBeenCalled();
+  });
+
+  it("reuses the same user message id when a blocked snapshot is retried", async () => {
+    mocks.flushConversation
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-retry",
+          title: "新内容流程",
+          messages: [],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("同一请求", []);
+      await result.current.sendMessage("同一请求", []);
+    });
+
+    expect(mocks.addMessage).toHaveBeenCalledTimes(1);
+    const messageId = mocks.addMessage.mock.calls[0]![1].id;
+    expect(mocks.createTask).toHaveBeenCalledTimes(1);
+    expect(mocks.createTask.mock.calls[0]![1]).toMatchObject({
+      conversationId: "ordinary-retry",
+      clientRequestId: messageId,
+    });
+  });
+
+  it("retains the pending dispatch when a 422 error has no settlement evidence", async () => {
+    mocks.createTask.mockRejectedValue(
+      Object.assign(new Error("请求未结算"), {
+        status: 422,
+        code: "VALIDATION_FAILED",
+        retryable: false,
+      }),
+    );
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-unsettled-422",
+          title: "新内容流程",
+          messages: [],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("保留同一请求", []);
+      await result.current.sendMessage("保留同一请求", []);
+    });
+
+    expect(mocks.createTask).toHaveBeenCalledTimes(2);
+    expect(mocks.createTask.mock.calls[1]![1].clientRequestId).toBe(
+      mocks.createTask.mock.calls[0]![1].clientRequestId,
+    );
+    expect(
+      mocks.addMessage.mock.calls.filter(
+        ([, message]) => message.role === "user",
+      ),
+    ).toHaveLength(1);
+    expect(mocks.settleGeneralChatDispatch).not.toHaveBeenCalled();
+  });
+
+  it("settles the pending dispatch only when the error explicitly proves it", async () => {
+    mocks.createTask.mockRejectedValueOnce(
+      Object.assign(new Error("请求已被明确拒绝"), {
+        status: 422,
+        code: "SEND_REJECTED",
+        retryable: false,
+        dispatchSettled: true,
+      }),
+    );
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-settled-422",
+          title: "新内容流程",
+          messages: [],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("明确拒绝", []);
+    });
+
+    const userMessage = mocks.addMessage.mock.calls.find(
+      ([, message]) => message.role === "user",
+    )?.[1];
+    expect(mocks.settleGeneralChatDispatch).toHaveBeenCalledWith(
+      "ordinary-settled-422",
+      userMessage.id,
+    );
+  });
+
+  it("reuses the frozen PNG asset envelope after snapshot ACK fails", async () => {
+    const png = new File([new Uint8Array([137, 80, 78, 71])], "proof.png", {
+      type: "image/png",
+      lastModified: 1_725_000_000_000,
+    });
+    mocks.isImageUpload.mockReturnValue(true);
+    let uploadAttempt = 0;
+    mocks.uploadChatLocalAsset.mockImplementation(async () => {
+      uploadAttempt += 1;
+      return {
+        fileId: uploadAttempt === 1 ? "asset_png_first" : "asset_png_forked",
+        filename: "proof.png",
+        expiresAt: 2_593_000_000,
+      };
+    });
+    mocks.flushConversation
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-png-retry",
+          title: "新内容流程",
+          messages: [],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("分析这张图", [png]);
+      await result.current.sendMessage("分析这张图", [png]);
+    });
+
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledTimes(1);
+    expect(mocks.prepareUploadFiles).toHaveBeenCalledTimes(1);
+    expect(mocks.addMessage).toHaveBeenCalledTimes(1);
+    const persistedMessage = mocks.addMessage.mock.calls[0]![1];
+    expect(persistedMessage.attachments).toEqual([
+      expect.objectContaining({ fileId: "asset_png_first", name: "proof.png" }),
+    ]);
+    expect(mocks.flushConversation).toHaveBeenCalledTimes(2);
+    expect(mocks.createTask).toHaveBeenCalledTimes(1);
+    expect(mocks.createTask.mock.calls[0]![1]).toMatchObject({
+      conversationId: "ordinary-png-retry",
+      clientRequestId: persistedMessage.id,
+    });
+    expect(mocks.createTask.mock.calls[0]![0]).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "分析这张图" },
+          expect.objectContaining({
+            type: "input_file",
+            file_id: "asset_png_first",
+            filename: "proof.png",
+            mime_type: "image/png",
+          }),
+        ],
+      },
+    ]);
+  });
+
+  it("uses a new request identity after a terminal create DTO", async () => {
+    const png = new File([new Uint8Array([137, 80, 78, 71])], "retry.png", {
+      type: "image/png",
+      lastModified: 1_725_000_000_001,
+    });
+    mocks.isImageUpload.mockReturnValue(true);
+    mocks.uploadChatLocalAsset.mockResolvedValue({
+      fileId: "asset_retry_png",
+      filename: "retry.png",
+      expiresAt: 2_593_000_000,
+    });
+    mocks.createTask
+      .mockResolvedValueOnce({
+        id: "same-local-task",
+        status: "error",
+        output: [],
+        error: { code: "CREATE_PREPARATION_FAILED" },
+      })
+      .mockResolvedValueOnce({
+        id: "same-local-task",
+        status: "completed",
+        output: [],
+      });
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-create-retry",
+          title: "新内容流程",
+          messages: [],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("重试首轮", [png]);
+      await result.current.sendMessage("重试首轮", [png]);
+    });
+
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledTimes(2);
+    expect(mocks.addMessage).toHaveBeenCalledTimes(2);
+    expect(mocks.createTask).toHaveBeenCalledTimes(2);
+    const firstOptions = mocks.createTask.mock.calls[0]![1];
+    const secondOptions = mocks.createTask.mock.calls[1]![1];
+    expect(secondOptions.clientRequestId).not.toBe(
+      firstOptions.clientRequestId,
+    );
+    expect(mocks.settleGeneralChatDispatch).toHaveBeenCalledWith(
+      "ordinary-create-retry",
+      firstOptions.clientRequestId,
+    );
+    expect(mocks.createTask.mock.calls[1]![0][0].content).toContainEqual(
+      expect.objectContaining({ file_id: "asset_retry_png" }),
+    );
+  });
+
+  it("clears stale task pointers for a terminal DTO without a reusable task", async () => {
+    const staleTaskId = "33333333-3333-4333-8333-333333333333";
+    mocks.createTask.mockResolvedValueOnce({
+      id: staleTaskId,
+      status: "error",
+      output: [],
+      clearTaskPointer: true,
+      error: { code: "CREATE_PREPARATION_FAILED" },
+    });
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "ordinary-terminal-no-task",
+          title: "继续处理",
+          messages: [],
+          taskId: staleTaskId,
+          previousResponseId: staleTaskId,
+          status: "completed",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("重新准备", []);
+    });
+
+    const terminalStatus = mocks.updateStatus.mock.calls.find(
+      ([conversationId, status]) =>
+        conversationId === "ordinary-terminal-no-task" && status === "error",
+    )?.[2];
+    expect(terminalStatus).toMatchObject({ clearTaskPointer: true });
+    expect(terminalStatus).not.toHaveProperty("taskId");
+    expect(terminalStatus).not.toHaveProperty("previousResponseId");
+  });
+
+  it("replays a remounted first-create PNG from durable metadata without uploading or changing identity", async () => {
+    const messageId = "msg-remounted-create";
+    const pendingMessage = {
+      id: messageId,
+      role: "user" as const,
+      content: "分析这张图",
+      timestamp: 1_725_000_000_000,
+      modelName: "frontmind-base",
+      attachments: [
+        {
+          id: "attachment-remounted",
+          type: "image" as const,
+          name: "proof.png",
+          fileId: "asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+      ],
+      generalChatDispatch: {
+        schemaVersion: 1 as const,
+        kind: "pending_user" as const,
+        clientRequestId: messageId,
+        providerPrompt: "分析这张图",
+        localAssetIds: ["asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        localTaskId: null,
+        modelProfile: "frontmind-base" as const,
+      },
+    };
+    mocks.createTask
+      .mockRejectedValueOnce(
+        Object.assign(new Error("outcome unknown"), { status: 409 }),
+      )
+      .mockResolvedValueOnce({
+        id: "11111111-1111-4111-8111-111111111111",
+        status: "running",
+        output: [],
+      });
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "remounted-create",
+          title: "分析这张图",
+          messages: [pendingMessage],
+          status: "idle",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.retryLastMessage();
+      await result.current.retryLastMessage();
+    });
+
+    expect(mocks.uploadChatLocalAsset).not.toHaveBeenCalled();
+    expect(mocks.prepareUploadFiles).not.toHaveBeenCalled();
+    expect(
+      mocks.addMessage.mock.calls.filter(
+        ([, message]) => message.role === "user",
+      ),
+    ).toHaveLength(0);
+    expect(mocks.createTask).toHaveBeenCalledTimes(2);
+    for (const [input, taskOptions] of mocks.createTask.mock.calls) {
+      expect(taskOptions).toMatchObject({
+        conversationId: "remounted-create",
+        clientRequestId: messageId,
+        modelProfile: "frontmind-base",
+      });
+      expect(taskOptions.previousResponseId).toBeUndefined();
+      expect(input).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "分析这张图" },
+            {
+              type: "input_file",
+              file_id: "asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              filename: "proof.png",
+            },
+          ],
+        },
+      ]);
+    }
+  });
+
+  it("replays a remounted continuation against its frozen local task", async () => {
+    const localTaskId = "22222222-2222-4222-8222-222222222222";
+    const pendingMessage = {
+      id: "msg-remounted-continuation",
+      role: "user" as const,
+      content: "继续完善",
+      timestamp: 1_725_000_000_100,
+      generalChatDispatch: {
+        schemaVersion: 1 as const,
+        kind: "pending_user" as const,
+        clientRequestId: "msg-remounted-continuation",
+        providerPrompt: "继续完善",
+        localAssetIds: [] as string[],
+        localTaskId,
+        modelProfile: null,
+      },
+    };
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "remounted-continuation",
+          title: "继续完善",
+          messages: [pendingMessage],
+          taskId: localTaskId,
+          previousResponseId: localTaskId,
+          status: "completed",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+    );
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.retryLastMessage();
+    });
+
+    expect(mocks.createTask).toHaveBeenCalledTimes(1);
+    expect(mocks.createTask.mock.calls[0]![1]).toMatchObject({
+      conversationId: "remounted-continuation",
+      clientRequestId: "msg-remounted-continuation",
+      previousResponseId: localTaskId,
+    });
+    expect(mocks.createTask.mock.calls[0]![1].modelProfile).toBeUndefined();
+    expect(mocks.uploadChatLocalAsset).not.toHaveBeenCalled();
   });
 
   it("hands response-logic tasks to the dedicated poller without ordinary projection", async () => {
@@ -2637,6 +3083,16 @@ describe("useSendMessage", () => {
         mime_type: "application/zip",
       }),
     );
+    const persistedMessage = mocks.addMessage.mock.calls.find(
+      ([, message]) => message.role === "user",
+    )?.[1];
+    expect(persistedMessage.generalChatDispatch).toMatchObject({
+      providerPrompt:
+        "with zip\n附件 ZIP 中包含用户上传的原始参考图片，请解压后读取图片内容作为参考。",
+      localAssetIds: ["asset_frontmindoriginalimages2026070"],
+      localTaskId: null,
+      modelProfile: "frontmind-pro",
+    });
   });
 
   it("does not create a task when file upload fails", async () => {

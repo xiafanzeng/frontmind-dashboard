@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import axios from "axios";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -15,6 +17,7 @@ import {
   ManusV2Client,
   isManusV2ProviderFileMimeUsable,
   manusV2EventsContainOperationToken,
+  manusV2EventMatchesGeneralChatRequest,
   normalizeManusV2Output,
 } from "./manus-v2-client";
 
@@ -1110,6 +1113,36 @@ describe("ManusV2Client", () => {
     expect(
       manusV2EventsContainOperationToken([event], "operation-token-10"),
     ).toBe(true);
+  });
+
+  it("matches ordinary-chat reconciliation by exact prompt hash and file set", () => {
+    const event = {
+      id: "u-general-chat",
+      type: "user_message",
+      timestamp: 1,
+      user_message: {
+        content: [
+          { type: "text", text: "analyze this" },
+          { type: "file", file_id: "file-b" },
+          { type: "file", file_id: "file-a" },
+        ],
+      },
+    };
+    const promptSha256 = createHash("sha256")
+      .update("analyze this")
+      .digest("hex");
+    expect(
+      manusV2EventMatchesGeneralChatRequest(event, {
+        promptSha256,
+        attachmentFileIds: ["file-a", "file-b"],
+      }),
+    ).toBe(true);
+    expect(
+      manusV2EventMatchesGeneralChatRequest(event, {
+        promptSha256,
+        attachmentFileIds: ["file-a"],
+      }),
+    ).toBe(false);
   });
 
   it.each([

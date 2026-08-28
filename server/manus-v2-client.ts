@@ -11,6 +11,7 @@ import {
   upstreamTaskRecord,
 } from "./upstream-task-adapter";
 import { classifyManusV2StructuredResultEnvelope } from "./manus-v2-structured-result";
+import { stripFrontMindGeneralChatOperationContract } from "../shared/frontmind-general-chat-contract";
 
 export {
   classifyManusV2StructuredResultEnvelope,
@@ -1011,7 +1012,49 @@ export function orderManusV2EventsByProviderRank(
 export function manusV2EventUserText(event: ManusV2MessageEvent) {
   if (event.type !== "user_message") return null;
   const message = upstreamTaskRecord(event.user_message);
-  return typeof message?.content === "string" ? message.content : null;
+  if (typeof message?.content === "string") return message.content;
+  if (!Array.isArray(message?.content)) return null;
+  const text = message.content.flatMap((item) => {
+    const record = upstreamTaskRecord(item);
+    return typeof record?.text === "string" ? [record.text] : [];
+  });
+  return text.length > 0 ? text.join("\n") : null;
+}
+
+export function manusV2EventUserAttachmentFileIds(event: ManusV2MessageEvent) {
+  if (event.type !== "user_message") return [];
+  const message = upstreamTaskRecord(event.user_message);
+  const raw = [
+    ...(Array.isArray(message?.attachments) ? message.attachments : []),
+    ...(Array.isArray(message?.content) ? message.content : []),
+  ];
+  return Array.from(
+    new Set(
+      raw.flatMap((attachment) => {
+        const record = upstreamTaskRecord(attachment);
+        const value = record?.file_id ?? record?.fileId;
+        return typeof value === "string" && value.trim() ? [value.trim()] : [];
+      }),
+    ),
+  ).sort();
+}
+
+export function manusV2EventMatchesGeneralChatRequest(
+  event: ManusV2MessageEvent,
+  input: { promptSha256: string; attachmentFileIds: readonly string[] },
+) {
+  const text = manusV2EventUserText(event);
+  if (text === null) return false;
+  const promptSha256 = createHash("sha256")
+    .update(stripFrontMindGeneralChatOperationContract(text), "utf8")
+    .digest("hex");
+  if (promptSha256 !== input.promptSha256) return false;
+  const expected = [...new Set(input.attachmentFileIds)].sort();
+  const observed = manusV2EventUserAttachmentFileIds(event);
+  return (
+    expected.length === observed.length &&
+    expected.every((fileId, index) => fileId === observed[index])
+  );
 }
 
 export function manusV2EventsContainOperationToken(
@@ -2095,7 +2138,9 @@ export class ManusV2Client {
 
   async findCreatedTask(input: {
     title: string;
-    operationToken: string;
+    operationToken?: string;
+    promptSha256?: string;
+    attachmentFileIds?: readonly string[];
     createdAfterSeconds?: number;
     createdBeforeSeconds?: number;
     apiKeyId?: string;
@@ -2113,14 +2158,29 @@ export class ManusV2Client {
           task.createdAt === null ||
           task.createdAt <= input.createdBeforeSeconds),
     );
+    if (!input.operationToken && !input.promptSha256) {
+      throw new Error("findCreatedTask requires reconciliation evidence");
+    }
     const matches: ManusV2TaskSummary[] = [];
     for (const candidate of candidates) {
       const events = await this.listAllMessages({
         taskId: candidate.id,
         order: "asc",
-        stopAfterOperationToken: input.operationToken,
+        ...(input.operationToken
+          ? { stopAfterOperationToken: input.operationToken }
+          : {}),
       });
-      if (manusV2EventsContainOperationToken(events, input.operationToken)) {
+      if (
+        (input.operationToken &&
+          manusV2EventsContainOperationToken(events, input.operationToken)) ||
+        (input.promptSha256 &&
+          events.some((event) =>
+            manusV2EventMatchesGeneralChatRequest(event, {
+              promptSha256: input.promptSha256!,
+              attachmentFileIds: input.attachmentFileIds ?? [],
+            }),
+          ))
+      ) {
         matches.push(candidate);
       }
     }

@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { getTableConfig, MySqlDialect } from "drizzle-orm/mysql-core";
 import { createHash } from "node:crypto";
 import {
+  agentEvents,
+  agentOperations,
+  agentTasks,
   apiCredentials,
   attachments,
   conversations,
@@ -17,23 +20,29 @@ import {
 } from "../drizzle/schema";
 import {
   assignBrowserOwnedSnapshotMessageSequences,
+  authoritativeGeneralChatTurnIdForBrowserMessage,
   assertLocalImportHasNoProviderResources,
   buildMessageMetadata,
   collectSnapshotResourceRefs,
   conversationSyncMysqlErrorCode,
   conversationSnapshotSchema,
   discardClientClaimedServerOwnedKnowledgeBaseMessages,
+  generalChatDispatchSettlementIsSafe,
+  generalChatDispatchSettlementKind,
   getActiveCredentialId,
   listSnapshots,
+  loadSnapshotResourceBindings,
   loadPersistedMessages,
   matchesAuthoritativeKnowledgeBaseMessageTuple,
   mergeConversationMessages,
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
   persistSnapshot,
+  protectUnsettledGeneralChatBoundUserMessageTombstones,
   reconstructKnowledgeBaseUserMessageAttachments,
   reconstructKnowledgeBasePresentationInlineImages,
   repairSnapshotMessageIds,
+  removeAcknowledgedGeneralChatDispatchMetadata,
   retryConversationSyncTransaction,
   resolveSnapshotCredentialId,
   sanitizeKnowledgeBaseDeletionTombstones,
@@ -114,9 +123,7 @@ describe("server-owned SiteOps conversation boundary", () => {
         : [],
     );
 
-    await expect(
-      persistSnapshot(executor, 7, snapshot),
-    ).rejects.toMatchObject({
+    await expect(persistSnapshot(executor, 7, snapshot)).rejects.toMatchObject({
       code: "CONFLICT",
     });
   });
@@ -145,11 +152,7 @@ describe("server-owned SiteOps conversation boundary", () => {
     });
 
     await expect(
-      listSnapshots(
-        7,
-        null,
-        executor as Parameters<typeof listSnapshots>[2],
-      ),
+      listSnapshots(7, null, executor as Parameters<typeof listSnapshots>[2]),
     ).resolves.toEqual([]);
   });
 });
@@ -185,6 +188,23 @@ function serverOwnedMessage(
             leafId: "1.2",
           }
         : { clientRequestId: "request-1" }),
+      serverOwned: true,
+    },
+  };
+}
+
+function serverOwnedGeneralChatMessage(
+  id: string,
+  timestamp: number,
+): SnapshotMessage {
+  return {
+    ...message(id, "assistant", timestamp),
+    generalChat: {
+      schemaVersion: 1,
+      kind: "assistant_projection",
+      turnId: "88888888-8888-4888-8888-888888888888",
+      agentTaskId: "99999999-9999-4999-8999-999999999999",
+      providerEventId: "provider-event-1",
       serverOwned: true,
     },
   };
@@ -1418,6 +1438,59 @@ describe("conversation multi-device merge", () => {
     );
   });
 
+  it("round-trips a strict browser-owned ordinary dispatch envelope through message metadata", () => {
+    const generalChatDispatch = {
+      schemaVersion: 1 as const,
+      kind: "pending_user" as const,
+      clientRequestId: "msg-pending-general-chat",
+      providerPrompt: "正文\nZIP reference",
+      localAssetIds: ["asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      localTaskId: null,
+      modelProfile: "frontmind-pro" as const,
+    };
+    const parsed = conversationSnapshotSchema.parse({
+      id: "conversation-pending-general-chat",
+      title: "普通聊天",
+      status: "idle",
+      executionKind: "general_chat_v2",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [
+        {
+          id: generalChatDispatch.clientRequestId,
+          role: "user",
+          content: "界面正文",
+          timestamp: 1,
+          generalChatDispatch,
+        },
+      ],
+    });
+
+    expect(parsed.messages[0]?.generalChatDispatch).toEqual(
+      generalChatDispatch,
+    );
+    expect(
+      buildMessageMetadata(parsed.messages[0]!).generalChatDispatch,
+    ).toEqual(generalChatDispatch);
+    expect(() =>
+      conversationSnapshotSchema.parse({
+        ...parsed,
+        messages: [
+          {
+            ...parsed.messages[0],
+            generalChatDispatch: {
+              ...generalChatDispatch,
+              localAssetIds: [
+                "asset_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              ],
+            },
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
   it("preserves the derived response-logic execution boundary in snapshots", () => {
     const parsed = conversationSnapshotSchema.parse({
       id: "response-conversation-1",
@@ -1484,6 +1557,358 @@ describe("conversation multi-device merge", () => {
         incomingUpdatedAt: 2_001,
       }),
     ).toEqual({ taskId: "T2", previousResponseId: "T2" });
+  });
+});
+
+describe("server-owned general chat projection", () => {
+  const taskId = "99999999-9999-4999-8999-999999999999";
+  const turnId = "88888888-8888-4888-8888-888888888888";
+  const pendingUser = {
+    ...message("msg-general-pending", "user", 100, "界面正文"),
+    generalChatDispatch: {
+      schemaVersion: 1 as const,
+      kind: "pending_user" as const,
+      clientRequestId: "msg-general-pending",
+      providerPrompt: "精确 Provider 正文",
+      localAssetIds: [] as string[],
+      localTaskId: null,
+      modelProfile: "frontmind-pro" as const,
+    },
+  };
+  const settledUser = message("msg-general-pending", "user", 100, "界面正文");
+  const turnAuthority = new Map([
+    [
+      "msg-general-pending",
+      {
+        id: turnId,
+        clientRequestId: "msg-general-pending",
+        upstreamTaskId: taskId,
+        operationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        settlementKind: "acknowledged" as const,
+        safeToSettle: true,
+      },
+    ],
+  ]);
+
+  it("settles a pending marker only from the exact acknowledged turn and does not revive it during merge", () => {
+    const persistedForMerge = removeAcknowledgedGeneralChatDispatchMetadata({
+      persistedMessages: [pendingUser],
+      incomingMessages: [settledUser],
+      executionKind: "general_chat_v2",
+      taskId,
+      previousResponseId: taskId,
+      authority: {
+        turnByClientRequestId: turnAuthority,
+        persistedTurnIdByPublicMessageId: new Map([
+          ["msg-general-pending", turnId],
+        ]),
+      },
+    });
+    const reloaded = mergeConversationMessages(
+      persistedForMerge,
+      [settledUser],
+      [],
+    );
+
+    expect(reloaded[0]?.generalChatDispatch).toBeUndefined();
+    expect(
+      authoritativeGeneralChatTurnIdForBrowserMessage(
+        reloaded[0]!,
+        turnAuthority,
+      ),
+    ).toBe(turnId);
+  });
+
+  it("derives settlement only from an exact acknowledged or proven-rejected reservation", () => {
+    expect(
+      generalChatDispatchSettlementKind({
+        reservationStatus: "acknowledged",
+        rejectionProven: false,
+      }),
+    ).toBe("acknowledged");
+    expect(
+      generalChatDispatchSettlementKind({
+        reservationStatus: "rejected",
+        rejectionProven: true,
+      }),
+    ).toBe("rejected");
+    for (const reservationStatus of [
+      undefined,
+      "preparation_failed",
+      "preparing",
+      "sending",
+      "outcome_unknown",
+      "ambiguous",
+      "rejected",
+    ]) {
+      expect(
+        generalChatDispatchSettlementIsSafe({
+          reservationStatus,
+          rejectionProven: false,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("allows a proven create rejection to clear without task pointers but keeps acknowledged markers until both pointers match", () => {
+    const rejectedAuthority = new Map([
+      [
+        "msg-general-pending",
+        {
+          ...turnAuthority.get("msg-general-pending")!,
+          settlementKind: "rejected" as const,
+        },
+      ],
+    ]);
+    expect(
+      removeAcknowledgedGeneralChatDispatchMetadata({
+        persistedMessages: [pendingUser],
+        incomingMessages: [settledUser],
+        executionKind: "general_chat_v2",
+        authority: {
+          turnByClientRequestId: rejectedAuthority,
+          persistedTurnIdByPublicMessageId: new Map([
+            ["msg-general-pending", turnId],
+          ]),
+        },
+      })[0]?.generalChatDispatch,
+    ).toBeUndefined();
+
+    expect(
+      removeAcknowledgedGeneralChatDispatchMetadata({
+        persistedMessages: [pendingUser],
+        incomingMessages: [settledUser],
+        executionKind: "general_chat_v2",
+        taskId,
+        authority: {
+          turnByClientRequestId: turnAuthority,
+          persistedTurnIdByPublicMessageId: new Map([
+            ["msg-general-pending", turnId],
+          ]),
+        },
+      })[0]?.generalChatDispatch,
+    ).toEqual(pendingUser.generalChatDispatch);
+  });
+
+  it("filters tombstones for an unsettled exact bound user while allowing settled users to be deleted", () => {
+    const persistedBinding = new Map([["msg-general-pending", turnId]]);
+    const unsettledAuthority = new Map([
+      [
+        "msg-general-pending",
+        {
+          ...turnAuthority.get("msg-general-pending")!,
+          settlementKind: null,
+          safeToSettle: false,
+        },
+      ],
+    ]);
+    expect(
+      protectUnsettledGeneralChatBoundUserMessageTombstones(
+        ["msg-general-pending", "other", "msg-general-pending"],
+        {
+          turnByClientRequestId: unsettledAuthority,
+          persistedTurnIdByPublicMessageId: persistedBinding,
+        },
+      ),
+    ).toEqual(["other"]);
+    expect(
+      protectUnsettledGeneralChatBoundUserMessageTombstones(
+        ["msg-general-pending"],
+        {
+          turnByClientRequestId: turnAuthority,
+          persistedTurnIdByPublicMessageId: persistedBinding,
+        },
+      ),
+    ).toEqual(["msg-general-pending"]);
+  });
+
+  it("keeps pending when the database user message has no authoritative turn binding", () => {
+    const result = removeAcknowledgedGeneralChatDispatchMetadata({
+      persistedMessages: [pendingUser],
+      incomingMessages: [settledUser],
+      executionKind: "general_chat_v2",
+      taskId,
+      previousResponseId: taskId,
+      authority: {
+        turnByClientRequestId: turnAuthority,
+        persistedTurnIdByPublicMessageId: new Map(),
+      },
+    });
+
+    expect(result[0]?.generalChatDispatch).toEqual(
+      pendingUser.generalChatDispatch,
+    );
+  });
+
+  it("keeps pending for a different bound turn or a mismatched snapshot pointer", () => {
+    const authority = {
+      turnByClientRequestId: turnAuthority,
+      persistedTurnIdByPublicMessageId: new Map([
+        ["msg-general-pending", "77777777-7777-4777-8777-777777777777"],
+      ]),
+    };
+    expect(
+      removeAcknowledgedGeneralChatDispatchMetadata({
+        persistedMessages: [pendingUser],
+        incomingMessages: [settledUser],
+        executionKind: "general_chat_v2",
+        taskId,
+        previousResponseId: taskId,
+        authority,
+      })[0]?.generalChatDispatch,
+    ).toEqual(pendingUser.generalChatDispatch);
+    expect(
+      removeAcknowledgedGeneralChatDispatchMetadata({
+        persistedMessages: [pendingUser],
+        incomingMessages: [settledUser],
+        executionKind: "general_chat_v2",
+        taskId: "66666666-6666-4666-8666-666666666666",
+        previousResponseId: "66666666-6666-4666-8666-666666666666",
+        authority: {
+          turnByClientRequestId: turnAuthority,
+          persistedTurnIdByPublicMessageId: new Map([
+            ["msg-general-pending", turnId],
+          ]),
+        },
+      })[0]?.generalChatDispatch,
+    ).toEqual(pendingUser.generalChatDispatch);
+  });
+
+  it("keeps an authoritative assistant projection when a stale browser omits or forges it", () => {
+    const user = message("general-user", "user", 100, "你好");
+    const authoritative = serverOwnedGeneralChatMessage(
+      "general-assistant",
+      110,
+    );
+    const forged = {
+      ...serverOwnedGeneralChatMessage("forged-assistant", 120),
+      content: "forged",
+    };
+
+    expect(
+      mergeConversationMessages(
+        [user, authoritative],
+        [user, forged],
+        [authoritative.id],
+      ),
+    ).toEqual([user, authoritative]);
+    expect(
+      assignBrowserOwnedSnapshotMessageSequences(
+        [user, authoritative],
+        new Map([
+          [user.id, 0],
+          [authoritative.id, 1],
+        ]),
+      ).map(({ message: item }) => item.id),
+    ).toEqual([user.id]);
+  });
+
+  it("verifies and rebuilds general-chat metadata and execution kind from durable rows", async () => {
+    const operationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const generalChat = serverOwnedGeneralChatMessage(
+      "general-assistant",
+      2_000,
+    ).generalChat!;
+    const conversation = {
+      id: "u7:conversation-general",
+      userId: 7,
+      projectAssignmentId: null,
+      title: "通用聊天",
+      status: "completed",
+      upstreamTaskId: taskId,
+      previousResponseId: taskId,
+      taskUrl: null,
+      createdAt: new Date(1_000),
+      updatedAt: new Date(2_000),
+      startedAt: new Date(1_100),
+      completedAt: new Date(2_000),
+      deletedAt: null,
+      lastKnownOutputLength: 2,
+      deletedMessageIds: [],
+    };
+    const messageRows = [
+      {
+        id: "u7:general-user",
+        conversationId: conversation.id,
+        turnId,
+        userId: 7,
+        role: "user",
+        content: "你好",
+        sequence: 0,
+        metadata: null,
+        sentAt: new Date(1_000),
+        createdAt: new Date(1_000),
+        updatedAt: new Date(1_000),
+        deletedAt: null,
+      },
+      {
+        id: "u7:general-assistant",
+        conversationId: conversation.id,
+        turnId,
+        userId: 7,
+        role: "assistant",
+        content: "你好！",
+        sequence: 1,
+        metadata: { generalChat },
+        sentAt: new Date(2_000),
+        createdAt: new Date(2_000),
+        updatedAt: new Date(2_000),
+        deletedAt: null,
+      },
+    ];
+    const { executor } = createSelectExecutor((table) => {
+      if (table === conversations) return [conversation];
+      if (table === messages) return messageRows;
+      if (table === attachments) return [];
+      if (table === conversationTurns) {
+        return [
+          {
+            id: turnId,
+            conversationId: conversation.id,
+            userId: 7,
+            apiCredentialId: "credential-general",
+            operationType: "general_chat_v2",
+            upstreamTaskId: taskId,
+            metadata: { agentTaskId: taskId },
+          },
+        ];
+      }
+      if (table === agentTasks) {
+        return [{ id: taskId, operationId, createdAt: new Date(1_100) }];
+      }
+      if (table === agentOperations) {
+        return [
+          {
+            id: operationId,
+            scope: "managed_user",
+            accountUserId: 7,
+            presalesProjectId: null,
+            operationType: "dashboard.general-chat",
+            contractName: "dashboard.general-chat",
+            contractRevision: 2,
+            apiCredentialId: "credential-general",
+          },
+        ];
+      }
+      if (table === agentEvents) {
+        return [{ taskId, providerEventId: "provider-event-1" }];
+      }
+      return [];
+    });
+
+    const snapshots = await listSnapshots(
+      7,
+      null,
+      executor as Parameters<typeof listSnapshots>[2],
+    );
+
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({ executionKind: "general_chat_v2" });
+    expect(snapshots[0]?.messages[1]).toMatchObject({
+      id: "general-assistant",
+      content: "你好！",
+      generalChat,
+    });
   });
 });
 
@@ -1844,12 +2269,445 @@ describe("conversation credential binding", () => {
     ).resolves.toMatchObject({
       credentialId: "credential-former-manager",
     });
-    expect(selectedTables).toEqual([upstreamResources, apiCredentials]);
+    expect(selectedTables).toContain(agentTasks);
+    expect(selectedTables).toContain(upstreamResources);
+    expect(selectedTables).toContain(apiCredentials);
     expect(selectedTables).not.toContain(userUsageOwners);
   });
 });
 
 describe("legacy upstream resource ownership validation", () => {
+  const projectTaskId = "10101010-1010-4010-8010-101010101010";
+  const projectOperationId = "20202020-2020-4020-8020-202020202020";
+  const projectA = "30303030-3030-4030-8030-303030303030";
+  const projectB = "40404040-4040-4040-8040-404040404040";
+  const projectSnapshot: ConversationSnapshot = {
+    id: "project-general-chat",
+    title: "工程师通用聊天",
+    executionKind: "general_chat_v2",
+    status: "running",
+    taskId: projectTaskId,
+    previousResponseId: projectTaskId,
+    createdAt: 1,
+    updatedAt: 2,
+    messages: [],
+  };
+
+  function projectGeneralChatRows(input: {
+    persistedConversationId: string;
+    projectAssignmentId: string;
+    includeTurn?: boolean;
+  }) {
+    return (table: unknown) => {
+      if (table === agentTasks) {
+        return [
+          {
+            id: projectTaskId,
+            operationId: projectOperationId,
+            createdAt: new Date(10),
+          },
+        ];
+      }
+      if (table === agentOperations) {
+        return [
+          {
+            id: projectOperationId,
+            scope: "managed_user",
+            accountUserId: 7,
+            presalesProjectId: null,
+            operationType: "dashboard.general-chat",
+            contractName: "dashboard.general-chat",
+            contractRevision: 2,
+            apiCredentialId: "credential-project-general",
+          },
+        ];
+      }
+      if (table === conversationTurns) {
+        return input.includeTurn === false
+          ? []
+          : [
+              {
+                conversationId: input.persistedConversationId,
+                userId: 7,
+                operationType: "general_chat_v2",
+                upstreamTaskId: projectTaskId,
+              },
+            ];
+      }
+      if (table === conversations) {
+        return [
+          {
+            id: input.persistedConversationId,
+            userId: 7,
+            projectAssignmentId: input.projectAssignmentId,
+            deletedAt: null,
+          },
+        ];
+      }
+      return [];
+    };
+  }
+
+  it("accepts an exact project-bound general-chat task and previous response", async () => {
+    const persistedConversationId = `p${projectA}:${projectSnapshot.id}`;
+    const { executor, selectedTables } = createSelectExecutor(
+      projectGeneralChatRows({
+        persistedConversationId,
+        projectAssignmentId: projectA,
+      }),
+    );
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, projectA, projectSnapshot),
+    ).resolves.toEqual(
+      new Map([
+        [
+          JSON.stringify(["task", projectTaskId]),
+          expect.objectContaining({ domain: "general_chat_v2" }),
+        ],
+      ]),
+    );
+    expect(selectedTables).toContain(conversationTurns);
+    expect(selectedTables).toContain(conversations);
+  });
+
+  it("rejects reuse of a project-A general-chat task in project B", async () => {
+    const persistedConversationId = `p${projectA}:${projectSnapshot.id}`;
+    const { executor } = createSelectExecutor(
+      projectGeneralChatRows({
+        persistedConversationId,
+        projectAssignmentId: projectA,
+      }),
+    );
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, projectB, projectSnapshot),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("rejects an unbound general-chat task in a project snapshot", async () => {
+    const persistedConversationId = `p${projectA}:${projectSnapshot.id}`;
+    const { executor } = createSelectExecutor(
+      projectGeneralChatRows({
+        persistedConversationId,
+        projectAssignmentId: projectA,
+        includeTurn: false,
+      }),
+    );
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, projectA, projectSnapshot),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("project-binds an untagged task after legacy dual-domain classification", async () => {
+    const untaggedSnapshot: ConversationSnapshot = { ...projectSnapshot };
+    delete untaggedSnapshot.executionKind;
+    const persistedConversationId = `p${projectA}:${projectSnapshot.id}`;
+    const { executor: exactExecutor, selectedTables } = createSelectExecutor(
+      projectGeneralChatRows({
+        persistedConversationId,
+        projectAssignmentId: projectA,
+      }),
+    );
+
+    await expect(
+      loadSnapshotResourceBindings(
+        exactExecutor,
+        7,
+        projectA,
+        untaggedSnapshot,
+      ),
+    ).resolves.toEqual(
+      new Map([
+        [
+          JSON.stringify(["task", projectTaskId]),
+          expect.objectContaining({ domain: "general_chat_v2" }),
+        ],
+      ]),
+    );
+    expect(selectedTables).toContain(upstreamResources);
+
+    const { executor: crossProjectExecutor } = createSelectExecutor(
+      projectGeneralChatRows({
+        persistedConversationId,
+        projectAssignmentId: projectA,
+      }),
+    );
+    await expect(
+      loadSnapshotResourceBindings(
+        crossProjectExecutor,
+        7,
+        projectB,
+        untaggedSnapshot,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("validates explicit general-chat task and asset references without reading the legacy ledger", async () => {
+    const taskId = "11111111-1111-4111-8111-111111111111";
+    const operationId = "22222222-2222-4222-8222-222222222222";
+    const assetId = "33333333-3333-4333-8333-333333333333";
+    const snapshot: ConversationSnapshot = {
+      id: "conversation-general-v2",
+      title: "通用聊天",
+      executionKind: "general_chat_v2",
+      status: "running",
+      taskId,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [
+        {
+          ...message("user-general", "user", 1),
+          attachments: [
+            { id: "image", type: "image", name: "input.png", fileId: assetId },
+          ],
+        },
+      ],
+    };
+    const { executor, selectedTables } = createSelectExecutor((table) => {
+      if (table === agentTasks) {
+        return [{ id: taskId, operationId, createdAt: new Date(10) }];
+      }
+      if (table === agentOperations) {
+        return [
+          {
+            id: operationId,
+            scope: "managed_user",
+            accountUserId: 7,
+            presalesProjectId: null,
+            operationType: "dashboard.general-chat",
+            contractName: "dashboard.general-chat",
+            contractRevision: 2,
+            apiCredentialId: "credential-general",
+          },
+        ];
+      }
+      if (table === localAssets) {
+        return [
+          {
+            id: assetId,
+            scope: "managed_user",
+            accountUserId: 7,
+            presalesProjectId: null,
+            createdAt: new Date(5),
+          },
+        ];
+      }
+      if (table === upstreamResources) {
+        throw new Error("general-chat references must not touch legacy ledger");
+      }
+      return [];
+    });
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, null, snapshot),
+    ).resolves.toEqual(
+      new Map([
+        [
+          JSON.stringify(["task", taskId]),
+          expect.objectContaining({
+            domain: "general_chat_v2",
+            apiCredentialId: "credential-general",
+          }),
+        ],
+        [
+          JSON.stringify(["file", assetId]),
+          expect.objectContaining({ domain: "general_chat_v2" }),
+        ],
+      ]),
+    );
+    expect(selectedTables).not.toContain(upstreamResources);
+  });
+
+  it("rejects a general-chat task owned by another managed account", async () => {
+    const taskId = "44444444-4444-4444-8444-444444444444";
+    const operationId = "55555555-5555-4555-8555-555555555555";
+    const snapshot: ConversationSnapshot = {
+      id: "conversation-foreign-general-v2",
+      title: "通用聊天",
+      executionKind: "general_chat_v2",
+      status: "running",
+      taskId,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    const { executor } = createSelectExecutor((table) => {
+      if (table === agentTasks) {
+        return [{ id: taskId, operationId, createdAt: new Date(10) }];
+      }
+      if (table === agentOperations) {
+        return [
+          {
+            id: operationId,
+            scope: "managed_user",
+            accountUserId: 8,
+            presalesProjectId: null,
+            operationType: "dashboard.general-chat",
+            contractName: "dashboard.general-chat",
+            contractRevision: 2,
+            apiCredentialId: "credential-foreign",
+          },
+        ];
+      }
+      return [];
+    });
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, null, snapshot),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("rejects an expired local asset in the explicit general-chat domain", async () => {
+    const assetId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const snapshot: ConversationSnapshot = {
+      id: "conversation-expired-general-asset",
+      title: "通用聊天",
+      executionKind: "general_chat_v2",
+      status: "idle",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [
+        {
+          ...message("user-expired-asset", "user", 1),
+          attachments: [
+            { id: "image", type: "image", name: "old.png", fileId: assetId },
+          ],
+        },
+      ],
+    };
+    const { executor } = createSelectExecutor((table) => {
+      if (table === localAssets) {
+        return [
+          {
+            id: assetId,
+            scope: "managed_user",
+            accountUserId: 7,
+            presalesProjectId: null,
+            retainUntil: new Date(0),
+            createdAt: new Date(0),
+          },
+        ];
+      }
+      return [];
+    });
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, null, snapshot),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("accepts an untagged reference only when exactly one identity domain owns it", async () => {
+    const taskId = "66666666-6666-4666-8666-666666666666";
+    const operationId = "77777777-7777-4777-8777-777777777777";
+    const snapshot: ConversationSnapshot = {
+      id: "conversation-ambiguous",
+      title: "旧客户端",
+      status: "running",
+      taskId,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    const { executor } = createSelectExecutor((table) => {
+      if (table === agentTasks) {
+        return [{ id: taskId, operationId, createdAt: new Date(10) }];
+      }
+      if (table === agentOperations) {
+        return [
+          {
+            id: operationId,
+            scope: "managed_user",
+            accountUserId: 7,
+            presalesProjectId: null,
+            operationType: "dashboard.general-chat",
+            contractName: "dashboard.general-chat",
+            contractRevision: 2,
+            apiCredentialId: "credential-general",
+          },
+        ];
+      }
+      if (table === upstreamResources) {
+        return [
+          {
+            userId: 7,
+            projectAssignmentId: null,
+            kind: "task",
+            upstreamId: taskId,
+            apiCredentialId: "credential-legacy",
+            createdAt: new Date(9),
+          },
+        ];
+      }
+      return [];
+    });
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, null, snapshot),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("ignores a foreign collision when an untagged reference has exactly one owned domain", async () => {
+    const taskId = "88888888-8888-4888-8888-888888888888";
+    const operationId = "99999999-9999-4999-8999-999999999999";
+    const snapshot: ConversationSnapshot = {
+      id: "conversation-owned-legacy-collision",
+      title: "旧客户端",
+      status: "running",
+      taskId,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    const { executor } = createSelectExecutor((table) => {
+      if (table === agentTasks) {
+        return [{ id: taskId, operationId, createdAt: new Date(10) }];
+      }
+      if (table === agentOperations) {
+        return [
+          {
+            id: operationId,
+            scope: "managed_user",
+            accountUserId: 8,
+            presalesProjectId: null,
+            operationType: "dashboard.general-chat",
+            contractName: "dashboard.general-chat",
+            contractRevision: 2,
+            apiCredentialId: "credential-foreign-general",
+          },
+        ];
+      }
+      if (table === upstreamResources) {
+        return [
+          {
+            userId: 7,
+            projectAssignmentId: null,
+            kind: "task",
+            upstreamId: taskId,
+            apiCredentialId: "credential-owned-legacy",
+            createdAt: new Date(9),
+          },
+        ];
+      }
+      return [];
+    });
+
+    await expect(
+      loadSnapshotResourceBindings(executor, 7, null, snapshot),
+    ).resolves.toEqual(
+      new Map([
+        [
+          JSON.stringify(["task", taskId]),
+          expect.objectContaining({
+            domain: "legacy_upstream",
+            apiCredentialId: "credential-owned-legacy",
+          }),
+        ],
+      ]),
+    );
+  });
+
   it("deduplicates task and file IDs before upstream validation", () => {
     const snapshot: ConversationSnapshot = {
       id: "conversation-1",

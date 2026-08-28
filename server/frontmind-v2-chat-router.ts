@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 
 import axios from "axios";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -11,7 +11,11 @@ import {
   agentOperations,
   agentTasks,
   artifacts,
+  attachments as conversationAttachments,
+  conversations,
+  conversationTurns,
   localAssets,
+  messages,
   providerFileLeases,
 } from "../drizzle/schema";
 import { getDecryptedCredentialForAccountById } from "./auth-service";
@@ -19,9 +23,10 @@ import { getDb } from "./db";
 import {
   latestManusV2TaskState,
   latestManusV2WaitingDetail,
-  manusV2EventsContainOperationToken,
+  manusV2EventMatchesGeneralChatRequest,
   ManusV2ApiError,
   ManusV2Client,
+  orderManusV2EventsByProviderRank,
   type ManusV2MessageEvent,
 } from "./manus-v2-client";
 import {
@@ -52,11 +57,19 @@ import {
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
 import { sanitizeFrontMindPublicText } from "../shared/frontmind-public-brand";
+import { stripFrontMindGeneralChatOperationContract } from "../shared/frontmind-general-chat-contract";
 import {
   generalAgentModelProfileModel,
   generalAgentModelProfileSchema,
+  type GeneralAgentModelProfile,
 } from "../shared/manus-agent-profile";
 import { getUpstreamBaseUrl } from "./upstream-config";
+import { readGeneralChatIncidentProviderMessages } from "./general-chat-incident-repair-20260828-core";
+import {
+  createGeneralChatPreparationClaim,
+  generalChatPreparationClaimIsStale,
+} from "./general-chat-preparation-claim";
+import { validateGeneralChatDispatchMetadata } from "./general-chat-dispatch-validation";
 
 const router = Router();
 
@@ -69,7 +82,7 @@ const MAX_LOCAL_ASSET_BYTES = 100 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const LOCAL_CONTENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const RESULT_GRACE_MS = 120_000;
-const CREATE_RECONCILE_MS = 5 * 60_000;
+const GENERAL_CHAT_TURN_TYPE = "general_chat_v2";
 
 const taskCreateSchema = z
   .object({
@@ -105,6 +118,7 @@ class ChatV2HttpError extends Error {
     readonly code: string,
     readonly statusCode: number,
     readonly retryable = false,
+    readonly dispatchSettled = false,
   ) {
     super(code);
     this.name = "ChatV2HttpError";
@@ -124,6 +138,20 @@ function hash(value: string) {
 
 function requestHash(value: unknown) {
   return hash(JSON.stringify(value));
+}
+
+function sortedUnique(values: readonly string[]) {
+  return [...new Set(values)].sort();
+}
+
+function providerAttachmentFileIds(
+  attachments: readonly { file_id?: string }[],
+) {
+  return sortedUnique(
+    attachments.flatMap((attachment) =>
+      typeof attachment.file_id === "string" ? [attachment.file_id] : [],
+    ),
+  );
 }
 
 function localAssetId() {
@@ -223,18 +251,6 @@ function clientFor(apiKey: string, accountUserId: number) {
     apiKey,
     rateLimitScope: `managed-user:${accountUserId}`,
   });
-}
-
-function operationMarker(operationToken: string) {
-  return `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({
-    operationToken,
-    contract: CHAT_CONTRACT,
-    revision: CHAT_CONTRACT_REVISION,
-  })}`;
-}
-
-function promptWithMarker(prompt: string, operationToken: string) {
-  return `${prompt}\n\n# FrontMind operation contract\n${operationMarker(operationToken)}`;
 }
 
 async function findOwnedTask(input: { userId: number; localTaskId: string }) {
@@ -582,17 +598,242 @@ function assistantText(event: ManusV2MessageEvent) {
             .filter(Boolean)
             .join("\n")
         : "";
-  return sanitizeFrontMindPublicText(text).trim();
+  return sanitizeFrontMindPublicText(
+    stripFrontMindGeneralChatOperationContract(text),
+  ).trim();
+}
+
+type GeneralChatProjectionTurn = {
+  id: string;
+  conversationId: string;
+  metadata: Record<string, unknown>;
+};
+
+async function generalChatProjectionTurns(input: {
+  userId: number;
+  localTaskId: string;
+}) {
+  return (await (
+    await requireDb()
+  )
+    .select({
+      id: conversationTurns.id,
+      conversationId: conversationTurns.conversationId,
+      metadata: conversationTurns.metadata,
+    })
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+        eq(conversationTurns.upstreamTaskId, input.localTaskId),
+      ),
+    )
+    .orderBy(
+      conversationTurns.createdAt,
+      conversationTurns.id,
+    )) as GeneralChatProjectionTurn[];
+}
+
+function providerEventTurnAssignments(
+  events: readonly ManusV2MessageEvent[],
+  turns: readonly GeneralChatProjectionTurn[],
+) {
+  const assignments = new Map<string, GeneralChatProjectionTurn>();
+  const unmatched = [...turns];
+  let current: GeneralChatProjectionTurn | null = null;
+  for (const event of events) {
+    if (event.type === "user_message") {
+      const index = unmatched.findIndex((turn) => {
+        const promptSha256 = turn.metadata.promptSha256;
+        const attachmentFileIds = turn.metadata.providerAttachmentFileIds;
+        return (
+          typeof promptSha256 === "string" &&
+          manusV2EventMatchesGeneralChatRequest(event, {
+            promptSha256,
+            attachmentFileIds: Array.isArray(attachmentFileIds)
+              ? attachmentFileIds.filter(
+                  (value): value is string => typeof value === "string",
+                )
+              : [],
+          })
+        );
+      });
+      current = index >= 0 ? unmatched.splice(index, 1)[0]! : null;
+      continue;
+    }
+    if (event.type === "assistant_message" && current) {
+      assignments.set(event.id, current);
+    }
+  }
+  return assignments;
+}
+
+function persistedMessageIdForConversation(
+  persistedConversationId: string,
+  publicMessageId: string,
+) {
+  const separator = persistedConversationId.indexOf(":");
+  return separator >= 0
+    ? `${persistedConversationId.slice(0, separator + 1)}${publicMessageId}`
+    : publicMessageId;
+}
+
+async function persistAssistantProjection(input: {
+  operation: AgentOperation;
+  task: AgentTask;
+  event: ManusV2MessageEvent;
+  turn: GeneralChatProjectionTurn;
+  upstreamOutputId: string;
+  text: string;
+  localized: Array<{
+    artifactId: string;
+    filename: string;
+    mimeType: string;
+    bytes: number;
+    sha256: string;
+  }>;
+}) {
+  const userId = input.operation.accountUserId!;
+  const publicMessageId = `msg-general-chat-${hash(
+    `${input.task.id}\0${input.event.id}`,
+  )}`;
+  const messageId = persistedMessageIdForConversation(
+    input.turn.conversationId,
+    publicMessageId,
+  );
+  const outputFiles = input.localized
+    .filter((artifact) => !artifact.mimeType.startsWith("image/"))
+    .map((artifact) => ({
+      fileUrl: `/api/frontmind/v2/artifacts/${encodeURIComponent(artifact.artifactId)}/content`,
+      fileName: artifact.filename,
+      mimeType: artifact.mimeType,
+    }));
+  const inlineImages = input.localized
+    .filter((artifact) => artifact.mimeType.startsWith("image/"))
+    .map((artifact) => ({
+      src: `/api/frontmind/v2/artifacts/${encodeURIComponent(artifact.artifactId)}/content`,
+      alt: artifact.filename,
+    }));
+  const metadata = {
+    // The polling DTO uses the durable agent_events row id as its output id.
+    // Reusing it here lets a later hydrate replace, rather than duplicate,
+    // the browser's optimistic projection of the same Provider event.
+    upstreamOutputId: input.upstreamOutputId,
+    ...(outputFiles.length > 0 ? { outputFiles } : {}),
+    ...(inlineImages.length > 0 ? { inlineImages } : {}),
+    generalChat: {
+      schemaVersion: 1,
+      kind: "assistant_projection",
+      turnId: input.turn.id,
+      agentTaskId: input.task.id,
+      providerEventId: input.event.id,
+      serverOwned: true,
+    },
+  };
+  const sentAt = new Date(
+    input.event.timestamp < 1_000_000_000_000
+      ? input.event.timestamp * 1_000
+      : input.event.timestamp,
+  );
+  const db = await requireDb();
+  await db.transaction(async (tx) => {
+    await tx
+      .select({ id: conversations.id })
+      .from(conversations)
+      .where(eq(conversations.id, input.turn.conversationId))
+      .limit(1)
+      .for("update");
+    const existing = (
+      await tx
+        .select({ id: messages.id })
+        .from(messages)
+        .where(eq(messages.id, messageId))
+        .limit(1)
+    )[0];
+    if (existing) {
+      await tx
+        .update(messages)
+        .set({
+          content: input.text,
+          metadata,
+          turnId: input.turn.id,
+          sentAt,
+          deletedAt: null,
+        })
+        .where(eq(messages.id, messageId));
+      return;
+    }
+    const latest = (
+      await tx
+        .select({ sequence: messages.sequence })
+        .from(messages)
+        .where(eq(messages.conversationId, input.turn.conversationId))
+        .orderBy(desc(messages.sequence))
+        .limit(1)
+    )[0];
+    await tx.insert(messages).values({
+      id: messageId,
+      conversationId: input.turn.conversationId,
+      turnId: input.turn.id,
+      userId,
+      role: "assistant",
+      content: input.text,
+      sequence: (latest?.sequence ?? -1) + 1,
+      metadata,
+      sentAt,
+      createdAt: sentAt,
+    });
+  });
 }
 
 async function persistProviderEvents(input: {
   operation: AgentOperation;
   task: AgentTask;
   events: readonly ManusV2MessageEvent[];
+  forcedAssistantProjection?: {
+    turnId: string;
+    expectedProviderAssistantEventIds: readonly string[];
+  };
 }) {
   const db = await requireDb();
   const waiting = latestManusV2WaitingDetail(input.events);
-  for (const event of input.events) {
+  const turns = await generalChatProjectionTurns({
+    userId: input.operation.accountUserId!,
+    localTaskId: input.task.id,
+  });
+  // Provider list calls are normally newest-first. Projection must instead
+  // walk the wire chronology so each assistant event is bound to the user
+  // turn immediately before it and durable message sequence stays monotonic.
+  const orderedEvents = orderManusV2EventsByProviderRank(
+    input.events,
+    "oldest_first",
+  );
+  let eventTurns: Map<string, GeneralChatProjectionTurn>;
+  if (input.forcedAssistantProjection) {
+    const expectedIds = sortedUnique(
+      input.forcedAssistantProjection.expectedProviderAssistantEventIds,
+    );
+    const actualIds = sortedUnique(
+      orderedEvents
+        .filter((event) => event.type === "assistant_message")
+        .map((event) => event.id),
+    );
+    const turn = turns.filter(
+      (candidate) => candidate.id === input.forcedAssistantProjection!.turnId,
+    );
+    if (
+      expectedIds.length === 0 ||
+      turn.length !== 1 ||
+      JSON.stringify(actualIds) !== JSON.stringify(expectedIds)
+    ) {
+      throw new ChatV2HttpError("GENERAL_CHAT_REPAIR_PROJECTION_MISMATCH", 409);
+    }
+    eventTurns = new Map(expectedIds.map((eventId) => [eventId, turn[0]!]));
+  } else {
+    eventTurns = providerEventTurnAssignments(orderedEvents, turns);
+  }
+  for (const event of orderedEvents) {
     const localized = [];
     for (const attachment of assistantAttachments(event)) {
       try {
@@ -636,10 +877,11 @@ async function persistProviderEvents(input: {
           }
         : {}),
     };
+    const localEventId = randomUUID();
     await db
       .insert(agentEvents)
       .values({
-        id: randomUUID(),
+        id: localEventId,
         taskId: input.task.id,
         providerEventId: event.id,
         eventType: event.type,
@@ -653,6 +895,33 @@ async function persistProviderEvents(input: {
           normalizedPayload,
         },
       });
+    const persistedEvent = (
+      await db
+        .select({ id: agentEvents.id })
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.task.id),
+            eq(agentEvents.providerEventId, event.id),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (!persistedEvent) {
+      throw new ChatV2HttpError("PROVIDER_EVENT_PERSISTENCE_FAILED", 500, true);
+    }
+    const projectionTurn = eventTurns.get(event.id);
+    if (projectionTurn && (normalizedPayload.text || localized.length > 0)) {
+      await persistAssistantProjection({
+        operation: input.operation,
+        task: input.task,
+        event,
+        turn: projectionTurn,
+        upstreamOutputId: persistedEvent.id,
+        text: String(normalizedPayload.text ?? ""),
+        localized,
+      });
+    }
   }
 }
 
@@ -666,32 +935,35 @@ async function cachedOutput(taskId: string) {
   return rows.flatMap((row) => {
     const payload = row.normalizedPayload ?? {};
     if (payload.kind !== "provider_event") return [];
-    const output = [];
+    const content = [];
     const text = typeof payload.text === "string" ? payload.text : "";
     if (text) {
-      output.push({
-        id: row.id,
-        type: "message",
-        role: "assistant",
-        content: [{ type: "output_text", text }],
-      });
+      content.push({ type: "output_text", text });
     }
     const resources = Array.isArray(payload.artifacts) ? payload.artifacts : [];
-    resources.forEach((raw, index) => {
+    resources.forEach((raw) => {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
       const resource = raw as Record<string, unknown>;
       const artifactId = String(resource.artifactId ?? "");
       if (!artifactId.startsWith("artifact_")) return;
       const mimeType = cleanMimeType(resource.mimeType);
-      output.push({
-        id: `${row.id}:artifact:${index}`,
+      content.push({
         type: mimeType.startsWith("image/") ? "output_image" : "output_file",
         file_url: `/api/frontmind/v2/artifacts/${encodeURIComponent(artifactId)}/content`,
         file_name: cleanFilename(resource.filename),
         mime_type: mimeType,
       });
     });
-    return output;
+    return content.length > 0
+      ? [
+          {
+            id: row.id,
+            type: "message",
+            role: "assistant",
+            content,
+          },
+        ]
+      : [];
   });
 }
 
@@ -716,6 +988,10 @@ async function taskDto(operation: AgentOperation, task: AgentTask) {
     model: operation.publicProfile,
     metadata: { task_title: "FrontMind 内容流程" },
     output: await cachedOutput(task.id),
+    ...(!task.providerTaskId &&
+    ["failed", "cancelled"].includes(operation.status)
+      ? { clearTaskPointer: true }
+      : {}),
     ...(operation.errorCode
       ? { error: { message: "任务未能完成", code: operation.errorCode } }
       : {}),
@@ -731,6 +1007,7 @@ async function updateTaskState(input: {
   providerTaskId?: string;
   providerRequestId?: string | null;
   resultDeadlineAt?: Date | null;
+  clearConversationTaskPointers?: boolean;
 }) {
   const db = await requireDb();
   await db.transaction(async (tx) => {
@@ -754,7 +1031,481 @@ async function updateTaskState(input: {
         lastMessageSyncAt: new Date(),
       })
       .where(eq(agentTasks.id, input.localTaskId));
+    const turnStatus =
+      input.status === "succeeded"
+        ? "completed"
+        : ["failed", "attention_required"].includes(input.status)
+          ? "failed"
+          : input.status === "cancelled"
+            ? "cancelled"
+            : input.status === "queued"
+              ? "queued"
+              : "running";
+    await tx
+      .update(conversationTurns)
+      .set({
+        status: turnStatus,
+        errorCode: input.errorCode ?? null,
+        ...(turnStatus === "completed" ||
+        turnStatus === "failed" ||
+        turnStatus === "cancelled"
+          ? { completedAt: new Date() }
+          : {}),
+      })
+      .where(
+        input.status === "running"
+          ? and(
+              eq(conversationTurns.upstreamTaskId, input.localTaskId),
+              eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+              eq(conversationTurns.status, "queued"),
+            )
+          : and(
+              eq(conversationTurns.upstreamTaskId, input.localTaskId),
+              eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+            ),
+      );
+    const conversationStatus =
+      input.status === "succeeded"
+        ? "completed"
+        : ["failed", "cancelled", "attention_required"].includes(input.status)
+          ? "error"
+          : input.status === "queued"
+            ? "pending"
+            : "running";
+    const boundConversationIds = (
+      await tx
+        .select({ conversationId: conversationTurns.conversationId })
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.upstreamTaskId, input.localTaskId),
+            eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+          ),
+        )
+    ).map((turn) => turn.conversationId);
+    if (boundConversationIds.length > 0) {
+      await tx
+        .update(conversations)
+        .set({
+          status: conversationStatus,
+          ...(input.clearConversationTaskPointers
+            ? { upstreamTaskId: null, previousResponseId: null }
+            : {}),
+          ...(conversationStatus === "completed" ||
+          conversationStatus === "error"
+            ? { completedAt: new Date() }
+            : { completedAt: null }),
+        })
+        .where(inArray(conversations.id, boundConversationIds));
+    }
   });
+}
+
+type CreateReconcileEvidence = {
+  promptSha256: string;
+  attachmentFileIds: string[];
+};
+
+type CreateReservationStatus =
+  | "preparation_failed"
+  | "preparing"
+  | "sending"
+  | "outcome_unknown"
+  | "acknowledged"
+  | "rejected"
+  | "ambiguous";
+
+async function ensureCreatePreparationReservation(input: {
+  taskId: string;
+  requestHash: string;
+  prompt: string;
+  localAssetIds: readonly string[];
+}) {
+  const db = await requireDb();
+  const providerEventId = `local-create:${input.taskId}`;
+  await db
+    .insert(agentEvents)
+    .values({
+      id: randomUUID(),
+      taskId: input.taskId,
+      providerEventId,
+      eventType: "local_create_reservation",
+      providerTimestampMs: Date.now(),
+      normalizedPayload: {
+        kind: "local_create_reservation",
+        requestHash: input.requestHash,
+        promptSha256: hash(input.prompt),
+        localAssetIds: sortedUnique(input.localAssetIds),
+        status: "preparation_failed",
+      },
+    })
+    .onDuplicateKeyUpdate({ set: { providerEventId } });
+  const reservation = (
+    await db
+      .select()
+      .from(agentEvents)
+      .where(
+        and(
+          eq(agentEvents.taskId, input.taskId),
+          eq(agentEvents.providerEventId, providerEventId),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (
+    !reservation ||
+    reservation.normalizedPayload.kind !== "local_create_reservation" ||
+    reservation.normalizedPayload.requestHash !== input.requestHash
+  ) {
+    throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
+  }
+  return reservation;
+}
+
+async function claimCreatePreparation(input: {
+  operationId: string;
+  taskId: string;
+  userId: number;
+  requestHash: string;
+  prompt: string;
+  localAssetIds: readonly string[];
+}) {
+  await ensureCreatePreparationReservation(input);
+  const db = await requireDb();
+  const { claimToken, claimUpdatedAtMs } = createGeneralChatPreparationClaim();
+  const claim = await db.transaction(async (tx) => {
+    const reservation = (
+      await tx
+        .select()
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.taskId),
+            eq(agentEvents.providerEventId, `local-create:${input.taskId}`),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (
+      !reservation ||
+      reservation.normalizedPayload.requestHash !== input.requestHash
+    ) {
+      throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
+    }
+    const status = reservation.normalizedPayload.status;
+    const mayTakeOverStaleClaim =
+      status === "preparing" &&
+      generalChatPreparationClaimIsStale(
+        reservation.normalizedPayload.claimUpdatedAtMs,
+      );
+    if (status !== "preparation_failed" && !mayTakeOverStaleClaim) {
+      return {
+        acquired: false as const,
+        claimToken: null,
+        status: typeof status === "string" ? status : ("ambiguous" as const),
+      };
+    }
+    await tx
+      .update(agentEvents)
+      .set({
+        normalizedPayload: {
+          ...reservation.normalizedPayload,
+          claimToken,
+          claimUpdatedAtMs,
+          status: "preparing",
+        },
+      })
+      .where(eq(agentEvents.id, reservation.id));
+    await tx
+      .update(agentOperations)
+      .set({ status: "queued", errorCode: null })
+      .where(eq(agentOperations.id, input.operationId));
+    await tx
+      .update(agentTasks)
+      .set({ providerState: "preparing" })
+      .where(eq(agentTasks.id, input.taskId));
+    return {
+      acquired: true as const,
+      claimToken,
+      status: "preparing" as const,
+    };
+  });
+  return claim;
+}
+
+async function freezeCreateReconcileEvidence(input: {
+  taskId: string;
+  userId: number;
+  clientRequestId: string;
+  requestHash: string;
+  claimToken: string;
+  prompt: string;
+  localAssetIds: readonly string[];
+  modelProfile: GeneralAgentModelProfile;
+  attachmentFileIds: readonly string[];
+}) {
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const reservation = (
+      await tx
+        .select()
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.taskId),
+            eq(agentEvents.providerEventId, `local-create:${input.taskId}`),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    const payload = reservation?.normalizedPayload;
+    if (
+      !reservation ||
+      payload?.requestHash !== input.requestHash ||
+      payload.status !== "preparing" ||
+      payload.claimToken !== input.claimToken ||
+      typeof payload.promptSha256 !== "string"
+    ) {
+      throw new ChatV2HttpError("CREATE_RESERVATION_CONFLICT", 409, true);
+    }
+    const turn = (
+      await tx
+        .select({
+          id: conversationTurns.id,
+          conversationId: conversationTurns.conversationId,
+          clientRequestId: conversationTurns.clientRequestId,
+          requestHash: conversationTurns.requestHash,
+          metadata: conversationTurns.metadata,
+        })
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.clientRequestId, input.clientRequestId),
+            eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+            eq(conversationTurns.upstreamTaskId, input.taskId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!turn) throw new ChatV2HttpError("GENERAL_CHAT_TURN_NOT_FOUND", 409);
+    const localAssetIds = sortedUnique(input.localAssetIds);
+    if (
+      turn.clientRequestId !== input.clientRequestId ||
+      turn.requestHash !== requestHash({ prompt: input.prompt, localAssetIds })
+    ) {
+      throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
+    }
+    const persistedMessageId = persistedMessageIdForConversation(
+      turn.conversationId,
+      input.clientRequestId,
+    );
+    const boundUserMessage = (
+      await tx
+        .select({
+          content: messages.content,
+          metadata: messages.metadata,
+          turnId: messages.turnId,
+        })
+        .from(messages)
+        .where(
+          and(
+            eq(messages.id, persistedMessageId),
+            eq(messages.conversationId, turn.conversationId),
+            eq(messages.userId, input.userId),
+            eq(messages.role, "user"),
+            eq(messages.turnId, turn.id),
+            isNull(messages.deletedAt),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!boundUserMessage || boundUserMessage.turnId !== turn.id) {
+      throw new ChatV2HttpError("USER_MESSAGE_TURN_CONFLICT", 409);
+    }
+    const dispatchValidation = validateGeneralChatDispatchMetadata({
+      metadata: boundUserMessage.metadata,
+      clientRequestId: input.clientRequestId,
+      providerPrompt: input.prompt,
+      localAssetIds,
+      originalLocalTaskId: null,
+      modelProfile: input.modelProfile,
+    });
+    if (
+      dispatchValidation.kind === "invalid" ||
+      (dispatchValidation.kind === "legacy" &&
+        stripFrontMindGeneralChatOperationContract(
+          boundUserMessage.content,
+        ).trim() !== input.prompt.trim())
+    ) {
+      throw new ChatV2HttpError("USER_MESSAGE_DISPATCH_CONFLICT", 409);
+    }
+    const attachmentFileIds = sortedUnique(input.attachmentFileIds);
+    const frozenPayload = {
+      ...payload,
+      attachmentFileIds,
+      status: "sending",
+    };
+    await tx
+      .update(agentEvents)
+      .set({ normalizedPayload: frozenPayload })
+      .where(eq(agentEvents.id, reservation.id));
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: {
+          ...(turn.metadata ?? {}),
+          providerAttachmentFileIds: attachmentFileIds,
+          providerEventWatermark: [],
+        },
+        status: "running",
+        startedAt: new Date(),
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    return {
+      promptSha256: payload.promptSha256,
+      attachmentFileIds,
+    } satisfies CreateReconcileEvidence;
+  });
+}
+
+async function transitionCreateReservation(input: {
+  taskId: string;
+  status: CreateReservationStatus;
+  expectedStatus?: CreateReservationStatus;
+  claimToken?: string;
+  rejectionProven?: boolean;
+}) {
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const reservation = (
+      await tx
+        .select()
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.taskId),
+            eq(agentEvents.providerEventId, `local-create:${input.taskId}`),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!reservation) return false;
+    const payload = reservation.normalizedPayload;
+    if (
+      (input.expectedStatus && payload.status !== input.expectedStatus) ||
+      (input.claimToken && payload.claimToken !== input.claimToken)
+    ) {
+      return false;
+    }
+    if (payload.status === "acknowledged" && input.status !== "acknowledged") {
+      return false;
+    }
+    await tx
+      .update(agentEvents)
+      .set({
+        normalizedPayload: {
+          ...payload,
+          status: input.status,
+          ...(input.status === "rejected"
+            ? { rejectionProven: input.rejectionProven === true }
+            : {}),
+        },
+      })
+      .where(eq(agentEvents.id, reservation.id));
+    return true;
+  });
+}
+
+async function readCreateReservation(taskId: string) {
+  const payload = (
+    await (
+      await requireDb()
+    )
+      .select({ payload: agentEvents.normalizedPayload })
+      .from(agentEvents)
+      .where(
+        and(
+          eq(agentEvents.taskId, taskId),
+          eq(agentEvents.providerEventId, `local-create:${taskId}`),
+        ),
+      )
+      .limit(1)
+  )[0]?.payload;
+  if (payload?.kind !== "local_create_reservation") return null;
+  const promptSha256 =
+    typeof payload.promptSha256 === "string" ? payload.promptSha256 : null;
+  const attachmentFileIds = Array.isArray(payload.attachmentFileIds)
+    ? payload.attachmentFileIds.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  return {
+    status:
+      typeof payload.status === "string"
+        ? (payload.status as CreateReservationStatus)
+        : null,
+    rejectionProven: payload.rejectionProven === true,
+    evidence: promptSha256
+      ? ({ promptSha256, attachmentFileIds } satisfies CreateReconcileEvidence)
+      : null,
+  };
+}
+
+async function assertCreateTaskDtoMaySettle(input: {
+  operation: AgentOperation;
+  task: AgentTask;
+}) {
+  let owned = input;
+  let reservation = await readCreateReservation(input.task.id);
+  if (
+    input.task.providerTaskId &&
+    (reservation?.status === "sending" ||
+      reservation?.status === "outcome_unknown")
+  ) {
+    await transitionCreateReservation({
+      taskId: input.task.id,
+      expectedStatus: reservation.status,
+      status: "acknowledged",
+    });
+    reservation = await readCreateReservation(input.task.id);
+  }
+  if (
+    reservation?.status === "rejected" &&
+    reservation.rejectionProven &&
+    !owned.task.providerTaskId &&
+    !["failed", "cancelled"].includes(owned.operation.status)
+  ) {
+    await updateTaskState({
+      operationId: owned.operation.id,
+      localTaskId: owned.task.id,
+      status: "failed",
+      providerState: "failed",
+      errorCode: owned.operation.errorCode ?? "TASK_CREATE_REJECTED",
+      clearConversationTaskPointers: true,
+    });
+    owned = await findOwnedTask({
+      userId: owned.operation.accountUserId!,
+      localTaskId: owned.task.id,
+    });
+  }
+  const terminalSafe =
+    reservation?.status === "rejected" &&
+    reservation.rejectionProven &&
+    !owned.task.providerTaskId &&
+    ["failed", "cancelled"].includes(owned.operation.status);
+  if (
+    (reservation?.status === "acknowledged" && owned.task.providerTaskId) ||
+    terminalSafe
+  ) {
+    return owned;
+  }
+  throw new ChatV2HttpError("CREATE_OUTCOME_UNRESOLVED", 409, true);
 }
 
 async function reconcileUnknownCreate(input: {
@@ -767,17 +1518,30 @@ async function reconcileUnknownCreate(input: {
   if (input.task.providerTaskId || input.operation.status !== "queued") {
     return input;
   }
+  const reservation = await readCreateReservation(input.task.id);
+  if (
+    !reservation?.evidence ||
+    !["sending", "outcome_unknown"].includes(reservation.status ?? "")
+  ) {
+    return input;
+  }
+  const evidence = reservation.evidence;
   const result = await clientFor(
     input.credential.apiKey,
     input.operation.accountUserId!,
   ).findCreatedTask({
     title: input.task.title,
-    operationToken: input.task.createMarker,
+    promptSha256: evidence.promptSha256,
+    attachmentFileIds: evidence.attachmentFileIds,
     createdAfterSeconds:
       Math.floor(input.operation.createdAt.getTime() / 1_000) - 60,
     createdBeforeSeconds: Math.floor(Date.now() / 1_000) + 60,
   });
   if (result.matches.length > 1) {
+    await transitionCreateReservation({
+      taskId: input.task.id,
+      status: "ambiguous",
+    });
     await updateTaskState({
       operationId: input.operation.id,
       localTaskId: input.task.id,
@@ -794,15 +1558,20 @@ async function reconcileUnknownCreate(input: {
       providerTaskId: result.unique.id,
       errorCode: null,
     });
-  } else if (
-    Date.now() - input.operation.createdAt.getTime() >=
-    CREATE_RECONCILE_MS
-  ) {
+    await transitionCreateReservation({
+      taskId: input.task.id,
+      status: "acknowledged",
+    });
+  } else {
+    await transitionCreateReservation({
+      taskId: input.task.id,
+      status: "outcome_unknown",
+    });
     await updateTaskState({
       operationId: input.operation.id,
       localTaskId: input.task.id,
-      status: "attention_required",
-      providerState: "attention_required",
+      status: "queued",
+      providerState: "outcome_unknown",
       errorCode: "CREATE_OUTCOME_UNKNOWN",
     });
   }
@@ -812,9 +1581,49 @@ async function reconcileUnknownCreate(input: {
   });
 }
 
-async function syncTask(input: { userId: number; localTaskId: string }) {
+async function latestGeneralChatTurnOutputState(input: {
+  userId: number;
+  localTaskId: string;
+}) {
+  const db = await requireDb();
+  const turn = (
+    await db
+      .select({ id: conversationTurns.id })
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+          eq(conversationTurns.upstreamTaskId, input.localTaskId),
+        ),
+      )
+      .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
+      .limit(1)
+  )[0];
+  if (!turn) return { hasTurn: false, hasOutput: false };
+  const output = (
+    await db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.turnId, turn.id),
+          eq(messages.role, "assistant"),
+          isNull(messages.deletedAt),
+        ),
+      )
+      .limit(1)
+  )[0];
+  return { hasTurn: true, hasOutput: Boolean(output) };
+}
+
+async function syncTask(
+  input: { userId: number; localTaskId: string },
+  options: { forceProjection?: boolean } = {},
+) {
   let owned = await findOwnedTask(input);
   if (
+    !options.forceProjection &&
     ["succeeded", "failed", "cancelled", "attention_required"].includes(
       owned.operation.status,
     )
@@ -845,6 +1654,10 @@ async function syncTask(input: { userId: number; localTaskId: string }) {
     await persistProviderEvents({ ...owned, events });
     const state = latestManusV2TaskState(events) ?? detail.status ?? "running";
     const output = await cachedOutput(owned.task.id);
+    const latestTurnOutput = await latestGeneralChatTurnOutputState(input);
+    const hasCurrentOutput = latestTurnOutput.hasTurn
+      ? latestTurnOutput.hasOutput
+      : output.length > 0;
     let status: AgentOperation["status"] = "running";
     let errorCode: string | null = null;
     let resultDeadlineAt = owned.task.resultDeadlineAt;
@@ -854,9 +1667,18 @@ async function syncTask(input: { userId: number; localTaskId: string }) {
     } else if (
       ["completed", "succeeded", "success", "finished", "done"].includes(state)
     ) {
-      status = "succeeded";
+      if (hasCurrentOutput) {
+        status = "succeeded";
+      } else {
+        resultDeadlineAt ??= new Date(Date.now() + RESULT_GRACE_MS);
+        status =
+          Date.now() >= resultDeadlineAt.getTime()
+            ? "failed"
+            : "result_pending";
+        errorCode = status === "failed" ? "RESULT_MISSING" : null;
+      }
     } else if (state === "stopped") {
-      if (output.length > 0) {
+      if (hasCurrentOutput) {
         status = "succeeded";
       } else {
         resultDeadlineAt ??= new Date(Date.now() + RESULT_GRACE_MS);
@@ -889,8 +1711,323 @@ async function syncTask(input: { userId: number; localTaskId: string }) {
   return owned;
 }
 
+/**
+ * Signed-image incident maintenance may only reuse the ordinary task's
+ * read/reconcile path. This wrapper deliberately exposes no create/send
+ * capability and therefore cannot issue a Provider write.
+ */
+export async function syncGeneralChatTaskForRepair(input: {
+  userId: number;
+  localTaskId: string;
+  recoveryTurnId: string;
+  expectedProviderAssistantEventIds: readonly string[];
+}) {
+  const owned = await findOwnedTask(input);
+  if (
+    owned.operation.status !== "succeeded" ||
+    owned.task.providerState !== "stopped" ||
+    !owned.task.providerTaskId
+  ) {
+    throw new ChatV2HttpError("GENERAL_CHAT_REPAIR_TASK_MISMATCH", 409);
+  }
+  const credential = await getDecryptedCredentialForAccountById(
+    input.userId,
+    owned.operation.apiCredentialId,
+  );
+  if (
+    !credential ||
+    credential.id !== owned.operation.apiCredentialId ||
+    credential.version !== owned.operation.credentialVersion
+  ) {
+    throw new ChatV2HttpError("GENERAL_CHAT_REPAIR_CREDENTIAL_MISMATCH", 409);
+  }
+  const events = await readGeneralChatIncidentProviderMessages(
+    clientFor(credential.apiKey, input.userId),
+    { taskId: owned.task.providerTaskId, order: "desc" },
+  );
+  await persistProviderEvents({
+    ...owned,
+    events,
+    forcedAssistantProjection: {
+      turnId: input.recoveryTurnId,
+      expectedProviderAssistantEventIds:
+        input.expectedProviderAssistantEventIds,
+    },
+  });
+}
+
+function persistedConversationResourceId(
+  userId: number,
+  publicId: string,
+  projectAssignmentId: string | null,
+) {
+  const prefix = projectAssignmentId
+    ? `p${projectAssignmentId}:`
+    : `u${userId}:`;
+  return publicId.startsWith(prefix) ? publicId : `${prefix}${publicId}`;
+}
+
+async function bindPersistedGeneralChatUserMessageTurn(input: {
+  executor: any;
+  userMessage: typeof messages.$inferSelect;
+  persistedConversationId: string;
+  turnId: string;
+}) {
+  if (input.userMessage.turnId === input.turnId) return;
+  if (input.userMessage.turnId !== null) {
+    throw new ChatV2HttpError("USER_MESSAGE_TURN_CONFLICT", 409);
+  }
+  await input.executor
+    .update(messages)
+    .set({ turnId: input.turnId })
+    .where(
+      and(
+        eq(messages.id, input.userMessage.id),
+        eq(messages.conversationId, input.persistedConversationId),
+        isNull(messages.turnId),
+      ),
+    );
+}
+
+async function reservePersistedGeneralChatTurn(input: {
+  executor: any;
+  userId: number;
+  projectAssignmentId: string | null;
+  credentialId: string;
+  conversationId: string;
+  clientRequestId: string;
+  prompt: string;
+  localAssetIds: readonly string[];
+  operationId: string;
+  localTaskId: string;
+  model: string;
+  modelProfile: GeneralAgentModelProfile | null;
+  continuation: boolean;
+}) {
+  const persistedConversationId = persistedConversationResourceId(
+    input.userId,
+    input.conversationId,
+    input.projectAssignmentId,
+  );
+  const persistedMessageId = persistedConversationResourceId(
+    input.userId,
+    input.clientRequestId,
+    input.projectAssignmentId,
+  );
+  const conversation = (
+    await input.executor
+      .select()
+      .from(conversations)
+      .where(eq(conversations.id, persistedConversationId))
+      .limit(1)
+      .for("update")
+  )[0] as typeof conversations.$inferSelect | undefined;
+  const owned = input.projectAssignmentId
+    ? conversation?.projectAssignmentId === input.projectAssignmentId
+    : conversation?.userId === input.userId &&
+      conversation?.projectAssignmentId == null;
+  if (!conversation || !owned || conversation.deletedAt) {
+    throw new ChatV2HttpError("CONVERSATION_NOT_SYNCED", 409, true);
+  }
+  if (conversation.apiCredentialId !== input.credentialId) {
+    throw new ChatV2HttpError("CONVERSATION_CREDENTIAL_CONFLICT", 409);
+  }
+  const conversationTaskPointers = [
+    conversation.upstreamTaskId,
+    conversation.previousResponseId,
+  ].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  if (
+    (input.continuation &&
+      (conversationTaskPointers.length === 0 ||
+        conversationTaskPointers.some(
+          (pointer) => pointer !== input.localTaskId,
+        ))) ||
+    (!input.continuation &&
+      conversationTaskPointers.some((pointer) => pointer !== input.localTaskId))
+  ) {
+    throw new ChatV2HttpError("CONVERSATION_TASK_CONFLICT", 409);
+  }
+  if (input.continuation) {
+    const authoritativeTaskTurns = (await input.executor
+      .select({ conversationId: conversationTurns.conversationId })
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+          eq(conversationTurns.upstreamTaskId, input.localTaskId),
+        ),
+      )) as Array<{ conversationId: string }>;
+    if (
+      authoritativeTaskTurns.length === 0 ||
+      authoritativeTaskTurns.some(
+        (turn) => turn.conversationId !== persistedConversationId,
+      )
+    ) {
+      throw new ChatV2HttpError("CONVERSATION_TASK_CONFLICT", 409);
+    }
+  }
+  const userMessage = (
+    await input.executor
+      .select()
+      .from(messages)
+      .where(
+        and(
+          eq(messages.id, persistedMessageId),
+          eq(messages.conversationId, persistedConversationId),
+          eq(messages.userId, input.userId),
+          eq(messages.role, "user"),
+          isNull(messages.deletedAt),
+        ),
+      )
+      .limit(1)
+      .for("update")
+  )[0] as typeof messages.$inferSelect | undefined;
+  if (!userMessage) {
+    throw new ChatV2HttpError("USER_MESSAGE_NOT_SYNCED", 409, true);
+  }
+  const attachmentRows = (await input.executor
+    .select({ fileId: conversationAttachments.upstreamFileId })
+    .from(conversationAttachments)
+    .where(
+      and(
+        eq(conversationAttachments.userId, input.userId),
+        eq(conversationAttachments.conversationId, persistedConversationId),
+        eq(conversationAttachments.messageId, persistedMessageId),
+        isNull(conversationAttachments.deletedAt),
+      ),
+    )) as Array<{ fileId: string | null }>;
+  const persistedAssetIds = sortedUnique(
+    attachmentRows.flatMap(({ fileId }) => (fileId ? [fileId] : [])),
+  );
+  const requestedAssetIds = sortedUnique(input.localAssetIds);
+  if (
+    persistedAssetIds.length !== requestedAssetIds.length ||
+    !requestedAssetIds.every(
+      (assetId, index) => assetId === persistedAssetIds[index],
+    )
+  ) {
+    throw new ChatV2HttpError("MESSAGE_ATTACHMENTS_NOT_SYNCED", 409, true);
+  }
+  const dispatchValidation = validateGeneralChatDispatchMetadata({
+    metadata: userMessage.metadata,
+    clientRequestId: input.clientRequestId,
+    providerPrompt: input.prompt,
+    localAssetIds: requestedAssetIds,
+    originalLocalTaskId: input.continuation ? input.localTaskId : null,
+    modelProfile: input.modelProfile,
+  });
+  if (dispatchValidation.kind === "invalid") {
+    throw new ChatV2HttpError(dispatchValidation.code, 409);
+  }
+  if (
+    dispatchValidation.kind === "legacy" &&
+    stripFrontMindGeneralChatOperationContract(userMessage.content).trim() !==
+      input.prompt.trim()
+  ) {
+    // Compatibility only for snapshots written before durable ordinary-chat
+    // dispatch metadata existed. A present-but-invalid key is rejected above.
+    throw new ChatV2HttpError("USER_MESSAGE_NOT_SYNCED", 409, true);
+  }
+  const turnRequestHash = requestHash({
+    prompt: input.prompt,
+    localAssetIds: requestedAssetIds,
+  });
+  const operationKey = `chat-turn:${hash(
+    `${input.userId}\0${input.conversationId}\0${input.clientRequestId}`,
+  )}`;
+  const existingTurn = (
+    await input.executor
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.conversationId, persistedConversationId),
+          eq(conversationTurns.clientRequestId, input.clientRequestId),
+        ),
+      )
+      .limit(1)
+  )[0] as typeof conversationTurns.$inferSelect | undefined;
+  if (existingTurn) {
+    const metadata = existingTurn.metadata ?? {};
+    if (
+      existingTurn.userId !== input.userId ||
+      existingTurn.operationType !== GENERAL_CHAT_TURN_TYPE ||
+      existingTurn.operationKey !== operationKey ||
+      existingTurn.requestHash !== turnRequestHash ||
+      existingTurn.upstreamTaskId !== input.localTaskId ||
+      metadata.agentTaskId !== input.localTaskId ||
+      metadata.operationId !== input.operationId
+    ) {
+      throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
+    }
+    await bindPersistedGeneralChatUserMessageTurn({
+      executor: input.executor,
+      userMessage,
+      persistedConversationId,
+      turnId: existingTurn.id,
+    });
+    return { conversation, turn: existingTurn, persistedConversationId };
+  }
+  const turnId = randomUUID();
+  const now = new Date();
+  const metadata = {
+    schemaVersion: 1,
+    agentTaskId: input.localTaskId,
+    operationId: input.operationId,
+    userMessageId: input.clientRequestId,
+    promptSha256: hash(input.prompt),
+    attachmentManifestHash: requestHash(requestedAssetIds),
+    providerAttachmentFileIds: [],
+    providerEventWatermark: [],
+  };
+  await input.executor.insert(conversationTurns).values({
+    id: turnId,
+    conversationId: persistedConversationId,
+    userId: input.userId,
+    apiCredentialId: input.credentialId,
+    clientRequestId: input.clientRequestId,
+    operationKey,
+    operationType: GENERAL_CHAT_TURN_TYPE,
+    requestHash: turnRequestHash,
+    upstreamIdempotencyKeyHash: hash(operationKey),
+    attachmentFileIds: requestedAssetIds,
+    metadata,
+    model: input.model,
+    status: "queued",
+    upstreamTaskId: input.localTaskId,
+  });
+  await bindPersistedGeneralChatUserMessageTurn({
+    executor: input.executor,
+    userMessage,
+    persistedConversationId,
+    turnId,
+  });
+  await input.executor
+    .update(conversations)
+    .set({
+      upstreamTaskId: input.localTaskId,
+      previousResponseId: input.localTaskId,
+      status: "running",
+      startedAt: conversation.startedAt ?? now,
+    })
+    .where(eq(conversations.id, persistedConversationId));
+  return {
+    conversation,
+    turn: {
+      id: turnId,
+      conversationId: persistedConversationId,
+      metadata,
+    },
+    persistedConversationId,
+  };
+}
+
 async function reserveCreate(input: {
   userId: number;
+  projectAssignmentId: string | null;
   credential: NonNullable<Express.Request["frontmindCredential"]>;
   value: z.infer<typeof taskCreateSchema>;
 }) {
@@ -924,7 +2061,38 @@ async function reserveCreate(input: {
     ) {
       throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
     }
-    return { ...existing, acquired: false as const };
+    await db.transaction((tx) =>
+      reservePersistedGeneralChatTurn({
+        executor: tx,
+        userId: input.userId,
+        projectAssignmentId: input.projectAssignmentId,
+        credentialId: input.credential.id,
+        conversationId: input.value.conversationId,
+        clientRequestId: input.value.clientRequestId,
+        prompt: input.value.prompt,
+        localAssetIds: input.value.localAssetIds,
+        operationId: existing.operation.id,
+        localTaskId: existing.task.id,
+        model: existing.operation.upstreamModel,
+        modelProfile: input.value.modelProfile,
+        continuation: false,
+      }),
+    );
+    const claim = await claimCreatePreparation({
+      operationId: existing.operation.id,
+      taskId: existing.task.id,
+      userId: input.userId,
+      requestHash: frozenRequestHash,
+      prompt: input.value.prompt,
+      localAssetIds: input.value.localAssetIds,
+    });
+    const owned = claim.acquired
+      ? await findOwnedTask({
+          userId: input.userId,
+          localTaskId: existing.task.id,
+        })
+      : existing;
+    return { ...owned, ...claim, created: false as const };
   }
 
   const operationId = randomUUID();
@@ -959,6 +2127,21 @@ async function reserveCreate(input: {
         title,
         providerState: "queued",
       });
+      await reservePersistedGeneralChatTurn({
+        executor: tx,
+        userId: input.userId,
+        projectAssignmentId: input.projectAssignmentId,
+        credentialId: input.credential.id,
+        conversationId: input.value.conversationId,
+        clientRequestId: input.value.clientRequestId,
+        prompt: input.value.prompt,
+        localAssetIds: input.value.localAssetIds,
+        operationId,
+        localTaskId,
+        model: generalAgentModelProfileModel(input.value.modelProfile),
+        modelProfile: input.value.modelProfile,
+        continuation: false,
+      });
     });
   } catch (error) {
     const raced = (
@@ -981,10 +2164,49 @@ async function reserveCreate(input: {
     ) {
       throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
     }
-    return { ...raced, acquired: false as const };
+    await db.transaction((tx) =>
+      reservePersistedGeneralChatTurn({
+        executor: tx,
+        userId: input.userId,
+        projectAssignmentId: input.projectAssignmentId,
+        credentialId: input.credential.id,
+        conversationId: input.value.conversationId,
+        clientRequestId: input.value.clientRequestId,
+        prompt: input.value.prompt,
+        localAssetIds: input.value.localAssetIds,
+        operationId: raced.operation.id,
+        localTaskId: raced.task.id,
+        model: raced.operation.upstreamModel,
+        modelProfile: input.value.modelProfile,
+        continuation: false,
+      }),
+    );
+    const claim = await claimCreatePreparation({
+      operationId: raced.operation.id,
+      taskId: raced.task.id,
+      userId: input.userId,
+      requestHash: frozenRequestHash,
+      prompt: input.value.prompt,
+      localAssetIds: input.value.localAssetIds,
+    });
+    const owned = claim.acquired
+      ? await findOwnedTask({
+          userId: input.userId,
+          localTaskId: raced.task.id,
+        })
+      : raced;
+    return { ...owned, ...claim, created: false as const };
   }
+  const claim = await claimCreatePreparation({
+    operationId,
+    taskId: localTaskId,
+    userId: input.userId,
+    requestHash: frozenRequestHash,
+    prompt: input.value.prompt,
+    localAssetIds: input.value.localAssetIds,
+  });
   const created = await findOwnedTask({ userId: input.userId, localTaskId });
-  return { ...created, acquired: true as const };
+  return { ...created, ...claim, created: true as const };
 }
 
 async function sendProviderMessage(input: {
@@ -996,6 +2218,7 @@ async function sendProviderMessage(input: {
   clientRequestId: string;
   prompt: string;
   localAssetIds: readonly string[];
+  turnId: string;
 }) {
   if (!input.task.providerTaskId) {
     throw new ChatV2HttpError("TASK_NOT_READY", 409, true);
@@ -1005,12 +2228,19 @@ async function sendProviderMessage(input: {
     `${input.operation.accountUserId}\0${input.task.id}\0${input.clientRequestId}`,
   );
   const providerEventId = `local-send:${markerHash}`;
-  const operationToken = `chat-send:${markerHash.slice(0, 48)}`;
   const frozenRequestHash = requestHash({
     prompt: input.prompt,
     localAssetIds: input.localAssetIds,
   });
   const eventId = randomUUID();
+  const initialClaim = createGeneralChatPreparationClaim();
+  const preparingPayload = {
+    kind: "local_send_reservation",
+    requestHash: frozenRequestHash,
+    localAssetIds: sortedUnique(input.localAssetIds),
+    ...initialClaim,
+    status: "preparing",
+  };
   await db
     .insert(agentEvents)
     .values({
@@ -1019,12 +2249,7 @@ async function sendProviderMessage(input: {
       providerEventId,
       eventType: "local_send_reservation",
       providerTimestampMs: Date.now(),
-      normalizedPayload: {
-        kind: "local_send_reservation",
-        requestHash: frozenRequestHash,
-        operationToken,
-        status: "reserved",
-      },
+      normalizedPayload: preparingPayload,
     })
     .onDuplicateKeyUpdate({ set: { providerEventId } });
   const reservation = (
@@ -1039,100 +2264,371 @@ async function sendProviderMessage(input: {
       )
       .limit(1)
   )[0]!;
-  const payload = reservation.normalizedPayload ?? {};
+  let payload = reservation.normalizedPayload ?? {};
   if (payload.requestHash !== frozenRequestHash) {
     throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
   }
-  const acquired = reservation.id === eventId;
-  if (!acquired) {
-    if (payload.status === "acknowledged") return;
-    const events = await clientFor(
-      input.credential.apiKey,
-      input.operation.accountUserId!,
-    ).listAllMessages({
-      taskId: input.task.providerTaskId,
-      order: "desc",
-      stopAfterOperationToken: operationToken,
-    });
-    if (manusV2EventsContainOperationToken(events, operationToken)) {
-      await db
-        .update(agentEvents)
-        .set({ normalizedPayload: { ...payload, status: "acknowledged" } })
-        .where(eq(agentEvents.id, reservation.id));
-      return;
-    }
-    await updateTaskState({
-      operationId: input.operation.id,
-      localTaskId: input.task.id,
-      status: "attention_required",
-      providerState: "attention_required",
-      errorCode: "SEND_OUTCOME_UNKNOWN",
-    });
-    return;
-  }
-
-  try {
-    const attachments = await ensureProviderAttachments({
-      operation: input.operation,
-      credential: input.credential,
-      localAssetIds: input.localAssetIds,
-    });
-    await clientFor(
-      input.credential.apiKey,
-      input.operation.accountUserId!,
-    ).sendMessage({
-      taskId: input.task.providerTaskId,
-      prompt: promptWithMarker(input.prompt, operationToken),
-      attachments,
-    });
-    await db
-      .update(agentEvents)
-      .set({ normalizedPayload: { ...payload, status: "acknowledged" } })
-      .where(eq(agentEvents.id, reservation.id));
-    await updateTaskState({
-      operationId: input.operation.id,
-      localTaskId: input.task.id,
-      status: "running",
-      providerState: "running",
-      errorCode: null,
-      resultDeadlineAt: null,
-    });
-  } catch (error) {
-    if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
-      const events = await clientFor(
-        input.credential.apiKey,
-        input.operation.accountUserId!,
-      ).listAllMessages({
-        taskId: input.task.providerTaskId,
-        order: "desc",
-        stopAfterOperationToken: operationToken,
-      });
-      if (manusV2EventsContainOperationToken(events, operationToken)) {
-        await db
-          .update(agentEvents)
-          .set({ normalizedPayload: { ...payload, status: "acknowledged" } })
-          .where(eq(agentEvents.id, reservation.id));
-        return;
+  let acquired = reservation.id === eventId;
+  let activeClaimToken = initialClaim.claimToken;
+  if (!acquired && payload.status === "preparing") {
+    const takeoverClaim = createGeneralChatPreparationClaim();
+    const takeover = await db.transaction(async (tx) => {
+      const lockedReservation = (
+        await tx
+          .select({ normalizedPayload: agentEvents.normalizedPayload })
+          .from(agentEvents)
+          .where(
+            and(
+              eq(agentEvents.id, reservation.id),
+              eq(agentEvents.taskId, input.task.id),
+              eq(agentEvents.providerEventId, providerEventId),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0];
+      const lockedPayload = lockedReservation?.normalizedPayload;
+      if (!lockedPayload || lockedPayload.requestHash !== frozenRequestHash) {
+        throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
       }
+      if (
+        lockedPayload.status !== "preparing" ||
+        !generalChatPreparationClaimIsStale(lockedPayload.claimUpdatedAtMs)
+      ) {
+        return { acquired: false as const, payload: lockedPayload };
+      }
+      const claimedPayload = {
+        ...lockedPayload,
+        ...takeoverClaim,
+        status: "preparing",
+      };
+      await tx
+        .update(agentEvents)
+        .set({ normalizedPayload: claimedPayload })
+        .where(eq(agentEvents.id, reservation.id));
+      return { acquired: true as const, payload: claimedPayload };
+    });
+    payload = takeover.payload;
+    if (takeover.acquired) {
+      acquired = true;
+      activeClaimToken = takeoverClaim.claimToken;
+    }
+  }
+  const client = clientFor(
+    input.credential.apiKey,
+    input.operation.accountUserId!,
+  );
+  const reconcileReservedSend = async (evidence: Record<string, unknown>) => {
+    if (evidence.status === "acknowledged") return true;
+    const promptSha256 =
+      typeof evidence.promptSha256 === "string" ? evidence.promptSha256 : null;
+    if (!promptSha256) {
+      await updateTaskState({
+        operationId: input.operation.id,
+        localTaskId: input.task.id,
+        status: "attention_required",
+        providerState: "attention_required",
+        errorCode: "SEND_RECONCILE_EVIDENCE_MISSING",
+      });
+      return false;
+    }
+    const expectedAttachmentFileIds = Array.isArray(evidence.attachmentFileIds)
+      ? evidence.attachmentFileIds.filter(
+          (value): value is string => typeof value === "string",
+        )
+      : [];
+    const watermark = new Set(
+      Array.isArray(evidence.providerEventWatermark)
+        ? evidence.providerEventWatermark.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [],
+    );
+    const events = await client.listAllMessages({
+      taskId: input.task.providerTaskId!,
+      order: "desc",
+    });
+    const matches = events.filter(
+      (event) =>
+        !watermark.has(event.id) &&
+        manusV2EventMatchesGeneralChatRequest(event, {
+          promptSha256,
+          attachmentFileIds: expectedAttachmentFileIds,
+        }),
+    );
+    if (matches.length === 1) {
       await db
         .update(agentEvents)
-        .set({ normalizedPayload: { ...payload, status: "outcome_unknown" } })
+        .set({ normalizedPayload: { ...evidence, status: "acknowledged" } })
+        .where(eq(agentEvents.id, reservation.id));
+      return true;
+    }
+    if (matches.length > 1) {
+      await db
+        .update(agentEvents)
+        .set({ normalizedPayload: { ...evidence, status: "ambiguous" } })
         .where(eq(agentEvents.id, reservation.id));
       await updateTaskState({
         operationId: input.operation.id,
         localTaskId: input.task.id,
         status: "attention_required",
         providerState: "attention_required",
-        errorCode: "SEND_OUTCOME_UNKNOWN",
+        errorCode: "SEND_RECONCILE_CONFLICT",
       });
-      return;
+      return false;
     }
     await db
       .update(agentEvents)
-      .set({ normalizedPayload: { ...payload, status: "rejected" } })
+      .set({ normalizedPayload: { ...evidence, status: "outcome_unknown" } })
       .where(eq(agentEvents.id, reservation.id));
+    await updateTaskState({
+      operationId: input.operation.id,
+      localTaskId: input.task.id,
+      status: "running",
+      providerState: "outcome_unknown",
+      errorCode: "SEND_OUTCOME_UNKNOWN",
+    });
+    return false;
+  };
+  if (!acquired) {
+    if (payload.status === "preparing") {
+      throw new ChatV2HttpError("SEND_PREPARATION_IN_PROGRESS", 409, true);
+    }
+    if (payload.status === "rejected") {
+      if (payload.rejectionProven === true) {
+        throw new ChatV2HttpError("SEND_REJECTED", 422, false, true);
+      }
+      throw new ChatV2HttpError("SEND_OUTCOME_UNRESOLVED", 409, true);
+    }
+    const acknowledged = await reconcileReservedSend(payload);
+    if (!acknowledged) {
+      throw new ChatV2HttpError("SEND_OUTCOME_UNRESOLVED", 409, true);
+    }
+    return;
+  }
+
+  let attachments: Awaited<ReturnType<typeof ensureProviderAttachments>>;
+  let frozenEvidence: Record<string, unknown>;
+  try {
+    const turnExists = (
+      await db
+        .select({ id: conversationTurns.id })
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, input.turnId),
+            eq(conversationTurns.userId, input.operation.accountUserId!),
+            eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+            eq(conversationTurns.upstreamTaskId, input.task.id),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (!turnExists) {
+      throw new ChatV2HttpError("GENERAL_CHAT_TURN_NOT_FOUND", 409);
+    }
+    attachments = await ensureProviderAttachments({
+      operation: input.operation,
+      credential: input.credential,
+      localAssetIds: input.localAssetIds,
+    });
+    const attachmentFileIds = providerAttachmentFileIds(attachments);
+    const beforeEvents = await client.listAllMessages({
+      taskId: input.task.providerTaskId,
+      order: "desc",
+    });
+    frozenEvidence = {
+      ...payload,
+      promptSha256: hash(input.prompt),
+      attachmentFileIds,
+      providerEventWatermark: beforeEvents.map((event) => event.id),
+      status: "sending",
+    };
+    await db.transaction(async (tx) => {
+      const lockedReservation = (
+        await tx
+          .select({ normalizedPayload: agentEvents.normalizedPayload })
+          .from(agentEvents)
+          .where(
+            and(
+              eq(agentEvents.id, reservation.id),
+              eq(agentEvents.taskId, input.task.id),
+              eq(agentEvents.providerEventId, providerEventId),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0];
+      if (
+        !lockedReservation ||
+        lockedReservation.normalizedPayload.requestHash !== frozenRequestHash ||
+        lockedReservation.normalizedPayload.status !== "preparing" ||
+        lockedReservation.normalizedPayload.claimToken !== activeClaimToken
+      ) {
+        throw new ChatV2HttpError("SEND_RESERVATION_CONFLICT", 409, true);
+      }
+      const turnRow = (
+        await tx
+          .select({
+            conversationId: conversationTurns.conversationId,
+            clientRequestId: conversationTurns.clientRequestId,
+            requestHash: conversationTurns.requestHash,
+            metadata: conversationTurns.metadata,
+          })
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.id, input.turnId),
+              eq(conversationTurns.userId, input.operation.accountUserId!),
+              eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+              eq(conversationTurns.upstreamTaskId, input.task.id),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0];
+      if (!turnRow) {
+        throw new ChatV2HttpError("GENERAL_CHAT_TURN_NOT_FOUND", 409);
+      }
+      if (
+        turnRow.clientRequestId !== input.clientRequestId ||
+        turnRow.requestHash !== frozenRequestHash
+      ) {
+        throw new ChatV2HttpError("IDEMPOTENCY_CONFLICT", 409);
+      }
+      const persistedMessageId = persistedMessageIdForConversation(
+        turnRow.conversationId,
+        input.clientRequestId,
+      );
+      const boundUserMessage = (
+        await tx
+          .select({
+            content: messages.content,
+            metadata: messages.metadata,
+            turnId: messages.turnId,
+          })
+          .from(messages)
+          .where(
+            and(
+              eq(messages.id, persistedMessageId),
+              eq(messages.conversationId, turnRow.conversationId),
+              eq(messages.userId, input.operation.accountUserId!),
+              eq(messages.role, "user"),
+              eq(messages.turnId, input.turnId),
+              isNull(messages.deletedAt),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0];
+      if (!boundUserMessage || boundUserMessage.turnId !== input.turnId) {
+        throw new ChatV2HttpError("USER_MESSAGE_TURN_CONFLICT", 409);
+      }
+      const dispatchValidation = validateGeneralChatDispatchMetadata({
+        metadata: boundUserMessage.metadata,
+        clientRequestId: input.clientRequestId,
+        providerPrompt: input.prompt,
+        localAssetIds: sortedUnique(input.localAssetIds),
+        originalLocalTaskId: input.task.id,
+        modelProfile: null,
+      });
+      if (
+        dispatchValidation.kind === "invalid" ||
+        (dispatchValidation.kind === "legacy" &&
+          stripFrontMindGeneralChatOperationContract(
+            boundUserMessage.content,
+          ).trim() !== input.prompt.trim())
+      ) {
+        throw new ChatV2HttpError("USER_MESSAGE_DISPATCH_CONFLICT", 409);
+      }
+      await tx
+        .update(agentEvents)
+        .set({ normalizedPayload: frozenEvidence })
+        .where(eq(agentEvents.id, reservation.id));
+      await tx
+        .update(conversationTurns)
+        .set({
+          metadata: {
+            ...(turnRow.metadata ?? {}),
+            providerAttachmentFileIds: attachmentFileIds,
+            providerEventWatermark: beforeEvents.map((event) => event.id),
+          },
+          status: "running",
+          startedAt: new Date(),
+        })
+        .where(eq(conversationTurns.id, input.turnId));
+    });
+  } catch (error) {
+    await db.transaction(async (tx) => {
+      const currentReservation = (
+        await tx
+          .select({ normalizedPayload: agentEvents.normalizedPayload })
+          .from(agentEvents)
+          .where(eq(agentEvents.id, reservation.id))
+          .limit(1)
+          .for("update")
+      )[0];
+      if (
+        currentReservation?.normalizedPayload.requestHash ===
+          frozenRequestHash &&
+        currentReservation.normalizedPayload.claimToken === activeClaimToken &&
+        ["preparing", "sending", "outcome_unknown"].includes(
+          String(currentReservation.normalizedPayload.status ?? ""),
+        )
+      ) {
+        await tx.delete(agentEvents).where(eq(agentEvents.id, reservation.id));
+      }
+    });
     throw error;
   }
+
+  try {
+    await client.sendMessage({
+      taskId: input.task.providerTaskId,
+      prompt: input.prompt,
+      attachments,
+    });
+  } catch (error) {
+    if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+      const acknowledged = await reconcileReservedSend(frozenEvidence);
+      if (!acknowledged) {
+        throw new ChatV2HttpError("SEND_OUTCOME_UNRESOLVED", 409, true);
+      }
+      return;
+    }
+    if (
+      !(error instanceof ManusV2ApiError) ||
+      error.operation !== "task.sendMessage" ||
+      error.outcomeUnknown
+    ) {
+      throw error;
+    }
+    await db
+      .update(agentEvents)
+      .set({
+        normalizedPayload: {
+          ...frozenEvidence,
+          status: "rejected",
+          rejectionProven: true,
+        },
+      })
+      .where(eq(agentEvents.id, reservation.id));
+    throw new ChatV2HttpError("SEND_REJECTED", 422, false, true);
+  }
+  await db
+    .update(agentEvents)
+    .set({
+      normalizedPayload: { ...frozenEvidence, status: "acknowledged" },
+    })
+    .where(eq(agentEvents.id, reservation.id));
+  await updateTaskState({
+    operationId: input.operation.id,
+    localTaskId: input.task.id,
+    status: "running",
+    providerState: "running",
+    errorCode: null,
+    resultDeadlineAt: null,
+  });
 }
 
 function sendError(res: Response, error: unknown) {
@@ -1156,6 +2652,7 @@ function sendError(res: Response, error: unknown) {
         code: error.code,
         message: error.code,
         retryable: error.retryable,
+        dispatchSettled: error.dispatchSettled,
       },
     });
     return;
@@ -1665,27 +3162,135 @@ router.post("/tasks", async (req, res) => {
     const value = taskCreateSchema.parse(req.body ?? {});
     const reserved = await reserveCreate({
       userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
       credential: req.frontmindCredential,
       value,
     });
+    if (!reserved.acquired && reserved.status === "preparing") {
+      throw new ChatV2HttpError("CREATE_PREPARATION_IN_PROGRESS", 409, true);
+    }
     if (reserved.acquired) {
+      if (!reserved.claimToken) {
+        throw new ChatV2HttpError("CREATE_RESERVATION_CONFLICT", 409, true);
+      }
+      let attachments: Awaited<ReturnType<typeof ensureProviderAttachments>>;
       try {
-        const attachments = await ensureProviderAttachments({
+        attachments = await ensureProviderAttachments({
           operation: reserved.operation,
           credential: req.frontmindCredential,
           localAssetIds: value.localAssetIds,
         });
-        const created = await clientFor(
+        await freezeCreateReconcileEvidence({
+          taskId: reserved.task.id,
+          userId: req.frontmindUser.id,
+          clientRequestId: value.clientRequestId,
+          requestHash: reserved.operation.requestHash,
+          claimToken: reserved.claimToken,
+          prompt: value.prompt,
+          localAssetIds: value.localAssetIds,
+          modelProfile: value.modelProfile,
+          attachmentFileIds: providerAttachmentFileIds(attachments),
+        });
+      } catch (error) {
+        let released = await transitionCreateReservation({
+          taskId: reserved.task.id,
+          expectedStatus: "preparing",
+          claimToken: reserved.claimToken,
+          status: "preparation_failed",
+        });
+        if (!released) {
+          // This owner has not invoked Provider yet. Even if the evidence
+          // transaction committed but its acknowledgement was lost, reverting
+          // this exact claim is safe and lets the same request retry.
+          released = await transitionCreateReservation({
+            taskId: reserved.task.id,
+            expectedStatus: "sending",
+            claimToken: reserved.claimToken,
+            status: "preparation_failed",
+          });
+        }
+        if (!released) {
+          released = await transitionCreateReservation({
+            taskId: reserved.task.id,
+            expectedStatus: "outcome_unknown",
+            claimToken: reserved.claimToken,
+            status: "preparation_failed",
+          });
+        }
+        if (released) {
+          await updateTaskState({
+            operationId: reserved.operation.id,
+            localTaskId: reserved.task.id,
+            status: "queued",
+            providerState: "preparation_failed",
+            errorCode: "CREATE_PREPARATION_FAILED",
+          });
+          throw error;
+        }
+        const reconciled = await reconcileUnknownCreate({
+          operation: reserved.operation,
+          task: reserved.task,
+          credential: req.frontmindCredential,
+        }).catch(() => reserved);
+        const settled = await assertCreateTaskDtoMaySettle(reconciled);
+        res.status(202).json(await taskDto(settled.operation, settled.task));
+        return;
+      }
+
+      let created: Awaited<ReturnType<ManusV2Client["createTask"]>> | null =
+        null;
+      try {
+        created = await clientFor(
           req.frontmindCredential.apiKey,
           req.frontmindUser.id,
         ).createTask({
-          prompt: promptWithMarker(value.prompt, reserved.task.createMarker),
+          prompt: value.prompt,
           attachments,
           title: reserved.task.title,
           agentProfile: reserved.operation.upstreamModel,
           interactiveMode: true,
           locale: "zh-CN",
         });
+      } catch (error) {
+        const explicitlyRejected =
+          error instanceof ManusV2ApiError &&
+          error.operation === "task.create" &&
+          !error.outcomeUnknown;
+        if (!explicitlyRejected) {
+          await transitionCreateReservation({
+            taskId: reserved.task.id,
+            expectedStatus: "sending",
+            status: "outcome_unknown",
+          });
+          const reconciled = await reconcileUnknownCreate({
+            operation: reserved.operation,
+            task: reserved.task,
+            credential: req.frontmindCredential,
+          }).catch(() => reserved);
+          const settled = await assertCreateTaskDtoMaySettle(reconciled);
+          res.status(202).json(await taskDto(settled.operation, settled.task));
+          return;
+        }
+        await transitionCreateReservation({
+          taskId: reserved.task.id,
+          expectedStatus: "sending",
+          status: "rejected",
+          rejectionProven: true,
+        });
+        await updateTaskState({
+          operationId: reserved.operation.id,
+          localTaskId: reserved.task.id,
+          status: "failed",
+          providerState: "failed",
+          errorCode:
+            error instanceof ManusV2ApiError
+              ? error.code
+              : "TASK_CREATE_FAILED",
+          clearConversationTaskPointers: true,
+        });
+      }
+      if (created) {
         await updateTaskState({
           operationId: reserved.operation.id,
           localTaskId: reserved.task.id,
@@ -1695,46 +3300,21 @@ router.post("/tasks", async (req, res) => {
           providerRequestId: created.requestId,
           errorCode: null,
         });
-      } catch (error) {
-        if (
-          error instanceof ManusV2ApiError &&
-          error.operation === "task.create" &&
-          error.outcomeUnknown
-        ) {
-          const reconciled = await reconcileUnknownCreate({
-            operation: reserved.operation,
-            task: reserved.task,
-            credential: req.frontmindCredential,
-          }).catch(() => reserved);
-          res
-            .status(202)
-            .json(await taskDto(reconciled.operation, reconciled.task));
-          return;
-        }
-        await updateTaskState({
-          operationId: reserved.operation.id,
-          localTaskId: reserved.task.id,
-          status:
-            error instanceof ManusV2ApiError && error.outcomeUnknown
-              ? "attention_required"
-              : "failed",
-          providerState:
-            error instanceof ManusV2ApiError && error.outcomeUnknown
-              ? "attention_required"
-              : "failed",
-          errorCode:
-            error instanceof ManusV2ApiError
-              ? error.code
-              : "TASK_CREATE_FAILED",
+        await transitionCreateReservation({
+          taskId: reserved.task.id,
+          expectedStatus: "sending",
+          status: "acknowledged",
         });
       }
     }
-    const synced = await syncTask({
-      userId: req.frontmindUser.id,
-      localTaskId: reserved.task.id,
-    });
+    const synced = await assertCreateTaskDtoMaySettle(
+      await syncTask({
+        userId: req.frontmindUser.id,
+        localTaskId: reserved.task.id,
+      }),
+    );
     res
-      .status(reserved.acquired ? 201 : 200)
+      .status(reserved.created ? 201 : 200)
       .json(await taskDto(synced.operation, synced.task));
   } catch (error) {
     sendError(res, error);
@@ -1760,12 +3340,33 @@ router.post("/tasks/:localTaskId/messages", async (req, res) => {
     ) {
       throw new ChatV2HttpError("TASK_CREDENTIAL_UNAVAILABLE", 409);
     }
+    const reservedTurn = await (
+      await requireDb()
+    ).transaction((tx) =>
+      reservePersistedGeneralChatTurn({
+        executor: tx,
+        userId: req.frontmindUser!.id,
+        projectAssignmentId:
+          req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+        credentialId: credential.id,
+        conversationId: value.conversationId,
+        clientRequestId: value.clientRequestId,
+        prompt: value.prompt,
+        localAssetIds: value.localAssetIds,
+        operationId: owned.operation.id,
+        localTaskId: owned.task.id,
+        model: owned.operation.upstreamModel,
+        modelProfile: null,
+        continuation: true,
+      }),
+    );
     await sendProviderMessage({
       ...owned,
       credential,
       clientRequestId: value.clientRequestId,
       prompt: value.prompt,
       localAssetIds: value.localAssetIds,
+      turnId: reservedTurn.turn.id,
     });
     owned = await syncTask({
       userId: req.frontmindUser.id,

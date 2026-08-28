@@ -121,6 +121,10 @@ import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
 import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
 import { startBrandQuestionUniverseWorkerScheduler } from "../brand-question-universe-worker";
 import {
+  runGeneralChatIncidentRepairCli,
+  scheduleAutomaticGeneralChatIncidentRepair20260828,
+} from "../general-chat-incident-repair-20260828-cli";
+import {
   resolveFrontMindRuntimeRole,
   runtimeRoleReadinessRequirements,
   runtimeRoleRunsKnowledgeBaseWorker,
@@ -533,6 +537,9 @@ async function startServer() {
       runtimeRole,
     });
     if (process.env.NODE_ENV === "production") {
+      if (runtimeRoleServesWeb(runtimeRole)) {
+        scheduleAutomaticGeneralChatIncidentRepair20260828();
+      }
       registerSiteOpsRuntimeProviders();
       if (runtimeRoleRunsSiteOps(runtimeRole)) {
         startSiteOpsWorkerScheduler();
@@ -672,7 +679,25 @@ async function startServer() {
   });
 }
 
-startServer().catch((error) => {
+async function main() {
+  if (process.argv[2] === "general-chat-incident-repair-20260828") {
+    const stdoutWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    console.log = () => undefined;
+    console.info = () => undefined;
+    console.warn = () => undefined;
+    console.error = () => undefined;
+    console.debug = () => undefined;
+    const result = await runGeneralChatIncidentRepairCli(process.argv.slice(3));
+    stdoutWrite(`${JSON.stringify(result)}\n`);
+    if (!result.success) process.exitCode = 1;
+    return;
+  }
+  await startServer();
+}
+
+main().catch((error) => {
   console.error("[Server] startup_failed", runtimeErrorForLog(error));
   process.exitCode = 1;
 });

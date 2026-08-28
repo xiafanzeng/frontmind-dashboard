@@ -8,9 +8,11 @@ import {
   conversationSyncErrorMessage,
   currentKnowledgeBaseReplySnapshot,
   mergeKnowledgeBaseHydration,
+  mergeDirtyConversationHydration,
   mergeServerOwnedKnowledgeBaseMessages,
   parseOutputMessages,
   prepareConversationForCloud,
+  remoteMissingLocalConversations,
   sanitizeKnowledgeBaseCustomerMarkdown,
   sanitizeKnowledgeBaseOutputMessages,
   useConversation,
@@ -18,13 +20,48 @@ import {
 } from "./ConversationContext";
 
 describe("conversation sync errors", () => {
-  it("localizes transient browser fetch failures without changing business errors", () => {
+  it("promises preservation for both transport and business write failures", () => {
     expect(conversationSyncErrorMessage(new TypeError("Failed to fetch"))).toBe(
-      "会话同步暂时中断，连接恢复后将自动重试。",
+      "会话尚未同步，消息和附件已保留。请重试，请勿重复发送。",
     );
     expect(conversationSyncErrorMessage(new Error("保存被拒绝"))).toBe(
-      "保存被拒绝",
+      "会话尚未同步，消息和附件已保留。请重试，请勿重复发送。",
     );
+  });
+});
+
+describe("dirty hydration fencing", () => {
+  const conversation = (id: string): Conversation => ({
+    id,
+    title: id,
+    messages: [],
+    status: "idle",
+    createdAt: 1,
+    updatedAt: 1,
+  });
+
+  it("preserves remote-missing dirty conversations on a later refresh", () => {
+    const local = [conversation("clean"), conversation("dirty")];
+    expect(
+      remoteMissingLocalConversations(
+        local,
+        new Set<string>(),
+        false,
+        (id) => id === "dirty",
+      ).map(({ id }) => id),
+    ).toEqual(["dirty"]);
+  });
+
+  it("preserves every optimistic conversation during initial hydration", () => {
+    const local = [conversation("already-remote"), conversation("new-local")];
+    expect(
+      remoteMissingLocalConversations(
+        local,
+        new Set(["already-remote"]),
+        true,
+        () => false,
+      ).map(({ id }) => id),
+    ).toEqual(["new-local"]);
   });
 });
 
@@ -497,7 +534,7 @@ describe("ConversationProvider cloud hydration", () => {
     expect(result.current.hydrated).toBe(false);
     expect(result.current.loading).toBe(false);
     expect(result.current.syncError).toBe(
-      "会话同步暂时中断，连接恢复后将自动重试。",
+      "会话尚未同步，消息和附件已保留。请重试，请勿重复发送。",
     );
     expect(result.current.state.conversations).toEqual([]);
 
@@ -950,6 +987,70 @@ describe("ConversationProvider cloud hydration", () => {
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
   });
 
+  it("does not delete or tombstone a pending ordinary-chat user message", async () => {
+    const pendingConversation: Conversation = {
+      ...conversation("pending-general-chat-delete"),
+      executionKind: "general_chat_v2",
+      messages: [
+        {
+          id: "pending-user",
+          role: "user",
+          content: "尚未确认的请求",
+          timestamp: 100,
+          generalChatDispatch: {
+            schemaVersion: 1,
+            kind: "pending_user",
+            clientRequestId: "pending-user",
+            providerPrompt: "尚未确认的 Provider 请求",
+            localAssetIds: [],
+            localTaskId: null,
+            modelProfile: "frontmind-base",
+          },
+        },
+        {
+          id: "settled-user",
+          role: "user",
+          content: "已确认的普通消息",
+          timestamp: 90,
+        },
+      ],
+    };
+    mocks.listRefetch.mockResolvedValueOnce({ data: [pendingConversation] });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => {
+      result.current.deleteMessage(
+        "pending-general-chat-delete",
+        "pending-user",
+      );
+    });
+
+    let current = result.current.state.conversations.find(
+      (item) => item.id === "pending-general-chat-delete",
+    );
+    expect(current?.messages.map((message) => message.id)).toEqual([
+      "settled-user",
+      "pending-user",
+    ]);
+    expect(current?.deletedMessageIds ?? []).not.toContain("pending-user");
+
+    act(() => {
+      result.current.deleteMessage(
+        "pending-general-chat-delete",
+        "settled-user",
+      );
+    });
+
+    current = result.current.state.conversations.find(
+      (item) => item.id === "pending-general-chat-delete",
+    );
+    expect(current?.messages.map((message) => message.id)).toEqual([
+      "pending-user",
+    ]);
+    expect(current?.deletedMessageIds).toContain("settled-user");
+  });
+
   it("keeps a reset-discarded conversation out of a late and subsequent cloud hydration", async () => {
     const stale = {
       ...conversation("reset-discarded"),
@@ -1117,6 +1218,127 @@ describe("ConversationProvider cloud hydration", () => {
 });
 
 describe("prepareConversationForCloud", () => {
+  it("keeps the browser-owned ordinary dispatch envelope in the cloud snapshot", () => {
+    const clean = prepareConversationForCloud({
+      ...conversation("pending-general-chat"),
+      executionKind: "general_chat_v2",
+      messages: [
+        {
+          id: "msg-pending-general-chat",
+          role: "user",
+          content: "界面展示正文",
+          timestamp: 1,
+          attachments: [
+            {
+              id: "attachment-pending-general-chat",
+              type: "image",
+              name: "proof.png",
+              fileId: "asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+          ],
+          generalChatDispatch: {
+            schemaVersion: 1,
+            kind: "pending_user",
+            clientRequestId: "msg-pending-general-chat",
+            providerPrompt: "精确 Provider 正文",
+            localAssetIds: ["asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            localTaskId: null,
+            modelProfile: "frontmind-base",
+          },
+        },
+      ],
+    });
+
+    expect(clean.messages[0]?.generalChatDispatch).toEqual({
+      schemaVersion: 1,
+      kind: "pending_user",
+      clientRequestId: "msg-pending-general-chat",
+      providerPrompt: "精确 Provider 正文",
+      localAssetIds: ["asset_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      localTaskId: null,
+      modelProfile: "frontmind-base",
+    });
+  });
+
+  it("excludes server-owned ordinary assistant projections from browser snapshots", () => {
+    const clean = prepareConversationForCloud({
+      ...conversation("server-owned-general-chat"),
+      executionKind: "general_chat_v2",
+      messages: [
+        {
+          id: "user-1",
+          role: "user",
+          content: "你好",
+          timestamp: 1,
+        },
+        {
+          id: "assistant-event-1",
+          upstreamOutputId: "event-1",
+          role: "assistant",
+          content: "服务端结果",
+          timestamp: 2,
+          generalChat: {
+            schemaVersion: 1,
+            kind: "assistant_projection",
+            turnId: "turn-1",
+            agentTaskId: "task-1",
+            providerEventId: "event-1",
+            serverOwned: true,
+          },
+        },
+      ],
+    });
+
+    expect(clean.messages.map((message) => message.id)).toEqual(["user-1"]);
+    expect(clean.executionKind).toBe("general_chat_v2");
+  });
+
+  it("keeps dirty ordinary messages and deduplicates a server projection by output id", () => {
+    const local: Conversation = {
+      ...conversation("dirty-general-chat"),
+      executionKind: "general_chat_v2",
+      messages: [
+        { id: "user-local", role: "user", content: "未确认", timestamp: 2 },
+        {
+          id: "optimistic-output",
+          upstreamOutputId: "provider-event-1",
+          role: "assistant",
+          content: "轮询结果",
+          timestamp: 3,
+        },
+      ],
+    };
+    const remote: Conversation = {
+      ...conversation("dirty-general-chat"),
+      messages: [
+        { id: "user-remote", role: "user", content: "旧消息", timestamp: 1 },
+        {
+          id: "durable-output",
+          upstreamOutputId: "provider-event-1",
+          role: "assistant",
+          content: "持久结果",
+          timestamp: 3,
+          generalChat: {
+            schemaVersion: 1,
+            kind: "assistant_projection",
+            turnId: "turn-1",
+            agentTaskId: "task-1",
+            providerEventId: "provider-event-1",
+            serverOwned: true,
+          },
+        },
+      ],
+    };
+
+    const merged = mergeDirtyConversationHydration(local, remote);
+    expect(merged.messages.map((message) => message.id)).toEqual([
+      "user-local",
+      "durable-output",
+      "user-remote",
+    ]);
+    expect(merged.messages[1]?.content).toBe("持久结果");
+  });
+
   it("self-heals reused assistant and attachment IDs before cloud sync", () => {
     const clean = prepareConversationForCloud({
       ...conversation("duplicate-output"),

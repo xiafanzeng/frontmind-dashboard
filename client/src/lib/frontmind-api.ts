@@ -183,6 +183,8 @@ export interface TaskResponse {
   id: string;
   /** Response-logic operation boundary; absent on ordinary tasks. */
   operationRevision?: number;
+  /** Terminal ordinary task DTO has no reusable task binding. */
+  clearTaskPointer?: boolean;
   object?: string;
   status: "running" | "pending" | "completed" | "error" | "failed";
   model?: string;
@@ -643,9 +645,31 @@ async function apiRequest(
 
     if (!response.ok) {
       let errorMsg = `API Error ${response.status}`;
+      let errorDetails: Record<string, unknown> | undefined;
       try {
-        const errorData = await response.json();
-        errorMsg = errorData.error?.message || errorData.message || errorMsg;
+        const errorData = (await response.json()) as unknown;
+        if (
+          errorData !== null &&
+          typeof errorData === "object" &&
+          !Array.isArray(errorData)
+        ) {
+          const errorRecord = errorData as Record<string, unknown>;
+          const nestedError = errorRecord.error;
+          errorDetails =
+            nestedError !== null &&
+            typeof nestedError === "object" &&
+            !Array.isArray(nestedError)
+              ? (nestedError as Record<string, unknown>)
+              : errorRecord;
+          const structuredMessage = errorDetails.message;
+          const topLevelMessage = errorRecord.message;
+          errorMsg =
+            (typeof structuredMessage === "string"
+              ? structuredMessage
+              : typeof topLevelMessage === "string"
+                ? topLevelMessage
+                : undefined) ?? errorMsg;
+        }
       } catch {
         try {
           const errorText = await response.text();
@@ -661,8 +685,20 @@ async function apiRequest(
         ),
       ) as Error & {
         status?: number;
+        code?: string;
+        retryable?: boolean;
+        dispatchSettled?: boolean;
       };
       requestError.status = response.status;
+      if (typeof errorDetails?.code === "string") {
+        requestError.code = errorDetails.code;
+      }
+      if (typeof errorDetails?.retryable === "boolean") {
+        requestError.retryable = errorDetails.retryable;
+      }
+      if (typeof errorDetails?.dispatchSettled === "boolean") {
+        requestError.dispatchSettled = errorDetails.dispatchSettled;
+      }
       throw requestError;
     }
 
@@ -687,7 +723,7 @@ async function apiRequest(
  * Build the prompt text from user input content items.
  * Extracts text from ContentItem arrays.
  */
-function buildPromptText(input: Message[]): string {
+export function buildPromptText(input: Message[]): string {
   const parts: string[] = [];
 
   // Extract text from user messages

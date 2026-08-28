@@ -1584,6 +1584,36 @@ describe("retrieveTask", () => {
 });
 
 describe("ordinary chat local v2 contract", () => {
+  it("preserves structured dispatch settlement evidence on HTTP errors", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 422,
+      json: async () => ({
+        error: {
+          message: "请求已被明确拒绝",
+          code: "SEND_REJECTED",
+          retryable: false,
+          dispatchSettled: true,
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createTask([{ role: "user", content: "拒绝此请求" }], {
+        conversationId: "conversation-rejected",
+        clientRequestId: "request-rejected",
+        modelProfile: "frontmind-base",
+      }),
+    ).rejects.toMatchObject({
+      message: "请求已被明确拒绝",
+      status: 422,
+      code: "SEND_REJECTED",
+      retryable: false,
+      dispatchSettled: true,
+    });
+  });
+
   it("creates a local task with a public model profile and no Provider model fields", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
