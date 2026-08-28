@@ -39,7 +39,12 @@ export const buildArtifactBindingsSchema = z
 
 export const buildDeliveryCheckpointSchema = z
   .object({
-    renderMode: z.enum(["primary", "trusted_fallback", "twenty_first_native"]),
+    renderMode: z.enum([
+      "primary",
+      "content_patch",
+      "trusted_fallback",
+      "twenty_first_native",
+    ]),
     qaStatus: z.enum(["passed", "passed_with_warnings", "partial"]),
     warningCodes: z.array(z.string().trim().min(1).max(128)).max(100),
   })

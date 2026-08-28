@@ -99,6 +99,8 @@ const MATERIALIZED_RESULT_READ_WINDOW_MS = 10 * 60_000;
 const MATERIALIZED_RESULT_READ_BACKOFF_MS = [
   15_000, 30_000, 60_000, 120_000,
 ] as const;
+/** Healthy reads without any machine-contract result must not run forever. */
+const MATERIALIZED_RUNNING_PROGRESS_WINDOW_MS = 15 * 60_000;
 // 99 customer uploads plus Skill, instructions and optional prefill input.
 const MAX_ATTACHMENT_COUNT = 102;
 const MAX_USER_ATTACHMENT_COUNT = 99;
@@ -11086,6 +11088,34 @@ export async function deferKnowledgeBaseMaterializedProviderStatus(
       now,
       isRunning: input.status === "running",
     });
+    if (
+      input.status === "running" &&
+      Number(clocked.activeRunningMs) >= MATERIALIZED_RUNNING_PROGRESS_WINDOW_MS
+    ) {
+      const settled =
+        await settleLockedKnowledgeBaseMaterializedResultForApprovedReset({
+          tx,
+          userId: input.userId,
+          turn,
+          build,
+          metadata: {
+            ...metadata,
+            materializedCompletion: {
+              ...clocked,
+              schemaVersion: 1,
+              lastStatus: "running",
+              statusFirstObservedAt:
+                stored.statusFirstObservedAt ||
+                turn.startedAt?.toISOString() ||
+                now.toISOString(),
+              lastObservedAt: now.toISOString(),
+            },
+          },
+          code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+          now,
+        });
+      return { state: "unavailable", turn: settled };
+    }
     const priorStatus = stored.lastStatus;
     const sameInterruptionClass =
       (priorStatus === "waiting" || priorStatus === "quota_error") &&

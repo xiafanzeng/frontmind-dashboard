@@ -30,6 +30,7 @@ import { rebuildNativeReactProductionFromSource } from "./native-react-build-run
 import { validateNativeReactSourceArchive } from "./native-react-source";
 import {
   APPROVED_RESET_UNPUBLISH,
+  approvedResetUnpublishFreshEpochMatches,
   approvedResetUnpublishNonRevisionCoordinatesMatch,
   approvedResetUnpublishProjectMatches,
   parseApprovedResetUnpublishInput,
@@ -1082,7 +1083,8 @@ async function loadApprovedResetSafeNoExposureCoordinates(input: {
   const project = rows[0];
   if (
     !project ||
-    !approvedResetUnpublishNonRevisionCoordinatesMatch(input.reset, project)
+    (!approvedResetUnpublishNonRevisionCoordinatesMatch(input.reset, project) &&
+      !approvedResetUnpublishFreshEpochMatches(input.reset, project))
   ) {
     throw new EsaProviderFailure(
       "SITEOPS_RESET_INVALIDATED",

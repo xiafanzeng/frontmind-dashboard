@@ -8,6 +8,13 @@ import {
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
 } from "./siteops";
+
+/** Stable, public-safe delivery coordinate for a valid content patch whose
+ * invalid child slots were replaced with values from the frozen Brief. The
+ * UI projects this code to fixed copy and must never expose provider details. */
+export const SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE =
+  "SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS" as const;
+
 export const siteOpsKnowledgeSnapshotSchema = z
   .object({
     id: z.string().uuid(),
@@ -128,6 +135,7 @@ export const siteOpsBuildProjectionSchema = z
       .object({
         renderMode: z.enum([
           "primary",
+          "content_patch",
           "trusted_fallback",
           "twenty_first_native",
         ]),
@@ -139,6 +147,7 @@ export const siteOpsBuildProjectionSchema = z
       .default(null),
     buildPhase: z
       .enum([
+        "source_waiting",
         "source_repairing",
         "provider_sync_delayed",
         "source_validating",

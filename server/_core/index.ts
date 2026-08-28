@@ -122,6 +122,8 @@ import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
 import { startBrandQuestionUniverseWorkerScheduler } from "../brand-question-universe-worker";
 import {
   resolveFrontMindRuntimeRole,
+  runtimeRoleReadinessRequirements,
+  runtimeRoleRunsKnowledgeBaseWorker,
   runtimeRoleRunsSiteOps,
   runtimeRoleServesWeb,
 } from "./runtime-role";
@@ -146,6 +148,7 @@ const applicationImageDigest =
   process.env.FRONTMIND_IMAGE_DIGEST?.trim().toLowerCase() || null;
 const runtimeBuildRoot = path.dirname(fileURLToPath(import.meta.url));
 const runtimeRole = resolveFrontMindRuntimeRole();
+const readinessRequirements = runtimeRoleReadinessRequirements(runtimeRole);
 
 function assertProductionConfiguration() {
   if (process.env.NODE_ENV !== "production") return;
@@ -319,7 +322,9 @@ async function startServer() {
           schemaVerified:
             migrationState.journal.status === "exact" &&
             migrationState.schema.status === "exact",
-          recoveryRequired: process.env.NODE_ENV === "production",
+          recoveryRequired:
+            process.env.NODE_ENV === "production" &&
+            readinessRequirements.knowledgeBaseRecovery,
           assetRootRequired: process.env.NODE_ENV === "production",
           degradedBuildCount:
             getKnowledgeBaseInvariantAuditSnapshot().degradedBuildCount,
@@ -328,8 +333,9 @@ async function startServer() {
       ]);
       const ready =
         fileRetention?.ready === true &&
-        managedUploads.started === true &&
-        managedUploads.storageReady === true &&
+        (!readinessRequirements.managedUploads ||
+          (managedUploads.started === true &&
+            managedUploads.storageReady === true)) &&
         knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&
         migrationState.journal.status === "exact" &&
         migrationState.schema.status === "exact";
@@ -531,33 +537,35 @@ async function startServer() {
       if (runtimeRoleRunsSiteOps(runtimeRole)) {
         startSiteOpsWorkerScheduler();
       }
-      if (!runtimeRoleServesWeb(runtimeRole)) return;
-      startDeliveryTicketRetentionScheduler();
-      startConversationRetentionScheduler();
-      startJenovaBrandTrackingRecoveryScheduler();
-      startServiceContractLifecycleReconciliationScheduler();
-      startBrandQuestionUniverseWorkerScheduler();
-      startFileContentRetentionScheduler({
-        // Let the conversation transaction finish its initial pass before the
-        // file worker reconciles newly orphaned resources.
-        initialDelayMs: 2 * 60_000,
-        run: () =>
-          runFileContentRetentionCleanup({
-            cleanup: async () => {
-              const result = await cleanupExpiredFileContent({
-                removePreparedAssets: (resource) =>
-                  preparedFileService.deleteByOwnedFileSource({
-                    ownerUserId: resource.userId,
-                    fileId: resource.upstreamId,
-                    projectAssignmentId: resource.projectAssignmentId,
-                  }),
-                removePreparedAssetsByFileId: (fileId) =>
-                  preparedFileService.deleteByFileSource(fileId),
-              });
-              return result;
-            },
-          }),
-      });
+      if (runtimeRoleServesWeb(runtimeRole)) {
+        startDeliveryTicketRetentionScheduler();
+        startConversationRetentionScheduler();
+        startJenovaBrandTrackingRecoveryScheduler();
+        startServiceContractLifecycleReconciliationScheduler();
+        startBrandQuestionUniverseWorkerScheduler();
+        startFileContentRetentionScheduler({
+          // Let the conversation transaction finish its initial pass before the
+          // file worker reconciles newly orphaned resources.
+          initialDelayMs: 2 * 60_000,
+          run: () =>
+            runFileContentRetentionCleanup({
+              cleanup: async () => {
+                const result = await cleanupExpiredFileContent({
+                  removePreparedAssets: (resource) =>
+                    preparedFileService.deleteByOwnedFileSource({
+                      ownerUserId: resource.userId,
+                      fileId: resource.upstreamId,
+                      projectAssignmentId: resource.projectAssignmentId,
+                    }),
+                  removePreparedAssetsByFileId: (fileId) =>
+                    preparedFileService.deleteByFileSource(fileId),
+                });
+                return result;
+              },
+            }),
+        });
+      }
+      if (!runtimeRoleRunsKnowledgeBaseWorker(runtimeRole)) return;
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
         cleanupArtifactCandidates: () =>

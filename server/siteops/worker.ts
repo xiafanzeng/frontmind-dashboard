@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, like, lt, max, or } from "drizzle-orm";
 import {
   deliveryTickets,
   localAssets,
@@ -33,6 +33,7 @@ import {
   advanceApprovedSiteOpsResetAfterDnsRollback,
   finalizeApprovedSiteOpsReset,
   parseApprovedResetUnpublishInput,
+  siteOpsRebuildResetFencesExternalOperation,
 } from "./rebuild-ticket";
 import {
   approvedResetHasNoUnresolvedExternalExposure,
@@ -240,6 +241,13 @@ function pendingApprovedResetTicketNote(value: string | null | undefined) {
       "resetApprovedAt",
       "resetExpectedProjectRevision",
       "minimumKnowledgeSnapshotVersion",
+      "resetAppliedAt",
+      "resetAppliedProjectRevision",
+      "freshRootApplied",
+      "unpublishOperationId",
+      "resetEpochDecoupled",
+      "frozenReset",
+      "externalCleanupCompletedAt",
     ]);
     if (
       Object.keys(parsed).some((key) => !allowedKeys.has(key)) ||
@@ -256,7 +264,15 @@ function pendingApprovedResetTicketNote(value: string | null | undefined) {
       !Number.isInteger(parsed.resetExpectedProjectRevision) ||
       Number(parsed.resetExpectedProjectRevision) < 1 ||
       !Number.isInteger(parsed.minimumKnowledgeSnapshotVersion) ||
-      Number(parsed.minimumKnowledgeSnapshotVersion) < 1
+      Number(parsed.minimumKnowledgeSnapshotVersion) < 1 ||
+      (parsed.resetEpochDecoupled === true &&
+        (typeof parsed.resetAppliedAt !== "string" ||
+          !Number.isInteger(parsed.resetAppliedProjectRevision) ||
+          Number(parsed.resetAppliedProjectRevision) < 1 ||
+          parsed.freshRootApplied !== true ||
+          parsed.unpublishOperationId !== parsed.resetOperationId ||
+          !parseApprovedResetUnpublishInput(parsed.frozenReset) ||
+          parsed.externalCleanupCompletedAt !== undefined))
     ) {
       return null;
     }
@@ -718,6 +734,97 @@ function failureResult<
   return { status, code, message };
 }
 
+function isAliyunExternalWriteOperation(input: {
+  kind: string;
+  provider: string | null;
+}) {
+  return (
+    (input.provider === "aliyun_esa" &&
+      ["deploy", "rollback", "dns_apply"].includes(input.kind)) ||
+    (input.provider === "aliyun_alidns" &&
+      ["domain_sync", "dns_apply", "dns_rollback"].includes(input.kind))
+  );
+}
+
+export function siteOpsExternalOperationPredatesResetEpoch(input: {
+  operation: Pick<
+    Claimed,
+    "id" | "projectId" | "kind" | "provider" | "input" | "createdAt"
+  >;
+  currentTaskStartedAt: Date;
+  projectRevision?: number;
+  pendingResetNotes?: Array<string | null>;
+}) {
+  const exactResetFence =
+    input.projectRevision !== undefined &&
+    input.pendingResetNotes?.some((note) =>
+      siteOpsRebuildResetFencesExternalOperation(note, {
+        projectId: input.operation.projectId,
+        operationId: input.operation.id,
+        projectRevision: input.projectRevision!,
+        currentTaskStartedAt: input.currentTaskStartedAt,
+      }),
+    );
+  return Boolean(
+    isAliyunExternalWriteOperation(input.operation) &&
+      !approvedResetFromOperationInput(input.operation.input) &&
+      (input.operation.createdAt.getTime() <
+        input.currentTaskStartedAt.getTime() ||
+        exactResetFence),
+  );
+}
+
+async function operationPredatesCurrentResetEpoch(tx: any, operation: Claimed) {
+  if (
+    !isAliyunExternalWriteOperation(operation) ||
+    approvedResetFromOperationInput(operation.input)
+  ) {
+    return false;
+  }
+  const projectRows = await tx
+    .select({
+      revision: siteProjects.revision,
+      currentTaskStartedAt: siteProjects.currentTaskStartedAt,
+    })
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.id, operation.projectId),
+        eq(siteProjects.userId, operation.userId),
+      ),
+    )
+    .limit(1);
+  const project = projectRows[0];
+  const resetEpoch = project?.currentTaskStartedAt;
+  if (!resetEpoch) return false;
+  if (operation.createdAt.getTime() < resetEpoch.getTime()) return true;
+  if (operation.createdAt.getTime() !== resetEpoch.getTime()) return false;
+  const pendingTicketRows = await tx
+    .select({ internalNote: deliveryTickets.internalNote })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.userId, operation.userId),
+        eq(deliveryTickets.operation, "site_rebuild"),
+        inArray(deliveryTickets.status, ["scheduled", "in_progress"]),
+        like(deliveryTickets.internalNote, `%${operation.id}%`),
+      ),
+    )
+    .orderBy(desc(deliveryTickets.updatedAt))
+    .limit(8);
+  return Boolean(
+    project &&
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation,
+        currentTaskStartedAt: resetEpoch,
+        projectRevision: project.revision,
+        pendingResetNotes: pendingTicketRows.map(
+          (ticket: { internalNote: string | null }) => ticket.internalNote,
+        ),
+      }),
+  );
+}
+
 async function assertClaimLeaseActive(db: any, operation: Claimed) {
   const rows = await db
     .select({
@@ -1067,7 +1174,7 @@ function stagedBuildCheckpointResult(
       // durable pending marker directly without a provider read.
       return {
         status: "pending",
-        providerTaskId: fallback.taskId,
+        providerTaskId: fallback.taskId ?? undefined,
         buildStatus: "qa_running",
         nextPollMs: 10_000,
         result: checkpoint,
@@ -1152,11 +1259,14 @@ function fallbackMarkerMatchesOperation(input: {
   buildId: string;
   taskId: string | null;
 }) {
+  const allowedOperationTokens = new Set([
+    `siteops-native-fallback:${input.operation.id}`,
+    `siteops-content-baseline:${input.operation.id}`,
+  ]);
   return (
     input.marker.buildId === input.buildId &&
-    input.marker.taskId === input.taskId &&
-    input.marker.operationToken ===
-      `siteops-native-fallback:${input.operation.id}`
+    (input.marker.taskId === null || input.marker.taskId === input.taskId) &&
+    allowedOperationTokens.has(input.marker.operationToken)
   );
 }
 
@@ -1294,7 +1404,12 @@ async function verifiedBuildArtifactProjection(
     const delivery = result.result?.buildDelivery as
       | Record<string, unknown>
       | undefined;
-    if (!fallbackMatches || delivery?.renderMode !== "twenty_first_native") {
+    const expectedFormalRenderMode = boundFallback!.operationToken.startsWith(
+      "siteops-content-baseline:",
+    )
+      ? "content_patch"
+      : "twenty_first_native";
+    if (!fallbackMatches || delivery?.renderMode !== expectedFormalRenderMode) {
       throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
     }
   } else if (!allCurrentNull) {
@@ -1591,6 +1706,12 @@ async function finalize(
       if (affectedRows(pendingUpdate) !== 1) {
         throw new Error("SITEOPS_OPERATION_LEASE_LOST");
       }
+      if (await operationPredatesCurrentResetEpoch(tx, locked as Claimed)) {
+        // The provider may finish read-only reconciliation for the old
+        // external boundary, but it must not move the newly-created local
+        // reset epoch back to an old build/status while still pending.
+        return result.status;
+      }
       if (locked.buildId && result.buildStatus) {
         await appendBuildTimelineEvent(tx, {
           operation: locked as Claimed,
@@ -1750,6 +1871,14 @@ async function finalize(
         ),
       );
     void terminalUpdate;
+
+    if (await operationPredatesCurrentResetEpoch(tx, locked as Claimed)) {
+      // Approval freezes this old Aliyun operation in the reset ticket. Its
+      // terminal evidence is retained for deferred cleanup activation, while
+      // automatic publish/DNS successors and every project/head write are
+      // fenced from the new epoch.
+      return result.status;
+    }
 
     if (result.status === "succeeded") {
       await enqueueAutomaticDomainSuccessor(tx, locked, result, now);

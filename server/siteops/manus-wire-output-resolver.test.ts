@@ -160,6 +160,80 @@ describe("SiteOps wire output resolver", () => {
     expect(fetchPinned).not.toHaveBeenCalled();
   });
 
+  it("allows only an explicit native caller to accept a token-bound receipt while running", async () => {
+    const nativeToken =
+      "siteops-native-source:10000000-0000-4000-8000-000000000001:1";
+    const value = {
+      operationToken: nativeToken,
+      baseSourceSha256: "a".repeat(64),
+      archiveSha256: "b".repeat(64),
+      fileCount: 107,
+    };
+    const events = [marker(nativeToken), accepted(value)] as never;
+
+    await expect(
+      resolveWireOutput({
+        events,
+        operationToken: nativeToken,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1,
+        taskCompleted: false,
+        acceptCurrentPhaseWhileRunning: true,
+      }),
+    ).resolves.toMatchObject({ value, source: "structured" });
+
+    await expect(
+      resolveWireOutput({
+        events,
+        operationToken: nativeToken,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1,
+        taskCompleted: false,
+      }),
+    ).resolves.toBeNull();
+
+    await expect(
+      resolveSiteOpsWireOutput({
+        events,
+        operationToken: nativeToken,
+        taskCompleted: false,
+        acceptCurrentPhaseWhileRunning: true,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("accepts an explicitly enabled content-patch result while the task is still running", async () => {
+    const contentToken = "siteops-content:10000000-0000-4000-8000-000000000001";
+    const value = {
+      wireSchemaVersion: 1,
+      operationToken: contentToken,
+      baseSourceSha256: "a".repeat(64),
+      slots: [],
+    };
+    const events = [marker(contentToken), accepted(value)] as never;
+
+    await expect(
+      resolveWireOutput({
+        events,
+        operationToken: contentToken,
+        phase: "content",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1,
+        taskCompleted: false,
+        acceptCurrentPhaseWhileRunning: true,
+      }),
+    ).resolves.toMatchObject({ value, source: "structured" });
+
+    await expect(
+      resolveWireOutput({
+        events,
+        operationToken: contentToken,
+        phase: "content",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1,
+        taskCompleted: false,
+      }),
+    ).resolves.toBeNull();
+  });
+
   it("prefers an explicit structured success after the task stops", async () => {
     const fetchPinned = vi.fn();
     const value = {

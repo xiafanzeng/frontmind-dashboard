@@ -130,13 +130,17 @@ import {
 import {
   canonicalizeSiteContentDraft,
   canonicalPreviewToGeneratedContent,
-  draftFromPageContentWire,
 } from "./site-content-draft";
+import { applySiteContentPatchV1Resilient } from "./site-content-patch";
 import { terminalTaskState } from "./task-terminal-state";
 import {
   FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
   FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
   NATIVE_SOURCE_DEFAULT_LIMITS,
+  NATIVE_SOURCE_PREFLIGHT_FILENAME,
+  NATIVE_SOURCE_PREFLIGHT_SCRIPT,
+  NATIVE_SOURCE_PREFLIGHT_SHA256,
+  NATIVE_SOURCE_PREFLIGHT_VERSION,
   FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
   NativeReactSourceError,
   TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
@@ -167,6 +171,21 @@ import {
 } from "./build-artifact-checkpoint";
 
 export { terminalTaskState } from "./task-terminal-state";
+
+const PROVIDER_MUTABLE_BUILD_STATUSES = [
+  "preparing",
+  "visual_searching",
+  "awaiting_visual_selection",
+  "design_compiling",
+  "contract_ready",
+  "building",
+  "qa_running",
+] as const;
+
+const PROVIDER_MUTABLE_SOCIAL_PACKAGE_STATUSES = [
+  "queued",
+  "building",
+] as const;
 
 const operationInputSchema = z
   .object({
@@ -232,6 +251,7 @@ const providerStageSchema = z.enum([
 ]);
 
 const providerBuildPhaseSchema = z.enum([
+  "source_waiting",
   "source_repairing",
   "provider_sync_delayed",
   "source_validating",
@@ -256,7 +276,7 @@ const providerBuildCheckpointSchema = z.enum([
  * releases must not make a known-bad provider attachment hot-loop again.
  */
 export const NATIVE_SOURCE_VALIDATOR_VERSION =
-  "native-react-source-v1.2026-08-27" as const;
+  "native-react-source-and-build-v2.2026-08-28" as const;
 
 const nativeRejectedCandidateV1Schema = z
   .object({
@@ -268,7 +288,7 @@ const nativeRejectedCandidateV1Schema = z
     // Historical versions remain parseable so a validator bump revalidates
     // the candidate once instead of invalidating the whole provider state.
     validatorVersion: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u),
-    errorCode: z.string().regex(/^NATIVE_SOURCE_[A-Z0-9_]{1,112}$/u),
+    errorCode: z.string().regex(/^NATIVE_(?:SOURCE|BUILD)_[A-Z0-9_]{1,112}$/u),
     verdictSignature: z.string().regex(/^[a-f0-9]{64}$/u),
     rejectedAt: z.string().datetime(),
   })
@@ -448,7 +468,12 @@ const providerStateV2Schema = providerStateV1Schema
     providerReadFailureSince: z.string().datetime().optional(),
     providerNextPollAt: z.string().datetime().optional(),
     providerTaskNotFoundCount: z.number().int().min(0).max(3).optional(),
+    phaseOperationToken: z.string().min(1).max(512).optional(),
+    phaseStartedAt: z.string().datetime().optional(),
+    lastContractProgressAt: z.string().datetime().optional(),
     providerStoppedAt: z.string().datetime().optional(),
+    providerStoppedOperationToken: z.string().min(1).max(512).optional(),
+    resultPendingOperationToken: z.string().min(1).max(512).optional(),
     providerSyncStartedAt: z.string().datetime().optional(),
     providerLastReadFailure: providerReadFailureSchema.optional(),
     nativeSourceFileId: z.string().min(1).max(512).optional(),
@@ -544,7 +569,11 @@ function logManusBuildStage(input: {
   reason?: string;
   signature?: string;
   latencyMs?: number;
-  renderMode?: "primary" | "trusted_fallback" | "twenty_first_native";
+  renderMode?:
+    | "primary"
+    | "content_patch"
+    | "trusted_fallback"
+    | "twenty_first_native";
   qaStatus?: "passed" | "passed_with_warnings" | "partial";
   warningCount?: number;
 }) {
@@ -586,6 +615,17 @@ const emptyProviderAttempts = () => ({
 
 const NATIVE_SOURCE_STAGING_RETENTION_MS = 24 * 60 * 60 * 1_000;
 export const NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS = 5 * 60 * 1_000;
+export const NATIVE_FALLBACK_INITIAL_RECONCILIATION_MS = 60_000;
+
+export function nativeFallbackReconciliationDelayMs(
+  createdAt: string,
+  now = Date.now(),
+) {
+  const parsed = Date.parse(createdAt);
+  return Number.isFinite(parsed) && now - parsed < 60_000
+    ? NATIVE_FALLBACK_INITIAL_RECONCILIATION_MS
+    : NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS;
+}
 
 function providerStateV2(state: ProviderState | null): ProviderStateV2 {
   if (state?.schemaVersion === 2) return state;
@@ -867,6 +907,12 @@ function reactStaticRendererCoordinates(
       materializerVersion: SITEOPS_MATERIALIZER_V2_4.materializerVersion,
     } as const;
   }
+  if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
+    return {
+      componentLibraryVersion: SITEOPS_WORKFLOW.componentLibraryVersion,
+      materializerVersion: SITEOPS_WORKFLOW.materializerVersion,
+    } as const;
+  }
   throw new SiteOpsManusFailure(
     "SITEOPS_REACT_WORKFLOW_VERSION_UNSUPPORTED",
     "FrontMind React 建站工作流版本不受支持。",
@@ -888,7 +934,32 @@ export function usesBuildPlanContractV4(workflowVersion: string) {
  * route and slot from trusted input. Keep the explicit version boundary so
  * historical 2.3 tasks retain their immutable two-phase contract. */
 export function usesHostOwnedContentDraft(workflowVersion: string) {
-  return workflowVersion === SITEOPS_MATERIALIZER_V2_4.frontMindVersion;
+  return workflowVersion === SITEOPS_WORKFLOW.frontMindVersion;
+}
+
+/** Convert the fail-soft patch result into host-only materializer controls.
+ * Warning details remain in internal diagnostics; delivery receives one
+ * stable, public-safe coordinate whenever a frozen slot default was used. */
+export function contentPatchMaterializationOverrides(input: {
+  renderMode: "content_patch" | "trusted_fallback" | null;
+  warningCount: number;
+}) {
+  if (input.renderMode === "content_patch") {
+    return {
+      renderModeOverride: "content_patch" as const,
+      ...(input.warningCount > 0
+        ? { contentPatchUsesTrustedDefaults: true as const }
+        : {}),
+    };
+  }
+  if (input.renderMode === "trusted_fallback") {
+    return {
+      forceTrustedFallback: {
+        warningCode: "SITEOPS_CONTENT_PATCH_TRUSTED_FALLBACK",
+      },
+    };
+  }
+  return {};
 }
 
 export async function loadVerifiedSiteOpsWorkflowPackage(
@@ -1547,23 +1618,103 @@ export function phaseTerminalTaskState(
 // task.detail first reports `stopped`. Keep the task bound and reconcile the
 // same GET-only coordinates for five minutes before treating output as absent.
 export const MANUS_PROVIDER_STOPPED_GRACE_MS = 5 * 60_000;
+export const SITE_CONTENT_PATCH_PROGRESS_DEADLINE_MS = 15 * 60_000;
+
+export function siteContentPatchProgressDeadline(input: {
+  state: ProviderState | null;
+  operationToken: string;
+  now?: number;
+  operationStartedAt?: Date | string | null;
+}) {
+  const now = input.now ?? Date.now();
+  const current = providerStateV2(input.state);
+  const frozenPhaseStartedAt =
+    current.phaseOperationToken === input.operationToken
+      ? Date.parse(current.phaseStartedAt ?? "")
+      : Number.NaN;
+  const operationStartedAt =
+    input.operationStartedAt instanceof Date
+      ? input.operationStartedAt.getTime()
+      : Date.parse(String(input.operationStartedAt ?? ""));
+  const phaseStartedAt = Number.isFinite(frozenPhaseStartedAt)
+    ? Number.isFinite(operationStartedAt)
+      ? Math.min(frozenPhaseStartedAt, operationStartedAt)
+      : frozenPhaseStartedAt
+    : Number.isFinite(operationStartedAt)
+      ? operationStartedAt
+      : now;
+  const lastProgressAt =
+    current.phaseOperationToken === input.operationToken
+      ? Date.parse(current.lastContractProgressAt ?? "")
+      : Number.NaN;
+  const progressAnchor = Number.isFinite(lastProgressAt)
+    ? Math.max(phaseStartedAt, lastProgressAt)
+    : phaseStartedAt;
+  const state = providerStateV2Schema.parse({
+    ...current,
+    phaseOperationToken: input.operationToken,
+    phaseStartedAt: new Date(phaseStartedAt).toISOString(),
+    ...(current.phaseOperationToken === input.operationToken
+      ? {}
+      : {
+          lastContractProgressAt: undefined,
+          providerStoppedAt: undefined,
+          providerStoppedOperationToken: undefined,
+          resultPendingSince: undefined,
+          resultPendingOperationToken: undefined,
+        }),
+  });
+  return {
+    expired: now - progressAnchor >= SITE_CONTENT_PATCH_PROGRESS_DEADLINE_MS,
+    state,
+  };
+}
 
 export function structuredResultGrace(
   state: ProviderState,
   completed: boolean,
   now = Date.now(),
+  operationToken?: string,
 ) {
+  let scopedState = providerStateV2(state);
+  if (operationToken && scopedState.phaseOperationToken !== operationToken) {
+    scopedState = providerStateV2Schema.parse({
+      ...scopedState,
+      phaseOperationToken: operationToken,
+      phaseStartedAt: new Date(now).toISOString(),
+      lastContractProgressAt: undefined,
+      providerStoppedAt: undefined,
+      providerStoppedOperationToken: undefined,
+      resultPendingSince: undefined,
+      resultPendingOperationToken: undefined,
+    });
+  }
   const stoppedAt =
-    state.schemaVersion === 2 && state.providerStoppedAt
-      ? state.providerStoppedAt
+    scopedState.providerStoppedAt &&
+    (!operationToken ||
+      scopedState.providerStoppedOperationToken === operationToken)
+      ? scopedState.providerStoppedAt
       : undefined;
-  if (!completed && !stoppedAt) return { expired: false, state };
-  const parsed = Date.parse(state.resultPendingSince ?? stoppedAt ?? "");
+  const pendingSince =
+    scopedState.resultPendingSince &&
+    (!operationToken ||
+      scopedState.resultPendingOperationToken === operationToken)
+      ? scopedState.resultPendingSince
+      : undefined;
+  if (!completed && !stoppedAt) return { expired: false, state: scopedState };
+  const parsed = Date.parse(pendingSince ?? stoppedAt ?? "");
   const since = Number.isFinite(parsed) ? parsed : now;
   return {
     expired: now - since >= MANUS_PROVIDER_STOPPED_GRACE_MS,
     state: {
-      ...state,
+      ...scopedState,
+      ...(operationToken
+        ? {
+            providerStoppedAt: stoppedAt ?? new Date(since).toISOString(),
+            providerStoppedOperationToken: operationToken,
+            resultPendingOperationToken: operationToken,
+          }
+        : {}),
       resultPendingSince: new Date(since).toISOString(),
     } satisfies ProviderState,
   };
@@ -1749,43 +1900,51 @@ function generatedContentOutputSchema(
     : pageContentWireOutputSchema(input);
 }
 
-function siteContentDraftOutputSchema(input: {
+type SiteContentPatchSlotManifest = {
+  routeId: string;
+  slotId: string;
+  kind: "richText" | "list";
+  sourceIds: readonly string[];
+};
+
+function siteContentPatchOutputSchema(input: {
   operationToken: string;
-  routeIds: readonly string[];
+  baseSourceSha256: string;
+  slots: readonly SiteContentPatchSlotManifest[];
   sourceDocumentIds: readonly string[];
 }) {
   const nullableString = {
     anyOf: [{ type: "string" }, { type: "null" }],
   } as const;
+  const routeIds = [...new Set(input.slots.map((slot) => slot.routeId))];
+  const slotIds = [...new Set(input.slots.map((slot) => slot.slotId))];
   return assertSiteOpsStructuredOutputSchema({
     type: "object",
     properties: {
+      wireSchemaVersion: { type: "integer", enum: [1] },
       operationToken: { type: "string", enum: [input.operationToken] },
-      routes: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            routeId: { type: "string", enum: [...input.routeIds] },
-            heading: nullableString,
-            summary: nullableString,
-          },
-          required: ["routeId", "heading", "summary"],
-          additionalProperties: false,
-        },
+      baseSourceSha256: {
+        type: "string",
+        enum: [input.baseSourceSha256],
       },
       // Manus structured output is limited to five schema levels. Keep the
-      // provider transport flat, then project these records into the nested
-      // host-only SiteContentDraftV1 before canonicalization.
-      sections: {
+      // transport flat and project it into SiteContentPatchV1 pages locally.
+      slots: {
         type: "array",
         items: {
           type: "object",
           properties: {
-            routeId: { type: "string", enum: [...input.routeIds] },
-            heading: nullableString,
-            paragraphs: { type: "array", items: { type: "string" } },
-            bullets: { type: "array", items: { type: "string" } },
+            routeId: {
+              type: "string",
+              ...(routeIds.length > 0 ? { enum: routeIds } : {}),
+            },
+            slotId: {
+              type: "string",
+              ...(slotIds.length > 0 ? { enum: slotIds } : {}),
+            },
+            kind: { type: "string", enum: ["richText", "list"] },
+            valueText: nullableString,
+            valueList: { type: "array", items: { type: "string" } },
             sourceIds: {
               type: "array",
               items: {
@@ -1798,18 +1957,79 @@ function siteContentDraftOutputSchema(input: {
           },
           required: [
             "routeId",
-            "heading",
-            "paragraphs",
-            "bullets",
+            "slotId",
+            "kind",
+            "valueText",
+            "valueList",
             "sourceIds",
           ],
           additionalProperties: false,
         },
       },
     },
-    required: ["operationToken", "routes", "sections"],
+    required: [
+      "wireSchemaVersion",
+      "operationToken",
+      "baseSourceSha256",
+      "slots",
+    ],
     additionalProperties: false,
   });
+}
+
+function siteContentPatchFromWire(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.pages)) return value;
+  if (record.wireSchemaVersion !== 1 || !Array.isArray(record.slots)) {
+    return value;
+  }
+  const pages = new Map<string, unknown[]>();
+  for (const rawSlot of record.slots.slice(0, 480)) {
+    if (!rawSlot || typeof rawSlot !== "object" || Array.isArray(rawSlot)) {
+      continue;
+    }
+    const slot = rawSlot as Record<string, unknown>;
+    if (typeof slot.routeId !== "string") continue;
+    const routeId = slot.routeId.trim();
+    if (!routeId || routeId.length > 64) continue;
+    const projected = {
+      slotId: slot.slotId,
+      kind: slot.kind,
+      value: slot.kind === "list" ? slot.valueList : slot.valueText,
+      sourceIds: slot.sourceIds,
+    };
+    const current = pages.get(routeId) ?? [];
+    current.push(projected);
+    pages.set(routeId, current);
+  }
+  return {
+    schemaVersion: 1,
+    operationToken: record.operationToken,
+    baseSourceSha256: record.baseSourceSha256,
+    pages: [...pages].map(([routeId, slots]) => ({ routeId, slots })),
+  };
+}
+
+function siteContentPatchSlotManifestAttachment(input: {
+  operationToken: string;
+  baseSourceSha256: string;
+  slots: readonly SiteContentPatchSlotManifest[];
+}) {
+  const bytes = Buffer.from(
+    `${canonicalJson({
+      schemaVersion: 1,
+      operationToken: input.operationToken,
+      baseSourceSha256: input.baseSourceSha256,
+      slots: input.slots,
+    })}\n`,
+    "utf8",
+  );
+  return {
+    filename: "frontmind-site-content-slot-manifest-v1.json",
+    mime_type: "application/json",
+    file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+  } as const;
 }
 
 function socialOutputSchema(
@@ -2063,6 +2283,7 @@ async function bindCreatedBuildTask(input: {
   buildId: string;
   taskId: string;
   state: ProviderState;
+  preservePreview?: boolean;
 }) {
   if (!input.operation.leaseOwner) {
     throw new Error("SITEOPS_OPERATION_LEASE_LOST");
@@ -2078,13 +2299,14 @@ async function bindCreatedBuildTask(input: {
       .update(siteBuilds)
       .set({
         upstreamManusTaskId: input.taskId,
-        status: "design_compiling",
+        status: input.preservePreview ? "qa_running" : "design_compiling",
         updatedAt: new Date(),
       })
       .where(
         and(
           eq(siteBuilds.id, input.buildId),
           eq(siteBuilds.userId, input.operation.userId),
+          inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
           or(
             isNull(siteBuilds.upstreamManusTaskId),
             eq(siteBuilds.upstreamManusTaskId, input.taskId),
@@ -2258,9 +2480,22 @@ export function nativeSourceAttachmentRetryWindow(
 
 function clearProviderReadFailureState(
   state: ProviderState | null,
-  input: { completed: boolean; now: number },
+  input: { completed: boolean; now: number; operationToken: string },
 ) {
-  const current = providerStateV2(state);
+  const parsed = providerStateV2(state);
+  const current =
+    parsed.phaseOperationToken === input.operationToken
+      ? parsed
+      : providerStateV2Schema.parse({
+          ...parsed,
+          phaseOperationToken: input.operationToken,
+          phaseStartedAt: new Date(input.now).toISOString(),
+          lastContractProgressAt: undefined,
+          providerStoppedAt: undefined,
+          providerStoppedOperationToken: undefined,
+          resultPendingSince: undefined,
+          resultPendingOperationToken: undefined,
+        });
   return providerStateV2Schema.parse({
     ...current,
     providerReadFailureCount: undefined,
@@ -2277,6 +2512,9 @@ function clearProviderReadFailureState(
     providerStoppedAt:
       current.providerStoppedAt ??
       (input.completed ? new Date(input.now).toISOString() : undefined),
+    providerStoppedOperationToken: input.completed
+      ? input.operationToken
+      : current.providerStoppedOperationToken,
     providerSyncStartedAt: [
       "native_repair_send_unknown",
       "repair_send_unknown",
@@ -2330,7 +2568,11 @@ export async function pollManusTaskEvents(input: {
   const now = input.now ?? Date.now();
   const [detailRead, messagesRead] = await Promise.allSettled([
     input.client.taskDetail(input.taskId),
-    input.client.listAllMessages({ taskId: input.taskId, order: "asc" }),
+    input.client.listAllMessages({
+      taskId: input.taskId,
+      order: "desc",
+      stopAfterOperationToken: input.operationToken,
+    }),
   ]);
   const detail = detailRead.status === "fulfilled" ? detailRead.value : null;
   const events = messagesRead.status === "fulfilled" ? messagesRead.value : [];
@@ -2385,10 +2627,6 @@ export async function pollManusTaskEvents(input: {
       : messagesRead.status === "fulfilled"
         ? combinedTerminalTaskState(eventStatus, undefined)
         : { failed: false, completed: false };
-  const stoppedObserved =
-    terminalTaskState(detail?.status).completed ||
-    terminalTaskState(eventStatus).completed;
-
   if (failures.length === 0) {
     const recovered = Number(
       providerStateV2(input.providerState).providerReadFailureCount ?? 0,
@@ -2408,10 +2646,11 @@ export async function pollManusTaskEvents(input: {
       detailAvailable: true,
       messagesAvailable: true,
       state: terminalState,
-      waiting: latestManusV2WaitingDetail(events),
+      waiting: latestManusV2WaitingDetail(phaseEvents),
       providerState: clearProviderReadFailureState(input.providerState, {
-        completed: stoppedObserved,
+        completed: terminalState.completed,
         now,
+        operationToken: input.operationToken,
       }),
       deferred: false,
       nextPollMs: 10_000,
@@ -2428,8 +2667,9 @@ export async function pollManusTaskEvents(input: {
       (error): error is ManusV2ApiError => error instanceof ManusV2ApiError,
     )!;
     const recovered = clearProviderReadFailureState(input.providerState, {
-      completed: stoppedObserved,
+      completed: terminalState.completed,
       now,
+      operationToken: input.operationToken,
     });
     let partialState = providerStateV2Schema.parse({
       ...recovered,
@@ -2487,8 +2727,9 @@ export async function pollManusTaskEvents(input: {
     }
     const resultGrace = structuredResultGrace(
       partialState,
-      stoppedObserved,
+      terminalState.completed,
       now,
+      input.operationToken,
     );
     partialState = providerStateV2Schema.parse(resultGrace.state);
     if (resultGrace.expired && !hasResultCandidate) {
@@ -2505,14 +2746,19 @@ export async function pollManusTaskEvents(input: {
       detailAvailable: detailRead.status === "fulfilled",
       messagesAvailable: true,
       state: terminalState,
-      waiting: latestManusV2WaitingDetail(events),
+      waiting: latestManusV2WaitingDetail(phaseEvents),
       providerState: partialState,
       deferred: false,
       nextPollMs: 10_000,
     };
   }
 
-  const current = providerStateV2(input.providerState);
+  const current = structuredResultGrace(
+    providerStateV2(input.providerState),
+    false,
+    now,
+    input.operationToken,
+  ).state as ProviderStateV2;
   const failureCount = (current.providerReadFailureCount ?? 0) + 1;
   const bothReadsNotFound =
     detailRead.status === "rejected" &&
@@ -2553,7 +2799,10 @@ export async function pollManusTaskEvents(input: {
     providerLastReadFailure: safeManusReadFailure(primaryFailure),
     providerStoppedAt:
       current.providerStoppedAt ??
-      (stoppedObserved ? new Date(now).toISOString() : undefined),
+      (terminalState.completed ? new Date(now).toISOString() : undefined),
+    providerStoppedOperationToken: terminalState.completed
+      ? input.operationToken
+      : current.providerStoppedOperationToken,
   });
   for (const error of failures) {
     logManusReadFailure({
@@ -2581,7 +2830,12 @@ export async function pollManusTaskEvents(input: {
       state: delayedState,
     });
   }
-  const resultGrace = structuredResultGrace(delayedState, stoppedObserved, now);
+  const resultGrace = structuredResultGrace(
+    delayedState,
+    terminalState.completed,
+    now,
+    input.operationToken,
+  );
   const graceState = providerStateV2Schema.parse(resultGrace.state);
   if (resultGrace.expired) {
     throw providerReadAttentionFailure({
@@ -2634,12 +2888,24 @@ function nativeSourceReceiptOutputSchema(input: {
       },
       archiveSha256: { type: "string" },
       fileCount: { type: "integer" },
+      preflightVersion: {
+        type: "string",
+        enum: [NATIVE_SOURCE_PREFLIGHT_VERSION],
+      },
+      preflightStatus: { type: "string", enum: ["passed"] },
+      preflightSha256: {
+        type: "string",
+        enum: [NATIVE_SOURCE_PREFLIGHT_SHA256],
+      },
     },
     required: [
       "operationToken",
       "baseSourceSha256",
       "archiveSha256",
       "fileCount",
+      "preflightVersion",
+      "preflightStatus",
+      "preflightSha256",
     ],
     additionalProperties: false,
   });
@@ -2679,6 +2945,10 @@ export function nativeSourceOutputAttachment(
         record.filename ?? record.file_name ?? record.fileName ?? "";
       const contentType =
         record.content_type ?? record.mime_type ?? record.mimeType ?? "";
+      const mediaType =
+        typeof contentType === "string"
+          ? contentType.split(";", 1)[0]?.trim().toLowerCase()
+          : "";
       const url = record.url ?? record.file_url ?? record.fileUrl ?? "";
       const rawFileId = record.file_id ?? record.fileId;
       const fileId =
@@ -2689,7 +2959,11 @@ export function nativeSourceOutputAttachment(
           : null;
       if (
         filename === FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME &&
-        contentType === FRONTMIND_SITE_SOURCE_ARCHIVE_MIME &&
+        [
+          FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+          "application/x-zip-compressed",
+          "application/octet-stream",
+        ].includes(mediaType ?? "") &&
         typeof url === "string" &&
         url.length > 0
       ) {
@@ -2882,7 +3156,7 @@ function nativeSourcePrompt(input: {
   const repair = input.repair
     ? `\n\n${
         input.repair.kind === "hard_safety"
-          ? "上一份完整源码未通过硬安全检查。不得复用或修改该失败输出；必须从本消息重新附加的原始 21st 源码开始生成，不得重新设计。"
+          ? "上一份完整源码未通过硬安全检查。不得复用该失败输出；必须从本消息重新附加的原始 21st 源码开始生成，不得重新设计。仅允许按机器诊断删除禁止的非运行文件，或替换违规依赖、import、构建配置及远程资源；DOM、CSS、设计 Token、组件结构和本地媒体必须继续冻结。"
           : "上一份完整源码未通过本地编译。只修复下列编译坐标，不得重新设计。"
       }完成后仍返回完整源码 ZIP：\n${input.repair.diagnostics
         .slice(0, 8)
@@ -2901,7 +3175,7 @@ ${input.templateCoordinateInstruction ?? ""}
 
 ${input.hasCustomerFeedback ? "本次客户修改要求位于 frontmind-customer-feedback-v1.json；只能在知识事实和原生样式边界内落实。" : ""}
 
-Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256 以及实际 fileCount。源码包必须命名为 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME}，Receipt 必须命名为 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。${repair}`,
+交付前必须运行 ${NATIVE_SOURCE_PREFLIGHT_FILENAME} 并通过 package、文件类型、依赖、源码语法和 production build 自检。Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256、实际 fileCount、preflightVersion=${NATIVE_SOURCE_PREFLIGHT_VERSION}、preflightStatus=passed、preflightSha256=${NATIVE_SOURCE_PREFLIGHT_SHA256}。源码包必须命名为 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME}，Receipt 必须命名为 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。恰好返回这一个 ZIP 和一个 Receipt 后立即结束，不得继续解释、复盘、浏览或更新计划。${repair}`,
     input.operationToken,
   );
 }
@@ -3072,6 +3346,7 @@ async function readNativeSourceOfflineResume(input: {
 export const NATIVE_TRUSTED_FALLBACK_READ_DELAY_MS = 15 * 60_000;
 
 export type NativeTrustedFallbackReason =
+  | "initial_baseline"
   | "repair_budget_exhausted"
   | "provider_stopped_without_result"
   | "provider_read_delayed";
@@ -3082,12 +3357,14 @@ export function nativeTrustedFallbackReason(input: {
   firstBuild: boolean;
   hasPreview: boolean;
   repairBudgetExhausted?: boolean;
+  initialBaseline?: boolean;
   stoppedGraceExpired?: boolean;
   providerReadFailureSince?: string;
   nativeSourceReadFailureSince?: string;
   now?: number;
 }): NativeTrustedFallbackReason | null {
   if (!input.firstBuild || input.hasPreview) return null;
+  if (input.initialBaseline) return "initial_baseline";
   if (input.repairBudgetExhausted) return "repair_budget_exhausted";
   if (input.stoppedGraceExpired) return "provider_stopped_without_result";
   const since = Math.min(
@@ -3192,10 +3469,31 @@ function nativeTrustedFallbackAttentionReason(input: {
 }
 
 const NATIVE_TRUSTED_FALLBACK_WARNING_CODES = {
+  initial_baseline: "NATIVE_INITIAL_BASELINE_TRUSTED_FALLBACK",
   repair_budget_exhausted: "NATIVE_REPAIR_BUDGET_TRUSTED_FALLBACK",
   provider_stopped_without_result: "NATIVE_STOPPED_TRUSTED_FALLBACK",
   provider_read_delayed: "NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK",
 } as const satisfies Record<NativeTrustedFallbackReason, string>;
+
+export function shouldMaterializeNativeInitialBaseline(input: {
+  bundleSchemaVersion: number;
+  parentBuildId: string | null;
+  hasPreview: boolean;
+  hasFallback: boolean;
+  nativeRepairAttempt: number;
+}) {
+  return (
+    input.bundleSchemaVersion === 6 &&
+    input.parentBuildId === null &&
+    !input.hasPreview &&
+    !input.hasFallback &&
+    input.nativeRepairAttempt === 0
+  );
+}
+
+export function nativeInitialBaselineShouldYield(state: ProviderState | null) {
+  return Boolean(state?.schemaVersion === 2 && state.fallbackPreview);
+}
 
 function nativeFallbackReferenceBlueprint(input: {
   selection: NativeSelection;
@@ -3343,6 +3641,11 @@ async function handleNativeReactSiteBuild(input: {
       documents: input.documents,
     }),
     nativeSourceInputAttachment(input.nativeSelection),
+    {
+      filename: NATIVE_SOURCE_PREFLIGHT_FILENAME,
+      mime_type: "text/javascript",
+      file_data: `data:text/javascript;base64,${NATIVE_SOURCE_PREFLIGHT_SCRIPT.toString("base64")}`,
+    },
     ...(templateCoordinate ? [templateCoordinate.attachment] : []),
     ...nativeBrandAttachment(input.brandAsset),
     ...(input.input.feedback
@@ -3351,108 +3654,7 @@ async function handleNativeReactSiteBuild(input: {
   ];
   let taskId =
     input.state?.taskId ?? input.operation.providerTaskId ?? undefined;
-  if (!taskId) {
-    client = client ?? (await input.getClient());
-    if (input.state?.stage === "create_unknown") {
-      const found = await findUniqueCreatedTask(
-        client,
-        input.operation,
-        operationToken,
-      );
-      if (!found) return pending(input.state, undefined, "design_compiling");
-      taskId = found.id;
-    } else {
-      const createUnknownState = transitionProviderState(input.state, {
-        stage: "create_unknown",
-        nativeRepairAttempt: 0,
-      });
-      await persistOperationProgress(
-        input.db,
-        input.operation,
-        createUnknownState,
-      );
-      try {
-        await input.assertExecutionActive();
-        const created = await client.createTask({
-          title: operationTitle(input.operation),
-          prompt: nativeSourcePrompt({
-            operationToken,
-            baseSourceSha256,
-            hasCustomerFeedback: Boolean(input.input.feedback),
-            templateCoordinateInstruction:
-              templateCoordinate?.promptInstruction,
-          }),
-          attachments: sourceAttachments(operationToken),
-          locale: input.brief.primaryLanguage,
-          agentProfile: managedAgentProfileModel(input.input.agentProfile),
-          structuredOutputSchema: nativeSourceReceiptOutputSchema({
-            operationToken,
-            baseSourceSha256,
-          }),
-        });
-        taskId = created.taskId;
-      } catch (error) {
-        if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
-          return pending(createUnknownState, undefined, "design_compiling");
-        }
-        throw error;
-      }
-    }
-    const pendingState = transitionProviderState(input.state, {
-      stage: "native_source_pending",
-      taskId,
-      nativeRepairAttempt: 0,
-      resultPendingSince: undefined,
-      providerStoppedAt: undefined,
-    });
-    await bindCreatedBuildTask({
-      db: input.db,
-      operation: input.operation,
-      buildId: input.context.build.id,
-      taskId,
-      state: pendingState,
-    });
-    return pending(pendingState, taskId, "design_compiling");
-  }
-
   let boundBuildTaskId = input.context.build.upstreamManusTaskId;
-  if (boundBuildTaskId !== null && boundBuildTaskId !== taskId) {
-    throw new SiteOpsManusFailure(
-      "FRONTMIND_BUILD_RESULT_PENDING",
-      "FrontMind AI 建站任务坐标仍在确认中，系统不会混用源码。",
-      "failed",
-    );
-  }
-  if (input.context.build.upstreamManusTaskId === null) {
-    const rebound = await input.db
-      .update(siteBuilds)
-      .set({
-        upstreamManusTaskId: taskId,
-        status: "design_compiling",
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(siteBuilds.id, input.context.build.id),
-          eq(siteBuilds.userId, input.operation.userId),
-          isNull(siteBuilds.upstreamManusTaskId),
-        ),
-      );
-    const affectedRows = Number(
-      (Array.isArray(rebound)
-        ? (rebound[0] as { affectedRows?: unknown } | undefined)?.affectedRows
-        : (rebound as { affectedRows?: unknown } | undefined)?.affectedRows) ??
-        0,
-    );
-    if (affectedRows !== 1) {
-      throw new SiteOpsManusFailure(
-        "FRONTMIND_BUILD_RESULT_PENDING",
-        "FrontMind AI 建站任务坐标仍在确认中，系统不会混用源码。",
-        "failed",
-      );
-    }
-    boundBuildTaskId = taskId;
-  }
   const pendingExistingFallback = () => {
     const fallback =
       currentState?.schemaVersion === 2
@@ -3470,6 +3672,14 @@ async function handleNativeReactSiteBuild(input: {
           NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
         )
       : null;
+  };
+  const fallbackReconciliationPollMs = () => {
+    const fallback =
+      currentState?.schemaVersion === 2
+        ? currentState.fallbackPreview
+        : undefined;
+    if (!fallback) return undefined;
+    return nativeFallbackReconciliationDelayMs(fallback.createdAt);
   };
   const throwIfExistingFallbackExpired = (): void => {
     const state = providerStateV2(currentState);
@@ -3540,6 +3750,7 @@ async function handleNativeReactSiteBuild(input: {
           input.context.build.qaLocalAssetId ||
           input.context.build.provenanceLocalAssetId,
       ),
+      initialBaseline: requestedReason === "initial_baseline",
       repairBudgetExhausted: requestedReason === "repair_budget_exhausted",
       stoppedGraceExpired:
         requestedReason === "provider_stopped_without_result",
@@ -3613,7 +3824,10 @@ async function handleNativeReactSiteBuild(input: {
           and(
             eq(siteBuilds.id, input.context.build.id),
             eq(siteBuilds.userId, input.operation.userId),
-            eq(siteBuilds.upstreamManusTaskId, taskId),
+            inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
+            taskId
+              ? eq(siteBuilds.upstreamManusTaskId, taskId)
+              : isNull(siteBuilds.upstreamManusTaskId),
             isNull(siteBuilds.parentBuildId),
             isNull(siteBuilds.distLocalAssetId),
           ),
@@ -3708,7 +3922,7 @@ async function handleNativeReactSiteBuild(input: {
           createdAt: createdAt.toISOString(),
           reconcileUntilAt: reconcileUntil.toISOString(),
           buildId: input.context.build.id,
-          taskId,
+          taskId: taskId ?? null,
           operationToken,
           selectedPreviewSha256: selectedFallbackCandidate.previewSha256,
           selectedSourceTreeSha256: selectedFallbackCandidate.sourceTreeSha256,
@@ -3778,6 +3992,168 @@ async function handleNativeReactSiteBuild(input: {
       return pending(currentState, taskId, "qa_running", nextPollMs);
     }
   };
+  if (
+    shouldMaterializeNativeInitialBaseline({
+      bundleSchemaVersion: input.nativeSelection.bundle.schemaVersion,
+      parentBuildId: input.context.build.parentBuildId,
+      hasPreview: Boolean(
+        input.context.build.contractLocalAssetId ||
+          input.context.build.sourceLocalAssetId ||
+          input.context.build.distLocalAssetId ||
+          input.context.build.qaLocalAssetId ||
+          input.context.build.provenanceLocalAssetId,
+      ),
+      hasFallback: Boolean(
+        currentState?.schemaVersion === 2 && currentState.fallbackPreview,
+      ),
+      nativeRepairAttempt: attempt,
+    })
+  ) {
+    const baseline = await materializeTrustedFallback("initial_baseline");
+    // A successfully staged baseline must be bound by the worker before any
+    // provider side effect. A local baseline failure is diagnostic only: it
+    // must never starve a safe GET or prevent the provider task from starting.
+    if (baseline && nativeInitialBaselineShouldYield(currentState)) {
+      return baseline;
+    }
+  }
+  if (!taskId) {
+    client = client ?? (await input.getClient());
+    if (input.state?.stage === "create_unknown") {
+      const found = await findUniqueCreatedTask(
+        client,
+        input.operation,
+        operationToken,
+      );
+      if (!found) {
+        const sync = providerResultSyncWindow(
+          providerStateV2(currentState),
+          Date.now(),
+          input.operation.updatedAt,
+        );
+        if (sync.expired) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+            "AI 建站任务创建结果未能在限定时间内确认；基础预览与创建坐标已保留。",
+            "attention_required",
+            sync.state,
+          );
+        }
+        return pending(sync.state, undefined, "qa_running", 60_000);
+      }
+      taskId = found.id;
+    } else {
+      const createUnknownState = startProviderResultSyncWindow(
+        transitionProviderState(currentState, {
+          stage: "create_unknown",
+          nativeRepairAttempt: 0,
+          buildPhase: "source_waiting",
+        }),
+      );
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        createUnknownState,
+      );
+      try {
+        await input.assertExecutionActive();
+        const created = await client.createTask({
+          title: operationTitle(input.operation),
+          prompt: nativeSourcePrompt({
+            operationToken,
+            baseSourceSha256,
+            hasCustomerFeedback: Boolean(input.input.feedback),
+            templateCoordinateInstruction:
+              templateCoordinate?.promptInstruction,
+          }),
+          attachments: sourceAttachments(operationToken),
+          locale: input.brief.primaryLanguage,
+          agentProfile: managedAgentProfileModel(input.input.agentProfile),
+          structuredOutputSchema: nativeSourceReceiptOutputSchema({
+            operationToken,
+            baseSourceSha256,
+          }),
+        });
+        taskId = created.taskId;
+      } catch (error) {
+        if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+          return pending(createUnknownState, undefined, "qa_running", 60_000);
+        }
+        throw error;
+      }
+    }
+    const pendingState = transitionProviderState(currentState, {
+      stage: "native_source_pending",
+      taskId,
+      nativeRepairAttempt: 0,
+      phaseOperationToken: operationToken,
+      phaseStartedAt: new Date().toISOString(),
+      resultPendingSince: undefined,
+      resultPendingOperationToken: undefined,
+      providerStoppedAt: undefined,
+      providerStoppedOperationToken: undefined,
+      providerSyncStartedAt: undefined,
+      buildPhase: "source_waiting",
+    });
+    await bindCreatedBuildTask({
+      db: input.db,
+      operation: input.operation,
+      buildId: input.context.build.id,
+      taskId,
+      state: pendingState,
+      preservePreview: Boolean(
+        currentState?.schemaVersion === 2 && currentState.fallbackPreview,
+      ),
+    });
+    return pending(
+      pendingState,
+      taskId,
+      "qa_running",
+      fallbackReconciliationPollMs(),
+    );
+  }
+
+  if (boundBuildTaskId !== null && boundBuildTaskId !== taskId) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_RESULT_PENDING",
+      "FrontMind AI 建站任务坐标仍在确认中，系统不会混用源码。",
+      "failed",
+    );
+  }
+  if (boundBuildTaskId === null) {
+    const rebound = await input.db
+      .update(siteBuilds)
+      .set({
+        upstreamManusTaskId: taskId,
+        status:
+          currentState?.schemaVersion === 2 && currentState.fallbackPreview
+            ? "qa_running"
+            : "design_compiling",
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(siteBuilds.id, input.context.build.id),
+          eq(siteBuilds.userId, input.operation.userId),
+          inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
+          isNull(siteBuilds.upstreamManusTaskId),
+        ),
+      );
+    const affectedRows = Number(
+      (Array.isArray(rebound)
+        ? (rebound[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+        : (rebound as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+        0,
+    );
+    if (affectedRows !== 1) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_RESULT_PENDING",
+        "FrontMind AI 建站任务坐标仍在确认中，系统不会混用源码。",
+        "failed",
+      );
+    }
+    boundBuildTaskId = taskId;
+  }
   const scheduleNativeRepair = async (repairInput: {
     kind: "compile" | "hard_safety";
     signature: string;
@@ -3805,8 +4181,13 @@ async function handleNativeReactSiteBuild(input: {
         nativeLastErrorSignature: repairInput.signature,
         nativeSourceStaging: undefined,
         buildCheckpoint: undefined,
+        phaseOperationToken: nextToken,
+        phaseStartedAt: new Date().toISOString(),
+        lastContractProgressAt: undefined,
         resultPendingSince: undefined,
+        resultPendingOperationToken: undefined,
         providerStoppedAt: undefined,
+        providerStoppedOperationToken: undefined,
         buildPhase: "source_repairing",
       }),
     );
@@ -3961,21 +4342,31 @@ async function handleNativeReactSiteBuild(input: {
           grace.state,
         );
       }
-      return pending(grace.state, taskId, "qa_running", reconciled.nextPollMs);
+      return pending(
+        grace.state,
+        taskId,
+        "qa_running",
+        fallbackReconciliationPollMs() ?? reconciled.nextPollMs,
+      );
     }
     const pendingState = transitionProviderState(reconciled.providerState, {
       stage: "native_repair_pending",
       buildPhase: "source_repairing",
       providerSyncStartedAt: undefined,
     });
-    return pending(pendingState, taskId, "qa_running");
+    return pending(
+      pendingState,
+      taskId,
+      "qa_running",
+      fallbackReconciliationPollMs(),
+    );
   }
 
   let polled: Awaited<ReturnType<typeof pollEvents>> | null = null;
   if (!offlineResume) {
     try {
       client = client ?? (await input.getClient());
-      polled = await pollEvents(client, taskId, operationToken, input.state, {
+      polled = await pollEvents(client, taskId, operationToken, currentState, {
         operationId: input.operation.id,
         buildId: input.context.build.id,
       });
@@ -4008,7 +4399,7 @@ async function handleNativeReactSiteBuild(input: {
       polled.providerState,
       taskId,
       attempt > 0 ? "qa_running" : "building",
-      polled.nextPollMs,
+      fallbackReconciliationPollMs() ?? polled.nextPollMs,
     );
   }
   const receiptResolution = offlineResume
@@ -4021,6 +4412,7 @@ async function handleNativeReactSiteBuild(input: {
         phase: "design",
         expectedFilename: FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
         taskCompleted: polled!.state.completed,
+        acceptCurrentPhaseWhileRunning: true,
         signal: input.signal,
         validateCandidate: (value) => {
           siteSourceReceiptV1Schema.parse(value);
@@ -4089,10 +4481,14 @@ async function handleNativeReactSiteBuild(input: {
       stage: attempt > 0 ? "native_repair_pending" : "native_source_pending",
       taskId,
       nativeRepairAttempt: attempt,
-      resultPendingSince: input.state?.resultPendingSince,
-      buildPhase: attempt > 0 ? "source_repairing" : undefined,
+      buildPhase: attempt > 0 ? "source_repairing" : "source_waiting",
     });
-    const grace = structuredResultGrace(pendingState, polled.state.completed);
+    const grace = structuredResultGrace(
+      pendingState,
+      polled.state.completed,
+      Date.now(),
+      operationToken,
+    );
     if (grace.expired) {
       currentState = providerStateSchema.parse(grace.state);
       const fallback = await materializeTrustedFallback(
@@ -4116,6 +4512,7 @@ async function handleNativeReactSiteBuild(input: {
       grace.state,
       taskId,
       attempt > 0 ? "qa_running" : "building",
+      fallbackReconciliationPollMs(),
     );
   }
   const receipt = siteSourceReceiptV1Schema.parse(receiptResolution.value);
@@ -4123,13 +4520,18 @@ async function handleNativeReactSiteBuild(input: {
     currentState?.schemaVersion === 2
       ? currentState.nativeRejectedCandidateV1
       : undefined;
+  const rejectedAttachmentIdentity =
+    attachment?.attachmentIdentity ??
+    (currentState?.schemaVersion === 2
+      ? currentState.nativeSourceAttachmentIdentity
+      : undefined);
   if (
-    attachment &&
+    rejectedAttachmentIdentity &&
     nativeRejectedCandidateMatches(rejectedCandidate, {
       taskId,
       repairAttempt: attempt,
       operationToken,
-      attachmentIdentity: attachment.attachmentIdentity,
+      attachmentIdentity: rejectedAttachmentIdentity,
       archiveSha256: receipt.archiveSha256,
       validatorVersion: NATIVE_SOURCE_VALIDATOR_VERSION,
     })
@@ -4260,6 +4662,7 @@ async function handleNativeReactSiteBuild(input: {
       currentState = transitionProviderState(currentState, {
         stage: attempt > 0 ? "native_repair_pending" : "native_source_pending",
         taskId,
+        lastContractProgressAt: new Date().toISOString(),
         buildPhase: "source_validating",
         buildCheckpoint: "archive_downloaded",
         nativeSourceReadFailureCount: undefined,
@@ -4382,8 +4785,7 @@ async function handleNativeReactSiteBuild(input: {
         !error.retryable &&
         rejectionAttachmentIdentity &&
         error.code !== "NATIVE_SOURCE_ATTACHMENT_UNAVAILABLE" &&
-        error.code !== "NATIVE_SOURCE_ATTACHMENT_INVALID" &&
-        error.code !== "NATIVE_SOURCE_ARCHIVE_HASH_MISMATCH"
+        error.code !== "NATIVE_SOURCE_ATTACHMENT_INVALID"
       ) {
         const verdict = createNativeRejectedCandidateV1({
           taskId,
@@ -4451,6 +4853,7 @@ async function handleNativeReactSiteBuild(input: {
         and(
           eq(siteBuilds.id, input.context.build.id),
           eq(siteBuilds.userId, input.operation.userId),
+          inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
           eq(siteBuilds.upstreamManusTaskId, taskId),
         ),
       );
@@ -4508,6 +4911,35 @@ async function handleNativeReactSiteBuild(input: {
       error.code === "NATIVE_BUILD_COMPILE_FAILED"
     ) {
       const signature = nativeCompileSignature(error);
+      const rejectionAttachmentIdentity =
+        attachment?.attachmentIdentity ??
+        (currentState?.schemaVersion === 2
+          ? currentState.nativeSourceAttachmentIdentity
+          : undefined);
+      if (rejectionAttachmentIdentity) {
+        const verdict = createNativeRejectedCandidateV1({
+          taskId,
+          repairAttempt: attempt,
+          operationToken,
+          attachmentIdentity: rejectionAttachmentIdentity,
+          archiveSha256: receipt.archiveSha256,
+          errorCode: error.code,
+        });
+        currentState = transitionProviderState(currentState, {
+          stage:
+            attempt > 0 ? "native_repair_pending" : "native_source_pending",
+          taskId,
+          nativeRepairAttempt: attempt,
+          buildPhase: "compiling",
+          nativeRejectedCandidateV1: verdict,
+        });
+        await persistOperationProgress(
+          input.db,
+          input.operation,
+          currentState,
+          taskId,
+        );
+      }
       const scheduled = await scheduleNativeRepair({
         kind: "compile",
         signature,
@@ -4733,6 +5165,7 @@ async function resolveBuildWireValue(input: {
   phase: SiteOpsWireOutputPhase;
   expectedFilename: string;
   taskCompleted: boolean;
+  acceptCurrentPhaseWhileRunning?: boolean;
   signal: AbortSignal;
   validateCandidate?: Parameters<
     typeof resolveSiteOpsWireOutput
@@ -5196,6 +5629,8 @@ async function scheduleRepair(input: {
       .where(
         and(
           eq(siteBuilds.id, input.build.id),
+          eq(siteBuilds.userId, input.operation.userId),
+          inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
           eq(siteBuilds.repairAttempts, input.build.repairAttempts),
         ),
       );
@@ -5739,7 +6174,17 @@ export function createManusSiteOpsProviderHandler(
             status: "ready",
             updatedAt: new Date(),
           })
-          .where(eq(socialPackages.id, context.package.id));
+          .where(
+            and(
+              eq(socialPackages.id, context.package.id),
+              eq(socialPackages.userId, operation.userId),
+              eq(socialPackages.operationId, operation.id),
+              inArray(
+                socialPackages.status,
+                PROVIDER_MUTABLE_SOCIAL_PACKAGE_STATUSES,
+              ),
+            ),
+          );
         const packageAffectedRows = Number(
           (Array.isArray(packageUpdated)
             ? (packageUpdated[0] as { affectedRows?: unknown } | undefined)
@@ -5777,10 +6222,17 @@ export function createManusSiteOpsProviderHandler(
           state.buildCheckpoint &&
             NATIVE_SOURCE_OFFLINE_RESUME_CHECKPOINTS.has(state.buildCheckpoint),
         );
-      if (!canAttemptOfflineNativeSourceResume) {
+      const context = await loadBuildContext(db, operation);
+      const hostOwnedContentBuild = usesHostOwnedContentDraft(
+        context.build.workflowVersion,
+      );
+      // Historical and Native workflows retain their existing eager Provider
+      // readiness boundary. A new host-owned content build is deliberately
+      // different: its trusted baseline must be staged and atomically bound by
+      // the worker before credential lookup or any Provider request can run.
+      if (!canAttemptOfflineNativeSourceResume && !hostOwnedContentBuild) {
         await getClient();
       }
-      const context = await loadBuildContext(db, operation);
       const archiveBytes = await readArchive({
         userId: operation.userId,
         snapshotId: context.snapshot.id,
@@ -5993,7 +6445,6 @@ export function createManusSiteOpsProviderHandler(
           readArtifact,
         });
       }
-      const client = await getClient();
       if (
         context.build.workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION
       ) {
@@ -6061,7 +6512,7 @@ export function createManusSiteOpsProviderHandler(
         workflow.frontMindVersion,
       )
         ? usesHostOwnedContentDraft(workflow.frontMindVersion)
-          ? SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1
+          ? SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1
           : SITEOPS_WIRE_OUTPUT_FILES.contentV3
         : SITEOPS_WIRE_OUTPUT_FILES.content;
       const referenceBlueprint = referenceBlueprintSchema.safeParse(
@@ -6158,6 +6609,254 @@ export function createManusSiteOpsProviderHandler(
             taxonomy,
           })
         : null;
+      // SiteContentPatchV1 is bound to the immutable, verified executable
+      // starter source. The operation token separately fences the frozen
+      // design/Brief instance; content values never become source files.
+      const hostContentBaseSourceSha256 = hostOwnedContentDraft
+        ? workflow.starterSha256
+        : null;
+      const hostContentBaseline = hostOwnedDesign
+        ? canonicalPreviewToGeneratedContent({
+            canonical: canonicalizeSiteContentDraft({
+              draft: null,
+              operationToken: contentToken,
+              brief,
+              seo: hostOwnedDesign.designSpec.seoPlan,
+            }),
+            designRouteCompositions:
+              hostOwnedDesign.designSpec.routeCompositions.map((route) => ({
+                routeId: route.routeId,
+                slots: route.slots.map((slot) => ({
+                  slotId: slot.slotId,
+                  variant: slot.variant,
+                })),
+              })),
+            fallbackSourceDocumentIds: Object.fromEntries(
+              brief.routes.map((route) => [route.id, route.sourceDocumentIds]),
+            ),
+          })
+        : null;
+      const sourceIdsByRoute = Object.fromEntries(
+        brief.routes.map((route) => [route.id, route.sourceDocumentIds]),
+      );
+      const hostContentPatchSlots: SiteContentPatchSlotManifest[] =
+        hostContentBaseline
+          ? hostContentBaseline.routes.flatMap((route) => {
+              const sourceIds = sourceIdsByRoute[route.routeId] ?? [];
+              if (sourceIds.length === 0) return [];
+              return route.sections.map((section) => ({
+                routeId: route.routeId,
+                slotId: section.slotId,
+                kind:
+                  section.blockType === "feature_list"
+                    ? ("list" as const)
+                    : ("richText" as const),
+                sourceIds,
+              }));
+            })
+          : [];
+      const existingHostBaseline =
+        siteOpsTrustedFallbackPreviewFromResult(state);
+      const buildPreviewBindings = [
+        context.build.contractLocalAssetId,
+        context.build.sourceLocalAssetId,
+        context.build.distLocalAssetId,
+        context.build.qaLocalAssetId,
+        context.build.provenanceLocalAssetId,
+      ];
+      const buildHasAnyBoundPreview = buildPreviewBindings.some(Boolean);
+      const buildHasCompleteBoundPreview = buildPreviewBindings.every(Boolean);
+      const stageHostContentBaseline = async (input: {
+        trigger: "initial_baseline" | "provider_no_contract_progress";
+        taskId?: string;
+      }) => {
+        if (
+          !hostOwnedContentDraft ||
+          !hostOwnedDesign ||
+          !hostContentBaseline ||
+          !hostContentBaseSourceSha256 ||
+          context.build.parentBuildId != null ||
+          buildHasAnyBoundPreview ||
+          existingHostBaseline
+        ) {
+          return null;
+        }
+        const qaUpdated = await db
+          .update(siteBuilds)
+          .set({ status: "qa_running", updatedAt: new Date() })
+          .where(
+            and(
+              eq(siteBuilds.id, context.build.id),
+              eq(siteBuilds.userId, operation.userId),
+              inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
+              isNull(siteBuilds.parentBuildId),
+              isNull(siteBuilds.distLocalAssetId),
+            ),
+          );
+        const qaAffectedRows = Number(
+          (Array.isArray(qaUpdated)
+            ? (qaUpdated[0] as { affectedRows?: unknown } | undefined)
+                ?.affectedRows
+            : (qaUpdated as { affectedRows?: unknown } | undefined)
+                ?.affectedRows) ?? 0,
+        );
+        if (qaAffectedRows !== 1) {
+          throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+        }
+        const attempt = await materializeWithSingleHostRetry({
+          signal,
+          run: () =>
+            materialize({
+              build: context.build,
+              snapshot: { ...context.snapshot, documents },
+              brief,
+              visual,
+              designSpec: hostOwnedDesign.designSpec,
+              generatedContent:
+                siteOpsGeneratedContentV2Schema.parse(hostContentBaseline),
+              assetDecisions,
+              brandAsset,
+              mode: "preview",
+              abortSignal: signal,
+              forceTrustedFallback: {
+                warningCode: "SITEOPS_CONTENT_PATCH_TRUSTED_FALLBACK",
+              },
+            }),
+        });
+        const materialized = attempt.value;
+        const artifacts = await persistBuildArtifacts(
+          operation,
+          materialized,
+          persist,
+          assertExecutionActive,
+          "trusted-fallback",
+        );
+        const artifactBindings = buildArtifactBindingsSchema.parse({
+          contract: {
+            id: artifacts.contract.id,
+            sha256: materialized.contractSha256,
+            bytes: materialized.contractJson.length,
+            mimeType: "application/json",
+          },
+          source: {
+            id: artifacts.source.id,
+            sha256: materialized.sourceSha256,
+            bytes: materialized.sourceZip.length,
+            mimeType: "application/zip",
+          },
+          dist: {
+            id: artifacts.dist.id,
+            sha256: materialized.distSha256,
+            bytes: materialized.distZip.length,
+            mimeType: "application/zip",
+          },
+          qa: {
+            id: artifacts.qa.id,
+            sha256: materialized.visualQaSha256,
+            bytes: materialized.visualQaZip.length,
+            mimeType: "application/zip",
+          },
+          provenance: {
+            id: artifacts.provenance.id,
+            sha256: materialized.provenanceSha256,
+            bytes: materialized.provenanceJson.length,
+            mimeType: "application/json",
+          },
+        });
+        const createdAt = new Date();
+        const phase = siteContentPatchProgressDeadline({
+          state,
+          operationToken: contentToken,
+          operationStartedAt: operation.startedAt ?? operation.createdAt,
+        }).state;
+        const baselineState = providerStateV2Schema.parse({
+          ...phase,
+          stage: "content_pending",
+          taskId: input.taskId,
+          design: hostOwnedDesign,
+          buildPhase: "provider_sync_delayed",
+          buildCheckpoint: "artifacts_staged",
+          fallbackPreview: {
+            status: "staged",
+            trigger: input.trigger,
+            createdAt: createdAt.toISOString(),
+            reconcileUntilAt: nativeTrustedFallbackReconcileUntil({
+              fallbackTriggeredAt: createdAt,
+              operationStartedAt: operation.startedAt,
+              operationCreatedAt: operation.createdAt,
+            }).toISOString(),
+            buildId: context.build.id,
+            taskId: input.taskId ?? null,
+            operationToken: `siteops-content-baseline:${operation.id}`,
+            selectedPreviewSha256:
+              referenceBlueprint.success &&
+              referenceBlueprint.data.schemaVersion === 4
+                ? referenceBlueprint.data.previewSha256
+                : visualEvidence.previewSha256,
+            selectedSourceTreeSha256: hostContentBaseSourceSha256,
+            artifactBindings,
+            buildDelivery: materialized.buildDelivery,
+          },
+        });
+        await persistOperationProgress(
+          db,
+          operation,
+          baselineState,
+          input.taskId,
+        );
+        logManusBuildStage({
+          stage: "fallback_render",
+          operationId: operation.id,
+          buildId: context.build.id,
+          phase: "content",
+          reason: input.trigger,
+          renderMode: "trusted_fallback",
+          qaStatus: "partial",
+          warningCount: materialized.buildDelivery.warningCodes.length,
+        });
+        return pending(baselineState, input.taskId, "qa_running", 10_000);
+      };
+
+      if (
+        hostOwnedContentDraft &&
+        context.build.parentBuildId == null &&
+        !buildHasCompleteBoundPreview
+      ) {
+        if (buildHasAnyBoundPreview) {
+          throw new SiteOpsManusFailure(
+            "BUILD_ARTIFACT_BINDING_FAILED",
+            "可信基础预览产物未能完整绑定，已保留本地产物等待处理。",
+            "attention_required",
+            providerStateV2(state),
+          );
+        }
+        if (!existingHostBaseline) {
+          const baseline = await stageHostContentBaseline({
+            trigger: "initial_baseline",
+            taskId: state?.taskId ?? operation.providerTaskId ?? undefined,
+          });
+          if (baseline) return baseline;
+        }
+        if (existingHostBaseline?.status === "staged") {
+          // persistOperationProgress can survive a worker crash immediately
+          // before fallback_bind. Yield the same staged coordinates so the
+          // next worker transaction binds them; never cross the Provider
+          // boundary while the executable baseline is still unbound.
+          return pending(
+            providerStateV2(state),
+            state?.taskId ?? operation.providerTaskId ?? undefined,
+            "qa_running",
+            10_000,
+          );
+        }
+        throw new SiteOpsManusFailure(
+          "BUILD_ARTIFACT_BINDING_FAILED",
+          "可信基础预览绑定状态不一致，已保留本地产物等待处理。",
+          "attention_required",
+          providerStateV2(state),
+        );
+      }
+      const client = await getClient();
       const parseDesignCandidate = (value: unknown) => {
         const parsed =
           reactStatic && referenceBlueprint.success
@@ -6205,6 +6904,15 @@ export function createManusSiteOpsProviderHandler(
         });
         return parsed;
       };
+      const providerPendingBuildStatus = (
+        providerState: ProviderState | null,
+      ) =>
+        hostOwnedContentDraft
+          ? siteOpsTrustedFallbackPreviewFromResult(providerState)?.status ===
+            "bound"
+            ? ("qa_running" as const)
+            : ("building" as const)
+          : ("design_compiling" as const);
       let taskId = state?.taskId ?? operation.providerTaskId ?? undefined;
 
       if (!taskId) {
@@ -6221,7 +6929,7 @@ export function createManusSiteOpsProviderHandler(
                 ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
               }),
               undefined,
-              hostOwnedContentDraft ? "building" : "design_compiling",
+              providerPendingBuildStatus(state),
             );
           taskId = found.id;
           const taskPendingState = transitionProviderState(state, {
@@ -6236,6 +6944,9 @@ export function createManusSiteOpsProviderHandler(
               buildId: context.build.id,
               taskId,
               state: taskPendingState,
+              preservePreview:
+                hostOwnedContentDraft &&
+                existingHostBaseline?.status === "bound",
             });
           } catch (error) {
             const code = error instanceof Error ? error.message : "";
@@ -6254,13 +6965,13 @@ export function createManusSiteOpsProviderHandler(
                 ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
               }),
               undefined,
-              hostOwnedContentDraft ? "building" : "design_compiling",
+              providerPendingBuildStatus(state),
             );
           }
           return pending(
             taskPendingState,
             taskId,
-            hostOwnedContentDraft ? "building" : "design_compiling",
+            providerPendingBuildStatus(taskPendingState),
           );
         } else {
           const workflowPackage =
@@ -6338,6 +7049,15 @@ export function createManusSiteOpsProviderHandler(
               visualEvidence: visual,
               documents,
             }),
+            ...(hostOwnedContentDraft && hostContentBaseSourceSha256
+              ? [
+                  siteContentPatchSlotManifestAttachment({
+                    operationToken: contentToken,
+                    baseSourceSha256: hostContentBaseSourceSha256,
+                    slots: hostContentPatchSlots,
+                  }),
+                ]
+              : []),
             await visualPreviewAttachment(
               realizationPreviewArtifact,
               "selected-visual.png",
@@ -6361,7 +7081,7 @@ export function createManusSiteOpsProviderHandler(
           ];
           const prompt = promptWithMarker(
             hostOwnedContentDraft
-              ? `你是 FrontMind 官网内容编辑。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}；frontmind-siteops-source-dossier-v1.json 是唯一事实来源。Dashboard 已冻结全部 route、路径、slot、组件、响应式布局、调色板和空状态；你不得输出或控制这些设计坐标。只返回 SiteContentDraftV1 的扁平传输：routes 只含 routeId、heading、summary；sections 是独立数组，每项只含 routeId、heading、paragraphs、bullets、sourceIds。每个事实 section 仅引用所附 source dossier 中真实存在的 sourceIds。${emptyRouteIds.length ? `不得返回宿主空状态 route：${emptyRouteIds.join(",")}；` : ""}不得输出 HTML、CSS、JavaScript、文件路径、组件名、外部资源 URL、调色板、未知事实或解释性长文。把完全相同的 JSON 对象附加为 ${contentOutputFilename}；即使资料不足也返回可验证的空 routes 与 sections 数组，Dashboard 会从冻结资料生成基础预览。`
+              ? `你是 FrontMind 官网内容编辑。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}；frontmind-siteops-source-dossier-v1.json 是唯一事实来源，frontmind-site-content-slot-manifest-v1.json 是唯一可写槽位合同。Dashboard 已冻结源码、route、路径、slot、组件、CSS、响应式布局、调色板和空状态；你不得修改或输出任何执行代码。只返回 SiteContentPatchWireV1 扁平传输：wireSchemaVersion、operationToken、baseSourceSha256 与 slots；每个 slot 只含 routeId、slotId、kind、valueText、valueList、sourceIds，并严格使用 manifest 中的坐标。richText 使用 valueText 且 valueList 为空；list 使用 valueList 且 valueText 为 null。每个事实 slot 仅引用所附 source dossier 与 manifest 中真实存在的 sourceIds。${emptyRouteIds.length ? `不得返回宿主空状态 route：${emptyRouteIds.join(",")}；` : ""}不得输出 HTML、CSS、JavaScript、依赖、配置、文件路径、组件名、外部资源 URL、调色板、未知事实或解释性长文。把完全相同的扁平 JSON 对象附加为 ${contentOutputFilename} 后立即结束；资料不足时返回空 slots，Dashboard 会使用冻结企业资料中的可信默认值生成基础预览。`
               : reactStatic
                 ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，selected-reference.png（若附加）是与该方案一对一绑定的真实视觉灵感参考；二者都不是客户网站素材。请返回 SiteDesignWireV3：只为 provider-owned route 输出按冻结顺序分组且唯一的 routeSlots；${emptyRouteIds.length ? `不得返回 Dashboard 自有空状态 route：${emptyRouteIds.join(",")}；` : ""}缺少模型区块时为该 route 返回 overview/statement。使用结构化合同允许的调色板索引；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
                 : `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${workflow.frontMindVersion}，并只使用冻结 SiteBrief、视觉证据和知识来源。请返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本、21st 代码或未知事实。`,
@@ -6381,9 +7101,10 @@ export function createManusSiteOpsProviderHandler(
               locale: brief.primaryLanguage,
               agentProfile: managedAgentProfileModel(input.agentProfile),
               structuredOutputSchema: hostOwnedContentDraft
-                ? siteContentDraftOutputSchema({
+                ? siteContentPatchOutputSchema({
                     operationToken: contentToken,
-                    routeIds: providerRouteIds,
+                    baseSourceSha256: hostContentBaseSourceSha256!,
+                    slots: hostContentPatchSlots,
                     sourceDocumentIds: documents.map((document) => document.id),
                   })
                 : designOutputSchema(
@@ -6399,7 +7120,7 @@ export function createManusSiteOpsProviderHandler(
               return pending(
                 createUnknownState,
                 undefined,
-                hostOwnedContentDraft ? "building" : "design_compiling",
+                providerPendingBuildStatus(createUnknownState),
               );
             if (!hostOwnedContentDraft || !(error instanceof ManusV2ApiError)) {
               throw error;
@@ -6428,6 +7149,9 @@ export function createManusSiteOpsProviderHandler(
               buildId: context.build.id,
               taskId,
               state: taskPendingState,
+              preservePreview:
+                hostOwnedContentDraft &&
+                existingHostBaseline?.status === "bound",
             });
           } catch (error) {
             const code = error instanceof Error ? error.message : "";
@@ -6446,13 +7170,13 @@ export function createManusSiteOpsProviderHandler(
             return pending(
               createUnknownState,
               undefined,
-              hostOwnedContentDraft ? "building" : "design_compiling",
+              providerPendingBuildStatus(createUnknownState),
             );
           }
           return pending(
             taskPendingState,
             taskId,
-            hostOwnedContentDraft ? "building" : "design_compiling",
+            providerPendingBuildStatus(taskPendingState),
           );
         }
       }
@@ -6471,6 +7195,7 @@ export function createManusSiteOpsProviderHandler(
             and(
               eq(siteBuilds.id, context.build.id),
               eq(siteBuilds.userId, operation.userId),
+              inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
               isNull(siteBuilds.upstreamManusTaskId),
             ),
           );
@@ -7081,11 +7806,13 @@ export function createManusSiteOpsProviderHandler(
                           workflow.componentLibraryVersion as
                             | "2.2.0"
                             | "2.3.0"
-                            | "2.4.0",
+                            | "2.4.0"
+                            | "2.6.0",
                         materializerVersion: workflow.materializerVersion as
                           | "2.2.0"
                           | "2.3.0"
-                          | "2.4.0",
+                          | "2.4.0"
+                          | "2.6.0",
                       },
                       content: {
                         schemaVersion: 2,
@@ -7303,11 +8030,59 @@ export function createManusSiteOpsProviderHandler(
                 }
               })()
           : null;
-      if (polled?.deferred) {
+      const contentProgress =
+        polled && hostOwnedContentDraft
+          ? siteContentPatchProgressDeadline({
+              state: polled.providerState,
+              operationToken: contentToken,
+              operationStartedAt: operation.startedAt ?? operation.createdAt,
+            })
+          : null;
+      const boundContentBaseline = siteOpsTrustedFallbackPreviewFromResult(
+        contentProgress?.state ?? polled?.providerState ?? state,
+      );
+      const pendingBoundContentBaseline = (
+        providerState: ProviderState,
+        nextPollMs: number,
+      ) => {
+        if (
+          boundContentBaseline?.status !== "bound" ||
+          !boundContentBaseline.operationToken.startsWith(
+            "siteops-content-baseline:",
+          )
+        ) {
+          return null;
+        }
+        if (Date.now() >= Date.parse(boundContentBaseline.reconcileUntilAt)) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+            "正式内容补丁对账窗口已结束，可信基础预览与原任务坐标已保留。",
+            "attention_required",
+            providerStateV2(providerState),
+          );
+        }
         return pending(
-          polled.providerState,
+          transitionProviderState(providerState, {
+            stage: "content_pending",
+            taskId,
+            design,
+            buildPhase: "provider_sync_delayed",
+          }),
           taskId,
-          "building",
+          "qa_running",
+          nextPollMs,
+        );
+      };
+      if (polled?.deferred) {
+        const baselinePending = pendingBoundContentBaseline(
+          contentProgress?.state ?? polled.providerState,
+          contentProgress?.expired ? 300_000 : 60_000,
+        );
+        if (baselinePending) return baselinePending;
+        return pending(
+          contentProgress?.state ?? polled.providerState,
+          taskId,
+          providerPendingBuildStatus(polled.providerState),
           polled.nextPollMs,
         );
       }
@@ -7320,6 +8095,7 @@ export function createManusSiteOpsProviderHandler(
             phase: "content",
             expectedFilename: contentOutputFilename,
             taskCompleted: polled.state.completed,
+            acceptCurrentPhaseWhileRunning: hostOwnedContentDraft,
             signal,
             ...(!usesHostOwnedContentDraft(workflow.frontMindVersion)
               ? {
@@ -7363,6 +8139,20 @@ export function createManusSiteOpsProviderHandler(
       const rawContent = contentResolution?.invalid
         ? null
         : (repairedContent ?? contentResolution?.value ?? null);
+      if (!rawContent && polled) {
+        if (polled.waiting && !messageAskUserWaiting(polled.waiting)) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_UNEXPECTED_WAITING_ACTION",
+            "FrontMind AI 建站任务请求了当前流程不允许的外部操作。",
+            "failed",
+          );
+        }
+        const baselinePending = pendingBoundContentBaseline(
+          contentProgress?.state ?? polled.providerState,
+          contentProgress?.expired ? 300_000 : 60_000,
+        );
+        if (baselinePending) return baselinePending;
+      }
       const canUseTrustedContentFallback =
         hostCanonicalContent &&
         (contentResolution?.invalid === true ||
@@ -7458,6 +8248,9 @@ export function createManusSiteOpsProviderHandler(
         return pending(grace.state, taskId, "building");
       }
       let generatedContent: z.infer<typeof siteOpsGeneratedContentSchema>;
+      let contentPatchRenderMode: "content_patch" | "trusted_fallback" | null =
+        null;
+      let contentPatchWarningCount = 0;
       try {
         let canonicalizedFromProvider = false;
         const currentContent = usesBuildPlanContractV4(
@@ -7467,43 +8260,39 @@ export function createManusSiteOpsProviderHandler(
           ? null
           : parseContentCandidate(rawContent, design!);
         if (hostCanonicalContent) {
-          let draft: ReturnType<typeof draftFromPageContentWire> | null = null;
-          if (rawContent) {
-            try {
-              draft = draftFromPageContentWire(rawContent, contentToken);
-              canonicalizedFromProvider = true;
-            } catch {
-              // A malformed provider draft is data loss, not a site loss. The
-              // canonicalizer below still produces a complete preview from
-              // the frozen Brief and verified knowledge coordinates.
-              draft = null;
-            }
+          if (!hostContentBaseline || !hostContentBaseSourceSha256) {
+            throw new Error("SITE_CONTENT_PATCH_BASELINE_MISSING");
           }
-          const canonical = canonicalizeSiteContentDraft({
-            draft,
-            operationToken: contentToken,
-            brief,
-            seo: design!.designSpec.seoPlan,
+          const appliedPatch = applySiteContentPatchV1Resilient({
+            patch: siteContentPatchFromWire(rawContent),
+            expectedOperationToken: contentToken,
+            expectedBaseSourceSha256: hostContentBaseSourceSha256,
+            baseline: hostContentBaseline,
+            allowedSourceIdsByRoute: sourceIdsByRoute,
+            allowedAssetIds: assetDecisions
+              .filter((decision) => decision.decision === "publish")
+              .map((decision) => decision.id),
           });
+          contentPatchRenderMode = appliedPatch.renderMode;
+          contentPatchWarningCount = appliedPatch.warnings.length;
+          if (appliedPatch.renderMode === "trusted_fallback") {
+            const baselinePending = pendingBoundContentBaseline(
+              contentProgress?.state ?? polled?.providerState ?? state!,
+              300_000,
+            );
+            if (baselinePending) return baselinePending;
+          }
+          canonicalizedFromProvider =
+            appliedPatch.renderMode === "content_patch";
           generatedContent = siteOpsGeneratedContentV2Schema.parse(
-            canonicalPreviewToGeneratedContent({
-              canonical,
-              designRouteCompositions: design!.designSpec.routeCompositions.map(
-                (route) => ({
-                  routeId: route.routeId,
-                  slots: route.slots.map((slot) => ({
-                    slotId: slot.slotId,
-                    variant: slot.variant,
-                  })),
-                }),
-              ),
-              fallbackSourceDocumentIds: Object.fromEntries(
-                brief.routes.map((route) => [
-                  route.id,
-                  route.sourceDocumentIds,
-                ]),
-              ),
-            }),
+            // The frozen baseline was already aligned one-to-one with the
+            // host design before the patch was applied. Running the index-
+            // based adapter again can reinterpret a valid list slot as prose
+            // when its visual variant is not `cards`, silently discarding the
+            // provider value. The resilient applier preserves the exact
+            // frozen route/slot shape, so strict parsing is the only remaining
+            // boundary required here.
+            appliedPatch.canonical,
           );
         } else {
           generatedContent = currentContent
@@ -7532,8 +8321,13 @@ export function createManusSiteOpsProviderHandler(
             (route) => "emptyState" in route,
           ).length,
           ...(hostCanonicalContent && !canonicalizedFromProvider
-            ? { reason: "trusted_frozen_input_fallback" }
-            : {}),
+            ? {
+                reason: "trusted_frozen_input_fallback",
+                warningCount: contentPatchWarningCount,
+              }
+            : hostCanonicalContent
+              ? { warningCount: contentPatchWarningCount }
+              : {}),
         });
       } catch (error) {
         if (hostCanonicalContent) {
@@ -7566,10 +8360,26 @@ export function createManusSiteOpsProviderHandler(
           validationSignature: contentValidationSignature(error, repairReason),
         });
       }
-      await db
+      const qaUpdated = await db
         .update(siteBuilds)
         .set({ status: "qa_running", updatedAt: new Date() })
-        .where(eq(siteBuilds.id, context.build.id));
+        .where(
+          and(
+            eq(siteBuilds.id, context.build.id),
+            eq(siteBuilds.userId, operation.userId),
+            inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
+          ),
+        );
+      const qaAffectedRows = Number(
+        (Array.isArray(qaUpdated)
+          ? (qaUpdated[0] as { affectedRows?: unknown } | undefined)
+              ?.affectedRows
+          : (qaUpdated as { affectedRows?: unknown } | undefined)
+              ?.affectedRows) ?? 0,
+      );
+      if (qaAffectedRows !== 1) {
+        throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+      }
       let materialized: Awaited<ReturnType<typeof materializeAstroSite>>;
       const materializationStartedAt = Date.now();
       let localRetryCount = 0;
@@ -7589,6 +8399,10 @@ export function createManusSiteOpsProviderHandler(
               brandAsset,
               mode: "preview",
               abortSignal: signal,
+              ...contentPatchMaterializationOverrides({
+                renderMode: contentPatchRenderMode,
+                warningCount: contentPatchWarningCount,
+              }),
             }),
         });
         materialized = attempt.value;

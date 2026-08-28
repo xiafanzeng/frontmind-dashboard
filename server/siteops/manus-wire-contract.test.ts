@@ -289,6 +289,46 @@ describe("SiteOps provider wire contracts", () => {
     }
   });
 
+  it("fills only missing or out-of-range historical palette coordinates", () => {
+    const wire = {
+      operationToken: "design-token-missing-palette-coordinates",
+      schemaVersion: 2,
+      layoutArchetype: "hero_led",
+      heroVariant: "centered_statement",
+      density: "balanced",
+      surfaceStyle: "bordered",
+      typeScale: "restrained",
+      imageTreatment: "none",
+      motionLevel: "subtle",
+      siteTitle: "FrontMind",
+      description: "使用宿主可信默认坐标的历史官网。",
+      routeSlots: [
+        { routeId: "home", slotId: "overview", variant: "statement" },
+      ],
+    };
+    expect(
+      siteDesignResultFromWire(wire, ["home"], [], 2).designSpec.colorRoles,
+    ).toEqual({
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 1,
+      accentPaletteIndex: 1,
+    });
+
+    for (const invalidCoordinate of [null, "1", 0.5, Number.NaN]) {
+      expect(() =>
+        siteDesignResultFromWire(
+          {
+            ...wire,
+            backgroundPaletteIndex: invalidCoordinate,
+          },
+          ["home"],
+          [],
+          2,
+        ),
+      ).toThrow();
+    }
+  });
+
   it("injects the frozen Hero blueprint into SiteDesignSpecV2 and rejects provider overrides", () => {
     const blueprint = referenceBlueprintForVisualCandidate({
       candidateId: "candidate-F",

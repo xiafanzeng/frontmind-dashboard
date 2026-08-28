@@ -6,9 +6,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
   FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+  NATIVE_SOURCE_PREFLIGHT_FILENAME,
+  NATIVE_SOURCE_PREFLIGHT_SHA256,
+  NATIVE_SOURCE_PREFLIGHT_VERSION,
   NativeReactSourceError,
   TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
   readNativeSourceAttachment,
+  siteSourceReceiptV1Schema,
   validateNativeReactSourceArchive,
 } from "./native-react-source";
 
@@ -87,6 +91,10 @@ describe("native React source archive boundary", () => {
       "不是视觉设计师",
     );
     expect(TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT).toContain("不得主动修改");
+    expect(TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT).toContain(
+      NATIVE_SOURCE_PREFLIGHT_FILENAME,
+    );
+    expect(TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT).toContain("立即结束");
     for (const coordinate of [
       "CSS",
       "className",
@@ -101,6 +109,31 @@ describe("native React source archive boundary", () => {
     expect(TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT).toContain(
       FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
     );
+  });
+
+  it("keeps legacy receipts readable and validates complete preflight coordinates", () => {
+    const archiveSha256 = "b".repeat(64);
+    const legacy = {
+      operationToken,
+      baseSourceSha256,
+      archiveSha256,
+      fileCount: 4,
+    };
+    expect(siteSourceReceiptV1Schema.parse(legacy)).toEqual(legacy);
+    expect(
+      siteSourceReceiptV1Schema.parse({
+        ...legacy,
+        preflightVersion: NATIVE_SOURCE_PREFLIGHT_VERSION,
+        preflightStatus: "passed",
+        preflightSha256: NATIVE_SOURCE_PREFLIGHT_SHA256,
+      }),
+    ).toMatchObject({ preflightStatus: "passed" });
+    expect(
+      siteSourceReceiptV1Schema.safeParse({
+        ...legacy,
+        preflightVersion: NATIVE_SOURCE_PREFLIGHT_VERSION,
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts a bounded complete React archive and normalizes one wrapper directory", async () => {
@@ -494,6 +527,22 @@ describe("native source binary attachment boundary", () => {
       }),
     ).resolves.toEqual(body);
 
+    for (const contentType of [
+      "Application/ZIP; charset=binary",
+      "application/x-zip-compressed",
+      "application/octet-stream",
+    ]) {
+      await expect(
+        readNativeSourceAttachment({
+          attachment: {
+            filename: FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
+            contentType,
+            url: `data:${FRONTMIND_SITE_SOURCE_ARCHIVE_MIME};base64,${body.toString("base64")}`,
+          },
+        }),
+      ).resolves.toEqual(body);
+    }
+
     await expectCode(
       readNativeSourceAttachment({
         attachment: {
@@ -530,17 +579,40 @@ describe("native source binary attachment boundary", () => {
     ).resolves.toEqual(body);
     expect(fetchPinned).toHaveBeenCalledTimes(1);
 
+    for (const responseContentType of [
+      "Application/ZIP; charset=binary",
+      "application/x-zip-compressed",
+      "application/octet-stream",
+    ]) {
+      await expect(
+        readNativeSourceAttachment({
+          attachment: {
+            filename: FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
+            contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+            url: "https://files.example.test/source.zip?opaque=2",
+          },
+          fetchPinned: vi.fn(async () => ({
+            response: new Response(body, {
+              status: 200,
+              headers: { "content-type": responseContentType },
+            }),
+            finalUrl: { origin: "https://files.example.test", path: "/source" },
+          })) as never,
+        }),
+      ).resolves.toEqual(body);
+    }
+
     await expectCode(
       readNativeSourceAttachment({
         attachment: {
           filename: FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
           contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
-          url: "https://files.example.test/source.zip?opaque=2",
+          url: "https://files.example.test/source.zip?opaque=3",
         },
         fetchPinned: vi.fn(async () => ({
           response: new Response(body, {
             status: 200,
-            headers: { "content-type": "application/octet-stream" },
+            headers: { "content-type": "text/html" },
           }),
           finalUrl: { origin: "https://files.example.test", path: "/source" },
         })) as never,

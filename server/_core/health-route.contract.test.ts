@@ -155,4 +155,22 @@ describe("runtime health route contract", () => {
       "invariantSnapshot.degradedBuildCount",
     );
   });
+
+  it("gates readiness only on workers owned by the current runtime role", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+    const listener = source.indexOf("server.listen(", readinessStart);
+    const readiness = source.slice(readinessStart, listener);
+
+    expect(source).toContain(
+      "runtimeRoleReadinessRequirements(runtimeRole)",
+    );
+    expect(readiness).toContain(
+      "readinessRequirements.knowledgeBaseRecovery",
+    );
+    expect(readiness).toContain("!readinessRequirements.managedUploads");
+  });
 });

@@ -4,6 +4,7 @@ import {
   asc,
   desc,
   eq,
+  gte,
   inArray,
   isNull,
   like,
@@ -54,16 +55,38 @@ const ACTIVE_SITE_OPERATION_STATUSES = [
   "running",
   "outcome_unknown",
 ] as const;
-const ACTIVE_DEPLOYMENT_STATUSES = [
-  "reserved",
-  "deploying",
-  "verifying",
+const RESET_RETIRABLE_GENERATION_STATUSES = [
+  ...ACTIVE_SITE_OPERATION_STATUSES,
+  "attention_required",
+  "failed",
 ] as const;
-const ACTIVE_DNS_RECORD_STATUSES = [
-  "applying",
-  "propagating",
-  "outcome_unknown",
-] as const;
+
+const MYSQL_TIMESTAMP_SECOND_MS = 1_000;
+
+/**
+ * SiteOps reset epochs are persisted in MySQL TIMESTAMP(0) columns. Keep the
+ * JSON coordinate at that same precision so a value written and read back is
+ * stable instead of depending on an in-memory millisecond remainder.
+ */
+export function siteOpsResetEpochAtDatabasePrecision(value: Date) {
+  return new Date(
+    Math.floor(value.getTime() / MYSQL_TIMESTAMP_SECOND_MS) *
+      MYSQL_TIMESTAMP_SECOND_MS,
+  );
+}
+
+function resetEpochSecond(value: Date | string) {
+  const timestamp =
+    value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(timestamp)
+    ? Math.floor(timestamp / MYSQL_TIMESTAMP_SECOND_MS)
+    : null;
+}
+
+function resetEpochsMatch(left: Date | string, right: Date | string) {
+  const leftSecond = resetEpochSecond(left);
+  return leftSecond !== null && leftSecond === resetEpochSecond(right);
+}
 
 function localResetRetirableOperation(input: {
   kind: string;
@@ -129,12 +152,20 @@ type SiteOpsRebuildNoteV4 = {
   resetAppliedProjectRevision?: number;
   freshRootApplied?: true;
   unpublishOperationId?: string;
+  /**
+   * New approvals apply the local reset epoch before external exposure is
+   * removed. Older V4 notes omit this marker and retain their original
+   * all-at-once completion semantics.
+   */
+  resetEpochDecoupled?: true;
+  frozenReset?: ApprovedResetUnpublishInput;
+  externalCleanupCompletedAt?: string;
 };
 
 /**
- * An approval that crossed an already-started Aliyun write boundary. V5 is
- * deliberately not a frozen reset coordinate: the original operation must
- * finish read-only reconciliation first, then the worker snapshots the latest
+ * An approval that cannot yet freeze an external reset coordinate. V5 keeps
+ * the approval durable while either an existing Aliyun write reconciles or
+ * required domain access is restored. The worker later snapshots the latest
  * live head/domain and atomically upgrades this note to V4.
  */
 type SiteOpsRebuildNoteV5 = {
@@ -146,8 +177,15 @@ type SiteOpsRebuildNoteV5 = {
   resetIntent: typeof APPROVED_RESET_UNPUBLISH;
   resetApprovedAt: string;
   minimumKnowledgeSnapshotVersion: number;
-  resetActivationState: "awaiting_external_reconciliation";
+  resetActivationState:
+    | "awaiting_external_reconciliation"
+    | "awaiting_external_access";
   awaitingExternalOperationIds: string[];
+  resetEpochDecoupled?: true;
+  resetAppliedAt?: string;
+  resetAppliedProjectRevision?: number;
+  freshRootApplied?: true;
+  frozenReset?: ApprovedResetUnpublishInput;
 };
 
 const completedFreshRootResetOperationResultV2Schema = z
@@ -199,8 +237,28 @@ export const approvedResetUnpublishInputSchema = z
     expectedGlobalLiveDeploymentId: z.string().uuid().nullable(),
     expectedMainlandLiveDeploymentId: z.string().uuid().nullable(),
     expectedCanonicalHostname: z.string().trim().min(1).max(255).nullable(),
+    resetAppliedProjectRevision: z.number().int().positive().optional(),
+    resetEpochStartedAt: z
+      .string()
+      .datetime({ offset: true })
+      .transform((value) =>
+        siteOpsResetEpochAtDatabasePrecision(new Date(value)).toISOString(),
+      )
+      .optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      (value.resetAppliedProjectRevision === undefined) !==
+      (value.resetEpochStartedAt === undefined)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "resetAppliedProjectRevision and resetEpochStartedAt must be provided together",
+      });
+    }
+  });
 
 export type ApprovedResetUnpublishInput = z.infer<
   typeof approvedResetUnpublishInputSchema
@@ -220,6 +278,25 @@ function parseApprovedResetFromOperationInput(value: unknown) {
   );
 }
 
+function approvedResetInputsEqual(
+  left: ApprovedResetUnpublishInput,
+  right: ApprovedResetUnpublishInput,
+) {
+  return (
+    left.rebuildTicketId === right.rebuildTicketId &&
+    left.expectedProjectRevision === right.expectedProjectRevision &&
+    left.expectedCurrentBuildId === right.expectedCurrentBuildId &&
+    left.expectedKnowledgeSnapshotId === right.expectedKnowledgeSnapshotId &&
+    left.expectedGlobalLiveDeploymentId ===
+      right.expectedGlobalLiveDeploymentId &&
+    left.expectedMainlandLiveDeploymentId ===
+      right.expectedMainlandLiveDeploymentId &&
+    left.expectedCanonicalHostname === right.expectedCanonicalHostname &&
+    left.resetAppliedProjectRevision === right.resetAppliedProjectRevision &&
+    left.resetEpochStartedAt === right.resetEpochStartedAt
+  );
+}
+
 export function approvedResetUnpublishProjectMatches(
   input: ApprovedResetUnpublishInput,
   project: Pick<
@@ -230,8 +307,10 @@ export function approvedResetUnpublishProjectMatches(
     | "globalLiveDeploymentId"
     | "mainlandLiveDeploymentId"
     | "canonicalHostname"
+    | "currentTaskStartedAt"
   >,
 ) {
+  if (approvedResetUnpublishFreshEpochMatches(input, project)) return true;
   return (
     project.revision === input.expectedProjectRevision &&
     approvedResetUnpublishNonRevisionCoordinatesMatch(input, project)
@@ -256,6 +335,71 @@ export function approvedResetUnpublishNonRevisionCoordinatesMatch(
     project.mainlandLiveDeploymentId ===
       input.expectedMainlandLiveDeploymentId &&
     project.canonicalHostname === input.expectedCanonicalHostname
+  );
+}
+
+/**
+ * A decoupled reset intentionally clears the old build/live-head coordinates
+ * before provider cleanup completes. The immutable epoch timestamp is the
+ * fence: later local builds may advance the revision and current build, while
+ * an old provider result can only reconcile the external coordinates frozen
+ * in the reset input.
+ */
+export function approvedResetUnpublishFreshEpochMatches(
+  input: ApprovedResetUnpublishInput,
+  project: Pick<
+    typeof siteProjects.$inferSelect,
+    "revision" | "currentTaskStartedAt"
+  >,
+) {
+  if (
+    input.resetAppliedProjectRevision === undefined ||
+    input.resetEpochStartedAt === undefined
+  ) {
+    return false;
+  }
+  return (
+    project.revision >= input.resetAppliedProjectRevision &&
+    resetEpochsMatch(project.currentTaskStartedAt, input.resetEpochStartedAt)
+  );
+}
+
+/**
+ * Exact fence for an Aliyun write that was already running when a decoupled
+ * reset was approved. Timestamp ordering alone cannot distinguish two rows
+ * created within one TIMESTAMP(0) second, so V5 freezes the old operation IDs
+ * and this check also binds them to the reset revision and epoch.
+ */
+export function siteOpsRebuildResetFencesExternalOperation(
+  value: string | null | undefined,
+  input: {
+    projectId: string;
+    operationId: string;
+    projectRevision: number;
+    currentTaskStartedAt: Date;
+  },
+) {
+  const note = parseSiteOpsRebuildNote(value);
+  if (
+    !note ||
+    note.schemaVersion !== 5 ||
+    note.resetEpochDecoupled !== true ||
+    note.freshRootApplied !== true ||
+    note.projectId !== input.projectId ||
+    !note.frozenReset ||
+    !note.awaitingExternalOperationIds.includes(input.operationId) ||
+    note.resetAppliedProjectRevision === undefined ||
+    input.projectRevision < note.resetAppliedProjectRevision
+  ) {
+    return false;
+  }
+  return (
+    note.frozenReset.resetAppliedProjectRevision ===
+      note.resetAppliedProjectRevision &&
+    resetEpochsMatch(
+      input.currentTaskStartedAt,
+      note.frozenReset.resetEpochStartedAt!,
+    )
   );
 }
 
@@ -305,6 +449,11 @@ function parseSiteOpsRebuildNote(
       const hasResetRevision =
         Number.isInteger(parsed.resetAppliedProjectRevision) &&
         Number(parsed.resetAppliedProjectRevision) > 0;
+      const decoupled = parsed.resetEpochDecoupled === true;
+      const frozenReset = parseApprovedResetUnpublishInput(parsed.frozenReset);
+      const externalCleanupTimestampValid =
+        parsed.externalCleanupCompletedAt === undefined ||
+        typeof parsed.externalCleanupCompletedAt === "string";
       if (
         parsed.resetIntent !== APPROVED_RESET_UNPUBLISH ||
         typeof parsed.resetOperationId !== "string" ||
@@ -314,17 +463,42 @@ function parseSiteOpsRebuildNote(
         Number(parsed.resetExpectedProjectRevision) < 1 ||
         !Number.isInteger(parsed.minimumKnowledgeSnapshotVersion) ||
         Number(parsed.minimumKnowledgeSnapshotVersion) < 1 ||
-        (hasResetTimestamp &&
-          (parsed.freshRootApplied !== true ||
-            parsed.unpublishOperationId !== parsed.resetOperationId)) ||
-        (!hasResetTimestamp &&
-          (parsed.freshRootApplied !== undefined ||
-            parsed.unpublishOperationId !== undefined)) ||
-        hasResetTimestamp !== hasResetRevision
+        hasResetTimestamp !== hasResetRevision ||
+        !externalCleanupTimestampValid ||
+        (decoupled
+          ? !hasResetTimestamp ||
+            parsed.freshRootApplied !== true ||
+            parsed.unpublishOperationId !== parsed.resetOperationId ||
+            !frozenReset ||
+            frozenReset.expectedProjectRevision !==
+              parsed.resetExpectedProjectRevision ||
+            frozenReset.resetAppliedProjectRevision !==
+              parsed.resetAppliedProjectRevision ||
+            !resetEpochsMatch(
+              frozenReset.resetEpochStartedAt!,
+              String(parsed.resetAppliedAt),
+            )
+          : parsed.frozenReset !== undefined ||
+            parsed.externalCleanupCompletedAt !== undefined ||
+            (hasResetTimestamp
+              ? parsed.freshRootApplied !== true ||
+                parsed.unpublishOperationId !== parsed.resetOperationId
+              : parsed.freshRootApplied !== undefined ||
+                parsed.unpublishOperationId !== undefined))
       ) {
         return null;
       }
-      return parsed as SiteOpsRebuildNoteV4;
+      return {
+        ...parsed,
+        ...(decoupled
+          ? {
+              frozenReset: frozenReset!,
+              resetAppliedAt: siteOpsResetEpochAtDatabasePrecision(
+                new Date(String(parsed.resetAppliedAt)),
+              ).toISOString(),
+            }
+          : {}),
+      } as SiteOpsRebuildNoteV4;
     }
     if (parsed.schemaVersion === 5) {
       const awaitingExternalOperationIds = Array.isArray(
@@ -332,13 +506,25 @@ function parseSiteOpsRebuildNote(
       )
         ? parsed.awaitingExternalOperationIds
         : [];
+      const decoupled = parsed.resetEpochDecoupled === true;
+      const frozenReset = parseApprovedResetUnpublishInput(parsed.frozenReset);
+      const hasResetTimestamp = typeof parsed.resetAppliedAt === "string";
+      const hasResetRevision =
+        Number.isInteger(parsed.resetAppliedProjectRevision) &&
+        Number(parsed.resetAppliedProjectRevision) > 0;
       if (
         parsed.resetIntent !== APPROVED_RESET_UNPUBLISH ||
         typeof parsed.resetApprovedAt !== "string" ||
         !Number.isInteger(parsed.minimumKnowledgeSnapshotVersion) ||
         Number(parsed.minimumKnowledgeSnapshotVersion) < 1 ||
-        parsed.resetActivationState !== "awaiting_external_reconciliation" ||
-        awaitingExternalOperationIds.length < 1 ||
+        ![
+          "awaiting_external_reconciliation",
+          "awaiting_external_access",
+        ].includes(String(parsed.resetActivationState)) ||
+        (parsed.resetActivationState === "awaiting_external_reconciliation" &&
+          awaitingExternalOperationIds.length < 1) ||
+        (parsed.resetActivationState === "awaiting_external_access" &&
+          awaitingExternalOperationIds.length !== 0) ||
         awaitingExternalOperationIds.length > 64 ||
         awaitingExternalOperationIds.some(
           (operationId) =>
@@ -346,11 +532,36 @@ function parseSiteOpsRebuildNote(
             !z.string().uuid().safeParse(operationId).success,
         ) ||
         new Set(awaitingExternalOperationIds).size !==
-          awaitingExternalOperationIds.length
+          awaitingExternalOperationIds.length ||
+        (decoupled
+          ? !hasResetTimestamp ||
+            !hasResetRevision ||
+            parsed.freshRootApplied !== true ||
+            !frozenReset ||
+            frozenReset.resetAppliedProjectRevision !==
+              parsed.resetAppliedProjectRevision ||
+            !resetEpochsMatch(
+              frozenReset.resetEpochStartedAt!,
+              String(parsed.resetAppliedAt),
+            )
+          : hasResetTimestamp ||
+            hasResetRevision ||
+            parsed.freshRootApplied !== undefined ||
+            parsed.frozenReset !== undefined)
       ) {
         return null;
       }
-      return parsed as SiteOpsRebuildNoteV5;
+      return {
+        ...parsed,
+        ...(decoupled
+          ? {
+              frozenReset: frozenReset!,
+              resetAppliedAt: siteOpsResetEpochAtDatabasePrecision(
+                new Date(String(parsed.resetAppliedAt)),
+              ).toISOString(),
+            }
+          : {}),
+      } as SiteOpsRebuildNoteV5;
     }
     return parsed as SiteOpsRebuildNoteV1;
   } catch {
@@ -364,6 +575,9 @@ export function siteOpsRebuildResetApplied(value: string | null | undefined) {
     note &&
       (note.schemaVersion === 2 ||
         ((note.schemaVersion === 3 || note.schemaVersion === 4) &&
+          note.resetAppliedAt) ||
+        (note.schemaVersion === 5 &&
+          note.resetEpochDecoupled === true &&
           note.resetAppliedAt)),
   );
 }
@@ -372,7 +586,10 @@ export function siteOpsRebuildResetPending(value: string | null | undefined) {
   const note = parseSiteOpsRebuildNote(value);
   return Boolean(
     note &&
-      ((note.schemaVersion === 4 && !note.resetAppliedAt) ||
+      ((note.schemaVersion === 4 &&
+        (note.resetEpochDecoupled === true
+          ? !note.externalCleanupCompletedAt
+          : !note.resetAppliedAt)) ||
         note.schemaVersion === 5),
   );
 }
@@ -486,8 +703,17 @@ export function projectSiteOpsRebuildReset(input: {
       siteRebuildCanRecheck: false,
     };
   }
-  const resetApplied = Boolean(
+  const legacyResetCompleted = Boolean(
     note.resetAppliedAt &&
+      note.resetAppliedProjectRevision &&
+      note.resetEpochDecoupled !== true &&
+      note.freshRootApplied === true &&
+      note.unpublishOperationId === operation.id,
+  );
+  const decoupledResetCompleted = Boolean(
+    note.resetEpochDecoupled === true &&
+      note.externalCleanupCompletedAt &&
+      note.resetAppliedAt &&
       note.resetAppliedProjectRevision &&
       note.freshRootApplied === true &&
       note.unpublishOperationId === operation.id,
@@ -503,7 +729,7 @@ export function projectSiteOpsRebuildReset(input: {
       completionResult.data.resetAppliedProjectRevision ===
         note.resetAppliedProjectRevision,
   );
-  if (resetApplied) {
+  if (legacyResetCompleted || decoupledResetCompleted) {
     return operation.status === "succeeded" && completionResultValid
       ? {
           siteRebuildResetState: "completed",
@@ -610,6 +836,7 @@ export class SiteOpsRebuildTicketError extends Error {
       | "BUILD_NOT_READY"
       | "DELIVERY_OWNER_NOT_ASSIGNED"
       | "ENTITLEMENT_NOT_FOUND"
+      | "EXTERNAL_ACCESS_REQUIRED"
       | "IN_FLIGHT_OPERATION"
       | "INVALID_TICKET"
       | "TICKET_ALREADY_OPEN",
@@ -1111,24 +1338,29 @@ async function queueApprovedResetFromLatestCoordinates(
     knowledgeSnapshotId: string | null;
     resetApprovedAt: string;
     minimumKnowledgeSnapshotVersion: number;
+    frozenReset?: ApprovedResetUnpublishInput;
+    resetAppliedProjectRevision?: number;
+    resetAppliedAt?: string;
     now: Date;
   },
 ) {
   const resetOperationId = randomUUID();
-  const resetInput = approvedResetUnpublishInputSchema.parse({
-    schemaVersion: 1,
-    intent: APPROVED_RESET_UNPUBLISH,
-    rebuildTicketId: input.ticketId,
-    expectedProjectRevision: input.project.revision,
-    expectedCurrentBuildId: input.project.currentBuildId ?? null,
-    expectedKnowledgeSnapshotId:
-      input.project.currentKnowledgeSnapshotId ?? null,
-    expectedGlobalLiveDeploymentId:
-      input.project.globalLiveDeploymentId ?? null,
-    expectedMainlandLiveDeploymentId:
-      input.project.mainlandLiveDeploymentId ?? null,
-    expectedCanonicalHostname: input.project.canonicalHostname ?? null,
-  });
+  const resetInput = input.frozenReset
+    ? approvedResetUnpublishInputSchema.parse(input.frozenReset)
+    : approvedResetUnpublishInputSchema.parse({
+        schemaVersion: 1,
+        intent: APPROVED_RESET_UNPUBLISH,
+        rebuildTicketId: input.ticketId,
+        expectedProjectRevision: input.project.revision,
+        expectedCurrentBuildId: input.project.currentBuildId ?? null,
+        expectedKnowledgeSnapshotId:
+          input.project.currentKnowledgeSnapshotId ?? null,
+        expectedGlobalLiveDeploymentId:
+          input.project.globalLiveDeploymentId ?? null,
+        expectedMainlandLiveDeploymentId:
+          input.project.mainlandLiveDeploymentId ?? null,
+        expectedCanonicalHostname: input.project.canonicalHostname ?? null,
+      });
   const profileRows = await tx
     .select({ domainRevision: workspaceSiteProfiles.domainRevision })
     .from(workspaceSiteProfiles)
@@ -1165,8 +1397,8 @@ async function queueApprovedResetFromLatestCoordinates(
       : [];
   if (rollbackRows.length > 0 && !connectionRows[0]) {
     throw new SiteOpsRebuildTicketError(
-      "IN_FLIGHT_OPERATION",
-      "旧官网仍有 FrontMind 管理的 DNS 记录，请先重新连接阿里云后再继续重置。",
+      "EXTERNAL_ACCESS_REQUIRED",
+      "官网重置已获批准，等待恢复外部域名访问后继续安全下线。",
     );
   }
   const resetOperationInput = connectionRows[0]
@@ -1194,7 +1426,7 @@ async function queueApprovedResetFromLatestCoordinates(
     buildId: input.sourceBuildId,
     kind: resetOperationKind,
     status: "queued",
-    clientRequestId: `site-rebuild-unpublish:${input.ticketId}:${input.project.revision}`,
+    clientRequestId: `site-rebuild-unpublish:${input.ticketId}:${resetInput.expectedProjectRevision}`,
     inputHash: resetInputHash,
     input: resetOperationInput,
     provider: resetOperationProvider,
@@ -1213,8 +1445,218 @@ async function queueApprovedResetFromLatestCoordinates(
     resetApprovedAt: input.resetApprovedAt,
     resetExpectedProjectRevision: input.project.revision,
     minimumKnowledgeSnapshotVersion: input.minimumKnowledgeSnapshotVersion,
+    ...(input.frozenReset &&
+    input.resetAppliedProjectRevision !== undefined &&
+    input.resetAppliedAt
+      ? {
+          resetExpectedProjectRevision: resetInput.expectedProjectRevision,
+          resetEpochDecoupled: true as const,
+          frozenReset: resetInput,
+          resetAppliedAt: input.resetAppliedAt,
+          resetAppliedProjectRevision: input.resetAppliedProjectRevision,
+          freshRootApplied: true as const,
+          unpublishOperationId: resetOperationId,
+        }
+      : {}),
   };
   return { resetOperationId, upgradedNote };
+}
+
+async function applyFreshLocalResetEpoch(
+  tx: any,
+  input: {
+    ticketId: string;
+    project: typeof siteProjects.$inferSelect;
+    expectedRevision: number;
+    resetEpochStartedAt: Date;
+    now: Date;
+  },
+) {
+  const nextRevision = input.expectedRevision + 1;
+  const sequenceRows = await tx
+    .select({ sequence: max(messages.sequence) })
+    .from(messages)
+    .where(eq(messages.conversationId, input.project.conversationId));
+  const projectUpdate = await tx
+    .update(siteProjects)
+    .set({
+      currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+      currentBuildId: null,
+      globalLiveDeploymentId: null,
+      mainlandLiveDeploymentId: null,
+      canonicalHostname: null,
+      currentTaskStartedAt: input.resetEpochStartedAt,
+      minimumKnowledgeSnapshotVersion: null,
+      brief: null,
+      status: "draft",
+      revision: nextRevision,
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(siteProjects.id, input.project.id),
+        eq(siteProjects.userId, input.project.userId),
+        eq(siteProjects.revision, input.expectedRevision),
+        nullableCoordinate(
+          siteProjects.currentBuildId,
+          input.project.currentBuildId,
+        ),
+        nullableCoordinate(
+          siteProjects.currentKnowledgeSnapshotId,
+          input.project.currentKnowledgeSnapshotId,
+        ),
+        nullableCoordinate(
+          siteProjects.globalLiveDeploymentId,
+          input.project.globalLiveDeploymentId,
+        ),
+        nullableCoordinate(
+          siteProjects.mainlandLiveDeploymentId,
+          input.project.mainlandLiveDeploymentId,
+        ),
+        nullableCoordinate(
+          siteProjects.canonicalHostname,
+          input.project.canonicalHostname,
+        ),
+      ),
+    );
+  if (affectedRows(projectUpdate) !== 1) {
+    throw new SiteOpsRebuildTicketError(
+      "IN_FLIGHT_OPERATION",
+      "建站项目在重置批准期间已变化，请刷新后重试。",
+    );
+  }
+
+  await tx
+    .update(siteBuilds)
+    .set({
+      status: "cancelled",
+      errorCode: "SITEOPS_RESET_APPROVED",
+      errorMessage: "官网重置已获批准，旧生成任务已停止。",
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(siteBuilds.projectId, input.project.id),
+        eq(siteBuilds.userId, input.project.userId),
+        inArray(siteBuilds.status, [
+          "preparing",
+          "visual_searching",
+          "awaiting_visual_selection",
+          "design_compiling",
+          "contract_ready",
+          "building",
+          "qa_running",
+          "failed",
+          "attention_required",
+        ]),
+      ),
+    );
+  await tx
+    .update(siteBuilds)
+    .set({ status: "superseded", updatedAt: input.now })
+    .where(
+      and(
+        eq(siteBuilds.projectId, input.project.id),
+        eq(siteBuilds.userId, input.project.userId),
+        inArray(siteBuilds.status, ["preview_ready", "approved"]),
+      ),
+    );
+  await tx
+    .update(siteBuilds)
+    .set({ quotaState: "released", updatedAt: input.now })
+    .where(
+      and(
+        eq(siteBuilds.projectId, input.project.id),
+        eq(siteBuilds.userId, input.project.userId),
+        eq(siteBuilds.quotaState, "reserved"),
+      ),
+    );
+
+  const candidatePoolRows = await tx
+    .select({ id: visualCandidatePools.id })
+    .from(visualCandidatePools)
+    .where(
+      and(
+        eq(visualCandidatePools.projectId, input.project.id),
+        eq(visualCandidatePools.userId, input.project.userId),
+        inArray(visualCandidatePools.status, ["active", "selected"]),
+      ),
+    )
+    .for("update");
+  const candidatePoolIds = candidatePoolRows.map(
+    (pool: { id: string }) => pool.id,
+  );
+  if (candidatePoolIds.length > 0) {
+    await tx
+      .update(visualCandidatePoolPages)
+      .set({ status: "superseded", updatedAt: input.now })
+      .where(
+        and(
+          inArray(visualCandidatePoolPages.poolId, candidatePoolIds),
+          inArray(visualCandidatePoolPages.status, [
+            "reserved",
+            "published",
+            "selected",
+          ]),
+        ),
+      );
+    await tx
+      .update(visualCandidatePools)
+      .set({ status: "superseded", updatedAt: input.now })
+      .where(
+        and(
+          inArray(visualCandidatePools.id, candidatePoolIds),
+          inArray(visualCandidatePools.status, ["active", "selected"]),
+        ),
+      );
+  }
+  await tx
+    .update(websiteStyleSampleBatches)
+    .set({ status: "superseded", updatedAt: input.now })
+    .where(
+      and(
+        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+        eq(websiteStyleSampleBatches.userId, input.project.userId),
+        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+        inArray(websiteStyleSampleBatches.status, ["published", "selected"]),
+      ),
+    );
+
+  await tx
+    .update(messages)
+    .set({ deletedAt: input.now, updatedAt: input.now })
+    .where(
+      and(
+        eq(messages.conversationId, input.project.conversationId),
+        eq(messages.userId, input.project.userId),
+        isNull(messages.deletedAt),
+      ),
+    );
+  await tx.insert(messages).values({
+    id: randomUUID(),
+    conversationId: input.project.conversationId,
+    userId: input.project.userId,
+    role: "assistant",
+    content:
+      "官网重置已完成，企业知识库保持不变，可从知识库开始全新的建站任务。旧官网的外部下线确认将在后台继续。",
+    sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
+    metadata: {
+      siteOps: {
+        kind: "brief_question",
+        subjectId: input.ticketId,
+        revision: nextRevision,
+        status: "active",
+        payload: {
+          rebuildTicketId: input.ticketId,
+          requested: "reuse_current_knowledge",
+          reset: true,
+          freshRootApplied: true,
+          unpublishCompleted: false,
+        },
+      },
+    },
+  });
+  return nextRevision;
 }
 
 export async function approveSiteOpsRebuildTicket(
@@ -1306,14 +1748,17 @@ export async function approveSiteOpsRebuildTicket(
       resetApplied: true as const,
       resetPending: true as const,
       resetOperationId: null,
-      resetAppliedProjectRevision: project.revision,
+      resetAppliedProjectRevision:
+        existingNote.resetAppliedProjectRevision ?? project.revision,
       pendingReplay: true as const,
       internalNote: JSON.stringify(existingNote),
     };
   }
   if (
     existingNote.schemaVersion === 4 &&
-    !existingNote.resetAppliedAt &&
+    (existingNote.resetEpochDecoupled === true
+      ? !existingNote.externalCleanupCompletedAt
+      : !existingNote.resetAppliedAt) &&
     !input.reapply
   ) {
     const resetOperationRows = await tx
@@ -1361,7 +1806,9 @@ export async function approveSiteOpsRebuildTicket(
       resetApplied: true as const,
       resetPending: true as const,
       resetOperationId: existingNote.resetOperationId,
-      resetAppliedProjectRevision: existingNote.resetExpectedProjectRevision,
+      resetAppliedProjectRevision:
+        existingNote.resetAppliedProjectRevision ??
+        existingNote.resetExpectedProjectRevision,
       internalNote: JSON.stringify(existingNote),
     };
     if (["queued", "running"].includes(resetOperation.status)) {
@@ -1494,54 +1941,44 @@ export async function approveSiteOpsRebuildTicket(
       internalNote: JSON.stringify(existingNote),
     };
   }
-  const [activeOperationRows, activeDeploymentRows, activeDnsRows] =
-    await Promise.all([
-      tx
-        .select({
-          id: siteOperations.id,
-          kind: siteOperations.kind,
-          provider: siteOperations.provider,
-          status: siteOperations.status,
-          attempt: siteOperations.attempt,
-          result: siteOperations.result,
-          providerOperationId: siteOperations.providerOperationId,
-          providerTaskId: siteOperations.providerTaskId,
-        })
-        .from(siteOperations)
-        .where(
-          and(
-            eq(siteOperations.projectId, project.id),
-            inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
-          ),
-        )
-        .for("update"),
-      tx
-        .select({
-          id: siteDeployments.id,
-          operationId: siteDeployments.operationId,
-        })
-        .from(siteDeployments)
-        .where(
-          and(
-            eq(siteDeployments.projectId, project.id),
-            inArray(siteDeployments.status, ACTIVE_DEPLOYMENT_STATUSES),
-          ),
-        )
-        .limit(1)
-        .for("update"),
-      tx
-        .select({ id: siteDnsRecords.id })
-        .from(siteDnsRecords)
-        .where(
-          and(
-            eq(siteDnsRecords.projectId, project.id),
-            inArray(siteDnsRecords.status, ACTIVE_DNS_RECORD_STATUSES),
-          ),
-        )
-        .limit(1)
-        .for("update"),
-    ]);
+  const activeOperationRows = await tx
+    .select({
+      id: siteOperations.id,
+      kind: siteOperations.kind,
+      provider: siteOperations.provider,
+      status: siteOperations.status,
+      attempt: siteOperations.attempt,
+      result: siteOperations.result,
+      providerOperationId: siteOperations.providerOperationId,
+      providerTaskId: siteOperations.providerTaskId,
+    })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, project.id),
+        gte(siteOperations.createdAt, project.currentTaskStartedAt),
+        inArray(siteOperations.status, RESET_RETIRABLE_GENERATION_STATUSES),
+      ),
+    )
+    .for("update");
   const now = input.now;
+  const resetEpochStartedAt = siteOpsResetEpochAtDatabasePrecision(now);
+  const resetEpochStartedAtIso = resetEpochStartedAt.toISOString();
+  const frozenProject = { ...project };
+  const resetAppliedProjectRevision = project.revision + 1;
+  const frozenReset = approvedResetUnpublishInputSchema.parse({
+    schemaVersion: 1,
+    intent: APPROVED_RESET_UNPUBLISH,
+    rebuildTicketId: input.ticket.id,
+    expectedProjectRevision: project.revision,
+    expectedCurrentBuildId: project.currentBuildId ?? null,
+    expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId ?? null,
+    expectedGlobalLiveDeploymentId: project.globalLiveDeploymentId ?? null,
+    expectedMainlandLiveDeploymentId: project.mainlandLiveDeploymentId ?? null,
+    expectedCanonicalHostname: project.canonicalHostname ?? null,
+    resetAppliedProjectRevision,
+    resetEpochStartedAt: resetEpochStartedAtIso,
+  });
   const typedActiveOperationRows = activeOperationRows as Array<{
     id: string;
     kind: string;
@@ -1557,31 +1994,21 @@ export async function approveSiteOpsRebuildTicket(
   );
   const cancelableIds = new Set(localCancelableRows.map((row) => row.id));
   const externalReconciliationRows = typedActiveOperationRows.filter(
-    (row) => !cancelableIds.has(row.id) && knownAliyunWriteOperation(row),
+    (row) =>
+      !cancelableIds.has(row.id) &&
+      ACTIVE_SITE_OPERATION_STATUSES.includes(row.status as never) &&
+      knownAliyunWriteOperation(row),
   );
   const externalReconciliationIds = new Set(
     externalReconciliationRows.map((row) => row.id),
   );
   const blockedOperationRows = typedActiveOperationRows.filter(
     (row) =>
-      !cancelableIds.has(row.id) && !externalReconciliationIds.has(row.id),
+      ACTIVE_SITE_OPERATION_STATUSES.includes(row.status as never) &&
+      !cancelableIds.has(row.id) &&
+      !externalReconciliationIds.has(row.id),
   );
-  const activeDeploymentUnbound = activeDeploymentRows.some(
-    (deployment: { operationId: string | null }) =>
-      !deployment.operationId ||
-      !externalReconciliationIds.has(deployment.operationId),
-  );
-  const hasActiveDnsReconciliation = externalReconciliationRows.some(
-    (row) =>
-      row.kind === "domain_sync" ||
-      row.kind === "dns_apply" ||
-      row.kind === "dns_rollback",
-  );
-  if (
-    blockedOperationRows.length > 0 ||
-    activeDeploymentUnbound ||
-    (activeDnsRows.length > 0 && !hasActiveDnsReconciliation)
-  ) {
+  if (blockedOperationRows.length > 0) {
     throw new SiteOpsRebuildTicketError(
       "IN_FLIGHT_OPERATION",
       "当前仍有已开始的生成、发布或 DNS 操作，需按原任务完成只读对账后再批准重置。",
@@ -1605,7 +2032,7 @@ export async function approveSiteOpsRebuildTicket(
       .where(
         and(
           inArray(siteOperations.id, localOperationIds),
-          inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
+          inArray(siteOperations.status, RESET_RETIRABLE_GENERATION_STATUSES),
           or(
             and(
               eq(siteOperations.kind, "visual_search"),
@@ -1628,38 +2055,6 @@ export async function approveSiteOpsRebuildTicket(
         "旧生成任务状态已变化，未启动重置，请刷新后重试。",
       );
     }
-    await tx
-      .update(siteBuilds)
-      .set({
-        status: "cancelled",
-        errorCode: "SITEOPS_RESET_APPROVED",
-        errorMessage: "官网重置已获批准，旧生成任务已停止。",
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(siteBuilds.projectId, project.id),
-          inArray(siteBuilds.status, [
-            "preparing",
-            "visual_searching",
-            "awaiting_visual_selection",
-            "design_compiling",
-            "contract_ready",
-            "building",
-            "qa_running",
-          ]),
-        ),
-      );
-    await tx
-      .update(siteBuilds)
-      .set({ quotaState: "released", updatedAt: now })
-      .where(
-        and(
-          eq(siteBuilds.projectId, project.id),
-          eq(siteBuilds.userId, project.userId),
-          eq(siteBuilds.quotaState, "reserved"),
-        ),
-      );
     await tx
       .update(socialPackages)
       .set({
@@ -1689,6 +2084,13 @@ export async function approveSiteOpsRebuildTicket(
   // reusable; only the old build, visual and provider-task lineage is retired.
   const minimumKnowledgeSnapshotVersion = 1;
   const preservedBuildId = project.currentBuildId ?? existingNote.sourceBuildId;
+  await applyFreshLocalResetEpoch(tx, {
+    ticketId: input.ticket.id,
+    project: frozenProject as typeof siteProjects.$inferSelect,
+    expectedRevision: frozenProject.revision,
+    resetEpochStartedAt,
+    now,
+  });
   if (externalReconciliationRows.length > 0) {
     const deferredNote: SiteOpsRebuildNoteV5 = {
       schemaVersion: 5,
@@ -1706,6 +2108,11 @@ export async function approveSiteOpsRebuildTicket(
       awaitingExternalOperationIds: externalReconciliationRows.map(
         (row) => row.id,
       ),
+      resetEpochDecoupled: true,
+      resetAppliedAt: resetEpochStartedAtIso,
+      resetAppliedProjectRevision,
+      freshRootApplied: true,
+      frozenReset,
     };
     return {
       projectId: project.id,
@@ -1713,14 +2120,17 @@ export async function approveSiteOpsRebuildTicket(
       resetApplied: true as const,
       resetPending: true as const,
       resetOperationId: null,
-      resetAppliedProjectRevision: project.revision,
+      resetAppliedProjectRevision,
       internalNote: JSON.stringify(deferredNote),
     };
   }
-  const { resetOperationId, upgradedNote } =
-    await queueApprovedResetFromLatestCoordinates(tx, {
+  let queuedReset: Awaited<
+    ReturnType<typeof queueApprovedResetFromLatestCoordinates>
+  >;
+  try {
+    queuedReset = await queueApprovedResetFromLatestCoordinates(tx, {
       ticketId: input.ticket.id,
-      project,
+      project: frozenProject as typeof siteProjects.$inferSelect,
       sourceBuildId: preservedBuildId,
       knowledgeSnapshotId:
         project.currentKnowledgeSnapshotId ??
@@ -1728,8 +2138,49 @@ export async function approveSiteOpsRebuildTicket(
         existingNote.knowledgeSnapshotId,
       resetApprovedAt: now.toISOString(),
       minimumKnowledgeSnapshotVersion,
+      frozenReset,
+      resetAppliedProjectRevision,
+      resetAppliedAt: resetEpochStartedAtIso,
       now,
     });
+  } catch (error) {
+    if (
+      !(error instanceof SiteOpsRebuildTicketError) ||
+      error.code !== "EXTERNAL_ACCESS_REQUIRED"
+    ) {
+      throw error;
+    }
+    const deferredNote: SiteOpsRebuildNoteV5 = {
+      schemaVersion: 5,
+      kind: REBUILD_NOTE_KIND,
+      projectId: project.id,
+      sourceBuildId: preservedBuildId,
+      knowledgeSnapshotId:
+        project.currentKnowledgeSnapshotId ??
+        currentBuild?.knowledgeSnapshotId ??
+        existingNote.knowledgeSnapshotId,
+      resetIntent: APPROVED_RESET_UNPUBLISH,
+      resetApprovedAt: now.toISOString(),
+      minimumKnowledgeSnapshotVersion,
+      resetActivationState: "awaiting_external_access",
+      awaitingExternalOperationIds: [],
+      resetEpochDecoupled: true,
+      resetAppliedAt: resetEpochStartedAtIso,
+      resetAppliedProjectRevision,
+      freshRootApplied: true,
+      frozenReset,
+    };
+    return {
+      projectId: project.id,
+      sourceBuildId: preservedBuildId,
+      resetApplied: true as const,
+      resetPending: true as const,
+      resetOperationId: null,
+      resetAppliedProjectRevision,
+      internalNote: JSON.stringify(deferredNote),
+    };
+  }
+  const { resetOperationId, upgradedNote } = queuedReset;
   return {
     projectId: project.id,
     sourceBuildId: preservedBuildId,
@@ -1738,7 +2189,7 @@ export async function approveSiteOpsRebuildTicket(
     resetOperationId,
     // Compatibility for the delivery approval response. The durable V4 note
     // does not claim completion until the worker stores resetAppliedAt.
-    resetAppliedProjectRevision: project.revision,
+    resetAppliedProjectRevision,
     internalNote: JSON.stringify(upgradedNote),
   };
 }
@@ -1793,20 +2244,34 @@ export async function activateDeferredApprovedSiteOpsReset(
     .for("update");
   const project = projectRows[0];
   if (!project) return { status: "blocked" as const };
+  const decoupledReset =
+    note.resetEpochDecoupled === true && note.frozenReset
+      ? note.frozenReset
+      : null;
+  if (
+    decoupledReset &&
+    !approvedResetUnpublishFreshEpochMatches(decoupledReset, project)
+  ) {
+    return { status: "blocked" as const };
+  }
 
-  const reconciledOperationRows = (await tx
-    .select({
-      id: siteOperations.id,
-      projectId: siteOperations.projectId,
-      userId: siteOperations.userId,
-      kind: siteOperations.kind,
-      provider: siteOperations.provider,
-      status: siteOperations.status,
-      completedAt: siteOperations.completedAt,
-    })
-    .from(siteOperations)
-    .where(inArray(siteOperations.id, note.awaitingExternalOperationIds))
-    .for("update")) as Array<{
+  const reconciledOperationRows = (
+    note.awaitingExternalOperationIds.length > 0
+      ? await tx
+          .select({
+            id: siteOperations.id,
+            projectId: siteOperations.projectId,
+            userId: siteOperations.userId,
+            kind: siteOperations.kind,
+            provider: siteOperations.provider,
+            status: siteOperations.status,
+            completedAt: siteOperations.completedAt,
+          })
+          .from(siteOperations)
+          .where(inArray(siteOperations.id, note.awaitingExternalOperationIds))
+          .for("update")
+      : []
+  ) as Array<{
     id: string;
     projectId: string;
     userId: number;
@@ -1838,80 +2303,101 @@ export async function activateDeferredApprovedSiteOpsReset(
     return { status: "awaiting_external_reconciliation" as const };
   }
 
-  // Catch provider-created successors as well as the originally recorded
-  // operation IDs. The reset gate prevents customer actions from creating a
-  // new lineage while V5 is pending, so any exact known Aliyun operation here
-  // still belongs to the approved external reconciliation boundary.
-  const activeOperationRows = (await tx
-    .select({
-      id: siteOperations.id,
-      kind: siteOperations.kind,
-      provider: siteOperations.provider,
-      status: siteOperations.status,
-    })
-    .from(siteOperations)
-    .where(
-      and(
-        eq(siteOperations.projectId, project.id),
-        inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
-      ),
-    )
-    .for("update")) as Array<{
-    id: string;
-    kind: string;
-    provider: string | null;
-    status: string;
-  }>;
-  if (
-    activeOperationRows.some(
-      (operation) => !knownAliyunWriteOperation(operation),
-    )
-  ) {
-    return { status: "blocked" as const };
-  }
-  if (activeOperationRows.length > 0) {
-    return { status: "awaiting_external_reconciliation" as const };
-  }
-  const [activeDeploymentRows, activeDnsRows] = await Promise.all([
-    tx
-      .select({ id: siteDeployments.id })
-      .from(siteDeployments)
+  if (!decoupledReset) {
+    // Legacy V5 approvals did not create an independent local epoch. Keep the
+    // historical all-operation gate for those notes only.
+    const activeOperationRows = (await tx
+      .select({
+        id: siteOperations.id,
+        kind: siteOperations.kind,
+        provider: siteOperations.provider,
+        status: siteOperations.status,
+      })
+      .from(siteOperations)
       .where(
         and(
-          eq(siteDeployments.projectId, project.id),
-          inArray(siteDeployments.status, ACTIVE_DEPLOYMENT_STATUSES),
+          eq(siteOperations.projectId, project.id),
+          inArray(siteOperations.status, ACTIVE_SITE_OPERATION_STATUSES),
         ),
       )
-      .limit(1)
-      .for("update"),
-    tx
-      .select({ id: siteDnsRecords.id })
-      .from(siteDnsRecords)
-      .where(
-        and(
-          eq(siteDnsRecords.projectId, project.id),
-          inArray(siteDnsRecords.status, ACTIVE_DNS_RECORD_STATUSES),
-        ),
+      .for("update")) as Array<{
+      id: string;
+      kind: string;
+      provider: string | null;
+      status: string;
+    }>;
+    if (
+      activeOperationRows.some(
+        (operation) => !knownAliyunWriteOperation(operation),
       )
-      .limit(1)
-      .for("update"),
-  ]);
-  if (activeDeploymentRows.length > 0 || activeDnsRows.length > 0) {
-    return { status: "awaiting_external_reconciliation" as const };
+    ) {
+      return { status: "blocked" as const };
+    }
+    if (activeOperationRows.length > 0) {
+      return { status: "awaiting_external_reconciliation" as const };
+    }
   }
-
-  const sourceBuildId = project.currentBuildId ?? note.sourceBuildId;
-  const { resetOperationId, upgradedNote } =
-    await queueApprovedResetFromLatestCoordinates(tx, {
+  const sourceBuildId = decoupledReset
+    ? note.sourceBuildId
+    : (project.currentBuildId ?? note.sourceBuildId);
+  let queuedReset: Awaited<
+    ReturnType<typeof queueApprovedResetFromLatestCoordinates>
+  >;
+  try {
+    queuedReset = await queueApprovedResetFromLatestCoordinates(tx, {
       ticketId: ticket.id,
       project,
       sourceBuildId,
       knowledgeSnapshotId:
-        project.currentKnowledgeSnapshotId ?? note.knowledgeSnapshotId,
+        decoupledReset?.expectedKnowledgeSnapshotId ??
+        project.currentKnowledgeSnapshotId ??
+        note.knowledgeSnapshotId,
       resetApprovedAt: note.resetApprovedAt,
       minimumKnowledgeSnapshotVersion: note.minimumKnowledgeSnapshotVersion,
+      ...(decoupledReset
+        ? {
+            frozenReset: decoupledReset,
+            resetAppliedProjectRevision: note.resetAppliedProjectRevision,
+            resetAppliedAt: note.resetAppliedAt,
+          }
+        : {}),
       now: input.now,
     });
+  } catch (error) {
+    if (
+      !(error instanceof SiteOpsRebuildTicketError) ||
+      error.code !== "EXTERNAL_ACCESS_REQUIRED"
+    ) {
+      throw error;
+    }
+    const accessNote: SiteOpsRebuildNoteV5 = {
+      ...note,
+      resetActivationState: "awaiting_external_access",
+      awaitingExternalOperationIds: [],
+    };
+    if (note.resetActivationState !== "awaiting_external_access") {
+      const accessUpdate = await tx
+        .update(deliveryTickets)
+        .set({
+          internalNote: JSON.stringify(accessNote),
+          revision: ticket.revision + 1,
+          publicSummary:
+            "官网重置已获批准，等待恢复外部域名访问后继续安全下线。",
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(deliveryTickets.id, ticket.id),
+            eq(deliveryTickets.revision, ticket.revision),
+          ),
+        );
+      if (affectedRows(accessUpdate) !== 1) {
+        throw new Error("SITEOPS_DEFERRED_RESET_ACTIVATION_CAS_CONFLICT");
+      }
+    }
+    return { status: "awaiting_external_access" as const };
+  }
+  const { resetOperationId, upgradedNote } = queuedReset;
   const updated = await tx
     .update(deliveryTickets)
     .set({
@@ -1933,7 +2419,8 @@ export async function activateDeferredApprovedSiteOpsReset(
   return {
     status: "activated" as const,
     resetOperationId,
-    resetExpectedProjectRevision: project.revision,
+    resetExpectedProjectRevision:
+      decoupledReset?.expectedProjectRevision ?? project.revision,
     internalNote: JSON.stringify(upgradedNote),
   };
 }
@@ -2175,7 +2662,11 @@ export async function finalizeApprovedSiteOpsReset(
   ) {
     return { status: "invalidated" as const };
   }
-  if (note.resetAppliedAt && note.resetAppliedProjectRevision) {
+  if (
+    note.resetAppliedAt &&
+    note.resetAppliedProjectRevision &&
+    (note.resetEpochDecoupled !== true || note.externalCleanupCompletedAt)
+  ) {
     return {
       status: "applied" as const,
       projectRevision: note.resetAppliedProjectRevision,
@@ -2184,6 +2675,193 @@ export async function finalizeApprovedSiteOpsReset(
         operationId: input.operation.id,
         projectId: project.id,
         minimumKnowledgeSnapshotVersion: note.minimumKnowledgeSnapshotVersion,
+        resetAppliedProjectRevision: note.resetAppliedProjectRevision,
+      }),
+    };
+  }
+
+  if (note.resetEpochDecoupled === true) {
+    if (
+      !note.resetAppliedAt ||
+      !note.resetAppliedProjectRevision ||
+      note.freshRootApplied !== true ||
+      note.unpublishOperationId !== input.operation.id ||
+      !note.frozenReset ||
+      !approvedResetInputsEqual(note.frozenReset, reset) ||
+      !approvedResetUnpublishFreshEpochMatches(reset, project)
+    ) {
+      return { status: "invalidated" as const };
+    }
+
+    const profileRows = await tx
+      .select({ revision: workspaceSiteProfiles.revision })
+      .from(workspaceSiteProfiles)
+      .where(eq(workspaceSiteProfiles.userId, project.userId))
+      .limit(1)
+      .for("update");
+    if (profileRows[0]) {
+      await tx
+        .update(workspaceSiteProfiles)
+        .set({
+          domain: null,
+          normalizedAsciiDomain: null,
+          unicodeDisplayDomain: null,
+          providerAccountUid: null,
+          domainOwnershipStatus: null,
+          dnsStatus: null,
+          domainStatus: "not_started",
+          domainVerifiedAt: null,
+          siteMode: "unknown",
+          icpDomainRevision: null,
+          icpProvince: null,
+          icpNumber: null,
+          icpStatus: "not_submitted",
+          icpVerifiedAt: null,
+          revision: profileRows[0].revision + 1,
+          updatedAt: input.now,
+        })
+        .where(eq(workspaceSiteProfiles.userId, project.userId));
+    }
+    await tx
+      .delete(siteDnsRecords)
+      .where(
+        and(
+          eq(siteDnsRecords.projectId, project.id),
+          eq(siteDnsRecords.userId, project.userId),
+        ),
+      );
+
+    const previousHeadIdList = [
+      reset.expectedGlobalLiveDeploymentId,
+      reset.expectedMainlandLiveDeploymentId,
+    ].filter((value): value is string => Boolean(value));
+    const previousHeadIds = new Set(previousHeadIdList);
+    const deploymentRows =
+      previousHeadIdList.length === 0
+        ? []
+        : await tx
+            .select({
+              id: siteDeployments.id,
+              status: siteDeployments.status,
+              verification: siteDeployments.verification,
+            })
+            .from(siteDeployments)
+            .where(
+              and(
+                eq(siteDeployments.projectId, project.id),
+                eq(siteDeployments.userId, project.userId),
+                inArray(siteDeployments.id, previousHeadIdList),
+              ),
+            )
+            .for("update");
+    for (const deployment of deploymentRows) {
+      // The query is intentionally scoped to the frozen old live heads. Keep
+      // this defensive check as a second fence for adapters/test doubles that
+      // do not enforce the SQL predicate themselves.
+      if (!previousHeadIds.has(deployment.id)) continue;
+      await tx
+        .update(siteDeployments)
+        .set({
+          status: "superseded",
+          verification: {
+            ...(deployment.verification ?? {}),
+            resetInvalidated: true,
+            resetInvalidatedAt: input.now.toISOString(),
+            resetOperationId: input.operation.id,
+            resetAppliedProjectRevision: note.resetAppliedProjectRevision,
+          },
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(siteDeployments.id, deployment.id),
+            eq(siteDeployments.projectId, project.id),
+            eq(siteDeployments.userId, project.userId),
+          ),
+        );
+    }
+
+    const sequenceRows = await tx
+      .select({ sequence: max(messages.sequence) })
+      .from(messages)
+      .where(eq(messages.conversationId, project.conversationId));
+    await tx.insert(messages).values({
+      id: randomUUID(),
+      conversationId: project.conversationId,
+      userId: project.userId,
+      role: "assistant",
+      content: "旧官网的外部发布与 DNS 下线确认已完成。",
+      sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
+      metadata: {
+        siteOps: {
+          kind: "domain_status",
+          subjectId: input.operation.id,
+          revision: project.revision,
+          status: "resolved",
+          payload: {
+            rebuildTicketId: ticket.id,
+            reset: true,
+            freshRootApplied: true,
+            unpublishCompleted: true,
+          },
+        },
+      },
+    });
+
+    const appliedNote: SiteOpsRebuildNoteV4 = {
+      ...note,
+      externalCleanupCompletedAt: input.now.toISOString(),
+    };
+    const priorTicketStatus = ticket.status;
+    const ticketUpdate = await tx
+      .update(deliveryTickets)
+      .set({
+        status: "completed",
+        publicSummary:
+          "官网本地重置与旧网站外部下线均已完成；企业知识库保持不变。",
+        internalNote: JSON.stringify(appliedNote),
+        quotaState: "consumed",
+        technicalDedupeKey: null,
+        resolvedAt: input.now,
+        revision: ticket.revision + 1,
+        updatedAt: input.now,
+      })
+      .where(
+        and(
+          eq(deliveryTickets.id, ticket.id),
+          eq(deliveryTickets.revision, ticket.revision),
+        ),
+      );
+    if (affectedRows(ticketUpdate) !== 1) {
+      throw new Error("SITEOPS_RESET_TICKET_CAS_CONFLICT");
+    }
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      actorUserId: null,
+      actorRole: "system",
+      kind: "delivery_result",
+      visibility: "customer",
+      message: "旧官网外部下线确认完成；全新建站流程保持不受影响。",
+      fromStatus: priorTicketStatus,
+      toStatus: "completed",
+      actorContext: {
+        projectAssignmentId: ticket.assignedProjectAssignmentId!,
+        customerUserId: ticket.userId,
+        roleType: "ai_operations_engineer",
+      },
+      createdAt: input.now,
+    });
+    return {
+      status: "applied" as const,
+      projectRevision: note.resetAppliedProjectRevision,
+      internalNote: JSON.stringify(appliedNote),
+      operationResult: completedFreshRootResetOperationProjection({
+        operationId: input.operation.id,
+        projectId: project.id,
+        minimumKnowledgeSnapshotVersion:
+          appliedNote.minimumKnowledgeSnapshotVersion,
         resetAppliedProjectRevision: note.resetAppliedProjectRevision,
       }),
     };
@@ -2202,7 +2880,7 @@ export async function finalizeApprovedSiteOpsReset(
       globalLiveDeploymentId: null,
       mainlandLiveDeploymentId: null,
       canonicalHostname: null,
-      currentTaskStartedAt: input.now,
+      currentTaskStartedAt: siteOpsResetEpochAtDatabasePrecision(input.now),
       minimumKnowledgeSnapshotVersion: null,
       brief: null,
       status: "draft",

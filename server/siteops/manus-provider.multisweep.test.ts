@@ -34,7 +34,6 @@ import {
 } from "./manus-provider";
 import { siteOpsArtifactIdForIdempotency } from "./artifact-store";
 import { SiteOpsMaterializationError } from "./materialization-error";
-import { ManusV2ApiError } from "../manus-v2-client";
 import {
   createNativeSourceArchive,
   createVisualSelectionBundleV5Artifact,
@@ -168,7 +167,7 @@ function operationMarker(operationToken: string, timestamp: number) {
 }
 
 describe("SiteOps personal-key build multi-sweep integration", () => {
-  it("uses the trusted 2.4 brief fallback when the single content-draft task is unavailable", async () => {
+  it("binds a deterministic 2.6 baseline before the patch task and keeps running prose on GET-only reconciliation", async () => {
     const preview = Buffer.from("frozen-hero-preview", "utf8");
     const realizationPreview = Buffer.from(
       "frozen-host-realization-preview",
@@ -448,10 +447,10 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       };
     });
 
-    const fallbackTaskId = `frontmind-host-fallback:${baseOperation.id}`;
+    const contentTaskId = "manus-content-patch-task";
     const createTask = vi.fn(async () => {
       timeline.push("provider:create");
-      throw new ManusV2ApiError("task.create", 503, "HTTP_503", true, false);
+      return { taskId: contentTaskId };
     });
     const sendMessage = vi.fn(async () => {
       timeline.push("provider:send");
@@ -460,12 +459,16 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       createTask,
       sendMessage,
       findCreatedTask: vi.fn(),
-      taskDetail: vi.fn(async () => {
-        throw new Error("fallback must not poll a provider task");
-      }),
-      listAllMessages: vi.fn(async () => {
-        throw new Error("fallback must not read provider messages");
-      }),
+      taskDetail: vi.fn(async () => ({ status: "running" })),
+      listAllMessages: vi.fn(async () => [
+        operationMarker(`siteops-content:${baseOperation.id}`, 1),
+        {
+          id: "assistant-thinking",
+          type: "assistant_message",
+          timestamp: 2,
+          assistant_message: { content: "正在思考并整理官网内容……" },
+        },
+      ]),
     };
 
     const contractJson = Buffer.from('{"contract":true}', "utf8");
@@ -477,9 +480,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     const materialized = {
       contract: { specHash: "9".repeat(64) },
       buildDelivery: {
-        renderMode: "primary",
-        qaStatus: "passed",
-        warningCodes: [],
+        renderMode: "trusted_fallback" as const,
+        qaStatus: "partial" as const,
+        warningCodes: ["SITEOPS_CONTENT_PATCH_TRUSTED_FALLBACK"],
       },
       contractJson,
       contractSha256: sha256(contractJson),
@@ -501,6 +504,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       timeline.push("materialize");
       expect(input).toMatchObject({
         mode: "preview",
+        forceTrustedFallback: {
+          warningCode: "SITEOPS_CONTENT_PATCH_TRUSTED_FALLBACK",
+        },
         generatedContent: {
           routes: [
             {
@@ -526,21 +532,32 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       }
       return materialized as never;
     });
+    const artifactIds = {
+      "site-contract": "a0000000-0000-4000-8000-000000000001",
+      "site-source": "a0000000-0000-4000-8000-000000000002",
+      "site-dist": "a0000000-0000-4000-8000-000000000003",
+      "site-qa": "a0000000-0000-4000-8000-000000000004",
+      "site-provenance": "a0000000-0000-4000-8000-000000000005",
+    } as const;
     const persistArtifact = vi.fn(
       async (input: { kind: string; buffer: Buffer }) => {
         timeline.push(`persist:${input.kind}`);
         return {
-          id: `asset-${input.kind}`,
+          id: artifactIds[input.kind as keyof typeof artifactIds],
           contentSha256: sha256(input.buffer),
         } as never;
       },
     );
-    const getCredential = vi.fn(async () => ({
-      id: baseOperation.input.manusCredentialId,
-      userId: baseOperation.userId,
-      version: baseOperation.input.manusCredentialVersion,
-      apiKey: "customer-personal-key",
-    }));
+    let providerAvailable = false;
+    const getCredential = vi.fn(async () => {
+      if (!providerAvailable) throw new Error("CREDENTIAL_OFFLINE");
+      return {
+        id: baseOperation.input.manusCredentialId,
+        userId: baseOperation.userId,
+        version: baseOperation.input.manusCredentialVersion,
+        apiKey: "customer-personal-key",
+      };
+    });
     const createClient = vi.fn(() => client as never);
     const assertLeaseActive = vi.fn(async () => {
       timeline.push("lease");
@@ -567,11 +584,18 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     const created = await sweep(buildOperation);
     expect(created).toMatchObject({
       status: "pending",
-      providerTaskId: fallbackTaskId,
+      buildStatus: "qa_running",
       result: {
         stage: "content_pending",
-        taskId: fallbackTaskId,
-        providerDraftUnavailable: true,
+        buildCheckpoint: "artifacts_staged",
+        fallbackPreview: {
+          status: "staged",
+          operationToken: `siteops-content-baseline:${baseOperation.id}`,
+          buildDelivery: {
+            renderMode: "trusted_fallback",
+            qaStatus: "partial",
+          },
+        },
         design: {
           designSpec: {
             schemaVersion: 2,
@@ -580,58 +604,124 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         },
       },
     });
+    expect(created.providerTaskId).toBeUndefined();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    expect(materializeSite).toHaveBeenCalledTimes(2);
+    expect(persistArtifact).toHaveBeenCalledTimes(5);
+
+    const stagedState = created.result as Record<string, any>;
+    const resumedStaging = await sweep(
+      operationWithState(buildOperation, null, stagedState) as never,
+    );
+    expect(resumedStaging).toMatchObject({
+      status: "pending",
+      buildStatus: "qa_running",
+      result: {
+        buildCheckpoint: "artifacts_staged",
+        fallbackPreview: { status: "staged" },
+      },
+    });
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    expect(materializeSite).toHaveBeenCalledTimes(2);
+    expect(persistArtifact).toHaveBeenCalledTimes(5);
+
+    Object.assign(context.build, {
+      contractLocalAssetId: artifactIds["site-contract"],
+    });
+    const partialBinding = await sweep(
+      operationWithState(buildOperation, null, stagedState) as never,
+    );
+    expect(partialBinding).toMatchObject({
+      status: "attention_required",
+      code: "BUILD_ARTIFACT_BINDING_FAILED",
+    });
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    Object.assign(context.build, { contractLocalAssetId: null });
+
+    providerAvailable = true;
+    const boundState = {
+      ...stagedState,
+      fallbackPreview: {
+        ...stagedState.fallbackPreview,
+        status: "bound",
+      },
+    };
+    Object.assign(context.build, {
+      status: "qa_running",
+      contractLocalAssetId: artifactIds["site-contract"],
+      sourceLocalAssetId: artifactIds["site-source"],
+      distLocalAssetId: artifactIds["site-dist"],
+      qaLocalAssetId: artifactIds["site-qa"],
+      provenanceLocalAssetId: artifactIds["site-provenance"],
+    });
+
+    const taskCreated = await sweep(
+      operationWithState(buildOperation, null, boundState) as never,
+    );
+    expect(taskCreated).toMatchObject({
+      status: "pending",
+      providerTaskId: contentTaskId,
+      buildStatus: "qa_running",
+      result: {
+        stage: "content_pending",
+        taskId: contentTaskId,
+        fallbackPreview: { status: "bound" },
+      },
+    });
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(createTask.mock.calls[0]![0]).toMatchObject({
       agentProfile: "manus-1.6",
     });
-    expect(createTask.mock.calls[0]![0].prompt).toContain("SiteContentDraftV1");
+    expect(createTask.mock.calls[0]![0].prompt).toContain(
+      "SiteContentPatchWireV1",
+    );
     expect(createTask.mock.calls[0]![0].prompt).not.toContain("SiteDesignWire");
+    expect(createTask.mock.calls[0]![0].attachments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          filename: "frontmind-site-content-slot-manifest-v1.json",
+        }),
+      ]),
+    );
     expect(
       JSON.stringify(createTask.mock.calls[0]![0].structuredOutputSchema),
     ).not.toMatch(/(?:layoutArchetype|routeSlots|palette|component)/u);
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(materializeSite).not.toHaveBeenCalled();
 
     timeline.length = 0;
-    const leaseCallsBeforeFinal = assertLeaseActive.mock.calls.length;
-    const finished = await sweep(
+    const twentyMinutesAgo = new Date(Date.now() - 20 * 60_000);
+    const runningState = {
+      ...(taskCreated.result as Record<string, any>),
+      phaseOperationToken: `siteops-content:${baseOperation.id}`,
+      phaseStartedAt: twentyMinutesAgo.toISOString(),
+      lastContractProgressAt: undefined,
+    };
+    const stillReconciling = await sweep(
       operationWithState(
-        buildOperation,
-        fallbackTaskId,
-        created.result,
+        {
+          ...buildOperation,
+          startedAt: twentyMinutesAgo,
+          createdAt: twentyMinutesAgo,
+        } as never,
+        contentTaskId,
+        runningState,
       ) as never,
     );
 
-    expect(finished).toMatchObject({
-      status: "succeeded",
-      providerTaskId: fallbackTaskId,
-      projectStatus: "preview_ready",
-      buildStatus: "preview_ready",
+    expect(stillReconciling).toMatchObject({
+      status: "pending",
+      providerTaskId: contentTaskId,
+      buildStatus: "qa_running",
+      nextPollMs: 300_000,
       result: {
-        buildId: baseOperation.buildId,
-        specHash: materialized.contract.specHash,
-        distHash: materialized.distSha256,
-        artifactIds: {
-          contract: "asset-site-contract",
-          source: "asset-site-source",
-          dist: "asset-site-dist",
-          qa: "asset-site-qa",
-          provenance: "asset-site-provenance",
-        },
-        artifactBindings: {
-          contract: {
-            id: "asset-site-contract",
-            sha256: materialized.contractSha256,
-            bytes: contractJson.length,
-            mimeType: "application/json",
-          },
-          source: {
-            id: "asset-site-source",
-            sha256: materialized.sourceSha256,
-            bytes: sourceZip.length,
-            mimeType: "application/zip",
-          },
-        },
+        stage: "content_pending",
+        buildPhase: "provider_sync_delayed",
+        fallbackPreview: { status: "bound" },
       },
     });
     expect(remotePreview.fetchPinnedPublicHttps).not.toHaveBeenCalled();
@@ -650,6 +740,8 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
 
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
+    expect(client.taskDetail).toHaveBeenCalledTimes(1);
+    expect(client.listAllMessages).toHaveBeenCalledTimes(1);
     expect(context.build.repairAttempts).toBe(0);
     expect(getCredential).toHaveBeenCalledTimes(2);
     expect(
@@ -667,21 +759,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       ),
     ).toBe(true);
 
-    const finalLeaseCalls =
-      assertLeaseActive.mock.calls.length - leaseCallsBeforeFinal;
-    expect(finalLeaseCalls).toBeGreaterThanOrEqual(5);
-    const materializeIndex = timeline.indexOf("materialize");
-    const firstLeaseIndex = timeline.indexOf("lease");
-    const lastPersistIndex = Math.max(
-      ...timeline.map((entry, index) =>
-        entry.startsWith("persist:") ? index : -1,
-      ),
+    expect(buildWrites.some((write) => write.status === "qa_running")).toBe(
+      true,
     );
-    const finalLeaseIndex = timeline.lastIndexOf("lease");
-    expect(firstLeaseIndex).toBeGreaterThanOrEqual(0);
-    expect(materializeIndex).toBeGreaterThan(firstLeaseIndex);
-    expect(finalLeaseIndex).toBeGreaterThan(lastPersistIndex);
-    expect(timeline).toContain("db:qa_running");
   });
 
   it("binds the selected V5 source ZIP through Manus receipt, native materialization, and persisted preview", async () => {
@@ -1121,11 +1201,34 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     expect(created).toMatchObject({
       status: "pending",
       providerTaskId: taskId,
-      result: { stage: "native_source_pending", nativeRepairAttempt: 0 },
+      result: {
+        stage: "native_source_pending",
+        nativeRepairAttempt: 0,
+        buildPhase: "source_waiting",
+      },
     });
     const createInput = createTask.mock.calls[0]![0] as any;
     expect(createInput.prompt).toContain("不是视觉设计师");
     expect(createInput.prompt).toContain(selectedBaseSha256);
+    expect(createInput.prompt).toContain("preflightStatus=passed");
+    expect(createInput.prompt).toContain("恰好返回这一个 ZIP 和一个 Receipt");
+    const preflightAttachment = createInput.attachments.find(
+      (item: any) => item.filename === "frontmind-native-preflight-v1.mjs",
+    );
+    expect(preflightAttachment.mime_type).toBe("text/javascript");
+    expect(
+      Buffer.from(
+        preflightAttachment.file_data.split(",", 2)[1],
+        "base64",
+      ).toString("utf8"),
+    ).toContain("PREFLIGHT_BUILD_FAILED");
+    expect(createInput.structuredOutputSchema.required).toEqual(
+      expect.arrayContaining([
+        "preflightVersion",
+        "preflightStatus",
+        "preflightSha256",
+      ]),
+    );
     const baseAttachment = createInput.attachments.find(
       (item: any) => item.filename === "frontmind-selected-21st-source-v1.zip",
     );

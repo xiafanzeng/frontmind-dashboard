@@ -1018,8 +1018,8 @@ const buildPlanContractV4BaseSchema = buildPlanContractV3BaseSchema
       .object({
         kind: z.literal("react_static_v2"),
         reactVersion: z.literal("19.2.1"),
-        componentLibraryVersion: z.enum(["2.2.0", "2.3.0", "2.4.0"]),
-        materializerVersion: z.enum(["2.2.0", "2.3.0", "2.4.0"]),
+        componentLibraryVersion: z.enum(["2.2.0", "2.3.0", "2.4.0", "2.6.0"]),
+        materializerVersion: z.enum(["2.2.0", "2.3.0", "2.4.0", "2.6.0"]),
       })
       .strict(),
     content: contentContractCoordinatesV4Schema,
@@ -1051,9 +1051,11 @@ function validateBuildContractV4Coordinates(
   }
   const workflowVersion = value.workflow.version;
   const expectedQaPolicyVersion =
-    workflowVersion === "2.4.0" ? "siteops-qa-v5" : "siteops-qa-v4";
+    workflowVersion === "2.4.0" || workflowVersion === "2.6.0"
+      ? "siteops-qa-v5"
+      : "siteops-qa-v4";
   if (
-    !["2.2.0", "2.3.0", "2.4.0"].includes(workflowVersion) ||
+    !["2.2.0", "2.3.0", "2.4.0", "2.6.0"].includes(workflowVersion) ||
     value.workflow.starterVersion !== workflowVersion ||
     value.workflow.componentLibraryVersion !== workflowVersion ||
     value.workflow.materializerVersion !== workflowVersion ||

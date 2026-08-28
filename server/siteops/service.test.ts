@@ -23,13 +23,14 @@ import {
   projectSiteOpsBuildProgress,
   projectSiteOpsCurrentResetCycle,
   referenceBlueprintForSiteOpsRevision,
-  requireTwentyFirstTemplateAdmission,
+  requireTwentyFirstReferenceAdmission,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
   runSiteOpsObservationQueries,
   runSiteOpsObservationSingleFlight,
   siteBriefFromSnapshot,
   siteOpsServiceErrorFromQuota,
+  siteOpsResetPendingBlocksAction,
   siteOpsVisualSelectionRecovery,
   SiteOpsServiceError,
   visualSearchAllowedForProjectStatus,
@@ -38,36 +39,67 @@ import {
 import { SiteOpsQuotaError } from "./quota-service";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
+  SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_MATERIALIZER_V2_5,
+  SITEOPS_MATERIALIZER_V2_6,
   SITEOPS_WORKFLOW,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
   siteOpsSendMessageInputSchema,
 } from "../../shared/siteops";
-import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
+import {
+  SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE,
+  siteOpsBuildProjectionSchema,
+} from "../../shared/siteops-contract";
 import {
   referenceBlueprintV3ForFamily,
   referenceBlueprintV4ForFamily,
 } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
-  it("admits visual work only for the exact ready Template credential", () => {
+  it("allows local work in a fresh reset epoch while external writes remain gated", () => {
+    for (const action of [
+      "select_snapshot",
+      "start_visual_search",
+      "reselect_visual",
+      "select_visual",
+      "delegate_visual",
+      "request_revision",
+      "create_wechat_package",
+      "create_xiaohongshu_package",
+    ] as const) {
+      expect(siteOpsResetPendingBlocksAction(action)).toBe(false);
+    }
+    for (const action of [
+      "request_rebuild",
+      "publish_global",
+      "publish_mainland",
+      "rollback",
+      "domain_sync",
+    ] as const) {
+      expect(siteOpsResetPendingBlocksAction(action)).toBe(true);
+    }
+  });
+
+  it("admits the host-owned visual-reference path without Template download readiness", () => {
     expect(
-      requireTwentyFirstTemplateAdmission({
+      requireTwentyFirstReferenceAdmission({
         configured: true,
         version: 7,
         fingerprint: "fingerprint",
-        nativeTemplateReadiness: "ready",
+        capabilities: { search: true },
+        nativeTemplateReadiness: "plan_ineligible",
       } as never),
     ).toEqual({ version: 7, fingerprint: "fingerprint" });
     expect(() =>
-      requireTwentyFirstTemplateAdmission({
+      requireTwentyFirstReferenceAdmission({
         configured: true,
         version: 7,
         fingerprint: "fingerprint",
-        nativeTemplateReadiness: "plan_ineligible",
+        capabilities: { search: false },
+        nativeTemplateReadiness: "ready",
       } as never),
-    ).toThrow(/下载权限/u);
+    ).toThrow(/视觉参考检索/u);
   });
 
   it("recognizes complete-template V6 metadata without legacy visual evidence", () => {
@@ -200,6 +232,61 @@ describe("SiteOps core contracts", () => {
     });
   });
 
+  it("projects a validated content-patch delivery as a formal preview", () => {
+    expect(
+      projectSiteOpsBuildDelivery({
+        buildId: "build-content-patch",
+        operations: [
+          {
+            buildId: "build-content-patch",
+            kind: "site_build",
+            status: "succeeded",
+            result: {
+              buildDelivery: {
+                renderMode: "content_patch",
+                qaStatus: "passed",
+                warningCodes: [],
+              },
+            },
+          },
+        ],
+      }),
+    ).toEqual({
+      renderMode: "content_patch",
+      qaStatus: "passed",
+      warningCodes: [],
+    });
+  });
+
+  it("projects partial content-patch defaults as fixed public preview copy", () => {
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: "build-content-patch-defaults",
+        operations: [
+          {
+            buildId: "build-content-patch-defaults",
+            kind: "site_build",
+            status: "succeeded",
+            result: {
+              buildDelivery: {
+                renderMode: "content_patch",
+                qaStatus: "passed_with_warnings",
+                warningCodes: [
+                  SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE,
+                  "INTERNAL_PROVIDER_SLOT_DETAIL_MUST_NOT_LEAK",
+                ],
+              },
+            },
+          },
+        ],
+      }),
+    ).toEqual({
+      buildPhase: null,
+      recoverable: false,
+      previewWarning: "官网预览已生成，部分内容使用企业资料中的可信默认值。",
+    });
+  });
+
   it("exposes a bound trusted fallback while its original task keeps running", () => {
     const fallbackBuildId = "30000000-0000-4000-8000-000000000003";
     const artifactBindings = Object.fromEntries(
@@ -269,6 +356,25 @@ describe("SiteOps core contracts", () => {
     expect(
       projectSiteOpsBuildProgress({
         buildId: fallbackBuildId,
+        operations: [
+          {
+            ...operation,
+            providerTaskId: null,
+            result: {
+              ...operation.result,
+              taskId: undefined,
+            },
+          },
+        ],
+      }),
+    ).toMatchObject({
+      buildPhase: "provider_sync_delayed",
+      recoverable: true,
+      previewWarning: expect.stringContaining("基础预览"),
+    });
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: fallbackBuildId,
         operations: [{ ...operation, status: "attention_required" }],
       }),
     ).toMatchObject({
@@ -278,6 +384,28 @@ describe("SiteOps core contracts", () => {
   });
 
   it("projects recoverable native repair and provider sync phases", () => {
+    expect(
+      projectSiteOpsBuildProgress({
+        buildId: "build-waiting",
+        operations: [
+          {
+            buildId: "build-waiting",
+            kind: "site_build",
+            status: "running",
+            providerTaskId: "manus-task-waiting",
+            result: {
+              schemaVersion: 2,
+              stage: "native_source_pending",
+              buildPhase: "source_waiting",
+            },
+          },
+        ],
+      }),
+    ).toMatchObject({
+      buildPhase: "source_waiting",
+      recoverable: true,
+      previewWarning: expect.stringContaining("可信默认内容"),
+    });
     expect(
       projectSiteOpsBuildProgress({
         buildId: "build-1",
@@ -781,13 +909,13 @@ describe("SiteOps core contracts", () => {
     ).toThrow("所选视觉方案已失效");
   });
 
-  it("freezes every new root or revision build to the current complete workflow coordinates", () => {
+  it("freezes every new root or revision build to the host-owned content-patch workflow", () => {
     expect(currentSiteOpsBuildWorkflowCoordinates()).toEqual({
-      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_5.upstreamVersion,
-      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_5.upstreamSha256,
-      workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
-      workflowPackageHash: SITEOPS_MATERIALIZER_V2_5.runtimeManifestSha256,
-      starterVersion: SITEOPS_MATERIALIZER_V2_5.starterVersion,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_6.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_6.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_6.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_6.starterVersion,
     });
   });
 
@@ -797,9 +925,19 @@ describe("SiteOps core contracts", () => {
     );
     expect(() =>
       assertCurrentVisualWorkflowVersion(
-        SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+        SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
       ),
     ).not.toThrow();
+    expect(() =>
+      assertCurrentVisualWorkflowVersion(
+        SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+      ),
+    ).toThrow("视觉检索使用的建站合同已升级");
+    expect(() =>
+      assertCurrentVisualWorkflowVersion(
+        SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
+      ),
+    ).toThrow("视觉检索使用的建站合同已升级");
   });
 
   it("creates a strict four-field visual operation without a Manus credential", () => {
@@ -1654,7 +1792,7 @@ describe("SiteOps core contracts", () => {
             knowledgeSnapshotId: snapshotId,
             credentialId: pinnedCredentialId,
             credentialVersion: 7,
-            workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+            workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
           },
         },
       ],

@@ -175,10 +175,7 @@ export const SITEOPS_MATERIALIZER_V2_3 = {
   qaPolicyVersion: "siteops-qa-v4",
 } as const;
 
-/** React Static 2.4 removes provider-owned design entirely. Manus returns one
- * lossy SiteContentDraftV1; Dashboard creates every route, slot, palette and
- * responsive coordinate, canonicalizes content and owns both the primary and
- * no-JavaScript trusted fallback renderers. */
+/** Immutable 2.4 content-draft coordinates retained for historical builds. */
 export const SITEOPS_MATERIALIZER_V2_4 = {
   upstreamVersion: "1.0.0",
   upstreamSha256:
@@ -195,6 +192,9 @@ export const SITEOPS_MATERIALIZER_V2_4 = {
     "58b09dd2789ba1aad6a66a8824fef2ab36bf2d5a8488df4248142f019283fed1",
   qaPolicyVersion: "siteops-qa-v5",
 } as const;
+
+/** Compatibility alias used by the exact source-replay registry. */
+export const SITEOPS_MATERIALIZER_V2_4_LEGACY = SITEOPS_MATERIALIZER_V2_4;
 
 /** Native React 2.5 freezes the complete 21st source/Demo/CSS/dependency
  * bundle, asks Manus for one complete source archive, and compiles that
@@ -216,9 +216,28 @@ export const SITEOPS_MATERIALIZER_V2_5 = {
   qaPolicyVersion: "siteops-native-qa-v1",
 } as const;
 
-/** Host-rendered historical default retained for immutable V1-V4 readers.
- * New SiteOps roots are explicitly pinned to V2.5 by the service boundary. */
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_4;
+/** Host-owned immutable baseline. Manus may only return SiteContentPatchV1;
+ * it cannot modify source, routes, components, styles, dependencies or paths. */
+export const SITEOPS_MATERIALIZER_V2_6 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "2.6.0",
+  runtimeManifestSha256:
+    "452b2738d73ad3c9a55438da6c3fd3cb5919b682b1524c0226d03459d8a20455",
+  starterVersion: "2.6.0",
+  starterSha256:
+    "4c862312094f62e9ab01c265ec9504ddbe470a76af9eb5da4d614316095a288d",
+  componentLibraryVersion: "2.6.0",
+  materializerVersion: "2.6.0",
+  materializerSha256:
+    "88671cbe362cdab533b081e4af71680175bb648c112fd923e7cbaf3110431680",
+  qaPolicyVersion: "siteops-qa-v5",
+} as const;
+
+/** Current host-owned SiteContentPatch workflow for every newly admitted root.
+ * V2.5 remains registered only so already-frozen Native operations can be read. */
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_6;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -232,6 +251,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_3.frontMindVersion]: SITEOPS_MATERIALIZER_V2_3,
   [SITEOPS_MATERIALIZER_V2_4.frontMindVersion]: SITEOPS_MATERIALIZER_V2_4,
   [SITEOPS_MATERIALIZER_V2_5.frontMindVersion]: SITEOPS_MATERIALIZER_V2_5,
+  [SITEOPS_MATERIALIZER_V2_6.frontMindVersion]: SITEOPS_MATERIALIZER_V2_6,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {

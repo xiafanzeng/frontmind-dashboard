@@ -39,12 +39,14 @@ import {
   SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
+  SITEOPS_MATERIALIZER_V2_4_LEGACY,
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
 } from "../../shared/siteops";
 import { canonicalJson } from "../../shared/siteops-workflow";
+import { SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE } from "../../shared/siteops-contract";
 import {
   assertVisualPaletteContrastV3,
   canonicalSiteOpsSha256,
@@ -110,6 +112,7 @@ type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V2_1
   | typeof SITEOPS_MATERIALIZER_V2_2
   | typeof SITEOPS_MATERIALIZER_V2_3
+  | typeof SITEOPS_MATERIALIZER_V2_4_LEGACY
   | typeof SITEOPS_WORKFLOW;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
@@ -169,6 +172,16 @@ function reactStaticCoordinatesForWorkflow(
       componentLibraryVersion:
         SITEOPS_MATERIALIZER_V2_3.componentLibraryVersion,
       materializerVersion: SITEOPS_MATERIALIZER_V2_3.materializerVersion,
+    } as const;
+  }
+  if (
+    workflow.frontMindVersion ===
+    SITEOPS_MATERIALIZER_V2_4_LEGACY.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_4_LEGACY.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_4_LEGACY.materializerVersion,
     } as const;
   }
   if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
@@ -328,6 +341,11 @@ export const siteOpsFrozenRuntimeInputSchema = z
     ]),
     designSpec: z.union([siteDesignSpecV2Schema, siteDesignSpecV1Schema]),
     generatedContent: siteOpsGeneratedContentSchema,
+    /** Present only when a validated SiteContentPatchV1 was applied to the
+     * immutable 2.4 baseline. Optional fields preserve every older source
+     * archive as an exact read-only input. */
+    renderMode: z.literal("content_patch").optional(),
+    contentPatchUsesTrustedDefaults: z.boolean().optional(),
     assetDecisions: z.array(siteOpsAssetDecisionSchema).max(500),
     brandAsset: z
       .object({
@@ -413,12 +431,19 @@ export type MaterializeAstroSiteInput = {
   brandAsset?: TrustedSiteBrandAsset | null;
   timeoutMs?: number;
   abortSignal?: AbortSignal;
-  /** Internal-only escape hatch for a native 2.5 first build whose bound
-   * provider task cannot currently yield safe source. The supplied code is a
-   * diagnostic coordinate, never provider content. */
+  /** Internal-only escape hatch for a first build whose provider result
+   * cannot safely alter the host baseline. The supplied code is a diagnostic
+   * coordinate, never provider content. */
   forceTrustedFallback?: {
     warningCode: string;
   };
+  /** A validated SiteContentPatchV1 changed content slots on the immutable
+   * host baseline. Rendering remains the same trusted local build path; this
+   * marker only makes the public delivery provenance explicit. */
+  renderModeOverride?: "content_patch";
+  /** At least one invalid patch child retained its frozen Brief value. This
+   * marker is public-safe; individual slot/provider diagnostics stay private. */
+  contentPatchUsesTrustedDefaults?: boolean;
 };
 
 export type SiteOpsQaReport = {
@@ -454,7 +479,7 @@ export type SiteOpsQaWarning = {
 };
 
 export type SiteOpsBuildDelivery = {
-  renderMode: "primary" | "trusted_fallback";
+  renderMode: "primary" | "content_patch" | "trusted_fallback";
   qaStatus: "passed" | "passed_with_warnings" | "partial";
   warningCodes: string[];
 };
@@ -1285,7 +1310,12 @@ function cssForMaterializer(
   design: SiteOpsDesignSpec,
   workflow: SiteOpsMaterializerCoordinates,
 ) {
-  return workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+  // 2.4 originally shipped with this visual CSS. Keep it on the same source
+  // selector as the current host-owned workflow so production replay remains
+  // byte-compatible; Native 2.5 is intentionally not admitted here.
+  return workflow.frontMindVersion ===
+    SITEOPS_MATERIALIZER_V2_4_LEGACY.frontMindVersion ||
+    workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
     ? cssForVisual(visual, design)
     : cssForVisualLegacy(visual, design);
 }
@@ -1841,6 +1871,8 @@ function buildTrustedReactSource(input: {
     files,
     "src/component-library.mjs",
     input.workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion ||
+      input.workflow.frontMindVersion ===
+        SITEOPS_MATERIALIZER_V2_4_LEGACY.frontMindVersion ||
       input.workflow.frontMindVersion ===
         SITEOPS_MATERIALIZER_V2_3.frontMindVersion
       ? TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE
@@ -3725,6 +3757,13 @@ async function materializeSiteWithWorkflow(
   renderer: SiteRenderer,
 ): Promise<MaterializedAstroSite> {
   assertNotAborted(input.abortSignal);
+  if (
+    (input.contentPatchUsesTrustedDefaults &&
+      input.renderModeOverride !== "content_patch") ||
+    (input.forceTrustedFallback && input.renderModeOverride)
+  ) {
+    throw new Error("SITEOPS_CONTENT_PATCH_DELIVERY_INTENT_INVALID");
+  }
   const reactCoordinates = isReactStaticRenderer(renderer)
     ? reactStaticCoordinatesForWorkflow(workflow)
     : null;
@@ -3836,11 +3875,16 @@ async function materializeSiteWithWorkflow(
                 kind: REACT_STATIC_RENDERER,
                 reactVersion: REACT_STATIC_REACT_VERSION,
                 componentLibraryVersion: reactCoordinates!
-                  .componentLibraryVersion as "2.2.0" | "2.3.0" | "2.4.0",
+                  .componentLibraryVersion as
+                  | "2.2.0"
+                  | "2.3.0"
+                  | "2.4.0"
+                  | "2.6.0",
                 materializerVersion: reactCoordinates!.materializerVersion as
                   | "2.2.0"
                   | "2.3.0"
-                  | "2.4.0",
+                  | "2.4.0"
+                  | "2.6.0",
               },
               content: {
                 schemaVersion: 2,
@@ -3940,12 +3984,22 @@ async function materializeSiteWithWorkflow(
         visual: validated.visual,
         designSpec: validated.designSpec,
         generatedContent: validated.generatedContent,
+        ...(input.renderModeOverride === "content_patch"
+          ? {
+              renderMode: "content_patch" as const,
+              ...(input.contentPatchUsesTrustedDefaults
+                ? { contentPatchUsesTrustedDefaults: true }
+                : {}),
+            }
+          : {}),
         assetDecisions: validated.assetDecisions,
         brandAsset: freezeSiteBrandAsset(validated.brandAsset),
       }),
   });
   let renderMode: SiteOpsBuildDelivery["renderMode"] =
-    input.forceTrustedFallback ? "trusted_fallback" : "primary";
+    input.forceTrustedFallback
+      ? "trusted_fallback"
+      : (input.renderModeOverride ?? "primary");
   const renderWarnings: SiteOpsQaWarning[] = [];
   if (input.forceTrustedFallback) {
     renderWarnings.push(
@@ -3953,6 +4007,18 @@ async function materializeSiteWithWorkflow(
         phase: "react_static_build",
         code: input.forceTrustedFallback.warningCode,
         checkId: "native-provider:trusted-fallback",
+      }),
+    );
+  }
+  if (
+    input.renderModeOverride === "content_patch" &&
+    input.contentPatchUsesTrustedDefaults
+  ) {
+    renderWarnings.push(
+      browserQaWarning({
+        phase: "react_static_build",
+        code: SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE,
+        checkId: "content-patch:trusted-defaults",
       }),
     );
   }
@@ -4587,6 +4653,19 @@ function materializeReactStaticSiteV2_4(input: MaterializeAstroSiteInput) {
   );
 }
 
+/** Reader-only compatibility materializer for source archives frozen before
+ * SiteContentPatchV1 added delivery provenance to the 2.4 runtime. New builds
+ * never select these coordinates through `siteOpsWorkflowForVersion`. */
+function materializeReactStaticSiteV2_4Legacy(
+  input: MaterializeAstroSiteInput,
+) {
+  return materializeSiteWithWorkflow(
+    input,
+    SITEOPS_MATERIALIZER_V2_4_LEGACY,
+    REACT_STATIC_RENDERER,
+  );
+}
+
 const productionMaterializerRegistry = [
   {
     workflow: SITEOPS_MATERIALIZER_V1_2,
@@ -4632,6 +4711,11 @@ const productionMaterializerRegistry = [
     workflow: SITEOPS_MATERIALIZER_V2_3,
     renderer: REACT_STATIC_RENDERER,
     materialize: materializeReactStaticSiteV2_3,
+  },
+  {
+    workflow: SITEOPS_MATERIALIZER_V2_4_LEGACY,
+    renderer: REACT_STATIC_RENDERER,
+    materialize: materializeReactStaticSiteV2_4Legacy,
   },
   {
     workflow: SITEOPS_WORKFLOW,
@@ -4707,6 +4791,12 @@ export async function materializeProductionSiteFromSource(input: {
   }
   const frozen = siteOpsFrozenRuntimeInputSchema.parse(rawRuntime);
   if (
+    frozen.contentPatchUsesTrustedDefaults &&
+    frozen.renderMode !== "content_patch"
+  ) {
+    throw new Error("SITEOPS_FROZEN_CONTENT_PATCH_INTENT_INVALID");
+  }
+  if (
     frozen.build.knowledgeSnapshotId !== frozen.snapshot.id ||
     frozen.build.knowledgeArchiveHash !== frozen.snapshot.archiveHash ||
     frozen.build.userId !== frozen.snapshot.userId
@@ -4779,6 +4869,14 @@ export async function materializeProductionSiteFromSource(input: {
     canonicalOrigin,
     timeoutMs: input.timeoutMs,
     abortSignal: input.abortSignal,
+    ...(frozen.renderMode === "content_patch"
+      ? {
+          renderModeOverride: "content_patch" as const,
+          ...(frozen.contentPatchUsesTrustedDefaults
+            ? { contentPatchUsesTrustedDefaults: true }
+            : {}),
+        }
+      : {}),
   });
   return {
     contractJson: materialized.contractJson,

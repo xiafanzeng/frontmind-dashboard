@@ -2488,7 +2488,7 @@ describe("Manus v2 canonical task writer fence", () => {
     });
   });
 
-  it("keeps a contract-v2 initial task waiting while the exact Provider task is running", async () => {
+  it("keeps a contract-v2 initial task waiting inside the healthy no-progress window", async () => {
     const leaseToken = "materialized-completion-deadline-lease";
     const activeTurn = turn({
       operationType: "start",
@@ -2550,7 +2550,7 @@ describe("Manus v2 canonical task writer fence", () => {
           turnId: activeTurn.id,
           leaseToken,
           status: "running",
-          now: new Date("2026-08-01T03:00:00.000Z"),
+          now: new Date("2026-08-01T00:14:59.000Z"),
         },
         harness.executor,
       ),
@@ -2565,6 +2565,102 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(
       (harness.store.turns[0]?.metadata as any).materializedCompletion,
     ).not.toHaveProperty("statusDeadlineAt");
+  });
+
+  it("makes a healthy materialized task resettable after fifteen minutes without machine-contract progress", async () => {
+    const leaseToken = "materialized-completion-no-progress-lease";
+    const activeTurn = turn({
+      operationType: "start",
+      expectedLeafId: null,
+      status: "running",
+      upstreamTaskId: "completion-task",
+      startedAt: new Date("2026-08-01T00:00:00.000Z"),
+      leaseExpiresAt: new Date("2026-08-01T01:00:00.000Z"),
+      metadata: {
+        attachmentsFrozen: true,
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        createAttemptState: "acknowledged",
+        providerAttemptState: "output_pending",
+        operationToken: "operation-1",
+        materializedCompletion: {
+          schemaVersion: 1,
+          lastStatus: "running",
+          statusFirstObservedAt: "2026-08-01T00:00:00.000Z",
+          activeRunningMs: 14 * 60_000,
+          runningObservedAt: "2026-08-01T00:14:00.000Z",
+        },
+      },
+    });
+    const current = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === activeTurn.id);
+    const harness = createTurnServiceExecutor({
+      build: build({
+        executionMode: "materialized_bundle_v1",
+        skillVersion: "5",
+        contentVersion: 0,
+        handoffProvenance: {
+          materializedRecoveryContractVersion: 1,
+          materializedCompletionContractVersion: 2,
+        },
+        upstreamTaskId: "completion-task",
+        canonicalTaskId: null,
+        status: "researching",
+      }),
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: 1,
+        projectAssignmentId: null,
+        deletedAt: null,
+        status: "running",
+        deletedMessageIds: [],
+        version: 2,
+      },
+      turns: [activeTurn],
+      turnSelections: [[current]],
+    });
+
+    await expect(
+      deferKnowledgeBaseMaterializedProviderStatus(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          status: "running",
+          now: new Date("2026-08-01T00:15:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      state: "unavailable",
+      turn: {
+        status: "failed",
+        providerAttemptState: "result_rejected",
+        recoveryAction: "approve_reset",
+      },
+    });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      errorCode: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+      metadata: {
+        canRegenerate: false,
+        materializedCompletion: {
+          activeRunningMs: 15 * 60_000,
+          lastStatus: "running",
+        },
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      status: "protocol_error",
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+    });
   });
 
   it("retains one 24-hour interruption window for waiting to exact quota and clears a lost candidate", async () => {
@@ -2857,7 +2953,7 @@ describe("Manus v2 canonical task writer fence", () => {
     },
   );
 
-  it("keeps a revision waiting while the exact Provider task is running", async () => {
+  it("keeps a revision waiting inside the healthy no-progress window", async () => {
     const leaseToken = "materialized-completion-revision-deadline-lease";
     const activeTurn = turn({
       operationType: "revise",
@@ -2915,7 +3011,7 @@ describe("Manus v2 canonical task writer fence", () => {
           turnId: activeTurn.id,
           leaseToken,
           status: "running",
-          now: new Date("2026-08-01T01:30:00.000Z"),
+          now: new Date("2026-08-01T00:14:59.000Z"),
         },
         harness.executor,
       ),

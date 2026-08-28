@@ -246,27 +246,36 @@ function databaseFixture() {
 function trustedFallbackResult(
   artifactBindings: ReturnType<typeof databaseFixture>["artifactBindings"],
   status: "staged" | "bound" = "staged",
+  taskId: string | null = "customer-private-task-1",
+  kind: "native" | "content" = "native",
 ) {
   return {
     schemaVersion: 2,
-    stage: "native_source_pending",
+    stage: kind === "content" ? "content_pending" : "native_source_pending",
     buildPhase: "provider_sync_delayed",
     fallbackPreview: {
       status,
-      trigger: "provider_read_delayed",
+      trigger:
+        kind === "content" ? "initial_baseline" : "provider_read_delayed",
       createdAt: "2026-08-27T00:15:00.000Z",
       reconcileUntilAt: "2026-08-28T00:00:00.000Z",
       buildId: "30000000-0000-4000-8000-000000000003",
-      taskId: "customer-private-task-1",
+      taskId,
       operationToken:
-        "siteops-native-fallback:10000000-0000-4000-8000-000000000001",
+        kind === "content"
+          ? "siteops-content-baseline:10000000-0000-4000-8000-000000000001"
+          : "siteops-native-fallback:10000000-0000-4000-8000-000000000001",
       selectedPreviewSha256: "a".repeat(64),
       selectedSourceTreeSha256: "b".repeat(64),
       artifactBindings,
       buildDelivery: {
         renderMode: "trusted_fallback",
         qaStatus: "partial",
-        warningCodes: ["NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK"],
+        warningCodes: [
+          kind === "content"
+            ? "SITEOPS_CONTENT_PATCH_TRUSTED_FALLBACK"
+            : "NATIVE_PROVIDER_SYNC_TRUSTED_FALLBACK",
+        ],
       },
     },
   };
@@ -501,6 +510,39 @@ describe("SiteOps React/QA terminal transaction", () => {
     });
   });
 
+  it("binds the V6 initial baseline before a Provider task exists", async () => {
+    const fixture = databaseFixture();
+    fixture.operation.kind = "site_build";
+    fixture.operation.providerTaskId = null;
+    fixture.build.upstreamManusTaskId = null;
+    fixture.build.parentBuildId = null;
+    fixture.project.currentBuildId = fixture.build.id;
+    fixture.operation.result = trustedFallbackResult(
+      fixture.artifactBindings,
+      "staged",
+      null,
+    ) as never;
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    const provider = vi.fn();
+    dependencies.getProvider.mockReturnValue(provider);
+
+    await expect(runSiteOpsWorkerSweep({ max: 1 })).resolves.toMatchObject({
+      claimed: 1,
+      deferred: 1,
+    });
+    expect(provider).not.toHaveBeenCalled();
+    expect(fixture.operation).toMatchObject({
+      status: "running",
+      providerTaskId: null,
+      result: { fallbackPreview: { status: "bound", taskId: null } },
+    });
+    expect(fixture.build).toMatchObject({
+      status: "qa_running",
+      contractLocalAssetId: fixture.artifactBindings.contract.id,
+      distLocalAssetId: fixture.artifactBindings.dist.id,
+    });
+  });
+
   it("preserves a staged fallback marker when an explicit artifact verdict needs attention", async () => {
     const fixture = databaseFixture();
     fixture.operation.kind = "site_build";
@@ -649,6 +691,82 @@ describe("SiteOps React/QA terminal transaction", () => {
           write.values.retainUntil instanceof Date,
       ),
     ).toBe(true);
+  });
+
+  it("atomically upgrades a bound 2.6 content baseline to content_patch", async () => {
+    const fixture = databaseFixture();
+    fixture.operation.kind = "site_build";
+    fixture.build.parentBuildId = null;
+    fixture.project.currentBuildId = fixture.build.id;
+    const formalBindings = addFormalArtifactSet(fixture);
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    let sweep = 0;
+    const provider = vi.fn(async () => {
+      sweep += 1;
+      return sweep === 1
+        ? {
+            status: "pending" as const,
+            providerTaskId: "customer-private-task-1",
+            projectStatus: "building" as const,
+            buildStatus: "qa_running" as const,
+            result: trustedFallbackResult(
+              fixture.artifactBindings,
+              "staged",
+              "customer-private-task-1",
+              "content",
+            ),
+          }
+        : {
+            status: "succeeded" as const,
+            providerTaskId: "customer-private-task-1",
+            projectStatus: "preview_ready" as const,
+            buildStatus: "preview_ready" as const,
+            result: {
+              artifactBindings: formalBindings,
+              buildDelivery: {
+                renderMode: "content_patch" as const,
+                qaStatus: "passed" as const,
+                warningCodes: [],
+              },
+            },
+            message: "正式内容补丁预览已完成。",
+          };
+    });
+    dependencies.getProvider.mockReturnValue(provider);
+
+    await expect(runSiteOpsWorkerSweep({ max: 1 })).resolves.toMatchObject({
+      deferred: 1,
+    });
+    expect(fixture.operation.result).toMatchObject({
+      fallbackPreview: {
+        status: "bound",
+        operationToken: `siteops-content-baseline:${fixture.operation.id}`,
+      },
+    });
+    expect(fixture.build.contractLocalAssetId).toBe(
+      fixture.artifactBindings.contract.id,
+    );
+
+    await expect(runSiteOpsWorkerSweep({ max: 1 })).resolves.toMatchObject({
+      succeeded: 1,
+    });
+    expect(provider).toHaveBeenCalledTimes(2);
+    expect(fixture.operation).toMatchObject({
+      status: "succeeded",
+      result: {
+        artifactBindings: formalBindings,
+        buildDelivery: { renderMode: "content_patch" },
+      },
+    });
+    expect(fixture.build).toMatchObject({
+      status: "approved",
+      quotaState: "consumed",
+      contractLocalAssetId: formalBindings.contract.id,
+      sourceLocalAssetId: formalBindings.source.id,
+      distLocalAssetId: formalBindings.dist.id,
+      qaLocalAssetId: formalBindings.qa.id,
+      provenanceLocalAssetId: formalBindings.provenance.id,
+    });
   });
 
   it("fails closed when any persisted fallback coordinate changes before formal upgrade", async () => {

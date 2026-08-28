@@ -17,6 +17,7 @@ export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
   content: "frontmind-page-content-wire-v2.json",
   contentV3: "frontmind-page-content-wire-v3.json",
   contentDraftV1: "frontmind-site-content-draft-v1.json",
+  contentPatchV1: "frontmind-site-content-patch-v1.json",
   sourceReceiptV1: "frontmind-site-source-receipt-v1.json",
 });
 
@@ -420,19 +421,29 @@ function jsonAttachments(
   const contentDraftV1 =
     phase === "content" &&
     expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1;
+  const contentPatchV1 =
+    phase === "content" &&
+    expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1;
   const sourceReceiptV1 =
     phase === "design" &&
     expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1;
-  if (!expectedWireVersion && !contentDraftV1 && !sourceReceiptV1) {
+  if (
+    !expectedWireVersion &&
+    !contentDraftV1 &&
+    !contentPatchV1 &&
+    !sourceReceiptV1
+  ) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
   const phaseStem = sourceReceiptV1
     ? "frontmind[-_]site[-_]source[-_]receipt[-_]v1"
-    : contentDraftV1
-      ? "frontmind[-_]site[-_]content[-_]draft[-_]v1"
-      : phase === "design"
-        ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
-        : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
+    : contentPatchV1
+      ? "frontmind[-_]site[-_]content[-_]patch[-_]v1"
+      : contentDraftV1
+        ? "frontmind[-_]site[-_]content[-_]draft[-_]v1"
+        : phase === "design"
+          ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
+          : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
   const providerFilenamePattern = new RegExp(
     `^${phaseStem}(?:[-_]repair[-_][1-3])?\\.json$`,
     "u",
@@ -610,6 +621,9 @@ export async function resolveSiteOpsWireOutput(input: {
   phase: SiteOpsWireOutputPhase;
   expectedFilename: string;
   taskCompleted: boolean;
+  /** Explicit safe-data paths only: a token-bound Native receipt or content
+   * patch may enter local validation before the Manus task reports stopped. */
+  acceptCurrentPhaseWhileRunning?: boolean;
   signal?: AbortSignal;
   fetchPinned?: FetchPinnedPublicHttps;
   validateCandidate?: (
@@ -628,16 +642,24 @@ export async function resolveSiteOpsWireOutput(input: {
           SITEOPS_WIRE_OUTPUT_FILES.content,
           SITEOPS_WIRE_OUTPUT_FILES.contentV3,
           SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1,
+          SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1,
         ];
   const maxBytes = SITEOPS_WIRE_OUTPUT_MAX_BYTES[input.phase];
   if (!allowedFilenames.includes(input.expectedFilename)) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
   const expectedFilename = input.expectedFilename;
-  // A structured result is phase output only after the task has stopped for
-  // that phase. Accepting it while running can send the next message into the
-  // same task before the current response is complete.
-  if (!input.taskCompleted) return null;
+  // Executable design/content output remains gated on phase completion. The
+  // two non-executable exceptions are locally revalidated against immutable
+  // coordinates before use: a Native receipt still needs its matching ZIP,
+  // while a content patch can only alter predeclared data slots.
+  const safeCurrentPhaseResult =
+    input.acceptCurrentPhaseWhileRunning === true &&
+    ((input.phase === "design" &&
+      expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1) ||
+      (input.phase === "content" &&
+        expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1));
+  if (!input.taskCompleted && !safeCurrentPhaseResult) return null;
   const window = currentOperationWindow(input.events, input.operationToken);
   if (!window) return null;
   const acceptedCandidates: SiteOpsWireOutputResolution[] = [];

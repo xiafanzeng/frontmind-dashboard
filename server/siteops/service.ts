@@ -38,8 +38,8 @@ import {
   workspaceSiteProfiles,
 } from "../../drizzle/schema";
 import {
-  SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_MATERIALIZER_V2_5,
+  SITEOPS_MATERIALIZER_V2_6,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
@@ -58,6 +58,7 @@ import {
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
+  SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE,
   siteOpsInteractionStateSchema,
   siteOpsObservationV1Schema,
   type SiteOpsExecutionStep,
@@ -175,7 +176,7 @@ export function requireAcceptedSiteOpsRebuild(input: {
 }
 
 function siteOpsBuildWorkflowCoordinates(
-  workflow: typeof SITEOPS_MATERIALIZER_V2_4 | typeof SITEOPS_MATERIALIZER_V2_5,
+  workflow: typeof SITEOPS_MATERIALIZER_V2_5 | typeof SITEOPS_MATERIALIZER_V2_6,
 ) {
   return {
     workflowUpstreamVersion: workflow.upstreamVersion,
@@ -187,7 +188,7 @@ function siteOpsBuildWorkflowCoordinates(
 }
 
 export function currentSiteOpsBuildWorkflowCoordinates() {
-  return siteOpsBuildWorkflowCoordinates(SITEOPS_MATERIALIZER_V2_5);
+  return siteOpsBuildWorkflowCoordinates(SITEOPS_MATERIALIZER_V2_6);
 }
 
 export function isSiteOpsOperationReplay(
@@ -1664,15 +1665,19 @@ export function projectSiteOpsBuildDelivery(input: {
       )
     : [];
   return delivery &&
-    ["primary", "trusted_fallback", "twenty_first_native"].includes(
-      String(delivery.renderMode),
-    ) &&
+    [
+      "primary",
+      "content_patch",
+      "trusted_fallback",
+      "twenty_first_native",
+    ].includes(String(delivery.renderMode)) &&
     ["passed", "passed_with_warnings", "partial"].includes(
       String(delivery.qaStatus),
     )
     ? {
         renderMode: delivery.renderMode as
           | "primary"
+          | "content_patch"
           | "trusted_fallback"
           | "twenty_first_native",
         qaStatus: delivery.qaStatus as
@@ -1685,6 +1690,8 @@ export function projectSiteOpsBuildDelivery(input: {
 }
 
 const SITEOPS_BUILD_PHASE_WARNINGS = {
+  source_waiting:
+    "正在等待 AI 内容结果；基础预览会保留，超时后将使用企业资料中的可信默认内容。",
   source_repairing:
     "首次源码未通过安全检查，系统正在同一任务内自动修复；已选视觉参考仍会保留。",
   provider_sync_delayed:
@@ -1719,10 +1726,26 @@ export function projectSiteOpsBuildProgress(input: {
       ? operation.result
       : null;
   if (operation?.status === "succeeded") {
+    const delivery =
+      result?.buildDelivery &&
+      typeof result.buildDelivery === "object" &&
+      !Array.isArray(result.buildDelivery)
+        ? (result.buildDelivery as Record<string, unknown>)
+        : null;
+    const warningCodes = Array.isArray(delivery?.warningCodes)
+      ? delivery.warningCodes
+      : [];
+    const partialContentPatch =
+      delivery?.renderMode === "content_patch" &&
+      warningCodes.includes(
+        SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE,
+      );
     return {
       buildPhase: null,
       recoverable: false,
-      previewWarning: null,
+      previewWarning: partialContentPatch
+        ? "官网预览已生成，部分内容使用企业资料中的可信默认值。"
+        : null,
     };
   }
   const rawPhase = String(result?.buildPhase ?? "");
@@ -1742,13 +1765,20 @@ export function projectSiteOpsBuildProgress(input: {
   );
   const fallbackBound =
     siteOpsTrustedFallbackPreviewFromResult(result)?.status === "bound";
+  const fallbackStillReconciling = Boolean(
+    fallbackBound &&
+      operation &&
+      ["queued", "running", "outcome_unknown"].includes(operation.status),
+  );
   const recoverable = Boolean(
-    taskBound &&
-      (buildPhase === "source_repairing" ||
-        buildPhase === "provider_sync_delayed" ||
-        operation?.status === "attention_required" ||
-        (operation?.status === "failed" &&
-          operation.errorCode === "FRONTMIND_BUILD_SERVICE_UNAVAILABLE")),
+    fallbackStillReconciling ||
+      (taskBound &&
+        (buildPhase === "source_repairing" ||
+          buildPhase === "source_waiting" ||
+          buildPhase === "provider_sync_delayed" ||
+          operation?.status === "attention_required" ||
+          (operation?.status === "failed" &&
+            operation.errorCode === "FRONTMIND_BUILD_SERVICE_UNAVAILABLE"))),
   );
   return {
     buildPhase,
@@ -2315,6 +2345,12 @@ async function projectObservationOnce(
                     typeof payload?.errorCode === "string"
                       ? payload.errorCode
                       : null,
+                  operationStatus:
+                    payload?.operationStatus === "failed" ||
+                    payload?.operationStatus === "attention_required" ||
+                    payload?.operationStatus === "outcome_unknown"
+                      ? payload.operationStatus
+                      : null,
                 })
               : projectedContent,
           sequence: row.sequence,
@@ -2828,19 +2864,9 @@ export async function sendSiteOpsMessage(
     if (!project) {
       throw new SiteOpsServiceError("NOT_FOUND", "AI 建站会话不存在。", 404);
     }
-    const resetGate = await loadSiteOpsRebuildRequest(tx, {
-      userId: actor.id,
-      projectId: project.id,
-      currentBuildId: project.currentBuildId,
-      hasWorkflowProgress: true,
-    });
-    if (resetGate.resetPending) {
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "旧网站正在安全下线；重置完成前不能启动新的建站、发布或域名操作。",
-        409,
-      );
-    }
+    // A reset approval already created a new local epoch. Conversation and
+    // build work may continue while the old external exposure is reconciled;
+    // publish/DNS mutations are gated at the action boundary below.
     const existing = await tx
       .select()
       .from(siteOperations)
@@ -3033,27 +3059,35 @@ export function parseSiteOpsActionPayload(
   }
 }
 
-type TwentyFirstTemplateAdmission = {
+export function siteOpsResetPendingBlocksAction(
+  action: SiteOpsActInput["action"],
+) {
+  return [
+    "request_rebuild",
+    "publish_global",
+    "publish_mainland",
+    "rollback",
+    "domain_sync",
+  ].includes(action);
+}
+
+type TwentyFirstReferenceAdmission = {
   version: number;
   fingerprint: string;
 };
 
-export function requireTwentyFirstTemplateAdmission(
+export function requireTwentyFirstReferenceAdmission(
   status: Awaited<ReturnType<typeof getTwentyFirstCredentialStatus>>,
-): TwentyFirstTemplateAdmission {
+): TwentyFirstReferenceAdmission {
   if (
     !status.configured ||
     status.version === null ||
     status.fingerprint === null ||
-    status.nativeTemplateReadiness !== "ready"
+    status.capabilities?.search !== true
   ) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      status.nativeTemplateReadiness === "plan_ineligible"
-        ? "当前 21st 账号没有完整 Template 下载权限，请联系 FrontMind 管理员更新。"
-        : status.nativeTemplateReadiness === "compiler_unavailable"
-          ? "完整 Template 构建环境尚未就绪，请联系 FrontMind 管理员处理。"
-          : "21st 完整 Template 目录暂时不可用，请稍后重试。",
+      "21st 视觉参考检索连接暂时不可用，请稍后重试。",
       409,
     );
   }
@@ -3226,7 +3260,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
 }
 
 export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
-  if (workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion) {
+  if (workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "视觉检索使用的建站合同已升级，请重新检索视觉方向后再继续。",
@@ -3625,7 +3659,7 @@ async function handleVisualSearch(
     requestHash: string;
     payload: Record<string, unknown>;
     reselect?: boolean;
-    expectedCredential?: TwentyFirstTemplateAdmission;
+    expectedCredential?: TwentyFirstReferenceAdmission;
   },
 ) {
   if (
@@ -3749,7 +3783,7 @@ async function handleVisualSearch(
   ) {
     throw new SiteOpsServiceError(
       "CREDENTIAL_ROTATED",
-      "21st 完整 Template 连接已更新，请刷新后重试。",
+      "21st 视觉参考连接已更新，请刷新后重试。",
       409,
     );
   }
@@ -3767,7 +3801,7 @@ async function handleVisualSearch(
     knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
     credentialId: credential.id,
     credentialVersion: credential.version,
-    workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+    workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
     mode,
     page,
     admissionRevision,
@@ -4226,7 +4260,7 @@ async function selectVisualSample(
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
     ...siteOpsBuildWorkflowCoordinates(
-      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_4,
+      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_6,
     ),
     twentyFirstCredentialId: credential.id,
     twentyFirstCredentialVersion: credential.version,
@@ -4251,7 +4285,7 @@ async function selectVisualSample(
       delegated: input.delegated,
       workflowVersion: nativeVisual
         ? SITEOPS_MATERIALIZER_V2_5.frontMindVersion
-        : SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
+        : SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
       ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },
@@ -4517,7 +4551,7 @@ async function handleRevision(
     // starter and materializer as one coordinate set instead of pairing the
     // current host runtime with a historical parent's contract.
     ...siteOpsBuildWorkflowCoordinates(
-      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_4,
+      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_6,
     ),
     twentyFirstCredentialId: parent.twentyFirstCredentialId,
     twentyFirstCredentialVersion: parent.twentyFirstCredentialVersion,
@@ -4538,7 +4572,7 @@ async function handleRevision(
       childBuildId: buildId,
       workflowVersion: nativeVisual
         ? SITEOPS_MATERIALIZER_V2_5.frontMindVersion
-        : SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
+        : SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
       ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },
@@ -5148,7 +5182,7 @@ export async function actOnSiteOpsFast(
   const requestHash = hashSiteOpsRequest({ action: input.action, payload });
   const templateAdmission =
     input.action === "start_visual_search" || input.action === "reselect_visual"
-      ? requireTwentyFirstTemplateAdmission(
+      ? requireTwentyFirstReferenceAdmission(
           await getTwentyFirstCredentialStatus(),
         )
       : undefined;
@@ -5169,10 +5203,13 @@ export async function actOnSiteOpsFast(
       currentBuildId: project.currentBuildId,
       hasWorkflowProgress: true,
     });
-    if (resetGate.resetPending) {
+    if (
+      resetGate.resetPending &&
+      siteOpsResetPendingBlocksAction(input.action)
+    ) {
       throw new SiteOpsServiceError(
         "STATE_CONFLICT",
-        "旧网站正在安全下线；重置完成前不能启动新的建站、发布或域名操作。",
+        "旧网站正在安全下线；完成前可以继续本地建站，但不能发起新的发布或域名操作。",
         409,
       );
     }

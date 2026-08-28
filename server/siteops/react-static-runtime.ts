@@ -14,8 +14,8 @@ export { TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE_V2_2 } from "./react-static-comp
 
 export const REACT_STATIC_RENDERER_V1 = "react_static_v1" as const;
 export const REACT_STATIC_RENDERER = "react_static_v2" as const;
-export const REACT_STATIC_COMPONENT_LIBRARY_VERSION = "2.4.0" as const;
-export const REACT_STATIC_MATERIALIZER_VERSION = "2.4.0" as const;
+export const REACT_STATIC_COMPONENT_LIBRARY_VERSION = "2.6.0" as const;
+export const REACT_STATIC_MATERIALIZER_VERSION = "2.6.0" as const;
 export const REACT_STATIC_REACT_VERSION = "19.2.1" as const;
 const VISUAL_PREVIEW_RENDER_BUDGET_MS = 75_000;
 const VISUAL_PREVIEW_BROWSER_LAUNCH_TIMEOUT_MS = 20_000;

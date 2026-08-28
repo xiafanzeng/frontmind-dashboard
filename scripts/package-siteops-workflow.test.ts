@@ -11,6 +11,7 @@ import {
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
   SITEOPS_MATERIALIZER_V2_4,
+  SITEOPS_MATERIALIZER_V2_6,
   SITEOPS_WORKFLOW,
 } from "../shared/siteops";
 import {
@@ -32,14 +33,14 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("freezes the current deterministic FrontMind 2.4 host workflow", async () => {
+  it("freezes the current deterministic FrontMind 2.6 host-patch workflow", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
-      version: "2.4.0",
+      version: "2.6.0",
       upstream: { archiveSha256: SITEOPS_UPSTREAM_SHA256 },
       host: {
         starterSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        componentLibraryVersion: "2.4.0",
+        componentLibraryVersion: "2.6.0",
         materializerVersion: SITEOPS_MATERIALIZER_VERSION,
         materializerSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
@@ -54,20 +55,20 @@ describe("SiteOps runtime workflow package", () => {
     const runtime = JSON.parse(runtimeBytes);
     expect(runtime).toMatchObject({
       schema: "frontmind-siteops-runtime/v9",
-      adapterVersion: "2.4.0",
+      adapterVersion: "2.6.0",
       aiTask: {
         taskCount: 1,
         stageCount: 1,
-        output: "SiteContentDraftV1-flat-transport",
-        outputSchema: "schemas/site-content-draft-v1.schema.json",
-        outputFilename: "frontmind-site-content-draft-v1.json",
+        output: "SiteContentPatchWireV1",
+        outputSchema: "schemas/site-content-patch-wire-v1.schema.json",
+        outputFilename: "frontmind-site-content-patch-v1.json",
         sourceOutputAllowed: false,
         designOutputAllowed: false,
         fullObjectRepairAllowed: false,
       },
       providerWire: {
-        schema: "schemas/site-content-draft-v1.schema.json",
-        hostDraft: "SiteContentDraftV1",
+        schema: "schemas/site-content-patch-wire-v1.schema.json",
+        hostPatch: "SiteContentPatchV1",
         canonical: "CanonicalPreviewModelV1",
         canonicalizerOwner: "dashboard",
         routeCoordinatesAcceptedFromProvider: false,
@@ -85,11 +86,11 @@ describe("SiteOps runtime workflow package", () => {
       renderer: {
         primary: "react_static_v2",
         fallback: "trusted_static_html_v1",
-        componentLibraryVersion: "2.4.0",
-        materializerVersion: "2.4.0",
+        componentLibraryVersion: "2.6.0",
+        materializerVersion: "2.6.0",
       },
       contentSystem: {
-        providerDraft: "SiteContentDraftV1",
+        providerPatch: "SiteContentPatchV1",
         canonical: "CanonicalPreviewModelV1",
         missingContentPolicy: "verified-brief-fallback",
       },
@@ -105,9 +106,9 @@ describe("SiteOps runtime workflow package", () => {
 
     expect(JSON.parse(starterBytes)).toMatchObject({
       schema: "frontmind-siteops-host-starter/v5",
-      version: "2.4.0",
+      version: "2.6.0",
       providerBoundary: {
-        acceptedOutput: "SiteContentDraftV1-flat-transport",
+        acceptedOutput: "SiteContentPatchWireV1",
         providerDesignAllowed: false,
         providerMarkupAllowed: false,
         providerExternalResourcesAllowed: false,
@@ -123,13 +124,13 @@ describe("SiteOps runtime workflow package", () => {
       },
     });
 
-    expect(SITEOPS_WORKFLOW).toBe(SITEOPS_MATERIALIZER_V2_4);
+    expect(SITEOPS_WORKFLOW).toBe(SITEOPS_MATERIALIZER_V2_6);
     expect(SITEOPS_WORKFLOW).toMatchObject({
-      frontMindVersion: "2.4.0",
+      frontMindVersion: "2.6.0",
       runtimeManifestSha256: createHash("sha256")
         .update(manifestBytes)
         .digest("hex"),
-      starterVersion: "2.4.0",
+      starterVersion: "2.6.0",
       starterSha256: generated.host.starterSha256,
       materializerVersion: SITEOPS_MATERIALIZER_VERSION,
       materializerSha256: generated.host.materializerSha256,
@@ -137,10 +138,10 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("ships a flat content-only wire and typed warning-aware materialization", async () => {
-    const [draftBytes, stageBytes, envelopeBytes] = await Promise.all([
+  it("ships a bounded slot patch wire and typed warning-aware materialization", async () => {
+    const [patchBytes, stageBytes, envelopeBytes] = await Promise.all([
       readFile(
-        `${workflowRoot}/schemas/site-content-draft-v1.schema.json`,
+        `${workflowRoot}/schemas/site-content-patch-wire-v1.schema.json`,
         "utf8",
       ),
       readFile(
@@ -152,18 +153,22 @@ describe("SiteOps runtime workflow package", () => {
         "utf8",
       ),
     ]);
-    const draft = JSON.parse(draftBytes) as {
+    const patch = JSON.parse(patchBytes) as {
       required: string[];
       properties: Record<string, unknown>;
     };
-    expect(draft.required.sort()).toEqual(
-      ["operationToken", "routes", "sections"].sort(),
+    expect(patch.required.sort()).toEqual(
+      [
+        "wireSchemaVersion",
+        "operationToken",
+        "baseSourceSha256",
+        "slots",
+      ].sort(),
     );
-    expect(draft.properties).not.toHaveProperty("routeSlots");
-    expect(draft.properties).not.toHaveProperty("layoutArchetype");
-    expect(draft.properties).not.toHaveProperty("palette");
-    expect(draftBytes).not.toContain("componentName");
-    expect(draftBytes).not.toContain("externalUrl");
+    expect(patch.properties).not.toHaveProperty("source");
+    expect(patch.properties).not.toHaveProperty("dependencies");
+    expect(patch.properties).not.toHaveProperty("styles");
+    expect(patchBytes).not.toContain("componentName");
 
     const stage = JSON.parse(stageBytes) as {
       properties: {
@@ -191,11 +196,11 @@ describe("SiteOps runtime workflow package", () => {
     };
     expect(envelope.properties.schemaVersion).toEqual({ const: 9 });
     expect(envelope.properties.workflow.properties).toMatchObject({
-      version: { const: "2.4.0" },
+      version: { const: "2.6.0" },
     });
   });
 
-  it("retains immutable historical manifests, including 2.3", async () => {
+  it("retains immutable historical manifests, including 2.4", async () => {
     const coordinates = [
       [
         "private-workflows/astro-company-site-workflow-v1.5.0/MANIFEST.json",
@@ -220,6 +225,10 @@ describe("SiteOps runtime workflow package", () => {
       [
         "private-workflows/react-static-company-site-workflow-v2.3.0/MANIFEST.json",
         SITEOPS_MATERIALIZER_V2_3.runtimeManifestSha256,
+      ],
+      [
+        "private-workflows/react-static-company-site-workflow-v2.4.0/MANIFEST.json",
+        SITEOPS_MATERIALIZER_V2_4.runtimeManifestSha256,
       ],
     ] as const;
     for (const [manifestPath, expectedSha256] of coordinates) {

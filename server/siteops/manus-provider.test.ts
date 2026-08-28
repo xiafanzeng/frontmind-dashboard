@@ -10,6 +10,7 @@ import {
   SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
+  SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
@@ -31,6 +32,7 @@ import {
   loadVerifiedSiteOpsWorkflowPackage,
   materializeWithSingleHostRetry,
   classifySiteOpsMaterializationFailure,
+  contentPatchMaterializationOverrides,
   messageAskUserWaiting,
   phaseTerminalTaskState,
   safePublicDocuments,
@@ -84,6 +86,34 @@ const operation = {
 afterEach(() => vi.restoreAllMocks());
 
 describe("Manus SiteOps provider boundary", () => {
+  it("maps resilient content-patch defaults to one public-safe delivery marker", () => {
+    expect(
+      contentPatchMaterializationOverrides({
+        renderMode: "content_patch",
+        warningCount: 2,
+      }),
+    ).toEqual({
+      renderModeOverride: "content_patch",
+      contentPatchUsesTrustedDefaults: true,
+    });
+    expect(
+      contentPatchMaterializationOverrides({
+        renderMode: "content_patch",
+        warningCount: 0,
+      }),
+    ).toEqual({ renderModeOverride: "content_patch" });
+    expect(
+      contentPatchMaterializationOverrides({
+        renderMode: "trusted_fallback",
+        warningCount: 1,
+      }),
+    ).toEqual({
+      forceTrustedFallback: {
+        warningCode: "SITEOPS_CONTENT_PATCH_TRUSTED_FALLBACK",
+      },
+    });
+  });
+
   it("keeps frozen 2.2 tasks on BuildContractV4 and PageContentWireV3", async () => {
     expect(
       usesBuildPlanContractV4(SITEOPS_MATERIALIZER_V2_2.frontMindVersion),
@@ -118,9 +148,12 @@ describe("Manus SiteOps provider boundary", () => {
     });
   });
 
-  it("keeps 2.3 on the historical two-phase contract and 2.4 content-only", async () => {
+  it("keeps historical 2.3/2.4 semantics and reserves content patches for 2.6", async () => {
     expect(
       usesHostOwnedContentDraft(SITEOPS_MATERIALIZER_V2_3.frontMindVersion),
+    ).toBe(false);
+    expect(
+      usesHostOwnedContentDraft(SITEOPS_MATERIALIZER_V2_4.frontMindVersion),
     ).toBe(false);
     expect(usesHostOwnedContentDraft(SITEOPS_WORKFLOW.frontMindVersion)).toBe(
       true,
@@ -1277,7 +1310,11 @@ describe("Manus SiteOps provider boundary", () => {
     });
 
     const result = await handler({
-      operation: operation as never,
+      // Social generation keeps the eager credential boundary. New 2.6 site
+      // builds deliberately stage their trusted baseline before credential
+      // lookup, so they need a complete build fixture instead of this narrow
+      // credential-only database stub.
+      operation: { ...operation, kind: "social_package" } as never,
       signal: new AbortController().signal,
     });
 
@@ -1364,7 +1401,7 @@ describe("Manus SiteOps provider boundary", () => {
     });
 
     const result = await handler({
-      operation: operation as never,
+      operation: { ...operation, kind: "social_package" } as never,
       signal: new AbortController().signal,
     });
 

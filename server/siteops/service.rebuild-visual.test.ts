@@ -9,6 +9,7 @@ const dependencies = vi.hoisted(() => ({
     configured: true,
     version: 3,
     fingerprint: "fingerprint",
+    capabilities: { search: true },
     nativeTemplateReadiness: "ready" as const,
   })),
 }));
@@ -51,7 +52,8 @@ import {
   websiteStyleSampleBatches,
   websiteStyleSamples,
 } from "../../drizzle/schema";
-import { SITEOPS_MATERIALIZER_V2_5 } from "../../shared/siteops";
+import { SITEOPS_MATERIALIZER_V2_6 } from "../../shared/siteops";
+import { referenceBlueprintV4ForFamily } from "../../shared/siteops-design";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { actOnSiteOps, siteBriefFromSnapshot } from "./service";
 
@@ -113,6 +115,26 @@ function serviceDatabaseFixture() {
     taxonomyDerivationVersion: "catalog-metadata-preview-v1",
   });
   const referencePreviewLocalAssetId = "41100000-0000-4000-8000-000000000004";
+  const realizationPreviewSha256 = "e".repeat(64);
+  const inspirationTaxonomy = {
+    role: "foundation" as const,
+    palette: [],
+    typography: [],
+    layout: ["split-layout"],
+    motion: [],
+    accessibility: ["reduced-motion"],
+  };
+  const referenceBlueprint = referenceBlueprintV4ForFamily({
+    candidateId: sampleId,
+    providerItemKey: evidence.providerItemKey,
+    referencePreviewLocalAssetId,
+    referencePreviewSha256: evidence.previewSha256,
+    realizationPreviewLocalAssetId: previewLocalAssetId,
+    realizationPreviewSha256,
+    heroFamily: "split_media",
+    inspirationEvidenceId: evidence.evidenceSha256,
+    inspirationTaxonomy,
+  });
   const batch = {
     id: "45000000-0000-4000-8000-000000000004",
     userId: 7,
@@ -127,24 +149,18 @@ function serviceDatabaseFixture() {
     batchId: batch.id,
     label: "A",
     note: "浮动轨道 Hero",
-    previewLocalAssetId,
+    previewLocalAssetId: referencePreviewLocalAssetId,
     sourceMetadata: {
-      schemaVersion: 5,
-      renderer: "twenty_first_native_react_v1",
-      providerItemId: "8435",
       providerItemKey: evidence.providerItemKey,
-      providerVersion: "v1",
       title: "Floating Orbit Hero",
       sourceUrl: "https://21st.dev/community/components/floating-orbit",
       visualEvidence: evidence,
-      referencePreviewLocalAssetId,
-      referencePreviewSha256: evidence.previewSha256,
+      taxonomy: inspirationTaxonomy,
+      referenceBlueprint,
+      realizationPreviewLocalAssetId: previewLocalAssetId,
+      realizationPreviewSha256,
       referencePerceptualHash: "1".repeat(16),
-      previewSha256: "e".repeat(64),
-      sourceTreeSha256: "f".repeat(64),
-      sourceArchiveSha256: "1".repeat(64),
-      entrypoint: "src/App.tsx",
-      demoEntrypoint: "src/App.tsx",
+      realizationPerceptualHash: "2".repeat(16),
       score: 95,
     },
   };
@@ -155,7 +171,7 @@ function serviceDatabaseFixture() {
     knowledgeSnapshotId: snapshot.id,
     credentialId: platformCredentialId,
     credentialVersion: 3,
-    workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+    workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
   };
   const customerCredential = {
     id: customerCredentialId,
@@ -288,6 +304,8 @@ function serviceDatabaseFixture() {
     activeVisualOperations,
     snapshots,
     userRows,
+    inspirationTaxonomy,
+    referenceBlueprint,
   };
 }
 
@@ -577,8 +595,13 @@ describe("SiteOps visual selection and current-task revisions", () => {
       ...Array.from({ length: 27 }, (_, index) => {
         const suffix = String(index + 1).padStart(12, "0");
         const sampleId = `40000000-0000-4000-8000-${suffix}`;
-        const previewLocalAssetId = `41000000-0000-4000-8000-${suffix}`;
+        const realizationPreviewLocalAssetId = `41000000-0000-4000-8000-${suffix}`;
+        const referencePreviewLocalAssetId = `41100000-0000-4000-8000-${suffix}`;
         const digest = ((index % 15) + 1).toString(16).repeat(64);
+        const realizationPreviewSha256 = (index + 16)
+          .toString(16)
+          .repeat(64)
+          .slice(0, 64);
         const visualEvidence = createVisualEvidenceV1({
           evidenceKind: "catalog_metadata_preview_v1",
           providerItemKey: `n:${index + 1}`,
@@ -587,30 +610,31 @@ describe("SiteOps visual selection and current-task revisions", () => {
           previewSha256: digest,
           taxonomyDerivationVersion: "catalog-metadata-preview-v1",
         });
+        const referenceBlueprint = referenceBlueprintV4ForFamily({
+          candidateId: sampleId,
+          providerItemKey: visualEvidence.providerItemKey,
+          referencePreviewLocalAssetId,
+          referencePreviewSha256: visualEvidence.previewSha256,
+          realizationPreviewLocalAssetId,
+          realizationPreviewSha256,
+          heroFamily: "split_media",
+          inspirationEvidenceId: visualEvidence.evidenceSha256,
+          inspirationTaxonomy: fixture.inspirationTaxonomy,
+        });
         return {
           batch: fixture.batch,
           sample: {
             ...fixture.sample,
             id: sampleId,
-            previewLocalAssetId,
+            previewLocalAssetId: referencePreviewLocalAssetId,
             sourceMetadata: {
               ...fixture.sample.sourceMetadata,
-              providerItemId: String(index + 1),
               providerItemKey: visualEvidence.providerItemKey,
-              providerVersion: `v${index + 1}`,
               visualEvidence,
-              referencePreviewLocalAssetId: `41100000-0000-4000-8000-${suffix}`,
-              referencePreviewSha256: visualEvidence.previewSha256,
+              referenceBlueprint,
+              realizationPreviewLocalAssetId,
+              realizationPreviewSha256,
               referencePerceptualHash: index.toString(16).padStart(16, "0"),
-              previewSha256: (index + 16).toString(16).repeat(64).slice(0, 64),
-              sourceTreeSha256: (index + 32)
-                .toString(16)
-                .repeat(64)
-                .slice(0, 64),
-              sourceArchiveSha256: (index + 48)
-                .toString(16)
-                .repeat(64)
-                .slice(0, 64),
               score: index,
             },
           },
@@ -656,8 +680,16 @@ describe("SiteOps visual selection and current-task revisions", () => {
       parentBuildId: null,
       quotaPeriodId: "50000000-0000-4000-8000-000000000005",
       quotaState: "reserved",
+      workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_6.runtimeManifestSha256,
     });
-    expect(operationInsert?.values).toMatchObject({ kind: "site_build" });
+    expect(operationInsert?.values).toMatchObject({
+      kind: "site_build",
+      input: {
+        workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+        referenceBlueprint: fixture.referenceBlueprint,
+      },
+    });
     expect(fixture.project.currentBuildId).toBe(buildInsert?.values.id);
   });
 
@@ -679,6 +711,51 @@ describe("SiteOps visual selection and current-task revisions", () => {
       parentBuildId: null,
       knowledgeSnapshotId: fixture.snapshots[0]!.id,
       knowledgeArchiveHash: fixture.snapshots[0]!.archiveHash,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+    });
+    expect(
+      fixture.inserts.find(
+        (entry) =>
+          entry.table === siteOperations && entry.values.kind === "site_build",
+      )?.values,
+    ).toMatchObject({
+      input: {
+        workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+        referenceBlueprint: fixture.referenceBlueprint,
+      },
+    });
+  });
+
+  it("starts a new visual root while the old external reset boundary is still reconciling", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    dependencies.loadRebuild.mockResolvedValue({
+      allowed: false,
+      ticketId: "46000000-0000-4000-8000-000000000004",
+      status: "in_progress",
+      resetApplied: true,
+      resetPending: true,
+      minimumKnowledgeSnapshotVersion: null,
+      resetSourceBuildId: "30000000-0000-4000-8000-000000000003",
+      acceptedForCurrentCycle: false,
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      selectVisualInput(fixture.project.revision, fixture.sample.id),
+    );
+
+    expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
+    expect(
+      fixture.inserts.find(
+        (entry) =>
+          entry.table === siteOperations && entry.values.kind === "site_build",
+      )?.values,
+    ).toMatchObject({
+      buildId: expect.any(String),
+      kind: "site_build",
+      provider: "manus",
     });
   });
 

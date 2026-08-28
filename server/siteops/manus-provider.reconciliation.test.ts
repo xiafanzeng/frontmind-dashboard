@@ -9,6 +9,8 @@ import {
   createNativeRejectedCandidateV1,
   manusProviderReadRetryDelayMs,
   nativeRejectedCandidateMatches,
+  nativeFallbackReconciliationDelayMs,
+  nativeInitialBaselineShouldYield,
   nativeSourceAttachmentIdentityConflicts,
   nativeSourceAttachmentRetryWindow,
   nativeSourceOutputAttachment,
@@ -18,6 +20,8 @@ import {
   pollManusTaskEvents,
   providerResultSyncWindow,
   startProviderResultSyncWindow,
+  structuredResultGrace,
+  shouldMaterializeNativeInitialBaseline,
 } from "./manus-provider";
 
 const taskId = "manus-task-incident";
@@ -113,6 +117,201 @@ function client(input: {
 }
 
 describe("Manus bound-task read reconciliation", () => {
+  it("backs a bound baseline reconciliation off from one minute to five minutes", () => {
+    const createdAt = "2026-08-28T00:00:00.000Z";
+    const start = Date.parse(createdAt);
+    expect(nativeFallbackReconciliationDelayMs(createdAt, start)).toBe(60_000);
+    expect(nativeFallbackReconciliationDelayMs(createdAt, start + 59_999)).toBe(
+      60_000,
+    );
+    expect(nativeFallbackReconciliationDelayMs(createdAt, start + 60_000)).toBe(
+      NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
+    );
+  });
+
+  it("does not let a failed initial baseline starve the Provider read", () => {
+    expect(
+      nativeInitialBaselineShouldYield({
+        schemaVersion: 2,
+        stage: "native_source_pending",
+        attempts: {
+          extraction: 0,
+          design: 0,
+          content: 0,
+          materialization: 0,
+        },
+        fallbackPreviewFailureCount: 1,
+        fallbackPreviewNextPollAt: "2026-08-28T00:01:00.000Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("stages the V6 first-build baseline once and lets the next sweep continue", () => {
+    const base = {
+      bundleSchemaVersion: 6,
+      parentBuildId: null,
+      hasPreview: false,
+      hasFallback: false,
+      nativeRepairAttempt: 0,
+    } as const;
+    expect(shouldMaterializeNativeInitialBaseline(base)).toBe(true);
+    expect(
+      shouldMaterializeNativeInitialBaseline({ ...base, hasFallback: true }),
+    ).toBe(false);
+    expect(
+      shouldMaterializeNativeInitialBaseline({ ...base, hasPreview: true }),
+    ).toBe(false);
+    expect(
+      shouldMaterializeNativeInitialBaseline({
+        ...base,
+        parentBuildId: "revision-build",
+      }),
+    ).toBe(false);
+    expect(
+      shouldMaterializeNativeInitialBaseline({
+        ...base,
+        nativeRepairAttempt: 1,
+      }),
+    ).toBe(false);
+    expect(
+      shouldMaterializeNativeInitialBaseline({
+        ...base,
+        bundleSchemaVersion: 5,
+      }),
+    ).toBe(false);
+  });
+
+  it("replays 23:09-23:17 without letting the prior phase stop expire the repair", async () => {
+    const oldToken = "siteops-native-source:operation-1:0";
+    const repairStartedAt = Date.parse("2026-08-27T23:09:34.000Z");
+    const resultArrivedAt = Date.parse("2026-08-27T23:17:05.000Z");
+    const staleState = {
+      schemaVersion: 2 as const,
+      stage: "native_repair_pending" as const,
+      taskId,
+      nativeRepairAttempt: 1,
+      attempts: {
+        extraction: 0,
+        design: 0,
+        content: 0,
+        materialization: 0,
+      },
+      phaseOperationToken: oldToken,
+      phaseStartedAt: new Date(repairStartedAt - 60_000).toISOString(),
+      providerStoppedAt: new Date(repairStartedAt - 30_000).toISOString(),
+      providerStoppedOperationToken: oldToken,
+      resultPendingSince: new Date(repairStartedAt - 30_000).toISOString(),
+      resultPendingOperationToken: oldToken,
+    };
+    const runningEvents = stoppedEvents().slice(0, 2);
+    const bound = client({
+      taskDetail: vi.fn().mockResolvedValue(detail("running")),
+      listAllMessages: vi.fn().mockResolvedValue(runningEvents),
+    });
+
+    const poll = await pollManusTaskEvents({
+      client: bound as never,
+      taskId,
+      operationToken,
+      providerState: staleState,
+      now: resultArrivedAt,
+    });
+
+    expect(poll.state).toEqual({ completed: false, failed: false });
+    expect(poll.providerState).toMatchObject({
+      phaseOperationToken: operationToken,
+      phaseStartedAt: new Date(resultArrivedAt).toISOString(),
+    });
+    expect(poll.providerState.providerStoppedAt).toBeUndefined();
+    expect(poll.providerState.resultPendingSince).toBeUndefined();
+    expect(
+      structuredResultGrace(
+        poll.providerState,
+        false,
+        Date.parse("2026-08-27T23:17:29.000Z"),
+        operationToken,
+      ).expired,
+    ).toBe(false);
+  });
+
+  it("ignores a waiting event from an older operation-token phase", async () => {
+    const olderToken = "siteops-native-source:operation-1:0";
+    const bound = client({
+      taskDetail: vi.fn().mockResolvedValue(detail("running")),
+      listAllMessages: vi.fn().mockResolvedValue([
+        {
+          id: "old-marker",
+          type: "user_message",
+          timestamp: 1,
+          user_message: {
+            content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({ operationToken: olderToken })}`,
+          },
+        },
+        {
+          id: "old-waiting",
+          type: "status_update",
+          timestamp: 2,
+          status_update: {
+            agent_status: "waiting",
+            status_detail: {
+              waiting_for_event_id: "old-confirmation",
+              waiting_for_event_type: "messageAskUser",
+            },
+          },
+        },
+        {
+          ...stoppedEvents()[0],
+          timestamp: 3,
+        },
+      ]),
+    });
+
+    const result = await pollManusTaskEvents({
+      client: bound as never,
+      taskId,
+      operationToken,
+      providerState: providerState(),
+      now: 1_000,
+    });
+
+    expect(result.waiting).toBeNull();
+    expect(result.state).toEqual({ completed: false, failed: false });
+  });
+
+  it("keeps a waiting event that belongs to the current operation-token phase", async () => {
+    const bound = client({
+      taskDetail: vi.fn().mockResolvedValue(detail("running")),
+      listAllMessages: vi.fn().mockResolvedValue([
+        stoppedEvents()[0],
+        {
+          id: "current-waiting",
+          type: "status_update",
+          timestamp: 2,
+          status_update: {
+            agent_status: "waiting",
+            status_detail: {
+              waiting_for_event_id: "current-confirmation",
+              waiting_for_event_type: "messageAskUser",
+            },
+          },
+        },
+      ]),
+    });
+
+    const result = await pollManusTaskEvents({
+      client: bound as never,
+      taskId,
+      operationToken,
+      providerState: providerState(),
+      now: 1_000,
+    });
+
+    expect(result.waiting).toMatchObject({
+      eventId: "current-confirmation",
+      eventType: "messageAskUser",
+    });
+  });
+
   it("reuses an authenticated deterministic rejection for the exact frozen candidate only", () => {
     const coordinates = {
       taskId,
@@ -162,10 +361,26 @@ describe("Manus bound-task read reconciliation", () => {
         coordinates,
       ),
     ).toBe(false);
+
+    const compileVerdict = createNativeRejectedCandidateV1({
+      ...coordinates,
+      errorCode: "NATIVE_BUILD_COMPILE_FAILED",
+      rejectedAt: new Date("2026-08-27T14:01:00.000Z"),
+    });
+    expect(nativeRejectedCandidateMatches(compileVerdict, coordinates)).toBe(
+      true,
+    );
   });
 
   it("opens trusted fallback only at the bounded root-build thresholds", () => {
     const providerReadFailureSince = new Date(1_000).toISOString();
+    expect(
+      nativeTrustedFallbackReason({
+        firstBuild: true,
+        hasPreview: false,
+        initialBaseline: true,
+      }),
+    ).toBe("initial_baseline");
     expect(
       nativeTrustedFallbackReason({
         firstBuild: true,
@@ -336,6 +551,11 @@ describe("Manus bound-task read reconciliation", () => {
     });
     expect(result.providerState.providerReadFailureCount).toBeUndefined();
     expect(result.events).toHaveLength(3);
+    expect(bound.listAllMessages).toHaveBeenCalledWith({
+      taskId,
+      order: "desc",
+      stopAfterOperationToken: operationToken,
+    });
     expect(bound.createTask).not.toHaveBeenCalled();
     expect(bound.sendMessage).not.toHaveBeenCalled();
   });
@@ -462,7 +682,8 @@ describe("Manus bound-task read reconciliation", () => {
       state: { completed: true, failed: false },
       providerState: {
         buildPhase: "source_repairing",
-        providerStoppedAt: new Date(1_000).toISOString(),
+        providerStoppedAt: new Date(12_000).toISOString(),
+        providerStoppedOperationToken: operationToken,
       },
     });
     expect(recovered.providerState.providerReadFailureCount).toBeUndefined();
@@ -474,7 +695,7 @@ describe("Manus bound-task read reconciliation", () => {
     expect(bound.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("limits a stopped task with an unavailable result stream to five minutes", async () => {
+  it("does not start stopped grace until the current phase stream also proves terminal", async () => {
     const bound = client({
       taskDetail: vi
         .fn()
@@ -492,23 +713,18 @@ describe("Manus bound-task read reconciliation", () => {
       providerState: providerState(),
       now: 1_000,
     });
-    expect(first.providerState).toMatchObject({
-      providerStoppedAt: new Date(1_000).toISOString(),
-      resultPendingSince: new Date(1_000).toISOString(),
+    expect(first.providerState.providerStoppedAt).toBeUndefined();
+    expect(first.providerState.resultPendingSince).toBeUndefined();
+    const second = await pollManusTaskEvents({
+      client: bound as never,
+      taskId,
+      operationToken,
+      providerState: first.providerState,
+      now: 1_000 + 5 * 60_000,
     });
-    await expect(
-      pollManusTaskEvents({
-        client: bound as never,
-        taskId,
-        operationToken,
-        providerState: first.providerState,
-        now: 1_000 + 5 * 60_000,
-      }),
-    ).rejects.toMatchObject({
-      code: "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
-      status: "attention_required",
-      result: { taskId },
-    });
+    expect(second.state.completed).toBe(false);
+    expect(second.providerState.providerStoppedAt).toBeUndefined();
+    expect(second.providerState.resultPendingSince).toBeUndefined();
   });
 
   it("moves three not-found reads and a 24-hour transport outage to recoverable attention", async () => {
@@ -709,6 +925,37 @@ describe("Manus bound-task read reconciliation", () => {
     expect(() =>
       nativeSourceOutputAttachment(conflict as never, operationToken),
     ).toThrow("AI 建站返回了多个不同的完整源码包");
+  });
+
+  it("accepts bounded ZIP MIME aliases and parameters from the current phase", () => {
+    for (const contentType of [
+      "Application/ZIP; charset=binary",
+      "application/x-zip-compressed",
+      "application/octet-stream",
+    ]) {
+      const attachment = nativeSourceOutputAttachment(
+        [
+          stoppedEvents()[0],
+          {
+            id: `attachment-${contentType}`,
+            type: "assistant_message",
+            timestamp: 2,
+            assistant_message: {
+              attachments: [
+                {
+                  filename: "frontmind-site-source-v1.zip",
+                  content_type: contentType,
+                  file_id: `file-${contentType}`,
+                  url: "https://download.example/source.zip",
+                },
+              ],
+            },
+          },
+        ] as never,
+        operationToken,
+      );
+      expect(attachment).toMatchObject({ contentType });
+    }
   });
 
   it("falls back to event and attachment index when a later GET omits file_id", () => {

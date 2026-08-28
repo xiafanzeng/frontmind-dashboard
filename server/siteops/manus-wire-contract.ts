@@ -142,11 +142,13 @@ export function normalizeSiteDesignWire(
   const normalizedPalette = Object.fromEntries(
     Object.entries(paletteFallbacks).map(([key, fallback]) => {
       const index = record[key];
+      const fallbackIndex = Math.min(fallback, paletteCardinality - 1);
       return [
         key,
-        Number.isInteger(index) &&
-        ((index as number) < 0 || (index as number) >= paletteCardinality)
-          ? Math.min(fallback, paletteCardinality - 1)
+        index === undefined ||
+        (Number.isInteger(index) &&
+          ((index as number) < 0 || (index as number) >= paletteCardinality))
+          ? fallbackIndex
           : index,
       ];
     }),

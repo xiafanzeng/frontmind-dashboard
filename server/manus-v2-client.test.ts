@@ -868,6 +868,67 @@ describe("ManusV2Client", () => {
     expect(get.mock.calls[1]?.[1]?.params).toMatchObject({ cursor: "page-2" });
   });
 
+  it("reads newest pages first and stops once the current operation marker is found", async () => {
+    const get = vi.spyOn(axios.Axios.prototype, "get");
+    get
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "canonical-task",
+          messages: [
+            {
+              id: "result",
+              type: "assistant_message",
+              timestamp: 30,
+              assistant_message: { content: "current result" },
+            },
+          ],
+          has_more: true,
+          next_cursor: "marker-page",
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "canonical-task",
+          messages: [
+            {
+              id: "marker",
+              type: "user_message",
+              timestamp: 20,
+              user_message: {
+                content:
+                  'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"current-operation"}',
+              },
+            },
+          ],
+          // Older shared-task history exists, but is outside this operation.
+          has_more: true,
+          next_cursor: "older-history",
+        },
+      });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    const events = await client.listAllMessages({
+      taskId: "canonical-task",
+      order: "desc",
+      stopAfterOperationToken: "current-operation",
+    });
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(get.mock.calls[0]?.[1]?.params).toMatchObject({ order: "desc" });
+    expect(get.mock.calls[1]?.[1]?.params).toMatchObject({
+      order: "desc",
+      cursor: "marker-page",
+    });
+    expect(events.map((event) => event.id)).toEqual(["marker", "result"]);
+  });
+
   it("uses Provider order rather than opaque ids for equal-timestamp messages", async () => {
     vi.spyOn(axios.Axios.prototype, "get").mockResolvedValueOnce({
       status: 200,

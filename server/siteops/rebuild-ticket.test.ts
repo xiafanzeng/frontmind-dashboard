@@ -17,9 +17,11 @@ import {
 } from "../../drizzle/schema";
 import {
   activateDeferredApprovedSiteOpsReset,
+  approvedResetUnpublishFreshEpochMatches,
   approveSiteOpsRebuildTicket,
   finalizeApprovedSiteOpsReset,
   loadSiteOpsRebuildRequest,
+  parseApprovedResetUnpublishInput,
   projectSiteOpsRebuildReset,
   siteOpsRebuildBuildId,
   siteOpsRebuildAcceptedForCurrentCycle,
@@ -592,6 +594,7 @@ function fixture(options?: {
     brief: { companyName: "FrontMind" },
     status: "approved",
     revision: 12,
+    currentTaskStartedAt: new Date("2026-08-24T07:00:00.000Z"),
     updatedAt: new Date("2026-08-24T07:00:00.000Z"),
     ...options?.projectOverrides,
   };
@@ -785,7 +788,49 @@ async function pendingResetFixture(
 }
 
 describe("site rebuild reset approval", () => {
-  it("queues one strict unpublish operation without clearing customer state early", async () => {
+  it("canonicalizes reset epoch coordinates to MySQL second precision", () => {
+    const parsed = parseApprovedResetUnpublishInput({
+      schemaVersion: 1,
+      intent: "approved_reset_unpublish",
+      rebuildTicketId: ticketId,
+      expectedProjectRevision: 12,
+      expectedCurrentBuildId: buildId,
+      expectedKnowledgeSnapshotId: snapshotId,
+      expectedGlobalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
+      expectedMainlandLiveDeploymentId: null,
+      expectedCanonicalHostname: null,
+      resetAppliedProjectRevision: 13,
+      resetEpochStartedAt: "2026-08-24T08:00:00.987Z",
+    });
+
+    expect(parsed?.resetEpochStartedAt).toBe("2026-08-24T08:00:00.000Z");
+    expect(
+      approvedResetUnpublishFreshEpochMatches(parsed!, {
+        revision: 13,
+        currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
+      }),
+    ).toBe(true);
+  });
+
+  it("persists subsecond approvals with a stable database reset epoch", async () => {
+    const state = fixture();
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.987Z"),
+    });
+    const note = JSON.parse(result!.internalNote);
+
+    expect(note.resetAppliedAt).toBe("2026-08-24T08:00:00.000Z");
+    expect(note.frozenReset.resetEpochStartedAt).toBe(
+      "2026-08-24T08:00:00.000Z",
+    );
+    expect(state.project.currentTaskStartedAt).toEqual(
+      new Date("2026-08-24T08:00:00.000Z"),
+    );
+  });
+
+  it("creates the local reset epoch immediately and queues old external cleanup", async () => {
     const state = fixture();
     const result = await approveSiteOpsRebuildTicket(state.tx, {
       ticket: state.ticket,
@@ -798,38 +843,57 @@ describe("site rebuild reset approval", () => {
       sourceBuildId: buildId,
       resetApplied: true,
       resetPending: true,
-      resetAppliedProjectRevision: 12,
+      resetAppliedProjectRevision: 13,
     });
-    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(false);
+    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
     expect(siteOpsRebuildResetPending(result!.internalNote)).toBe(true);
     expect(JSON.parse(result!.internalNote)).toMatchObject({
       schemaVersion: 4,
       resetIntent: "approved_reset_unpublish",
       resetExpectedProjectRevision: 12,
+      resetEpochDecoupled: true,
+      resetAppliedProjectRevision: 13,
+      frozenReset: expect.objectContaining({
+        expectedCurrentBuildId: buildId,
+        expectedGlobalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
+      }),
     });
     expect(state.project).toMatchObject({
       currentKnowledgeSnapshotId: snapshotId,
-      currentBuildId: buildId,
-      globalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
-      brief: { companyName: "FrontMind" },
-      status: "approved",
-      revision: 12,
+      currentBuildId: null,
+      globalLiveDeploymentId: null,
+      brief: null,
+      status: "draft",
+      revision: 13,
+      currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
     });
-    expect(state.updates).toHaveLength(0);
-    expect(state.inserts).toEqual([
-      expect.objectContaining({
-        table: siteOperations,
-        values: expect.objectContaining({
-          kind: "rollback",
-          status: "queued",
-          provider: "aliyun_esa",
-          input: expect.objectContaining({
-            intent: "approved_reset_unpublish",
-            expectedProjectRevision: 12,
+    expect(state.updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ table: siteProjects }),
+        expect.objectContaining({
+          table: visualCandidatePools,
+          values: expect.objectContaining({ status: "superseded" }),
+        }),
+      ]),
+    );
+    expect(state.inserts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: siteOperations,
+          values: expect.objectContaining({
+            kind: "rollback",
+            status: "queued",
+            provider: "aliyun_esa",
+            input: expect.objectContaining({
+              intent: "approved_reset_unpublish",
+              expectedProjectRevision: 12,
+              resetAppliedProjectRevision: 13,
+            }),
           }),
         }),
-      }),
-    ]);
+        expect.objectContaining({ table: messages }),
+      ]),
+    );
   });
 
   it("replays an existing reset marker without changing project state again", async () => {
@@ -855,7 +919,7 @@ describe("site rebuild reset approval", () => {
     ).resolves.toMatchObject({
       resetApplied: true,
       resetPending: true,
-      resetAppliedProjectRevision: 12,
+      resetAppliedProjectRevision: 13,
     });
     expect(replay.updates).toHaveLength(0);
     expect(replay.inserts).toHaveLength(0);
@@ -1067,14 +1131,14 @@ describe("site rebuild reset approval", () => {
       sourceBuildId: null,
       resetApplied: true,
       resetPending: true,
-      resetAppliedProjectRevision: 12,
+      resetAppliedProjectRevision: 13,
     });
-    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(false);
+    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
     expect(state.project).toMatchObject({
       currentBuildId: null,
       currentKnowledgeSnapshotId: snapshotId,
-      status: "awaiting_visual_selection",
-      revision: 12,
+      status: "draft",
+      revision: 13,
     });
   });
 
@@ -1110,10 +1174,15 @@ describe("site rebuild reset approval", () => {
     ).resolves.toMatchObject({
       resetApplied: true,
       resetPending: true,
-      resetAppliedProjectRevision: 12,
+      resetAppliedProjectRevision: 13,
     });
-    expect(repeated.updates).toHaveLength(0);
-    expect(repeated.inserts).toHaveLength(1);
+    expect(repeated.updates).not.toHaveLength(0);
+    expect(repeated.inserts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ table: siteOperations }),
+        expect.objectContaining({ table: messages }),
+      ]),
+    );
   });
 
   it("CAS-cancels a local Manus task and queues the approved reset", async () => {
@@ -1160,22 +1229,38 @@ describe("site rebuild reset approval", () => {
         }),
       ]),
     );
-    expect(state.inserts).toEqual([
-      expect.objectContaining({
-        table: siteOperations,
-        values: expect.objectContaining({
-          kind: "rollback",
-          provider: "aliyun_esa",
-          status: "queued",
+    expect(state.inserts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: siteOperations,
+          values: expect.objectContaining({
+            kind: "rollback",
+            provider: "aliyun_esa",
+            status: "queued",
+          }),
         }),
-      }),
-    ]);
+        expect.objectContaining({ table: messages }),
+      ]),
+    );
     expect(state.project.currentKnowledgeSnapshotId).toBe(snapshotId);
   });
 
   it.each([
     { kind: "site_build", provider: "manus", status: "running" },
     { kind: "build_revision", provider: "manus", status: "outcome_unknown" },
+    {
+      kind: "site_build",
+      provider: "manus",
+      status: "attention_required",
+      providerTaskId: "manus-task-needs-attention",
+      result: { preserved: true },
+    },
+    {
+      kind: "build_revision",
+      provider: "manus",
+      status: "failed",
+      providerTaskId: "manus-task-failed",
+    },
     {
       kind: "site_build",
       provider: "manus",
@@ -1291,9 +1376,18 @@ describe("site rebuild reset approval", () => {
       schemaVersion: 5,
       resetActivationState: "awaiting_external_reconciliation",
       awaitingExternalOperationIds: [externalOperationId],
+      resetEpochDecoupled: true,
+      resetAppliedProjectRevision: 13,
     });
-    expect(state.updates).toHaveLength(0);
-    expect(state.inserts).toHaveLength(0);
+    expect(state.project).toMatchObject({
+      revision: 13,
+      currentBuildId: null,
+      currentKnowledgeSnapshotId: snapshotId,
+      status: "draft",
+    });
+    expect(state.inserts).toEqual([
+      expect.objectContaining({ table: messages }),
+    ]);
   });
 
   it("idempotently replays the durable deferred approval without a second approval or reset task", async () => {
@@ -1361,12 +1455,20 @@ describe("site rebuild reset approval", () => {
     expect(JSON.parse(result!.internalNote)).toMatchObject({
       schemaVersion: 5,
       awaitingExternalOperationIds: [externalOperationId],
+      resetEpochDecoupled: true,
+      resetAppliedProjectRevision: 13,
     });
-    expect(state.updates).toHaveLength(0);
-    expect(state.inserts).toHaveLength(0);
+    expect(state.project).toMatchObject({
+      revision: 13,
+      currentBuildId: null,
+      status: "draft",
+    });
+    expect(state.inserts).toEqual([
+      expect.objectContaining({ table: messages }),
+    ]);
   });
 
-  it("fails safe for an active deployment that is not bound to an exact known Aliyun operation", async () => {
+  it("approves and queues a fresh rollback for an unbound stale deployment", async () => {
     const state = fixture({
       activeDeployment: {
         id: "82500000-0000-4000-8000-000000000008",
@@ -1380,9 +1482,50 @@ describe("site rebuild reset approval", () => {
         actorUserId: 1,
         now: new Date("2026-08-24T08:00:00.000Z"),
       }),
-    ).rejects.toMatchObject({ code: "IN_FLIGHT_OPERATION" });
-    expect(state.updates).toHaveLength(0);
-    expect(state.inserts).toHaveLength(0);
+    ).resolves.toMatchObject({
+      resetApplied: true,
+      resetPending: true,
+    });
+    expect(state.project).toMatchObject({ revision: 13, currentBuildId: null });
+    expect(state.inserts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: siteOperations,
+          values: expect.objectContaining({
+            kind: "rollback",
+            provider: "aliyun_esa",
+            status: "queued",
+          }),
+        }),
+        expect.objectContaining({ table: messages }),
+      ]),
+    );
+  });
+
+  it("durably approves reset when managed DNS access is unavailable", async () => {
+    const state = fixture({ activeDns: true });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(result).toMatchObject({
+      resetApplied: true,
+      resetPending: true,
+      resetOperationId: null,
+    });
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      schemaVersion: 5,
+      resetActivationState: "awaiting_external_access",
+      awaitingExternalOperationIds: [],
+      resetEpochDecoupled: true,
+      resetAppliedProjectRevision: 13,
+    });
+    expect(state.inserts).toEqual([
+      expect.objectContaining({ table: messages }),
+    ]);
   });
 
   it("still retires local generation lineage while an Aliyun write drains", async () => {
@@ -1436,10 +1579,12 @@ describe("site rebuild reset approval", () => {
     });
     expect(cancellation?.values).not.toHaveProperty("result");
     expect(cancellation?.values).not.toHaveProperty("providerOperationId");
-    expect(state.inserts).toHaveLength(0);
+    expect(state.inserts).toEqual([
+      expect.objectContaining({ table: messages }),
+    ]);
   });
 
-  it("automatically freezes the latest live coordinates after the approved external operation reconciles", async () => {
+  it("activates cleanup from the frozen old coordinates without blocking a new local build", async () => {
     const externalOperationId = "86000000-0000-4000-8000-000000000008";
     const approvalState = fixture({
       activeOperation: {
@@ -1461,7 +1606,6 @@ describe("site rebuild reset approval", () => {
     });
     const latestBuildId = "88000000-0000-4000-8000-000000000008";
     const latestSnapshotId = "89000000-0000-4000-8000-000000000008";
-    const latestDeploymentId = "8a000000-0000-4000-8000-000000000008";
     const state = fixture({
       internalNote: approval!.internalNote,
       ticketStatus: "in_progress",
@@ -1469,8 +1613,9 @@ describe("site rebuild reset approval", () => {
         revision: 19,
         currentBuildId: latestBuildId,
         currentKnowledgeSnapshotId: latestSnapshotId,
-        globalLiveDeploymentId: latestDeploymentId,
-        canonicalHostname: "latest.example.com",
+        globalLiveDeploymentId: null,
+        canonicalHostname: null,
+        currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
       },
       reconciledOperations: [
         {
@@ -1492,13 +1637,13 @@ describe("site rebuild reset approval", () => {
 
     expect(activated).toMatchObject({
       status: "activated",
-      resetExpectedProjectRevision: 19,
+      resetExpectedProjectRevision: 12,
     });
     const queuedReset = state.inserts.find(
       (entry) => entry.table === siteOperations,
     )?.values;
     expect(queuedReset).toMatchObject({
-      buildId: latestBuildId,
+      buildId,
       kind: "rollback",
       provider: "aliyun_esa",
       status: "queued",
@@ -1506,20 +1651,24 @@ describe("site rebuild reset approval", () => {
         schemaVersion: 1,
         intent: "approved_reset_unpublish",
         rebuildTicketId: ticketId,
-        expectedProjectRevision: 19,
-        expectedCurrentBuildId: latestBuildId,
-        expectedKnowledgeSnapshotId: latestSnapshotId,
-        expectedGlobalLiveDeploymentId: latestDeploymentId,
+        expectedProjectRevision: 12,
+        expectedCurrentBuildId: buildId,
+        expectedKnowledgeSnapshotId: snapshotId,
+        expectedGlobalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
         expectedMainlandLiveDeploymentId: null,
-        expectedCanonicalHostname: "latest.example.com",
+        expectedCanonicalHostname: null,
+        resetAppliedProjectRevision: 13,
+        resetEpochStartedAt: "2026-08-24T08:00:00.000Z",
       },
     });
     expect(JSON.parse(state.ticket.internalNote)).toMatchObject({
       schemaVersion: 4,
       resetApprovedAt: "2026-08-24T08:00:00.000Z",
-      resetExpectedProjectRevision: 19,
-      sourceBuildId: latestBuildId,
-      knowledgeSnapshotId: latestSnapshotId,
+      resetExpectedProjectRevision: 12,
+      resetAppliedProjectRevision: 13,
+      resetEpochDecoupled: true,
+      sourceBuildId: buildId,
+      knowledgeSnapshotId: snapshotId,
     });
     expect(
       state.updates.some(
@@ -1539,66 +1688,93 @@ describe("site rebuild reset approval", () => {
     ).toHaveLength(1);
   });
 
-  it.each([
-    {
-      name: "the original operation is still outcome-unknown",
-      reconciledStatus: "outcome_unknown",
-      activeDns: false,
-    },
-    {
-      name: "the provider operation is terminal but its DNS row is still propagating",
-      reconciledStatus: "succeeded",
-      activeDns: true,
-    },
-  ])(
-    "keeps the approved reset queued while $name",
-    async ({ reconciledStatus, activeDns }) => {
-      const externalOperationId = "8b000000-0000-4000-8000-000000000008";
-      const deferredNote = JSON.stringify({
-        schemaVersion: 5,
-        kind: "frontmind.siteops-rebuild.v1",
-        projectId,
-        sourceBuildId: buildId,
-        knowledgeSnapshotId: snapshotId,
-        resetIntent: "approved_reset_unpublish",
-        resetApprovedAt: "2026-08-24T08:00:00.000Z",
-        minimumKnowledgeSnapshotVersion: 1,
-        resetActivationState: "awaiting_external_reconciliation",
-        awaitingExternalOperationIds: [externalOperationId],
-      });
-      const state = fixture({
-        internalNote: deferredNote,
-        ticketStatus: "in_progress",
-        activeDns,
-        reconciledOperations: [
-          {
-            id: externalOperationId,
-            projectId,
-            userId: 9,
-            provider: "aliyun_alidns",
-            kind: "dns_apply",
-            status: reconciledStatus,
-            completedAt:
-              reconciledStatus === "succeeded"
-                ? new Date("2026-08-24T08:04:00.000Z")
-                : null,
-          },
-        ],
-      });
+  it("keeps the approved reset queued while the original operation is still outcome-unknown", async () => {
+    const externalOperationId = "8b000000-0000-4000-8000-000000000008";
+    const deferredNote = JSON.stringify({
+      schemaVersion: 5,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: buildId,
+      knowledgeSnapshotId: snapshotId,
+      resetIntent: "approved_reset_unpublish",
+      resetApprovedAt: "2026-08-24T08:00:00.000Z",
+      minimumKnowledgeSnapshotVersion: 1,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: [externalOperationId],
+    });
+    const state = fixture({
+      internalNote: deferredNote,
+      ticketStatus: "in_progress",
+      reconciledOperations: [
+        {
+          id: externalOperationId,
+          projectId,
+          userId: 9,
+          provider: "aliyun_alidns",
+          kind: "dns_apply",
+          status: "outcome_unknown",
+          completedAt: null,
+        },
+      ],
+    });
 
-      await expect(
-        activateDeferredApprovedSiteOpsReset(state.tx, {
-          ticketId,
-          now: new Date("2026-08-24T08:05:00.000Z"),
-        }),
-      ).resolves.toEqual({ status: "awaiting_external_reconciliation" });
-      expect(state.inserts).toHaveLength(0);
-      expect(state.updates).toHaveLength(0);
-      expect(JSON.parse(state.ticket.internalNote)).toMatchObject({
-        schemaVersion: 5,
-      });
-    },
-  );
+    await expect(
+      activateDeferredApprovedSiteOpsReset(state.tx, {
+        ticketId,
+        now: new Date("2026-08-24T08:05:00.000Z"),
+      }),
+    ).resolves.toEqual({ status: "awaiting_external_reconciliation" });
+    expect(state.inserts).toHaveLength(0);
+    expect(state.updates).toHaveLength(0);
+    expect(JSON.parse(state.ticket.internalNote)).toMatchObject({
+      schemaVersion: 5,
+    });
+  });
+
+  it("moves a reconciled DNS reset to durable access wait instead of blocking", async () => {
+    const externalOperationId = "8b100000-0000-4000-8000-000000000008";
+    const deferredNote = JSON.stringify({
+      schemaVersion: 5,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: buildId,
+      knowledgeSnapshotId: snapshotId,
+      resetIntent: "approved_reset_unpublish",
+      resetApprovedAt: "2026-08-24T08:00:00.000Z",
+      minimumKnowledgeSnapshotVersion: 1,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: [externalOperationId],
+    });
+    const state = fixture({
+      internalNote: deferredNote,
+      ticketStatus: "in_progress",
+      activeDns: true,
+      reconciledOperations: [
+        {
+          id: externalOperationId,
+          projectId,
+          userId: 9,
+          provider: "aliyun_alidns",
+          kind: "dns_apply",
+          status: "succeeded",
+          completedAt: new Date("2026-08-24T08:04:00.000Z"),
+        },
+      ],
+    });
+
+    await expect(
+      activateDeferredApprovedSiteOpsReset(state.tx, {
+        ticketId,
+        now: new Date("2026-08-24T08:05:00.000Z"),
+      }),
+    ).resolves.toEqual({ status: "awaiting_external_access" });
+    expect(JSON.parse(state.ticket.internalNote)).toMatchObject({
+      schemaVersion: 5,
+      resetActivationState: "awaiting_external_access",
+      awaitingExternalOperationIds: [],
+    });
+    expect(state.inserts).toHaveLength(0);
+  });
 
   it("fails safe if an unrecognized active provider appears before deferred activation", async () => {
     const externalOperationId = "8c000000-0000-4000-8000-000000000008";
@@ -1648,7 +1824,7 @@ describe("site rebuild reset approval", () => {
     expect(state.updates).toHaveLength(0);
   });
 
-  it("atomically clears live heads and build lineage while preserving the active knowledge snapshot", async () => {
+  it("completes old external cleanup without restarting or replacing the fresh local epoch", async () => {
     const state = fixture();
     const approval = await approveSiteOpsRebuildTicket(state.tx, {
       ticket: state.ticket,
@@ -1679,7 +1855,7 @@ describe("site rebuild reset approval", () => {
       globalLiveDeploymentId: null,
       mainlandLiveDeploymentId: null,
       canonicalHostname: null,
-      currentTaskStartedAt: new Date("2026-08-24T08:05:00.000Z"),
+      currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
       minimumKnowledgeSnapshotVersion: null,
       brief: null,
       status: "draft",
@@ -1751,28 +1927,18 @@ describe("site rebuild reset approval", () => {
           }),
         }),
       }),
-      expect.objectContaining({
-        values: expect.objectContaining({
-          status: "superseded",
-          verification: expect.objectContaining({
-            priorCheck: "passed",
-            resetInvalidated: true,
-          }),
-        }),
-      }),
     ]);
     expect(state.inserts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           table: messages,
           values: expect.objectContaining({
-            content:
-              "旧官网已下线，官网重置已完成。企业知识库保持不变，可从知识库开始全新的建站任务。",
+            content: "旧官网的外部发布与 DNS 下线确认已完成。",
             metadata: expect.objectContaining({
               siteOps: expect.objectContaining({
                 payload: expect.objectContaining({
-                  requested: "reuse_current_knowledge",
                   reset: true,
+                  freshRootApplied: true,
                   unpublishCompleted: true,
                 }),
               }),
@@ -1784,7 +1950,7 @@ describe("site rebuild reset approval", () => {
     );
     expect(
       state.inserts.filter((entry) => entry.table === messages),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
     expect(
       state.inserts.find((entry) => entry.table === deliveryTicketEvents)
         ?.values,
@@ -1794,7 +1960,38 @@ describe("site rebuild reset approval", () => {
     });
   });
 
-  it("finalizes against the observed revision only with a bound 0065 migration proof", async () => {
+  it("finalizes a pre-fix subsecond reset note after MySQL truncates the project epoch", async () => {
+    const state = fixture();
+    const approval = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.987Z"),
+    });
+    const operation = state.inserts.find(
+      (entry) => entry.table === siteOperations,
+    )!.values;
+    const legacyNote = JSON.parse(approval!.internalNote);
+    legacyNote.resetAppliedAt = "2026-08-24T08:00:00.987Z";
+    legacyNote.frozenReset.resetEpochStartedAt = "2026-08-24T08:00:00.987Z";
+    operation.input = {
+      ...(operation.input as Record<string, unknown>),
+      resetEpochStartedAt: "2026-08-24T08:00:00.987Z",
+    };
+    Object.assign(state.ticket, {
+      status: "in_progress",
+      internalNote: JSON.stringify(legacyNote),
+      revision: 6,
+    });
+
+    await expect(
+      finalizeApprovedSiteOpsReset(state.tx, {
+        operation: operation as never,
+        now: new Date("2026-08-24T08:05:00.000Z"),
+      }),
+    ).resolves.toMatchObject({ status: "applied", projectRevision: 13 });
+  });
+
+  it("allows external cleanup after the new local epoch advances its own revision", async () => {
     const state = fixture();
     const approval = await approveSiteOpsRebuildTicket(state.tx, {
       ticket: state.ticket,
@@ -1805,12 +2002,20 @@ describe("site rebuild reset approval", () => {
       (entry) => entry.table === siteOperations,
     )!.values;
     const migrationAt = new Date("2026-08-24T08:02:00.000Z");
+    const newBuildId = "91000000-0000-4000-8000-000000000009";
+    const newSnapshotId = "92000000-0000-4000-8000-000000000009";
     Object.assign(operation, {
       result: null,
       providerOperationId: null,
       providerTaskId: null,
     });
-    Object.assign(state.project, { revision: 13, updatedAt: migrationAt });
+    Object.assign(state.project, {
+      revision: 19,
+      currentBuildId: newBuildId,
+      currentKnowledgeSnapshotId: newSnapshotId,
+      status: "approved",
+      updatedAt: migrationAt,
+    });
     Object.assign(state.ticket, {
       status: "in_progress",
       internalNote: approval!.internalNote,
@@ -1820,31 +2025,21 @@ describe("site rebuild reset approval", () => {
     const finalized = await finalizeApprovedSiteOpsReset(state.tx, {
       operation: operation as never,
       now: new Date("2026-08-24T08:05:00.000Z"),
-      safeNoExposureProof: {
-        schemaVersion: 1,
-        classification: "safe_no_exposure",
-        source: "migration_0065_revision_only",
-        resetOperationId: operation.id as string,
-        projectId,
-        expectedProjectRevision: 12,
-        observedProjectRevision: 13,
-        observedProjectUpdatedAt: migrationAt.toISOString(),
-      },
     });
 
     expect(finalized).toMatchObject({
       status: "applied",
-      projectRevision: 14,
+      projectRevision: 13,
     });
     expect(state.project).toMatchObject({
-      revision: 14,
-      currentBuildId: null,
-      currentKnowledgeSnapshotId: snapshotId,
-      status: "draft",
+      revision: 19,
+      currentBuildId: newBuildId,
+      currentKnowledgeSnapshotId: newSnapshotId,
+      status: "approved",
     });
   });
 
-  it("rejects the same +1 revision drift when the 0065 proof is absent", async () => {
+  it("rejects external cleanup after a newer reset epoch replaces the frozen fence", async () => {
     const state = fixture();
     const approval = await approveSiteOpsRebuildTicket(state.tx, {
       ticket: state.ticket,
@@ -1855,7 +2050,9 @@ describe("site rebuild reset approval", () => {
       (entry) => entry.table === siteOperations,
     )!.values;
     Object.assign(state.project, {
-      revision: 13,
+      revision: 20,
+      currentBuildId: null,
+      currentTaskStartedAt: new Date("2026-08-24T08:02:00.000Z"),
       updatedAt: new Date("2026-08-24T08:02:00.000Z"),
     });
     Object.assign(state.ticket, {
@@ -1871,9 +2068,9 @@ describe("site rebuild reset approval", () => {
 
     expect(finalized).toEqual({ status: "invalidated" });
     expect(state.project).toMatchObject({
-      revision: 13,
-      currentBuildId: buildId,
-      status: "approved",
+      revision: 20,
+      currentBuildId: null,
+      status: "draft",
     });
   });
 });

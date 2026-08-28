@@ -121,9 +121,11 @@ import {
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
+  SITEOPS_MATERIALIZER_V2_4_LEGACY,
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
+import { SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE } from "../../shared/siteops-contract";
 import {
   FRONTMIND_VISUAL_FAMILIES_V3,
   referenceBlueprintForVisualCandidate,
@@ -872,6 +874,49 @@ async function legacyReactV2_3Source() {
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+async function legacyReactV2_4Source() {
+  const input = buildInput();
+  const frozen = siteOpsFrozenRuntimeInputSchema.parse({
+    schemaVersion: 2,
+    build: {
+      ...input.build,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_4_LEGACY.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_4_LEGACY.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_4_LEGACY.frontMindVersion,
+      workflowPackageHash:
+        SITEOPS_MATERIALIZER_V2_4_LEGACY.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_4_LEGACY.starterVersion,
+    },
+    host: {
+      starterSha256: SITEOPS_MATERIALIZER_V2_4_LEGACY.starterSha256,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_4_LEGACY.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_4_LEGACY.materializerVersion,
+      materializerSha256: SITEOPS_MATERIALIZER_V2_4_LEGACY.materializerSha256,
+      renderer: "react_static_v2",
+    },
+    snapshot: {
+      id: input.snapshot.id,
+      userId: input.snapshot.userId,
+      archiveHash: input.snapshot.archiveHash,
+      sourceBuildId: input.snapshot.sourceBuildId,
+      sourceBuildRevision: input.snapshot.sourceBuildRevision,
+      sourceDocumentIds: input.snapshot.documents.map(
+        (document) => document.id,
+      ),
+    },
+    brief: input.brief,
+    visual: input.visual,
+    designSpec: input.designSpec,
+    generatedContent: input.generatedContent,
+    assetDecisions: [],
+    brandAsset: null,
+  });
+  const zip = new JSZip();
+  zip.file("frontmind-runtime-input.json", `${JSON.stringify(frozen)}\n`);
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
 describe("SiteOps trusted React 19 static runtime", () => {
   let previewBuild: Awaited<ReturnType<typeof materializeAstroSite>>;
   let officialLogo: Buffer;
@@ -970,8 +1015,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       renderer: {
         kind: "react_static_v2",
         reactVersion: "19.2.1",
-        componentLibraryVersion: "2.4.0",
-        materializerVersion: "2.4.0",
+        componentLibraryVersion: "2.6.0",
+        materializerVersion: "2.6.0",
       },
       content: {
         schemaVersion: 2,
@@ -1137,8 +1182,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       const language = visualLanguages[family];
 
       expect(manifest).toMatchObject({
-        componentLibraryVersion: "2.4.0",
-        materializerVersion: "2.4.0",
+        componentLibraryVersion: "2.6.0",
+        materializerVersion: "2.6.0",
         heroFamily: family,
         referenceBlueprint: {
           schemaVersion: 4,
@@ -1188,8 +1233,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       expect(built.contract).toMatchObject({
         schemaVersion: 4,
         renderer: {
-          componentLibraryVersion: "2.4.0",
-          materializerVersion: "2.4.0",
+          componentLibraryVersion: "2.6.0",
+          materializerVersion: "2.6.0",
         },
         referenceBlueprint: {
           heroFamily: family,
@@ -1466,6 +1511,60 @@ describe("SiteOps trusted React 19 static runtime", () => {
     );
   }, 90_000);
 
+  it("preserves content-patch provenance through the trusted local renderer", async () => {
+    const input = buildInput();
+    input.renderModeOverride = "content_patch";
+    const built = await materializeAstroSite(input);
+    expect(built.buildDelivery).toEqual({
+      renderMode: "content_patch",
+      qaStatus: "passed",
+      warningCodes: [],
+    });
+    expect(JSON.parse(built.qaJson.toString("utf8"))).toMatchObject({
+      passed: true,
+      buildDelivery: built.buildDelivery,
+    });
+    expect(built.files.get("index.html")?.toString("utf8")).toContain(
+      "星河智造",
+    );
+  }, 90_000);
+
+  it("persists partial content-patch defaults and restores their delivery on production rebuild", async () => {
+    const input = buildInput();
+    input.renderModeOverride = "content_patch";
+    input.contentPatchUsesTrustedDefaults = true;
+    const built = await materializeAstroSite(input);
+    expect(built.buildDelivery).toEqual({
+      renderMode: "content_patch",
+      qaStatus: "passed_with_warnings",
+      warningCodes: [SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS_WARNING_CODE],
+    });
+
+    const source = await JSZip.loadAsync(built.sourceZip, {
+      checkCRC32: true,
+    });
+    const frozen = JSON.parse(
+      await source.file("frontmind-runtime-input.json")!.async("string"),
+    );
+    expect(frozen).toMatchObject({
+      renderMode: "content_patch",
+      contentPatchUsesTrustedDefaults: true,
+    });
+    const previewProvenance = JSON.parse(built.provenanceJson.toString("utf8"));
+    expect(previewProvenance.buildDelivery).toEqual(built.buildDelivery);
+
+    const production = await materializeProductionSiteFromSource({
+      sourceZip: built.sourceZip,
+      expectedSourceSha256: built.sourceSha256,
+      canonicalOrigin: "https://content-patch.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    expect(production.buildDelivery).toEqual(built.buildDelivery);
+    expect(
+      JSON.parse(production.provenanceJson.toString("utf8")).buildDelivery,
+    ).toEqual(built.buildDelivery);
+  }, 90_000);
+
   it("reports production-shaped Axe contrast findings without discarding the preview", async () => {
     browserQaMocks.axeAnalyze.mockResolvedValueOnce({
       violations: [{ id: "color-contrast", impact: "serious" }],
@@ -1641,8 +1740,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       schemaVersion: 4,
       renderer: {
         kind: "react_static_v2",
-        componentLibraryVersion: "2.4.0",
-        materializerVersion: "2.4.0",
+        componentLibraryVersion: "2.6.0",
+        materializerVersion: "2.6.0",
       },
       content: {
         schemaVersion: 2,
@@ -1847,6 +1946,70 @@ describe("SiteOps trusted React 19 static runtime", () => {
     expect(css).toContain("color-mix(in srgb,var(--ink) 22%,transparent)");
     expect(css).not.toContain("--accent-text:");
     expect(css).not.toContain("--inverse-surface:");
+  }, 90_000);
+
+  it("rebuilds pre-content-patch 2.4 source bundles with their legacy immutable coordinates", async () => {
+    const sourceZip = await legacyReactV2_4Source();
+    const rebuilt = await materializeProductionSiteFromSource({
+      sourceZip,
+      expectedSourceSha256: H(sourceZip),
+      canonicalOrigin: "https://react24-legacy.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    const contract = JSON.parse(rebuilt.contractJson.toString("utf8"));
+    expect(contract).toMatchObject({
+      workflow: {
+        version: "2.4.0",
+        componentLibraryVersion: "2.4.0",
+        materializerVersion: "2.4.0",
+      },
+      renderer: {
+        kind: "react_static_v2",
+        componentLibraryVersion: "2.4.0",
+        materializerVersion: "2.4.0",
+      },
+    });
+    const source = await JSZip.loadAsync(rebuilt.sourceZip, {
+      checkCRC32: true,
+    });
+    const currentSource = await JSZip.loadAsync(previewBuild.sourceZip, {
+      checkCRC32: true,
+    });
+    const frozen = JSON.parse(
+      await source.file("frontmind-runtime-input.json")!.async("string"),
+    );
+    expect(frozen).toMatchObject({
+      build: {
+        workflowPackageHash:
+          SITEOPS_MATERIALIZER_V2_4_LEGACY.runtimeManifestSha256,
+      },
+      host: {
+        materializerSha256: SITEOPS_MATERIALIZER_V2_4_LEGACY.materializerSha256,
+      },
+    });
+    const historicalCss = await source
+      .file("public/styles.css")!
+      .async("string");
+    const currentCss = await currentSource
+      .file("public/styles.css")!
+      .async("string");
+    expect(historicalCss).toBe(currentCss);
+    expect(historicalCss).toContain("--accent-text:");
+    expect(historicalCss).toContain("--inverse-surface:");
+    const historicalComponents = await source
+      .file("src/component-library.mjs")!
+      .async("string");
+    const currentComponents = await currentSource
+      .file("src/component-library.mjs")!
+      .async("string");
+    expect(historicalComponents).toBe(currentComponents);
+    expect(historicalComponents).toContain(
+      "/* frontmind-v4-component:start */",
+    );
+    const dist = await JSZip.loadAsync(rebuilt.distZip, { checkCRC32: true });
+    expect(await dist.file("index.html")!.async("string")).toContain(
+      'rel="canonical" href="https://react24-legacy.xinghe.example/"',
+    );
   }, 90_000);
 
   it("stops production materialization when the deployment signal is aborted", async () => {

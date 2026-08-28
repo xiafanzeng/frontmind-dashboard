@@ -28,3 +28,24 @@ export function runtimeRoleServesWeb(role: FrontMindRuntimeRole) {
 export function runtimeRoleRunsSiteOps(role: FrontMindRuntimeRole) {
   return role !== "web";
 }
+
+/**
+ * Knowledge-base recovery performs Provider reads, archive verification and
+ * local packaging. Keep it off the latency-sensitive web role and colocate it
+ * with the existing background worker process.
+ */
+export function runtimeRoleRunsKnowledgeBaseWorker(role: FrontMindRuntimeRole) {
+  return role !== "web";
+}
+
+/**
+ * Readiness may only depend on in-process workers owned by the current role.
+ * Otherwise a split web process would wait forever for the worker's recovery
+ * tracker, while the worker would wait for the web-only upload scheduler.
+ */
+export function runtimeRoleReadinessRequirements(role: FrontMindRuntimeRole) {
+  return {
+    managedUploads: runtimeRoleServesWeb(role),
+    knowledgeBaseRecovery: runtimeRoleRunsKnowledgeBaseWorker(role),
+  } as const;
+}

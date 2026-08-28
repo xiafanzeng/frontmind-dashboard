@@ -74,6 +74,40 @@ describe("SiteOps public error projection", () => {
     );
   });
 
+  it("keeps an already-public attention error stable during observation", () => {
+    expect(
+      publicSiteOpsMessageText({
+        content: "本次没有生成可安全展示的版本。",
+        errorCode: "FRONTMIND_BUILD_REQUIRES_ATTENTION",
+        operationStatus: "attention_required",
+      }),
+    ).toBe(
+      "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
+    );
+  });
+
+  it("uses operation status when projecting a legacy raw build error", () => {
+    expect(
+      publicSiteOpsMessageText({
+        content: "legacy provider failure",
+        errorCode: "FRONTMIND_BUILD_UNKNOWN",
+        operationStatus: "attention_required",
+      }),
+    ).toBe(
+      "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
+    );
+  });
+
+  it("does not hide an explicit service outage behind a reset message", () => {
+    expect(
+      publicSiteOpsMessageText({
+        content: "FrontMind AI 建站服务暂时不可用，请稍后重试。",
+        errorCode: "FRONTMIND_BUILD_SERVICE_UNAVAILABLE",
+        operationStatus: "attention_required",
+      }),
+    ).toBe("FrontMind AI 建站服务暂时不可用，请稍后重试。");
+  });
+
   it("does not project publishing runtime diagnostics into customer readiness", () => {
     const projected = sanitizeFrontMindPublicText(
       "ESA 无法使用当前 AliDNS access token 验证 CNAME",

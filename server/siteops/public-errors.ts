@@ -9,6 +9,25 @@ const INFRASTRUCTURE_TERM =
 const FRESH_RESET_MESSAGE =
   "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。";
 
+const PUBLIC_BUILD_ERROR_COPY: Readonly<Record<string, string>> = {
+  FRONTMIND_BUILD_REQUEST_INVALID: FRESH_RESET_MESSAGE,
+  FRONTMIND_BUILD_ASSET_CONFLICT: FRESH_RESET_MESSAGE,
+  FRONTMIND_BUILD_COMPILE_FAILED: FRESH_RESET_MESSAGE,
+  FRONTMIND_BUILD_OUTPUT_INVALID: FRESH_RESET_MESSAGE,
+  FRONTMIND_BUILD_QA_FAILED: FRESH_RESET_MESSAGE,
+  FRONTMIND_BUILD_REQUIRES_ATTENTION: FRESH_RESET_MESSAGE,
+  FRONTMIND_BUILD_RESULT_PENDING:
+    "FrontMind AI 建站任务结果仍在确认中，系统不会重复创建任务。",
+  FRONTMIND_BUILD_CONFIGURATION_ERROR:
+    "FrontMind AI 建站服务配置暂不可用，系统已停止继续创建任务。",
+  FRONTMIND_BUILD_RUNTIME_UNAVAILABLE:
+    "FrontMind AI 建站运行环境暂时不可用；若任务已经结束，可申请重置，批准后全新开始。",
+  FRONTMIND_BUILD_SERVICE_UNAVAILABLE:
+    "FrontMind AI 建站服务暂时不可用，请稍后重试。",
+  FRONTMIND_BUILD_RECONCILIATION_REQUIRED:
+    "FrontMind 基础预览已保留；自动结果同步已经结束，可申请重置后全新开始。",
+};
+
 export function sanitizeFrontMindPublicText(value: string) {
   if (VENDOR_NAME.test(value)) {
     return "FrontMind AI 建站任务未能完成，请提交工单获取协助。";
@@ -104,6 +123,13 @@ export function publicSiteOpsErrorProjection(input: {
       code: "FRONTMIND_BUILD_RESULT_PENDING",
       message: "FrontMind AI 建站任务结果仍在确认中，系统不会重复创建任务。",
     };
+  }
+  // Messages persisted by the worker have already crossed the public error
+  // boundary. Keep that projection stable when observation is rebuilt later;
+  // otherwise a missing status can turn an attention state into a generic
+  // service outage.
+  if (PUBLIC_BUILD_ERROR_COPY[code]) {
+    return { code, message: PUBLIC_BUILD_ERROR_COPY[code] };
   }
   if (
     code === "invalid_argument" ||
@@ -208,11 +234,13 @@ export function publicSiteOpsErrorProjection(input: {
 export function publicSiteOpsMessageText(input: {
   content: string;
   errorCode?: string | null;
+  operationStatus?: "failed" | "attention_required" | "outcome_unknown" | null;
 }) {
   const projected = input.errorCode
     ? publicSiteOpsErrorProjection({
         code: input.errorCode,
         message: input.content,
+        status: input.operationStatus ?? undefined,
       }).message || input.content
     : input.content;
   return sanitizeFrontMindPublicText(projected);

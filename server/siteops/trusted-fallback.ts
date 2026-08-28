@@ -13,18 +13,23 @@ export const siteOpsTrustedFallbackPreviewSchema = z
   .object({
     status: z.enum(["staged", "bound"]),
     trigger: z.enum([
+      "initial_baseline",
       "repair_budget_exhausted",
       "provider_stopped_without_result",
       "provider_read_delayed",
+      "provider_no_contract_progress",
     ]),
     createdAt: z.string().datetime(),
     reconcileUntilAt: z.string().datetime(),
     buildId: z.string().uuid(),
-    taskId: z.string().trim().min(1).max(255),
+    // The deterministic first preview can be bound before a Provider task is
+    // created. A later task remains fenced by buildId + operationToken and may
+    // atomically upgrade this same baseline.
+    taskId: z.string().trim().min(1).max(255).nullable(),
     operationToken: z
       .string()
       .regex(
-        /^siteops-native-fallback:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+        /^siteops-(?:native-fallback|content-baseline):[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
       ),
     selectedPreviewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     selectedSourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),

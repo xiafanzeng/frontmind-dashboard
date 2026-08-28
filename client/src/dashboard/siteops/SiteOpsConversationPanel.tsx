@@ -88,6 +88,7 @@ const BUILD_STATUS_LABELS: Record<string, string> = {
 };
 
 const BUILD_PHASE_LABELS: Record<string, string> = {
+  source_waiting: "正在等待内容结果",
   source_repairing: "正在修复源码",
   provider_sync_delayed: "正在同步建站结果",
   source_validating: "正在校验源码",
@@ -962,7 +963,14 @@ export default function SiteOpsConversationPanel({
   stopAliyunFlowRef.current = stopAliyunFlow;
 
   function syncOnlyAliyunDomain(domain: string, key: string) {
-    if (!observation || !onAction || busyAction) return;
+    if (
+      !observation ||
+      observation.rebuildRequest.resetPending ||
+      !onAction ||
+      busyAction
+    ) {
+      return;
+    }
     automaticallyConnectedDomainRef.current = key;
     setFailedAutomaticDomainKey(null);
     setBusyAction("domain_sync_auto");
@@ -1042,6 +1050,7 @@ export default function SiteOpsConversationPanel({
       observation.aliyunConnection.status !== "active" ||
       observation.domainState?.domain ||
       aliyunDomains.length !== 1 ||
+      observation.rebuildRequest.resetPending ||
       !onAction ||
       busyAction
     ) {
@@ -1101,11 +1110,9 @@ export default function SiteOpsConversationPanel({
   const aiBuilderConfigured =
     observation.serviceReadiness.website.status === "configured";
   const interactionLocked = Boolean(
-    busyAction ||
-      interactionPending ||
-      !onAction ||
-      observation.rebuildRequest.resetPending,
+    busyAction || interactionPending || !onAction,
   );
+  const externalResetPending = observation.rebuildRequest.resetPending;
   const visualGeneration = observation.visualGeneration ?? {
     status: "idle" as const,
     targetPage: null,
@@ -1236,24 +1243,23 @@ export default function SiteOpsConversationPanel({
                 />
               </button>
             )}
-            {(observation.rebuildRequest.allowed || rebuildRequestActive) &&
-              !latestAttempt?.recoverable && (
-                <button
-                  type="button"
-                  className="siteops-icon-button"
-                  aria-label={rebuildRequestLabel}
-                  disabled={Boolean(
-                    busyAction || !observation.rebuildRequest.allowed,
-                  )}
-                  title={rebuildRequestLabel}
-                  onClick={() => {
-                    setRebuildError(null);
-                    setRebuildDialogOpen(true);
-                  }}
-                >
-                  <Wrench size={17} aria-hidden="true" />
-                </button>
-              )}
+            {(observation.rebuildRequest.allowed || rebuildRequestActive) && (
+              <button
+                type="button"
+                className="siteops-icon-button"
+                aria-label={rebuildRequestLabel}
+                disabled={Boolean(
+                  busyAction || !observation.rebuildRequest.allowed,
+                )}
+                title={rebuildRequestLabel}
+                onClick={() => {
+                  setRebuildError(null);
+                  setRebuildDialogOpen(true);
+                }}
+              >
+                <Wrench size={17} aria-hidden="true" />
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -1727,9 +1733,11 @@ export default function SiteOpsConversationPanel({
                 BUILD_STATUS_LABELS[latestBuild.status] ||
                 "正在处理"}
             </h3>
-            {latestBuild.recoverable && latestBuild.previewWarning && (
-              <p>{latestBuild.previewWarning}</p>
-            )}
+            {latestBuild.previewWarning &&
+              (latestBuild.recoverable ||
+                latestBuild.buildDelivery?.renderMode === "content_patch") && (
+                <p>{latestBuild.previewWarning}</p>
+              )}
             {latestBuild.previewUrl &&
               latestBuild.buildDelivery?.renderMode === "trusted_fallback" && (
                 <p>
@@ -1840,6 +1848,7 @@ export default function SiteOpsConversationPanel({
                   className="siteops-primary-button"
                   disabled={
                     interactionLocked ||
+                    externalResetPending ||
                     !dnsReady ||
                     Boolean(globalDeployment.pending) ||
                     globalDeployment.active?.buildId === latestBuild.id
@@ -1870,6 +1879,7 @@ export default function SiteOpsConversationPanel({
                   className="siteops-secondary-button"
                   disabled={
                     interactionLocked ||
+                    externalResetPending ||
                     !mainlandReady ||
                     Boolean(mainlandDeployment.pending) ||
                     mainlandDeployment.active?.buildId === latestBuild.id
@@ -2130,7 +2140,7 @@ export default function SiteOpsConversationPanel({
                     <button
                       type="button"
                       className="siteops-secondary-button"
-                      disabled={Boolean(busyAction)}
+                      disabled={externalResetPending || Boolean(busyAction)}
                       onClick={() =>
                         syncOnlyAliyunDomain(
                           aliyunDomains[0].domain,
@@ -2181,7 +2191,11 @@ export default function SiteOpsConversationPanel({
                   <button
                     type="button"
                     className="siteops-primary-button"
-                    disabled={!selectedAliyunDomain || interactionLocked}
+                    disabled={
+                      !selectedAliyunDomain ||
+                      interactionLocked ||
+                      externalResetPending
+                    }
                     onClick={() =>
                       runAction(
                         "domain_sync",

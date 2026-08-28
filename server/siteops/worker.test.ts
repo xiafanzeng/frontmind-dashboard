@@ -8,6 +8,7 @@ import {
   parseSiteOpsBuildArtifactBindings,
   siteOpsBuildArtifactProjection,
   siteOpsInitialVisualSupersededMayStaySilent,
+  siteOpsExternalOperationPredatesResetEpoch,
   siteOpsDeterministicSuccessorId,
   siteOpsSupplementalVisualFailureMayRecover,
   siteOpsVisualOperationCoordinates,
@@ -44,6 +45,122 @@ describe("SiteOps mutually exclusive live heads", () => {
 });
 
 describe("SiteOps worker claim boundary", () => {
+  it("fences an old Aliyun result from a fresh local reset epoch but keeps the cleanup operation eligible", () => {
+    const currentTaskStartedAt = new Date("2026-08-28T01:00:00.000Z");
+    expect(
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation: {
+          kind: "deploy",
+          provider: "aliyun_esa",
+          input: { buildId: "old-build" },
+          createdAt: new Date("2026-08-28T00:59:00.000Z"),
+        } as never,
+        currentTaskStartedAt,
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation: {
+          kind: "site_build",
+          provider: "manus",
+          input: {},
+          createdAt: new Date("2026-08-28T00:59:00.000Z"),
+        } as never,
+        currentTaskStartedAt,
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation: {
+          kind: "rollback",
+          provider: "aliyun_esa",
+          input: {
+            schemaVersion: 1,
+            intent: "approved_reset_unpublish",
+            rebuildTicketId: "10000000-0000-4000-8000-000000000001",
+            expectedProjectRevision: 4,
+            expectedCurrentBuildId: null,
+            expectedKnowledgeSnapshotId: null,
+            expectedGlobalLiveDeploymentId: null,
+            expectedMainlandLiveDeploymentId: null,
+            expectedCanonicalHostname: null,
+          },
+          createdAt: new Date("2026-08-28T00:59:00.000Z"),
+        } as never,
+        currentTaskStartedAt,
+      }),
+    ).toBe(false);
+  });
+
+  it("uses the frozen operation id and reset revision to fence an old Aliyun write created in the reset second", () => {
+    const projectId = "20000000-0000-4000-8000-000000000002";
+    const operationId = "30000000-0000-4000-8000-000000000003";
+    const otherOperationId = "40000000-0000-4000-8000-000000000004";
+    const currentTaskStartedAt = new Date("2026-08-28T01:00:00.000Z");
+    const pendingResetNote = JSON.stringify({
+      schemaVersion: 5,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: null,
+      knowledgeSnapshotId: null,
+      resetIntent: "approved_reset_unpublish",
+      resetApprovedAt: "2026-08-28T01:00:00.987Z",
+      minimumKnowledgeSnapshotVersion: 1,
+      resetActivationState: "awaiting_external_reconciliation",
+      awaitingExternalOperationIds: [operationId],
+      resetEpochDecoupled: true,
+      resetAppliedAt: "2026-08-28T01:00:00.987Z",
+      resetAppliedProjectRevision: 13,
+      freshRootApplied: true,
+      frozenReset: {
+        schemaVersion: 1,
+        intent: "approved_reset_unpublish",
+        rebuildTicketId: "50000000-0000-4000-8000-000000000005",
+        expectedProjectRevision: 12,
+        expectedCurrentBuildId: null,
+        expectedKnowledgeSnapshotId: null,
+        expectedGlobalLiveDeploymentId: null,
+        expectedMainlandLiveDeploymentId: null,
+        expectedCanonicalHostname: null,
+        resetAppliedProjectRevision: 13,
+        resetEpochStartedAt: "2026-08-28T01:00:00.987Z",
+      },
+    });
+    const operation = {
+      id: operationId,
+      projectId,
+      kind: "deploy",
+      provider: "aliyun_esa",
+      input: { buildId: "old-build" },
+      createdAt: currentTaskStartedAt,
+    } as const;
+
+    expect(
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation,
+        currentTaskStartedAt,
+        projectRevision: 13,
+        pendingResetNotes: [pendingResetNote],
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation: { ...operation, id: otherOperationId },
+        currentTaskStartedAt,
+        projectRevision: 13,
+        pendingResetNotes: [pendingResetNote],
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsExternalOperationPredatesResetEpoch({
+        operation,
+        currentTaskStartedAt,
+        projectRevision: 12,
+        pendingResetNotes: [pendingResetNote],
+      }),
+    ).toBe(false);
+  });
+
   it("creates the automatic domain chain with deterministic replay-safe successors", async () => {
     const parent = (overrides: Record<string, unknown>) =>
       ({

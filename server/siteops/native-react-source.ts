@@ -13,6 +13,38 @@ export const FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME =
 export const FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME =
   "frontmind-site-source-receipt-v1.json";
 export const FRONTMIND_SITE_SOURCE_ARCHIVE_MIME = "application/zip";
+export const NATIVE_SOURCE_PREFLIGHT_VERSION =
+  "frontmind-native-preflight-v1" as const;
+export const NATIVE_SOURCE_PREFLIGHT_FILENAME =
+  `${NATIVE_SOURCE_PREFLIGHT_VERSION}.mjs` as const;
+
+export const NATIVE_SOURCE_PREFLIGHT_SCRIPT = Buffer.from(
+  `import { readFileSync, readdirSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+const root = path.resolve(process.argv[2] || ".");
+const allowed = new Set([".css", ".gif", ".html", ".ico", ".jpeg", ".jpg", ".json", ".jsx", ".md", ".mjs", ".png", ".svg", ".ts", ".tsx", ".txt", ".webp", ".woff", ".woff2"]);
+const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+  if (["node_modules", "dist", ".git"].includes(entry.name)) return [];
+  const absolute = path.join(dir, entry.name);
+  if (entry.isDirectory()) return walk(absolute);
+  if (!entry.isFile() || !allowed.has(path.extname(entry.name).toLowerCase())) throw new Error("PREFLIGHT_FILE_TYPE_FORBIDDEN:" + path.relative(root, absolute));
+  if (statSync(absolute).size > 8 * 1024 * 1024) throw new Error("PREFLIGHT_FILE_TOO_LARGE:" + path.relative(root, absolute));
+  return [absolute];
+});
+const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+if (!pkg || typeof pkg !== "object" || Array.isArray(pkg) || typeof pkg.scripts?.build !== "string") throw new Error("PREFLIGHT_PACKAGE_INVALID");
+walk(root);
+const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const built = spawnSync(npm, ["run", "build", "--ignore-scripts"], { cwd: root, encoding: "utf8", shell: false, timeout: 120000 });
+if (built.error || built.status !== 0) throw new Error("PREFLIGHT_BUILD_FAILED");
+process.stdout.write(JSON.stringify({ version: "${NATIVE_SOURCE_PREFLIGHT_VERSION}", status: "passed" }) + "\\n");
+`,
+  "utf8",
+);
+export const NATIVE_SOURCE_PREFLIGHT_SHA256 = createHash("sha256")
+  .update(NATIVE_SOURCE_PREFLIGHT_SCRIPT)
+  .digest("hex");
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 
@@ -22,8 +54,28 @@ export const siteSourceReceiptV1Schema = z
     baseSourceSha256: z.string().regex(SHA256_PATTERN),
     archiveSha256: z.string().regex(SHA256_PATTERN),
     fileCount: z.number().int().min(1).max(512),
+    preflightVersion: z.literal(NATIVE_SOURCE_PREFLIGHT_VERSION).optional(),
+    preflightStatus: z.literal("passed").optional(),
+    preflightSha256: z.literal(NATIVE_SOURCE_PREFLIGHT_SHA256).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((receipt, context) => {
+    const fields = [
+      receipt.preflightVersion,
+      receipt.preflightStatus,
+      receipt.preflightSha256,
+    ];
+    if (
+      fields.some((value) => value !== undefined) &&
+      fields.some((value) => value === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["preflightVersion"],
+        message: "Preflight receipt coordinates must be complete",
+      });
+    }
+  });
 
 export type SiteSourceReceiptV1 = z.infer<typeof siteSourceReceiptV1Schema>;
 
@@ -68,7 +120,7 @@ export const TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT = `你是企业官网内�
 不得添加外部脚本、远程请求、HTML 注入、未知依赖或未提供的媒体。
 package.json 中的依赖版本必须保留为附件运行清单所使用的精确版本号，不得改成范围、标签或其他版本。
 
-最终只返回 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME} 和 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。`;
+最终必须先运行随附的 ${NATIVE_SOURCE_PREFLIGHT_FILENAME}，确认 package、文件类型、依赖、源码语法和 production build 全部通过。然后只返回 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME} 和 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}，立即结束；不得继续解释、复盘、浏览或更新计划。`;
 
 export type NativeSourceLimits = {
   maxArchiveBytes: number;
@@ -909,7 +961,14 @@ async function readBoundedResponseBody(response: Response, maxBytes: number) {
     );
   }
   const contentType = response.headers.get("content-type");
-  if (contentType !== FRONTMIND_SITE_SOURCE_ARCHIVE_MIME) {
+  const responseMediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  if (
+    ![
+      FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+      "application/x-zip-compressed",
+      "application/octet-stream",
+    ].includes(responseMediaType ?? "")
+  ) {
     throw new NativeReactSourceError("NATIVE_SOURCE_ATTACHMENT_INVALID");
   }
   const declaredHeader = response.headers.get("content-length");
@@ -950,9 +1009,17 @@ export async function readNativeSourceAttachment(input: {
   fetchPinned?: FetchPinned;
   maxBytes?: number;
 }) {
+  const mediaType = input.attachment.contentType
+    .split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
   if (
     input.attachment.filename !== FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME ||
-    input.attachment.contentType !== FRONTMIND_SITE_SOURCE_ARCHIVE_MIME
+    ![
+      FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+      "application/x-zip-compressed",
+      "application/octet-stream",
+    ].includes(mediaType ?? "")
   ) {
     throw new NativeReactSourceError("NATIVE_SOURCE_ATTACHMENT_INVALID");
   }

@@ -426,6 +426,36 @@ describe("SiteOpsConversationPanel", () => {
     expect(screen.queryByText("高级选项")).not.toBeInTheDocument();
   });
 
+  it("keeps the fresh local build action enabled while old external cleanup is pending", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "draft",
+          },
+          interactionState: "select_snapshot",
+          rebuildRequest: {
+            allowed: false,
+            ticketId: "77777777-7777-4777-8777-777777777777",
+            status: "in_progress",
+            resetApplied: true,
+            resetPending: true,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "从知识库开始建站" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "正在下线旧官网" }),
+    ).toBeDisabled();
+  });
+
   it("sanitizes technical reset request failures", async () => {
     const onAction = vi
       .fn()
@@ -1444,7 +1474,7 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
-  it("keeps a recoverable first build in progress without offering a reset", () => {
+  it("keeps a recoverable first build in progress and still offers a reset", () => {
     const buildId = "33333333-3333-4333-8333-333333333333";
     render(
       <SiteOpsConversationPanel
@@ -1489,8 +1519,55 @@ describe("SiteOpsConversationPanel", () => {
     expect(screen.getByText(/不会重复创建或重复计费/u)).toBeInTheDocument();
     expect(screen.queryByText(/本次没有生成可安全展示的版本/u)).toBeNull();
     expect(
-      screen.queryByRole("button", { name: "申请重置并全新开始" }),
-    ).toBeNull();
+      screen.getByRole("button", { name: "申请重置并全新开始" }),
+    ).toBeEnabled();
+  });
+
+  it("submits a fresh reset for a recoverable service-unavailable build", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "failed" },
+          interactionState: "failed",
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 1,
+              parentBuildId: null,
+              status: "failed",
+              previewUrl: null,
+              sourceUrl: null,
+              buildPhase: "provider_sync_delayed",
+              recoverable: true,
+              previewWarning:
+                "AI 建站任务仍可恢复，但也可以申请重置后全新开始。",
+              needsHelp: true,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+            resetSourceBuildId: null,
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "申请重置并全新开始" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交重置申请" }));
+
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "request_rebuild",
+        input: {},
+      }),
+    );
   });
 
   it("shows the previous preview while a recoverable revision keeps reconciling", () => {
@@ -1547,8 +1624,8 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByRole("button", { name: "在新标签页打开预览" }),
     ).toBeEnabled();
     expect(
-      screen.queryByRole("button", { name: "申请重置并全新开始" }),
-    ).toBeNull();
+      screen.getByRole("button", { name: "申请重置并全新开始" }),
+    ).toBeEnabled();
   });
 
   it("offers only an approved fresh reset after a hard build failure", async () => {
@@ -1642,6 +1719,48 @@ describe("SiteOpsConversationPanel", () => {
       "SITEOPS_REACT_STATIC_BUILD_FAILED",
     );
     expect(screen.queryByText(/请重置后重新开始/u)).toBeNull();
+  });
+
+  it("shows fixed partial-default copy for a successful content-patch preview", () => {
+    const buildId = "33333333-3333-4333-8333-333333333333";
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "preview_ready" },
+          interactionState: "preview_ready",
+          builds: [
+            {
+              id: buildId,
+              ordinal: 1,
+              parentBuildId: null,
+              status: "preview_ready",
+              previewUrl: `/api/site-ops/builds/${buildId}/preview/`,
+              sourceUrl: null,
+              buildDelivery: {
+                renderMode: "content_patch",
+                qaStatus: "passed_with_warnings",
+                warningCodes: ["SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS"],
+              },
+              buildPhase: null,
+              recoverable: false,
+              previewWarning:
+                "官网预览已生成，部分内容使用企业资料中的可信默认值。",
+              needsHelp: false,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("官网预览已生成，部分内容使用企业资料中的可信默认值。"),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(
+      "SITEOPS_CONTENT_PATCH_PARTIAL_DEFAULTS",
+    );
   });
 
   it("shows primary QA findings as non-blocking preview advice", () => {

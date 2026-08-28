@@ -94,11 +94,12 @@ function observationProjectionTimestamp(observation: SiteOpsObservationV1) {
 }
 
 const BUILD_PHASE_RANK: Record<string, number> = {
-  source_repairing: 1,
-  provider_sync_delayed: 2,
-  source_validating: 3,
-  compiling: 4,
-  persisting_preview: 5,
+  source_waiting: 1,
+  source_repairing: 2,
+  provider_sync_delayed: 3,
+  source_validating: 4,
+  compiling: 5,
+  persisting_preview: 6,
 };
 
 function latestBuildProgressRank(observation: SiteOpsObservationV1) {
