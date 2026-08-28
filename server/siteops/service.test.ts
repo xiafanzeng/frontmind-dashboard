@@ -31,6 +31,8 @@ import {
   siteBriefFromSnapshot,
   siteOpsServiceErrorFromQuota,
   siteOpsResetPendingBlocksAction,
+  siteOpsVisualCycleWorkflowVersion,
+  siteOpsWorkflowForVisualSelectionMetadata,
   siteOpsVisualSelectionRecovery,
   SiteOpsServiceError,
   visualSearchAllowedForProjectStatus,
@@ -39,6 +41,7 @@ import {
 import { SiteOpsQuotaError } from "./quota-service";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
+  SITEOPS_DEFAULT_WORKFLOW,
   SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_MATERIALIZER_V2_6,
@@ -103,21 +106,29 @@ describe("SiteOps core contracts", () => {
   });
 
   it("recognizes complete-template V6 metadata without legacy visual evidence", () => {
+    const historicalV6 = {
+      schemaVersion: 6,
+      renderer: "twenty_first_native_template_v1",
+      providerTemplateId: "template-42",
+      providerSlug: "saas-landing",
+      providerVersion: null,
+      framework: "vite_react",
+      sourceTreeSha256: "a".repeat(64),
+      sourceArchiveSha256: "b".repeat(64),
+      previewSha256: "c".repeat(64),
+      sourceDirectory: "source",
+      entrypoint: "src/App.tsx",
+    } as const;
+    expect(isNativeVisualSelectionMetadata(historicalV6)).toBe(true);
     expect(
-      isNativeVisualSelectionMetadata({
-        schemaVersion: 6,
-        renderer: "twenty_first_native_template_v1",
-        providerTemplateId: "template-42",
-        providerSlug: "saas-landing",
-        providerVersion: null,
-        framework: "vite_react",
-        sourceTreeSha256: "a".repeat(64),
-        sourceArchiveSha256: "b".repeat(64),
-        previewSha256: "c".repeat(64),
-        sourceDirectory: "source",
-        entrypoint: "src/App.tsx",
-      }),
-    ).toBe(true);
+      siteOpsWorkflowForVisualSelectionMetadata(historicalV6).frontMindVersion,
+    ).toBe(SITEOPS_MATERIALIZER_V2_5.frontMindVersion);
+    expect(
+      siteOpsWorkflowForVisualSelectionMetadata({
+        ...historicalV6,
+        workflowVersion: SITEOPS_DEFAULT_WORKFLOW.frontMindVersion,
+      }).frontMindVersion,
+    ).toBe(SITEOPS_DEFAULT_WORKFLOW.frontMindVersion);
     expect(
       isNativeVisualSelectionMetadata({
         schemaVersion: 6,
@@ -909,13 +920,13 @@ describe("SiteOps core contracts", () => {
     ).toThrow("所选视觉方案已失效");
   });
 
-  it("freezes every new root or revision build to the host-owned content-patch workflow", () => {
+  it("freezes every new or reset root to the Native Template 2.7 workflow", () => {
     expect(currentSiteOpsBuildWorkflowCoordinates()).toEqual({
-      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_6.upstreamVersion,
-      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_6.upstreamSha256,
-      workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
-      workflowPackageHash: SITEOPS_MATERIALIZER_V2_6.runtimeManifestSha256,
-      starterVersion: SITEOPS_MATERIALIZER_V2_6.starterVersion,
+      workflowUpstreamVersion: SITEOPS_DEFAULT_WORKFLOW.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_DEFAULT_WORKFLOW.upstreamSha256,
+      workflowVersion: SITEOPS_DEFAULT_WORKFLOW.frontMindVersion,
+      workflowPackageHash: SITEOPS_DEFAULT_WORKFLOW.runtimeManifestSha256,
+      starterVersion: SITEOPS_DEFAULT_WORKFLOW.starterVersion,
     });
   });
 
@@ -925,7 +936,7 @@ describe("SiteOps core contracts", () => {
     );
     expect(() =>
       assertCurrentVisualWorkflowVersion(
-        SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+        SITEOPS_DEFAULT_WORKFLOW.frontMindVersion,
       ),
     ).not.toThrow();
     expect(() =>
@@ -938,6 +949,31 @@ describe("SiteOps core contracts", () => {
         SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
       ),
     ).toThrow("视觉检索使用的建站合同已升级");
+  });
+
+  it("keeps supplemental visual pages on the cycle's frozen workflow", () => {
+    const frozen = (workflowVersion: string, page: 1 | 2) => ({
+      schemaVersion: 2 as const,
+      knowledgeSnapshotId: "30000000-0000-4000-8000-000000000003",
+      credentialId: "20000000-0000-4000-8000-000000000002",
+      credentialVersion: 7,
+      workflowVersion,
+      mode: page === 1 ? ("initial" as const) : ("supplemental" as const),
+      page,
+      admissionRevision: page,
+    });
+    expect(
+      siteOpsVisualCycleWorkflowVersion([
+        frozen(SITEOPS_MATERIALIZER_V2_5.frontMindVersion, 1),
+        frozen(SITEOPS_MATERIALIZER_V2_5.frontMindVersion, 2),
+      ]),
+    ).toBe(SITEOPS_MATERIALIZER_V2_5.frontMindVersion);
+    expect(() =>
+      siteOpsVisualCycleWorkflowVersion([
+        frozen(SITEOPS_MATERIALIZER_V2_5.frontMindVersion, 1),
+        frozen(SITEOPS_DEFAULT_WORKFLOW.frontMindVersion, 2),
+      ]),
+    ).toThrow("冻结工作流不一致");
   });
 
   it("creates a strict four-field visual operation without a Manus credential", () => {
@@ -1792,7 +1828,7 @@ describe("SiteOps core contracts", () => {
             knowledgeSnapshotId: snapshotId,
             credentialId: pinnedCredentialId,
             credentialVersion: 7,
-            workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+            workflowVersion: SITEOPS_DEFAULT_WORKFLOW.frontMindVersion,
           },
         },
       ],

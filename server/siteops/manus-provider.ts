@@ -73,6 +73,7 @@ import {
   manusV2EventOperationToken,
   manusV2EventsContainOperationToken,
   orderManusV2EventsByProviderRank,
+  type ManusV2Attachment,
   type ManusV2MessageEvent,
   type ManusV2StructuredOutputSchema,
 } from "../manus-v2-client";
@@ -144,15 +145,19 @@ import {
   FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
   NativeReactSourceError,
   TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
+  TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT,
   readNativeSourceAttachment,
   siteSourceReceiptV1Schema,
   validateNativeReactSourceArchive,
 } from "./native-react-source";
 import {
+  SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
   SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
   VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
+  VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES,
   assertVisualSelectionBundleV6SourceArchiveSize,
+  isSiteOpsNativeVisualWorkflowVersion,
   selectedNativeSourceArchive,
 } from "./native-visual-source";
 import {
@@ -236,6 +241,7 @@ const repairReasonSchema = z.enum([
 type RepairReason = z.infer<typeof repairReasonSchema>;
 
 const providerStageSchema = z.enum([
+  "native_input_ready",
   "create_unknown",
   "native_source_pending",
   "native_repair_send_unknown",
@@ -479,6 +485,21 @@ const providerStateV2Schema = providerStateV1Schema
     nativeSourceFileId: z.string().min(1).max(512).optional(),
     nativeSourceAttachmentEventId: z.string().min(1).max(512).optional(),
     nativeSourceAttachmentIdentity: z.string().min(1).max(768).optional(),
+    nativeInputProviderFile: z
+      .object({
+        sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        bytes: z
+          .number()
+          .int()
+          .positive()
+          .max(VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES),
+        filename: z.literal("frontmind-selected-21st-source-v1.zip"),
+        fileId: z.string().min(1).max(512),
+        expiresAt: z.number().int().positive(),
+        status: z.literal("uploaded"),
+      })
+      .strict()
+      .optional(),
     nativeSourceReadFailureCount: z
       .number()
       .int()
@@ -3059,6 +3080,21 @@ const nativeTemplateCoordinateV1Schema = z
   })
   .strict();
 
+const normalizedNativeTemplateCoordinateV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sourceFormat: z.literal("normalized_v1"),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceDirectory: z.string().trim().min(1).max(240),
+    framework: z.enum(["vite_react", "next_static"]),
+    entrypoint: z.string().trim().min(1).max(500),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
 const FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME =
   "frontmind-selected-template-coordinate-v1.json";
 
@@ -3070,29 +3106,49 @@ const FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME =
 export function nativeTemplateCoordinateDirective(source: NativeSelection) {
   if (
     source.bundle.schemaVersion !== 6 ||
-    !("sourceFormat" in source.candidate) ||
-    source.candidate.sourceFormat !== "provider_archive_v1" ||
-    !("sourceFormat" in source.manifest) ||
-    source.manifest.sourceFormat !== "provider_archive_v1"
+    !("sourceFormat" in source.candidate)
   ) {
     return null;
   }
-  const manifest = nativeTemplateCoordinateV1Schema.parse({
-    schemaVersion: 1,
-    sourceFormat: "provider_archive_v1",
-    providerTemplateId: source.manifest.providerTemplateId,
-    providerSlug: source.manifest.providerSlug,
-    providerVersion: source.manifest.providerVersion,
-    sourceSubdirectory: source.manifest.sourceSubdirectory,
-    framework: source.manifest.framework,
-    entrypoint: source.manifest.entrypoint,
-    providerArchiveSha256: source.manifest.providerArchiveSha256,
-    sourceTreeSha256: source.manifest.sourceTreeSha256,
-  });
+  const manifest =
+    source.candidate.sourceFormat === "provider_archive_v1" &&
+    "sourceFormat" in source.manifest &&
+    source.manifest.sourceFormat === "provider_archive_v1"
+      ? nativeTemplateCoordinateV1Schema.parse({
+          schemaVersion: 1,
+          sourceFormat: "provider_archive_v1",
+          providerTemplateId: source.manifest.providerTemplateId,
+          providerSlug: source.manifest.providerSlug,
+          providerVersion: source.manifest.providerVersion,
+          sourceSubdirectory: source.manifest.sourceSubdirectory,
+          framework: source.manifest.framework,
+          entrypoint: source.manifest.entrypoint,
+          providerArchiveSha256: source.manifest.providerArchiveSha256,
+          sourceTreeSha256: source.manifest.sourceTreeSha256,
+        })
+      : source.candidate.sourceFormat === "normalized_v1" &&
+          !("sourceFormat" in source.manifest)
+        ? normalizedNativeTemplateCoordinateV1Schema.parse({
+            schemaVersion: 1,
+            sourceFormat: "normalized_v1",
+            providerTemplateId: source.candidate.providerTemplateId,
+            providerSlug: source.candidate.providerSlug,
+            providerVersion: source.candidate.providerVersion,
+            sourceDirectory: source.candidate.sourceDirectory,
+            framework: source.candidate.framework,
+            entrypoint: source.candidate.entrypoint,
+            sourceArchiveSha256: source.candidate.sourceArchiveSha256,
+            sourceTreeSha256: source.candidate.sourceTreeSha256,
+          })
+        : null;
+  if (!manifest) return null;
   const bytes = Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
   return {
     manifest,
-    promptInstruction: `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是所选完整 Template 的唯一执行坐标。必须只使用其中指定的 providerSlug、sourceSubdirectory 和 entrypoint；即使源码 ZIP 同时包含同一仓库的其他模板，也必须全部忽略，不得自行选择相邻模板或仓库默认首页。`,
+    promptInstruction:
+      manifest.sourceFormat === "provider_archive_v1"
+        ? `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是所选完整 Template 的唯一执行坐标。必须只使用其中指定的 providerSlug、sourceSubdirectory 和 entrypoint；即使源码 ZIP 同时包含同一仓库的其他模板，也必须全部忽略，不得自行选择相邻模板或仓库默认首页。`
+        : `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是所选完整 Template 的唯一执行坐标。源码 ZIP 已由 FrontMind 从该精确模板完成标准化和 production build 验证；必须使用其中指定的 providerSlug、sourceDirectory 和 entrypoint，不得改选其他模板或重新设计。`,
     attachment: {
       filename: FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME,
       mime_type: "application/json",
@@ -3101,12 +3157,31 @@ export function nativeTemplateCoordinateDirective(source: NativeSelection) {
   };
 }
 
-function nativeSourceInputAttachment(source: NativeSelection) {
+const MANUS_INLINE_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+const NATIVE_SOURCE_PROVIDER_FILENAME =
+  "frontmind-selected-21st-source-v1.zip" as const;
+const NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS = 15 * 60;
+
+export function nativeSourceAttachmentTransport(byteLength: number) {
+  if (!Number.isSafeInteger(byteLength) || byteLength < 1) {
+    throw new Error("NATIVE_SOURCE_ATTACHMENT_SIZE_INVALID");
+  }
+  return byteLength <= MANUS_INLINE_ATTACHMENT_MAX_BYTES
+    ? ("inline" as const)
+    : ("provider_file" as const);
+}
+
+function nativeSourceInlineAttachment(source: NativeSelection) {
   if (source.bundle.schemaVersion === 6) {
     assertVisualSelectionBundleV6SourceArchiveSize(source.archiveBytes);
   }
+  if (
+    nativeSourceAttachmentTransport(source.archiveBytes.length) !== "inline"
+  ) {
+    throw new Error("NATIVE_SOURCE_REQUIRES_PROVIDER_FILE_UPLOAD");
+  }
   return {
-    filename: "frontmind-selected-21st-source-v1.zip",
+    filename: NATIVE_SOURCE_PROVIDER_FILENAME,
     mime_type: "application/zip",
     file_data: `data:application/zip;base64,${source.archiveBytes.toString(
       "base64",
@@ -3137,9 +3212,16 @@ function nativeBrandAttachment(
   ];
 }
 
+export function nativeSourceSystemPromptForWorkflow(workflowVersion: string) {
+  return workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
+    ? TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT
+    : TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT;
+}
+
 function nativeSourcePrompt(input: {
   operationToken: string;
   baseSourceSha256: string;
+  workflowVersion: string;
   hasCustomerFeedback?: boolean;
   templateCoordinateInstruction?: string;
   repair?: {
@@ -3153,6 +3235,9 @@ function nativeSourcePrompt(input: {
     }[];
   };
 }) {
+  const systemPrompt = nativeSourceSystemPromptForWorkflow(
+    input.workflowVersion,
+  );
   const repair = input.repair
     ? `\n\n${
         input.repair.kind === "hard_safety"
@@ -3167,7 +3252,7 @@ function nativeSourcePrompt(input: {
         .join("\n")}`
     : "";
   return promptWithMarker(
-    `${TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT}
+    `${systemPrompt}
 
 frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZIP 是唯一视觉与组件基线。不得采用附件之外的企业事实、媒体、依赖或外部资源。
 
@@ -3627,7 +3712,74 @@ async function handleNativeReactSiteBuild(input: {
   const templateCoordinate = nativeTemplateCoordinateDirective(
     input.nativeSelection,
   );
-  const sourceAttachments = (token: string) => [
+  let taskId =
+    input.state?.taskId ?? input.operation.providerTaskId ?? undefined;
+  const providerSourceAttachment = async (
+    sourceClient: ManusV2Client,
+  ): Promise<ManusV2Attachment> => {
+    if (
+      nativeSourceAttachmentTransport(
+        input.nativeSelection.archiveBytes.length,
+      ) === "inline"
+    ) {
+      return nativeSourceInlineAttachment(input.nativeSelection);
+    }
+    if (input.nativeSelection.bundle.schemaVersion === 6) {
+      assertVisualSelectionBundleV6SourceArchiveSize(
+        input.nativeSelection.archiveBytes,
+      );
+    }
+    const prior =
+      currentState?.schemaVersion === 2
+        ? currentState.nativeInputProviderFile
+        : undefined;
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    if (
+      prior?.status === "uploaded" &&
+      prior.sourceArchiveSha256 === baseSourceSha256 &&
+      prior.bytes === input.nativeSelection.archiveBytes.length &&
+      prior.expiresAt - nowSeconds >=
+        NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS
+    ) {
+      return {
+        file_id: prior.fileId,
+        filename: prior.filename,
+      };
+    }
+
+    await input.assertExecutionActive();
+    const uploaded = await sourceClient.uploadFile({
+      filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+      bytes: input.nativeSelection.archiveBytes,
+      contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+      minimumUsableSeconds: NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
+    });
+    currentState = transitionProviderState(currentState, {
+      stage: currentState?.stage ?? "native_input_ready",
+      nativeInputProviderFile: {
+        sourceArchiveSha256: baseSourceSha256,
+        bytes: input.nativeSelection.archiveBytes.length,
+        filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+        fileId: uploaded.fileId,
+        expiresAt: uploaded.detail.expiresAt,
+        status: "uploaded",
+      },
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      currentState,
+      taskId,
+    );
+    return {
+      file_id: uploaded.fileId,
+      filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+    };
+  };
+  const sourceAttachments = async (
+    token: string,
+    sourceClient: ManusV2Client,
+  ): Promise<ManusV2Attachment[]> => [
     ...siteOpsSourceDossierAttachments({
       operationToken: token,
       snapshot: {
@@ -3640,7 +3792,7 @@ async function handleNativeReactSiteBuild(input: {
       visualEvidence: runtimeVisual,
       documents: input.documents,
     }),
-    nativeSourceInputAttachment(input.nativeSelection),
+    await providerSourceAttachment(sourceClient),
     {
       filename: NATIVE_SOURCE_PREFLIGHT_FILENAME,
       mime_type: "text/javascript",
@@ -3652,8 +3804,6 @@ async function handleNativeReactSiteBuild(input: {
       ? [siteOpsCustomerFeedbackAttachment(input.input.feedback)]
       : []),
   ];
-  let taskId =
-    input.state?.taskId ?? input.operation.providerTaskId ?? undefined;
   let boundBuildTaskId = input.context.build.upstreamManusTaskId;
   const pendingExistingFallback = () => {
     const fallback =
@@ -4043,6 +4193,7 @@ async function handleNativeReactSiteBuild(input: {
       }
       taskId = found.id;
     } else {
+      const createAttachments = await sourceAttachments(operationToken, client);
       const createUnknownState = startProviderResultSyncWindow(
         transitionProviderState(currentState, {
           stage: "create_unknown",
@@ -4062,11 +4213,12 @@ async function handleNativeReactSiteBuild(input: {
           prompt: nativeSourcePrompt({
             operationToken,
             baseSourceSha256,
+            workflowVersion: input.context.build.workflowVersion,
             hasCustomerFeedback: Boolean(input.input.feedback),
             templateCoordinateInstruction:
               templateCoordinate?.promptInstruction,
           }),
-          attachments: sourceAttachments(operationToken),
+          attachments: createAttachments,
           locale: input.brief.primaryLanguage,
           agentProfile: managedAgentProfileModel(input.input.agentProfile),
           structuredOutputSchema: nativeSourceReceiptOutputSchema({
@@ -4173,6 +4325,9 @@ async function handleNativeReactSiteBuild(input: {
     }
     const nextAttempt = attempt + 1;
     const nextToken = `siteops-native-source:${input.operation.id}:${nextAttempt}`;
+    await input.assertExecutionActive();
+    client = client ?? (await input.getClient());
+    const repairAttachments = await sourceAttachments(nextToken, client);
     const unknownState = startProviderResultSyncWindow(
       transitionProviderState(currentState, {
         stage: "native_repair_send_unknown",
@@ -4199,12 +4354,12 @@ async function handleNativeReactSiteBuild(input: {
     );
     try {
       await input.assertExecutionActive();
-      client = client ?? (await input.getClient());
       await client.sendMessage({
         taskId,
         prompt: nativeSourcePrompt({
           operationToken: nextToken,
           baseSourceSha256,
+          workflowVersion: input.context.build.workflowVersion,
           hasCustomerFeedback: Boolean(input.input.feedback),
           templateCoordinateInstruction: templateCoordinate?.promptInstruction,
           repair: {
@@ -4213,7 +4368,7 @@ async function handleNativeReactSiteBuild(input: {
             diagnostics: repairInput.diagnostics,
           },
         }),
-        attachments: sourceAttachments(nextToken),
+        attachments: repairAttachments,
         structuredOutputSchema: nativeSourceReceiptOutputSchema({
           operationToken: nextToken,
           baseSourceSha256,
@@ -6445,9 +6600,7 @@ export function createManusSiteOpsProviderHandler(
           readArtifact,
         });
       }
-      if (
-        context.build.workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION
-      ) {
+      if (isSiteOpsNativeVisualWorkflowVersion(context.build.workflowVersion)) {
         throw new SiteOpsManusFailure(
           "VISUAL_SELECTION_BUNDLE_INVALID",
           "当前原生源码候选缺少 V5 选择包。",

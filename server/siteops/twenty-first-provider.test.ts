@@ -333,7 +333,11 @@ async function preparedTemplateFixture(input: {
   );
   zip.file(
     "native-template/src/main.tsx",
-    `import React from "react";import {createRoot} from "react-dom/client";function App(){return <main>${input.slug}</main>}createRoot(document.getElementById("root")!).render(<App/>);`,
+    'import React from "react";import {createRoot} from "react-dom/client";import App from "./App";createRoot(document.getElementById("root")!).render(<App/>);',
+  );
+  zip.file(
+    "native-template/src/App.tsx",
+    `import React from "react";export default function App(){return <main>${input.slug}</main>}`,
   );
   const providerArchive = await zip.generateAsync({
     type: "nodebuffer",
@@ -361,6 +365,23 @@ async function preparedTemplateFixture(input: {
         contrast: 0,
       },
     }),
+    renderPreview: async ({ sourceArchive, signal }) => {
+      if (signal.aborted) throw signal.reason;
+      return sharp({
+        create: {
+          width: 120,
+          height: 80,
+          channels: 3,
+          background: {
+            r: Buffer.from(sha256(sourceArchive), "hex")[0]!,
+            g: Buffer.from(sha256(sourceArchive), "hex")[1]!,
+            b: Buffer.from(sha256(sourceArchive), "hex")[2]!,
+          },
+        },
+      })
+        .png()
+        .toBuffer();
+    },
   });
 }
 
@@ -910,7 +931,8 @@ describe("21st SiteOps provider", () => {
             contentSha256,
           } as never;
         }),
-        loadNativeTemplatePoolState: async ({ page }) => {
+        loadNativeTemplatePoolState: async ({ page, workflowVersion }) => {
+          expect(workflowVersion).toBe("2.5.0");
           if (!frozenPool) return null;
           const frozenPage = frozenPool.pages.find(
             (candidate) => candidate.pageNumber === page,
@@ -1239,7 +1261,8 @@ describe("21st SiteOps provider", () => {
         id: randomUUID(),
         contentSha256: sha256(input.buffer),
       })) as never,
-      loadNativeTemplatePoolState: vi.fn(async ({ page }) => {
+      loadNativeTemplatePoolState: vi.fn(async ({ page, workflowVersion }) => {
+        expect(workflowVersion).toBe("2.5.0");
         if (!frozenPool) return null;
         const frozenPage = frozenPool.pages.find(
           (candidate) => candidate.pageNumber === page,

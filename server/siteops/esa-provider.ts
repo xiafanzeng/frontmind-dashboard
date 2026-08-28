@@ -17,7 +17,6 @@ import {
   workspaceSiteProfiles,
   type SiteOperation,
 } from "../../drizzle/schema";
-import { SITEOPS_MATERIALIZER_V2_5 } from "../../shared/siteops";
 import { buildContractV2Schema } from "../../shared/siteops-design";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
@@ -28,6 +27,7 @@ import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import { fetchPinnedPublicHttps } from "./remote-preview";
 import { rebuildNativeReactProductionFromSource } from "./native-react-build-runtime";
 import { validateNativeReactSourceArchive } from "./native-react-source";
+import { isSiteOpsNativeVisualWorkflowVersion } from "./native-visual-source";
 import {
   APPROVED_RESET_UNPUBLISH,
   approvedResetUnpublishFreshEpochMatches,
@@ -1642,9 +1642,7 @@ export async function materializeSiteOpsProductionSource(input: {
   materializeNativeProduction: typeof rebuildNativeReactProductionFromSource;
   signal: AbortSignal;
 }) {
-  if (
-    input.build.workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion
-  ) {
+  if (!isSiteOpsNativeVisualWorkflowVersion(input.build.workflowVersion)) {
     return await input.materializeProduction({
       sourceZip: input.sourceZip,
       expectedSourceSha256: input.sourceSha256,

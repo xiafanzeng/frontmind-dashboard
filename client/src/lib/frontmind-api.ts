@@ -198,6 +198,8 @@ export interface TaskResponse {
   error?: {
     message?: string;
     code?: string;
+    /** The current turn produced customer-visible output before terminal error. */
+    partialResult?: boolean;
   };
   knowledgeInteraction?: KnowledgeBaseInteractionDto;
   knowledgeObservation?: KnowledgeBaseObservationDto;

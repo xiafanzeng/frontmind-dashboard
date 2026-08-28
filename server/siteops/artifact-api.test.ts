@@ -432,7 +432,27 @@ describe("SiteOps private preview proxy", () => {
 
 describe("SiteOps visual sample preview", () => {
   const previewAssetId = "323e4567-e89b-42d3-a456-426614174000";
+  const realizationAssetId = "423e4567-e89b-42d3-a456-426614174000";
   const previewBytes = Buffer.from("durable-preview-image");
+  const referenceHash = "a".repeat(64);
+  const realizationHash = "d".repeat(64);
+
+  function v4DualPreviewMetadata(
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      referenceBlueprint: {
+        schemaVersion: 4,
+        referencePreviewLocalAssetId: previewAssetId,
+        referencePreviewSha256: referenceHash,
+        previewLocalAssetId: realizationAssetId,
+        previewSha256: realizationHash,
+      },
+      realizationPreviewLocalAssetId: realizationAssetId,
+      realizationPreviewSha256: realizationHash,
+      ...overrides,
+    };
+  }
 
   it("shares one published-or-selected predicate with observation", () => {
     expect(CUSTOMER_VISIBLE_STYLE_BATCH_STATUSES).toEqual([
@@ -476,6 +496,137 @@ describe("SiteOps visual sample preview", () => {
       expectedSha256: "b".repeat(64),
       expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
     });
+  });
+
+  it("serves a V4 reference with its reference hash instead of the distinct realization hash", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(previewAssetId, v4DualPreviewMetadata()),
+    );
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "image/png",
+        sizeBytes: previewBytes.length,
+        contentSha256: referenceHash,
+        filename: "reference.png",
+      },
+      stored: { createReadStream: () => Readable.from([previewBytes]) },
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v4-reference`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: referenceHash,
+      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+    });
+  });
+
+  it("uses the realization hash only when the sample explicitly points to the V4 realization asset", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(realizationAssetId, v4DualPreviewMetadata()),
+    );
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: realizationAssetId,
+        mimeType: "image/webp",
+        sizeBytes: previewBytes.length,
+        contentSha256: realizationHash,
+        filename: "realization.webp",
+      },
+      stored: { createReadStream: () => Readable.from([previewBytes]) },
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v4-realization`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: realizationAssetId,
+      expectedSha256: realizationHash,
+      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+    });
+  });
+
+  it("allows independently frozen V4 images to contain identical bytes", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(
+        previewAssetId,
+        v4DualPreviewMetadata({
+          referenceBlueprint: {
+            schemaVersion: 4,
+            referencePreviewLocalAssetId: previewAssetId,
+            referencePreviewSha256: referenceHash,
+            previewLocalAssetId: realizationAssetId,
+            previewSha256: referenceHash,
+          },
+          realizationPreviewSha256: referenceHash,
+        }),
+      ),
+    );
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "image/png",
+        sizeBytes: previewBytes.length,
+        contentSha256: referenceHash,
+        filename: "reference.png",
+      },
+      stored: { createReadStream: () => Readable.from([previewBytes]) },
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v4-identical-bytes`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: referenceHash,
+      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+    });
+  });
+
+  it("fails closed when a V4 row points to neither frozen image coordinate", async () => {
+    const unrelatedAssetId = "523e4567-e89b-42d3-a456-426614174000";
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(unrelatedAssetId, v4DualPreviewMetadata()),
+    );
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v4-coordinate-mismatch`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when V4 realization metadata disagrees with its frozen blueprint", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(
+        previewAssetId,
+        v4DualPreviewMetadata({ realizationPreviewSha256: "e".repeat(64) }),
+      ),
+    );
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v4-metadata-mismatch`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
   });
 
   it("fails closed before reading a source-backed preview whose frozen hash is missing", async () => {

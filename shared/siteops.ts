@@ -235,9 +235,37 @@ export const SITEOPS_MATERIALIZER_V2_6 = {
   qaPolicyVersion: "siteops-qa-v5",
 } as const;
 
-/** Current host-owned SiteContentPatch workflow for every newly admitted root.
- * V2.5 remains registered only so already-frozen Native operations can be read. */
+/** Native Template 2.7 freezes a complete, locally compiled V6 Template and
+ * asks Manus to adapt that exact source archive with the frozen enterprise
+ * dossier. It deliberately keeps the existing native hard-safety/build
+ * boundary and does not add a host-owned visual or content-quality contract. */
+export const SITEOPS_MATERIALIZER_V2_7 = {
+  upstreamVersion: "twenty-first-native-template-v1",
+  // sha256("frontmind:siteops:2.7.0:twenty-first-native-template-v1")
+  upstreamSha256:
+    "3f59368c6e41fc9214af6ab449fb8f99d184e12c16053475ea88a404fad03373",
+  frontMindVersion: "2.7.0",
+  // sha256("frontmind:siteops:2.7.0:runtime-selection-v6")
+  runtimeManifestSha256:
+    "6b45bfbf91e499876a1e545c4c041e3b070c4aa768db4570790d6c1e0655d924",
+  starterVersion: "twenty-first-native-template-v1",
+  // sha256("frontmind:siteops:2.7.0:starter")
+  starterSha256:
+    "9e45cd2d7e5e98aa461f692610dba397a1e1ecba21bac947dd789ac7c2f7b77a",
+  componentLibraryVersion: "twenty-first-native-template-v1",
+  materializerVersion: "2.7.0",
+  // sha256("frontmind:siteops:2.7.0:materializer")
+  materializerSha256:
+    "59eb18e00212ca12906cef99ea02abc3c6b1cb0cd5d78c17221ecc69bfd47137",
+  qaPolicyVersion: "siteops-native-qa-v1",
+} as const;
+
+/** Current host-owned renderer. Historical 2.6 builds and the explicitly
+ * labelled native fallback keep using these immutable coordinates. */
 export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_6;
+
+/** Workflow frozen for every newly admitted/reset SiteOps root. */
+export const SITEOPS_DEFAULT_WORKFLOW = SITEOPS_MATERIALIZER_V2_7;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -252,6 +280,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_4.frontMindVersion]: SITEOPS_MATERIALIZER_V2_4,
   [SITEOPS_MATERIALIZER_V2_5.frontMindVersion]: SITEOPS_MATERIALIZER_V2_5,
   [SITEOPS_MATERIALIZER_V2_6.frontMindVersion]: SITEOPS_MATERIALIZER_V2_6,
+  [SITEOPS_MATERIALIZER_V2_7.frontMindVersion]: SITEOPS_MATERIALIZER_V2_7,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {

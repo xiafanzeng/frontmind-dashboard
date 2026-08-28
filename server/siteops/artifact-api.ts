@@ -622,7 +622,29 @@ const STYLE_PREVIEW_MIME_TYPES = [
   "image/webp",
 ] as const;
 
-function frozenStylePreviewSha256(sourceMetadata: unknown) {
+function normalizedSha256(value: unknown) {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/iu.test(value.trim())) {
+    return null;
+  }
+  return value.trim().toLowerCase();
+}
+
+function nonEmptyString(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+/**
+ * A V4 style sample freezes two independent images: the provider reference
+ * shown on the selection board and FrontMind's realization of that reference.
+ * The sample row decides which of those images is being served. Never choose a
+ * digest merely because one hash field happens to be present in metadata.
+ */
+function frozenStylePreviewSha256(
+  localAssetId: string,
+  sourceMetadata: unknown,
+) {
   if (
     !sourceMetadata ||
     typeof sourceMetadata !== "object" ||
@@ -631,6 +653,84 @@ function frozenStylePreviewSha256(sourceMetadata: unknown) {
     return { valid: true as const, value: undefined };
   }
   const metadata = sourceMetadata as Record<string, unknown>;
+  const rawBlueprint = metadata.referenceBlueprint;
+  const blueprint =
+    rawBlueprint &&
+    typeof rawBlueprint === "object" &&
+    !Array.isArray(rawBlueprint)
+      ? (rawBlueprint as Record<string, unknown>)
+      : null;
+  const v4Coordinates =
+    metadata.schemaVersion === 4 || blueprint?.schemaVersion === 4;
+
+  if (v4Coordinates) {
+    if (!blueprint || blueprint.schemaVersion !== 4) {
+      return { valid: false as const, value: undefined };
+    }
+    const referenceAssetId = nonEmptyString(
+      blueprint.referencePreviewLocalAssetId,
+    );
+    const referenceHash = normalizedSha256(blueprint.referencePreviewSha256);
+    const blueprintRealizationAssetId = nonEmptyString(
+      blueprint.previewLocalAssetId,
+    );
+    const blueprintRealizationHash = normalizedSha256(blueprint.previewSha256);
+    const metadataRealizationAssetId = nonEmptyString(
+      metadata.realizationPreviewLocalAssetId,
+    );
+    const metadataRealizationHash = normalizedSha256(
+      metadata.realizationPreviewSha256,
+    );
+
+    if (
+      !referenceAssetId ||
+      !referenceHash ||
+      !blueprintRealizationAssetId ||
+      !blueprintRealizationHash ||
+      !metadataRealizationAssetId ||
+      !metadataRealizationHash ||
+      metadataRealizationAssetId !== blueprintRealizationAssetId ||
+      metadataRealizationHash !== blueprintRealizationHash ||
+      (referenceAssetId === blueprintRealizationAssetId &&
+        referenceHash !== blueprintRealizationHash)
+    ) {
+      return { valid: false as const, value: undefined };
+    }
+
+    const topLevelReferenceAssetId =
+      metadata.referencePreviewLocalAssetId === undefined
+        ? null
+        : nonEmptyString(metadata.referencePreviewLocalAssetId);
+    const topLevelReferenceHash =
+      metadata.referencePreviewSha256 === undefined
+        ? null
+        : normalizedSha256(metadata.referencePreviewSha256);
+    if (
+      (metadata.referencePreviewLocalAssetId !== undefined ||
+        metadata.referencePreviewSha256 !== undefined) &&
+      (topLevelReferenceAssetId !== referenceAssetId ||
+        topLevelReferenceHash !== referenceHash)
+    ) {
+      return { valid: false as const, value: undefined };
+    }
+
+    if (
+      localAssetId === referenceAssetId &&
+      localAssetId === metadataRealizationAssetId
+    ) {
+      return referenceHash === metadataRealizationHash
+        ? { valid: true as const, value: referenceHash }
+        : { valid: false as const, value: undefined };
+    }
+    if (localAssetId === referenceAssetId) {
+      return { valid: true as const, value: referenceHash };
+    }
+    if (localAssetId === metadataRealizationAssetId) {
+      return { valid: true as const, value: metadataRealizationHash };
+    }
+    return { valid: false as const, value: undefined };
+  }
+
   const strictSourceBackedPreview =
     metadata.schemaVersion === 5 ||
     metadata.schemaVersion === 6 ||
@@ -642,10 +742,11 @@ function frozenStylePreviewSha256(sourceMetadata: unknown) {
       ? { valid: false as const, value: undefined }
       : { valid: true as const, value: undefined };
   }
-  if (typeof raw !== "string" || !/^[a-f0-9]{64}$/iu.test(raw.trim())) {
+  const normalized = normalizedSha256(raw);
+  if (!normalized) {
     return { valid: false as const, value: undefined };
   }
-  return { valid: true as const, value: raw.trim().toLowerCase() };
+  return { valid: true as const, value: normalized };
 }
 
 siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
@@ -748,7 +849,9 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       .limit(1);
     const row = rows[0];
     const localAssetId = row?.localAssetId;
-    const expectedHash = frozenStylePreviewSha256(row?.sourceMetadata);
+    const expectedHash = localAssetId
+      ? frozenStylePreviewSha256(localAssetId, row?.sourceMetadata)
+      : { valid: false as const, value: undefined };
     if (!localAssetId || !expectedHash.valid) return notFound(res);
     await sendOwnedAsset({
       res,

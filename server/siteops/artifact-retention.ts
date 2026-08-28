@@ -1,4 +1,4 @@
-import { and, eq, like, or } from "drizzle-orm";
+import { and, eq, like, or, sql } from "drizzle-orm";
 
 import {
   localAssets,
@@ -75,9 +75,28 @@ export async function isSiteOpsArtifactReferenced(
   const previewReferences = await database
     .select({ id: websiteStyleSamples.id })
     .from(websiteStyleSamples)
+    // V4 boards display the immutable 21st reference through the sample's
+    // indexed direct preview coordinate.
     .where(eq(websiteStyleSamples.previewLocalAssetId, localAssetId))
     .limit(1);
   if (previewReferences[0]) return true;
+
+  const v4MetadataPreviewReferences = await database
+    .select({ id: websiteStyleSamples.id })
+    .from(websiteStyleSamples)
+    .where(
+      or(
+        // The independently rendered V4 realization remains a durable input
+        // to the selected design/build even though it is not the board image.
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${websiteStyleSamples.sourceMetadata}, '$.realizationPreviewLocalAssetId')) = ${localAssetId}`,
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${websiteStyleSamples.sourceMetadata}, '$.referenceBlueprint.previewLocalAssetId')) = ${localAssetId}`,
+        // Retain an explicitly frozen reference coordinate as well as the
+        // direct column so a repaired/migrated row cannot orphan either side.
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${websiteStyleSamples.sourceMetadata}, '$.referenceBlueprint.referencePreviewLocalAssetId')) = ${localAssetId}`,
+      ),
+    )
+    .limit(1);
+  if (v4MetadataPreviewReferences[0]) return true;
 
   const bundleReferences = await database
     .select({ id: websiteStyleSampleBatches.id })

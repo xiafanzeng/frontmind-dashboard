@@ -66,7 +66,8 @@ import {
 } from "../twenty-first-service";
 import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
 import {
-  SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
+  SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
+  isSiteOpsNativeVisualWorkflowVersion,
   VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
   VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
@@ -76,6 +77,7 @@ import {
   createVisualSelectionBundleV6Artifact,
   classifyNativeTemplateRuntimeFailure,
   classifyNativeVisualFailure,
+  prepareLegacyNativeTemplateCandidate,
   prepareNativeTemplateCandidate,
   prepareNativeVisualCandidate,
   readVisualSelectionBundleArtifact,
@@ -408,6 +410,7 @@ export type TwentyFirstProviderDependencies = {
     context: TwentyFirstProviderContext;
     credentialId: string;
     credentialVersion: number;
+    workflowVersion: string;
     page: 1 | 2 | 3;
   }) => Promise<NativeTemplatePoolState | null>;
   persistNativeTemplatePool?: (
@@ -2777,6 +2780,7 @@ async function persistDefaultBoard(
             ? {
                 schemaVersion: 6,
                 renderer: "twenty_first_native_template_v1" as const,
+                workflowVersion: frozenOperationInput.data.workflowVersion,
                 providerTemplateId: item.providerTemplateId,
                 providerSlug: item.providerSlug,
                 providerVersion: item.providerVersion,
@@ -3602,6 +3606,7 @@ async function loadDefaultNativeTemplatePoolState(input: {
   context: TwentyFirstProviderContext;
   credentialId: string;
   credentialVersion: number;
+  workflowVersion: string;
   page: 1 | 2 | 3;
 }): Promise<NativeTemplatePoolState | null> {
   const poolRows = await input.db
@@ -3624,6 +3629,32 @@ async function loadDefaultNativeTemplatePoolState(input: {
     .limit(1);
   const pool = poolRows[0];
   if (!pool) return null;
+  const initialOperationRows = await input.db
+    .select({ input: siteOperations.input })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.id, pool.initialOperationId),
+        eq(siteOperations.projectId, input.context.project.id),
+        eq(siteOperations.userId, input.operation.userId),
+        eq(siteOperations.kind, "visual_search"),
+        eq(siteOperations.provider, "21st"),
+      ),
+    )
+    .limit(1);
+  const initialOperationInput = visualSearchOperationInputSchema.safeParse(
+    initialOperationRows[0]?.input,
+  );
+  if (
+    !initialOperationInput.success ||
+    initialOperationInput.data.workflowVersion !== input.workflowVersion
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_POOL_WORKFLOW_MISMATCH",
+      "冻结候选池与当前建站工作流不一致，请重置后重新检索。",
+      "attention_required",
+    );
+  }
   const pages = await input.db
     .select()
     .from(visualCandidatePoolPages)
@@ -3757,7 +3788,9 @@ async function restoreNativeTemplatePoolPage(input: {
   }
   if (
     restored.bundle.candidates.some(
-      (candidate) => candidate.sourceFormat !== "provider_archive_v1",
+      (candidate) =>
+        candidate.sourceFormat !== "normalized_v1" &&
+        candidate.sourceFormat !== "provider_archive_v1",
     )
   ) {
     throw new TwentyFirstProviderFailure(
@@ -3817,7 +3850,7 @@ async function restoreNativeTemplatePoolPage(input: {
       previewPerceptualHash:
         candidate.previewPerceptualHash ?? candidate.previewSha256.slice(0, 16),
       styleTokens: candidate.styleTokens,
-      sourceFormat: "provider_archive_v1" as const,
+      sourceFormat: candidate.sourceFormat,
       framework: candidate.framework,
       sourceTreeSha256: candidate.sourceTreeSha256,
       sourceArchiveSha256: candidate.sourceArchiveSha256,
@@ -4535,6 +4568,9 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const prepareTemplateCandidate =
     dependencies.prepareNativeTemplateCandidate ??
     prepareNativeTemplateCandidate;
+  const prepareLegacyTemplateCandidate =
+    dependencies.prepareNativeTemplateCandidate ??
+    prepareLegacyNativeTemplateCandidate;
   const templateShuffleKey =
     dependencies.resolveNativeTemplateShuffleKey ??
     resolveNativeTemplateShuffleKey;
@@ -4551,8 +4587,9 @@ export function createTwentyFirstSiteOpsProviderHandler(
       const parsedInput = visualSearchOperationInputSchema.parse(
         operation.input,
       );
-      const nativeSourceMode =
-        parsedInput.workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION;
+      const nativeSourceMode = isSiteOpsNativeVisualWorkflowVersion(
+        parsedInput.workflowVersion,
+      );
       stage = "load_context";
       const db = await dbGetter();
       if (!db) {
@@ -4594,6 +4631,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
                 context,
                 credentialId: parsedInput.credentialId,
                 credentialVersion: parsedInput.credentialVersion,
+                workflowVersion: parsedInput.workflowVersion,
                 page: "page" in parsedInput ? parsedInput.page : 1,
               })
             : null;
@@ -4623,6 +4661,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           context,
           credentialId: parsedInput.credentialId,
           credentialVersion: parsedInput.credentialVersion,
+          workflowVersion: parsedInput.workflowVersion,
           page: searchPlan.page,
         });
         if (poolState) {
@@ -4708,7 +4747,11 @@ export function createTwentyFirstSiteOpsProviderHandler(
           context,
           searchPlan,
           diagnostics,
-          prepareCandidate: prepareTemplateCandidate,
+          prepareCandidate:
+            parsedInput.workflowVersion ===
+            SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
+              ? prepareTemplateCandidate
+              : prepareLegacyTemplateCandidate,
           shuffleKey: templateShuffleKey(),
           fetchPreview,
           persistArtifact,

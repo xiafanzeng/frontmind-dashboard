@@ -321,4 +321,58 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
     expect(providerCallIndex).toBeGreaterThanOrEqual(0);
     expect(acknowledgedWriteIndex).toBeGreaterThan(providerCallIndex);
   });
+
+  it("settles only the exact current ordinary-chat turn and authoritative Provider projection", () => {
+    const persistenceSource = serverSource.slice(
+      serverSource.indexOf("async function persistProviderEvents"),
+      serverSource.indexOf("async function cachedOutput"),
+    );
+    const updateSource = serverSource.slice(
+      serverSource.indexOf("async function updateTaskState"),
+      serverSource.indexOf("type CreateReconcileEvidence"),
+    );
+    const settlementSource = serverSource.slice(
+      serverSource.indexOf(
+        "async function latestGeneralChatTurnSettlementContext",
+      ),
+      serverSource.indexOf("/**\n * Signed-image incident maintenance"),
+    );
+
+    expect(updateSource).toContain("turnId?: string");
+    expect(updateSource).toContain("conversationId?: string");
+    expect(updateSource).toContain("eq(conversationTurns.id, targetTurn.id)");
+    expect(updateSource).toContain(
+      "eq(conversationTurns.conversationId, targetTurn.conversationId)",
+    );
+    expect(updateSource).not.toContain("inArray(conversations.id");
+    expect(persistenceSource).toContain("generalChatProviderEventEvidence");
+    expect(persistenceSource).toContain("status_update:");
+    expect(persistenceSource).toContain("error_message:");
+    expect(persistenceSource).toContain("user_stop:");
+    expect(settlementSource).toContain("providerEventWatermark");
+    expect(settlementSource).toContain("latestGeneralChatTurnLifecycle");
+    expect(settlementSource).toContain(
+      '["completed", "cancelled"].includes(latestTurn.status)',
+    );
+    expect(settlementSource).toContain(
+      "currentGeneralChatTurnProviderEvidence",
+    );
+    expect(settlementSource).toContain("generalChat?.serverOwned === true");
+    expect(settlementSource).toContain(
+      'generalChat.kind === "assistant_projection"',
+    );
+    expect(settlementSource).toContain(
+      "generalChat.agentTaskId === input.localTaskId",
+    );
+  });
+
+  it("returns no error for complete success and marks preserved partial output", () => {
+    const dtoSource = serverSource.slice(
+      serverSource.indexOf("async function taskDto"),
+      serverSource.indexOf("async function updateTaskState"),
+    );
+    expect(dtoSource).toContain('status === "error" && operation.errorCode');
+    expect(dtoSource).toContain("GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE");
+    expect(dtoSource).toContain("partialResult: true");
+  });
 });

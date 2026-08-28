@@ -11,6 +11,7 @@ import {
   NATIVE_SOURCE_PREFLIGHT_VERSION,
   NativeReactSourceError,
   TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
+  TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT,
   readNativeSourceAttachment,
   siteSourceReceiptV1Schema,
   validateNativeReactSourceArchive,
@@ -108,6 +109,28 @@ describe("native React source archive boundary", () => {
     }
     expect(TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT).toContain(
       FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
+    );
+  });
+
+  it("guides 2.7 template adaptation through prompt-only quality constraints", () => {
+    for (const instruction of [
+      "这是适配用户选中的模板，不是从零重新设计",
+      "页面目的 × 用户问题 × 企业事实 × CTA",
+      "产品与服务 / 产品 / 服务",
+      "同一完整段落不得在多个页面或卡片中重复",
+      "不得把模板改造成通用卡片站",
+      "production build",
+      "不要输出思考过程",
+    ]) {
+      expect(TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT).toContain(
+        instruction,
+      );
+    }
+    expect(TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT).toContain(
+      FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
+    );
+    expect(TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT).not.toContain(
+      "视觉相似度阈值",
     );
   });
 

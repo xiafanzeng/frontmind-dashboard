@@ -2,9 +2,13 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { toast } from "sonner";
 import {
+  GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE,
+  GENERAL_CHAT_PARTIAL_RESULT_MESSAGE,
+  generalChatTerminalMessagePublicId,
+} from "@shared/frontmind-general-chat-terminal";
+import {
   useSendMessage,
   classifyFailure,
-  getTaskPollDelay,
   outputForKnowledgePresentation,
   readResponseLogicTaskStartFailure,
   responseLogicStartFailureMessage,
@@ -214,15 +218,6 @@ describe("outputForKnowledgePresentation", () => {
   });
 });
 
-describe("long-running task polling", () => {
-  it("backs off to 30 seconds without a one-hour terminal cutoff", () => {
-    expect(getTaskPollDelay(0)).toBe(3_000);
-    expect(getTaskPollDelay(5 * 60 * 1000)).toBe(10_000);
-    expect(getTaskPollDelay(30 * 60 * 1000)).toBe(30_000);
-    expect(getTaskPollDelay(8 * 60 * 60 * 1000)).toBe(30_000);
-  });
-});
-
 describe("useSendMessage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -327,6 +322,117 @@ describe("useSendMessage", () => {
   it("should return uploadProgress as null initially", () => {
     const { result } = renderHook(() => useSendMessage());
     expect(result.current.uploadProgress).toBeNull();
+  });
+
+  it("hands a running ordinary task to the global poll owner without retrieving locally", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.createTask.mockResolvedValueOnce({
+        id: "running-task",
+        status: "running",
+        output: [],
+      });
+      const { result, unmount } = renderHook(() => useSendMessage());
+
+      await act(async () => {
+        await result.current.sendMessage("继续处理", []);
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+
+      expect(mocks.updateStatus).toHaveBeenCalledWith(
+        "test-conv-id",
+        "running",
+        expect.objectContaining({ taskId: "running-task" }),
+      );
+      expect(mocks.retrieveTask).not.toHaveBeenCalled();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps immediate partial output and emits one deterministic terminal notice", async () => {
+    mocks.createTask.mockResolvedValue({
+      id: "partial-task",
+      status: "error",
+      output: [
+        {
+          id: "partial-output",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "已生成的部分结果" }],
+        },
+      ],
+      error: {
+        code: "PROVIDER_ERROR",
+        message: "任务未完整结束",
+        partialResult: true,
+      },
+    });
+    mocks.parseOutputMessages.mockReturnValue([
+      {
+        id: "partial-output",
+        role: "assistant",
+        content: "已生成的部分结果",
+        timestamp: 2,
+      },
+    ]);
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("生成图片", []);
+      await result.current.sendMessage("再次读取同一终态", []);
+    });
+
+    const expectedId = generalChatTerminalMessagePublicId({
+      conversationId: "test-conv-id",
+      taskId: "partial-task",
+      errorCode: GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE,
+    });
+    const terminalMessages = mocks.addMessage.mock.calls.filter(
+      ([, message]) => message.id === expectedId,
+    );
+    expect(terminalMessages).toEqual([
+      [
+        "test-conv-id",
+        expect.objectContaining({
+          id: expectedId,
+          content: GENERAL_CHAT_PARTIAL_RESULT_MESSAGE,
+        }),
+      ],
+    ]);
+    expect(mocks.updateAssistantMessages).toHaveBeenCalled();
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(toast.warning).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores stale error metadata on an immediate completed DTO", async () => {
+    mocks.createTask.mockResolvedValueOnce({
+      id: "completed-task",
+      status: "completed",
+      output: [],
+      error: {
+        code: "STALE_ERROR",
+        message: "不应展示",
+        partialResult: true,
+      },
+    });
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("已完成", []);
+    });
+
+    expect(
+      mocks.addMessage.mock.calls.some(([, message]) =>
+        message.id.startsWith("msg-general-chat-terminal-"),
+      ),
+    ).toBe(false);
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "completed",
+      expect.objectContaining({ completedAt: expect.any(Number) }),
+    );
   });
 
   it("does not dispatch an ordinary task until the conversation snapshot is acknowledged", async () => {
@@ -574,7 +680,16 @@ describe("useSendMessage", () => {
     });
 
     expect(mocks.uploadChatLocalAsset).toHaveBeenCalledTimes(2);
-    expect(mocks.addMessage).toHaveBeenCalledTimes(2);
+    expect(
+      mocks.addMessage.mock.calls.filter(
+        ([, message]) => message.role === "user",
+      ),
+    ).toHaveLength(2);
+    expect(
+      mocks.addMessage.mock.calls.filter(([, message]) =>
+        message.id.startsWith("msg-general-chat-terminal-"),
+      ),
+    ).toHaveLength(1);
     expect(mocks.createTask).toHaveBeenCalledTimes(2);
     const firstOptions = mocks.createTask.mock.calls[0]![1];
     const secondOptions = mocks.createTask.mock.calls[1]![1];

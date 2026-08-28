@@ -15,6 +15,19 @@ import {
   inspectGeneralChatIncidentRepair,
   isGeneralChatIncidentRepairLocallyComplete,
 } from "./general-chat-incident-repair-20260828";
+import {
+  GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+  generalChatTerminal1547FailureCode,
+  isGeneralChatTerminal1547Command,
+  parseGeneralChatTerminal1547RepairCommand,
+  runOrderedGeneralChatIncidentRepairSteps,
+  type GeneralChatTerminal1547RepairSummary,
+} from "./general-chat-incident-repair-20260828-1547-core";
+import {
+  executeGeneralChatTerminal1547Repair,
+  inspectGeneralChatTerminal1547Repair,
+  isGeneralChatTerminal1547RepairLocallyComplete,
+} from "./general-chat-incident-repair-20260828-1547";
 import { syncGeneralChatTaskForRepair } from "./frontmind-v2-chat-router";
 import { validateReleaseRuntimeEnvironment } from "./_core/release-channel-adapter";
 
@@ -129,7 +142,9 @@ async function releaseLock(connection: Connection | null) {
 
 export async function runGeneralChatIncidentRepairCli(
   args: readonly string[],
-): Promise<GeneralChatIncidentRepairSummary> {
+): Promise<
+  GeneralChatIncidentRepairSummary | GeneralChatTerminal1547RepairSummary
+> {
   const compiledBuildSha =
     typeof __FRONTMIND_BUILD_SHA__ === "string"
       ? __FRONTMIND_BUILD_SHA__.trim().toLowerCase()
@@ -140,8 +155,11 @@ export async function runGeneralChatIncidentRepairCli(
       : "";
   let mode: "preview" | "apply" = "preview";
   let connection: Connection | null = null;
+  const terminal1547 = isGeneralChatTerminal1547Command(args);
   try {
-    const command = parseGeneralChatIncidentRepairCommand(args);
+    const command = terminal1547
+      ? parseGeneralChatTerminal1547RepairCommand(args)
+      : parseGeneralChatIncidentRepairCommand(args);
     mode = command.mode;
     assertRuntime({
       compiledBuildSha,
@@ -149,11 +167,43 @@ export async function runGeneralChatIncidentRepairCli(
       ready: await readiness(),
     });
     connection = await acquireLock();
-    const result = await executeGeneralChatIncidentRepair(command, {
-      syncTask: async (input) => {
-        await syncGeneralChatTaskForRepair(input);
+    if (terminal1547) {
+      const result = await executeGeneralChatTerminal1547Repair(
+        command as ReturnType<
+          typeof parseGeneralChatTerminal1547RepairCommand
+        >,
+      );
+      const lockReleased = await releaseLock(connection);
+      connection = null;
+      if (!lockReleased) fail("LOCK_RELEASE_UNCONFIRMED");
+      await closeDbForOneShotMaintenance();
+      return {
+        schemaVersion: 1,
+        incident: GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+        mode,
+        success: true,
+        applicable: !result.before.complete,
+        applied: result.applied,
+        stateHash: result.before.stateHash,
+        finalStateHash: result.after.stateHash,
+        outcome: result.after.chosenOutcome,
+        counts: result.after.counts,
+        build: {
+          sha: compiledBuildSha,
+          imageDigest:
+            process.env.FRONTMIND_IMAGE_DIGEST?.trim().toLowerCase() ?? null,
+        },
+        errorCode: null,
+      };
+    }
+    const result = await executeGeneralChatIncidentRepair(
+      command as ReturnType<typeof parseGeneralChatIncidentRepairCommand>,
+      {
+        syncTask: async (input) => {
+          await syncGeneralChatTaskForRepair(input);
+        },
       },
-    });
+    );
     const lockReleased = await releaseLock(connection);
     connection = null;
     if (!lockReleased) fail("LOCK_RELEASE_UNCONFIRMED");
@@ -179,6 +229,28 @@ export async function runGeneralChatIncidentRepairCli(
     const released = await releaseLock(connection);
     connection = null;
     await closeDbForOneShotMaintenance().catch(() => undefined);
+    if (terminal1547) {
+      return {
+        schemaVersion: 1,
+        incident: GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+        mode,
+        success: false,
+        applicable: false,
+        applied: false,
+        stateHash: null,
+        finalStateHash: null,
+        outcome: null,
+        counts: null,
+        build: {
+          sha: compiledBuildSha || null,
+          imageDigest:
+            process.env.FRONTMIND_IMAGE_DIGEST?.trim().toLowerCase() ?? null,
+        },
+        errorCode: released
+          ? generalChatTerminal1547FailureCode(error)
+          : "LOCK_RELEASE_UNCONFIRMED",
+      };
+    }
     return {
       schemaVersion: 1,
       incident: GENERAL_CHAT_INCIDENT_REPAIR_ID,
@@ -232,17 +304,36 @@ async function runAutomaticAttempt() {
   });
   let connection: Connection | null = await acquireLock();
   try {
-    if (await isGeneralChatIncidentRepairLocallyComplete()) return;
-    const preview = await inspectGeneralChatIncidentRepair();
-    if (!preview.complete) {
-      await executeGeneralChatIncidentRepair(
-        { mode: "apply", expectedStateHash: preview.stateHash },
-        {
-          syncTask: async (input) => {
-            await syncGeneralChatTaskForRepair(input);
-          },
-        },
-      );
+    const results = await runOrderedGeneralChatIncidentRepairSteps([
+      {
+        incident: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+        isLocallyComplete: () => isGeneralChatIncidentRepairLocallyComplete(),
+        preview: () => inspectGeneralChatIncidentRepair(),
+        apply: async (expectedStateHash) =>
+          executeGeneralChatIncidentRepair(
+            { mode: "apply", expectedStateHash },
+            {
+              syncTask: async (input) => {
+                await syncGeneralChatTaskForRepair(input);
+              },
+            },
+          ),
+      },
+      {
+        incident: GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+        isLocallyComplete: () =>
+          isGeneralChatTerminal1547RepairLocallyComplete(),
+        preview: () => inspectGeneralChatTerminal1547Repair(),
+        apply: async (expectedStateHash) =>
+          executeGeneralChatTerminal1547Repair({
+            incident: "terminal-1547",
+            mode: "apply",
+            expectedStateHash,
+          }),
+      },
+    ]);
+    for (const result of results) {
+      console.info("[GeneralChatIncidentRepair] incident_complete", result);
     }
   } finally {
     const released = await releaseLock(connection);
@@ -264,21 +355,30 @@ export function scheduleAutomaticGeneralChatIncidentRepair20260828() {
     try {
       await runAutomaticAttempt();
       console.info("[GeneralChatIncidentRepair] complete", {
-        incident: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+        incidents: [
+          GENERAL_CHAT_INCIDENT_REPAIR_ID,
+          GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+        ],
         attempts,
       });
     } catch (error) {
       const errorCode = generalChatIncidentFailureCode(error);
       if (attempts >= AUTOMATIC_MAX_ATTEMPTS) {
         console.error("[GeneralChatIncidentRepair] failed", {
-          incident: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+          incidents: [
+            GENERAL_CHAT_INCIDENT_REPAIR_ID,
+            GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+          ],
           attempts,
           errorCode,
         });
         return;
       }
       console.warn("[GeneralChatIncidentRepair] retry_scheduled", {
-        incident: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+        incidents: [
+          GENERAL_CHAT_INCIDENT_REPAIR_ID,
+          GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
+        ],
         attempts,
         errorCode,
       });

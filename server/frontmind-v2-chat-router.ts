@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 
 import axios from "axios";
-import { and, desc, eq, gt, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -21,7 +21,6 @@ import {
 import { getDecryptedCredentialForAccountById } from "./auth-service";
 import { getDb } from "./db";
 import {
-  latestManusV2TaskState,
   latestManusV2WaitingDetail,
   manusV2EventMatchesGeneralChatRequest,
   ManusV2ApiError,
@@ -29,6 +28,11 @@ import {
   orderManusV2EventsByProviderRank,
   type ManusV2MessageEvent,
 } from "./manus-v2-client";
+import {
+  currentGeneralChatTurnProviderEvidence,
+  generalChatProviderEventEvidence,
+  settleGeneralChatTurn,
+} from "./general-chat-terminal-arbitration";
 import {
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
@@ -58,6 +62,7 @@ import {
 } from "./_core/safe-external-url";
 import { sanitizeFrontMindPublicText } from "../shared/frontmind-public-brand";
 import { stripFrontMindGeneralChatOperationContract } from "../shared/frontmind-general-chat-contract";
+import { GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE } from "../shared/frontmind-general-chat-terminal";
 import {
   generalAgentModelProfileModel,
   generalAgentModelProfileSchema,
@@ -834,6 +839,16 @@ async function persistProviderEvents(input: {
     eventTurns = providerEventTurnAssignments(orderedEvents, turns);
   }
   for (const event of orderedEvents) {
+    const providerEvidence = generalChatProviderEventEvidence(event);
+    const providerErrorContent = providerEvidence.errorContent
+      ? sanitizeFrontMindPublicText(
+          stripFrontMindGeneralChatOperationContract(
+            providerEvidence.errorContent,
+          ),
+        )
+          .trim()
+          .slice(0, 4_096)
+      : null;
     const localized = [];
     for (const attachment of assistantAttachments(event)) {
       try {
@@ -866,6 +881,22 @@ async function persistProviderEvents(input: {
       type: event.type,
       text: assistantText(event),
       artifacts: localized,
+      ...(providerEvidence.agentStatus
+        ? {
+            status_update: {
+              agent_status: providerEvidence.agentStatus,
+            },
+          }
+        : {}),
+      ...(providerEvidence.errorType || providerErrorContent
+        ? {
+            error_message: {
+              error_type: providerEvidence.errorType,
+              content: providerErrorContent,
+            },
+          }
+        : {}),
+      ...(providerEvidence.userStop ? { user_stop: { observed: true } } : {}),
       ...(waiting?.statusEventId === event.id
         ? {
             action: {
@@ -981,10 +1012,13 @@ function publicStatus(status: AgentOperation["status"]) {
 }
 
 async function taskDto(operation: AgentOperation, task: AgentTask) {
+  const status = publicStatus(operation.status);
+  const partialResult =
+    operation.errorCode === GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE;
   return {
     id: task.id,
     object: "frontmind.local_task",
-    status: publicStatus(operation.status),
+    status,
     model: operation.publicProfile,
     metadata: { task_title: "FrontMind 内容流程" },
     output: await cachedOutput(task.id),
@@ -992,8 +1026,14 @@ async function taskDto(operation: AgentOperation, task: AgentTask) {
     ["failed", "cancelled"].includes(operation.status)
       ? { clearTaskPointer: true }
       : {}),
-    ...(operation.errorCode
-      ? { error: { message: "任务未能完成", code: operation.errorCode } }
+    ...(status === "error" && operation.errorCode
+      ? {
+          error: {
+            message: partialResult ? "部分结果已保留" : "任务未能完成",
+            code: operation.errorCode,
+            ...(partialResult ? { partialResult: true } : {}),
+          },
+        }
       : {}),
   };
 }
@@ -1008,82 +1048,166 @@ async function updateTaskState(input: {
   providerRequestId?: string | null;
   resultDeadlineAt?: Date | null;
   clearConversationTaskPointers?: boolean;
+  turnId?: string;
+  conversationId?: string;
 }) {
+  if (Boolean(input.turnId) !== Boolean(input.conversationId)) {
+    throw new ChatV2HttpError("TASK_STATE_TURN_BOUNDARY_INVALID", 500);
+  }
   const db = await requireDb();
   await db.transaction(async (tx) => {
+    const explicitBoundary =
+      input.turnId && input.conversationId
+        ? { id: input.turnId, conversationId: input.conversationId }
+        : null;
+    const targetTurn = explicitBoundary
+      ? (
+          await tx
+            .select({
+              id: conversationTurns.id,
+              conversationId: conversationTurns.conversationId,
+              status: conversationTurns.status,
+            })
+            .from(conversationTurns)
+            .where(
+              and(
+                eq(conversationTurns.id, explicitBoundary.id),
+                eq(
+                  conversationTurns.conversationId,
+                  explicitBoundary.conversationId,
+                ),
+                eq(conversationTurns.upstreamTaskId, input.localTaskId),
+                eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+              ),
+            )
+            .limit(1)
+            .for("update")
+        )[0]
+      : (
+          await tx
+            .select({
+              id: conversationTurns.id,
+              conversationId: conversationTurns.conversationId,
+              status: conversationTurns.status,
+            })
+            .from(conversationTurns)
+            .where(
+              and(
+                eq(conversationTurns.upstreamTaskId, input.localTaskId),
+                eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+              ),
+            )
+            .orderBy(
+              desc(conversationTurns.createdAt),
+              desc(conversationTurns.id),
+            )
+            .limit(1)
+            .for("update")
+        )[0];
+    if (explicitBoundary && !targetTurn) {
+      throw new ChatV2HttpError("TASK_STATE_TURN_BOUNDARY_MISMATCH", 409);
+    }
+    const lockedOperation = (
+      await tx
+        .select({ status: agentOperations.status })
+        .from(agentOperations)
+        .where(eq(agentOperations.id, input.operationId))
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!lockedOperation) {
+      throw new ChatV2HttpError("TASK_STATE_OPERATION_NOT_FOUND", 409);
+    }
+    const lockedTask = (
+      await tx
+        .select({ providerState: agentTasks.providerState })
+        .from(agentTasks)
+        .where(
+          and(
+            eq(agentTasks.id, input.localTaskId),
+            eq(agentTasks.operationId, input.operationId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!lockedTask) {
+      throw new ChatV2HttpError("TASK_STATE_TASK_NOT_FOUND", 409);
+    }
+    const preserveSettledSuccess =
+      lockedOperation.status === "succeeded" &&
+      (!targetTurn || targetTurn.status === "completed") &&
+      input.status !== "succeeded";
+    const effectiveStatus = preserveSettledSuccess ? "succeeded" : input.status;
+    const effectiveErrorCode = preserveSettledSuccess
+      ? null
+      : (input.errorCode ?? null);
     await tx
       .update(agentOperations)
-      .set({ status: input.status, errorCode: input.errorCode ?? null })
+      .set({ status: effectiveStatus, errorCode: effectiveErrorCode })
       .where(eq(agentOperations.id, input.operationId));
     await tx
       .update(agentTasks)
       .set({
-        providerState: input.providerState,
+        providerState: preserveSettledSuccess
+          ? lockedTask.providerState
+          : input.providerState,
         ...(input.providerTaskId
           ? { providerTaskId: input.providerTaskId }
           : {}),
         ...(input.providerRequestId !== undefined
           ? { providerRequestId: input.providerRequestId }
           : {}),
-        ...(input.resultDeadlineAt !== undefined
-          ? { resultDeadlineAt: input.resultDeadlineAt }
-          : {}),
+        ...(preserveSettledSuccess
+          ? { resultDeadlineAt: null }
+          : input.resultDeadlineAt !== undefined
+            ? { resultDeadlineAt: input.resultDeadlineAt }
+            : {}),
         lastMessageSyncAt: new Date(),
       })
       .where(eq(agentTasks.id, input.localTaskId));
     const turnStatus =
-      input.status === "succeeded"
+      effectiveStatus === "succeeded"
         ? "completed"
-        : ["failed", "attention_required"].includes(input.status)
+        : ["failed", "attention_required"].includes(effectiveStatus)
           ? "failed"
-          : input.status === "cancelled"
+          : effectiveStatus === "cancelled"
             ? "cancelled"
-            : input.status === "queued"
+            : effectiveStatus === "queued"
               ? "queued"
               : "running";
-    await tx
-      .update(conversationTurns)
-      .set({
-        status: turnStatus,
-        errorCode: input.errorCode ?? null,
-        ...(turnStatus === "completed" ||
-        turnStatus === "failed" ||
-        turnStatus === "cancelled"
-          ? { completedAt: new Date() }
-          : {}),
-      })
-      .where(
-        input.status === "running"
-          ? and(
-              eq(conversationTurns.upstreamTaskId, input.localTaskId),
-              eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
-              eq(conversationTurns.status, "queued"),
-            )
-          : and(
-              eq(conversationTurns.upstreamTaskId, input.localTaskId),
-              eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
-            ),
-      );
-    const conversationStatus =
-      input.status === "succeeded"
-        ? "completed"
-        : ["failed", "cancelled", "attention_required"].includes(input.status)
-          ? "error"
-          : input.status === "queued"
-            ? "pending"
-            : "running";
-    const boundConversationIds = (
+    if (targetTurn) {
       await tx
-        .select({ conversationId: conversationTurns.conversationId })
-        .from(conversationTurns)
+        .update(conversationTurns)
+        .set({
+          status: turnStatus,
+          errorCode: effectiveErrorCode,
+          ...(turnStatus === "completed" ||
+          turnStatus === "failed" ||
+          turnStatus === "cancelled"
+            ? { completedAt: new Date() }
+            : { completedAt: null }),
+        })
         .where(
           and(
+            eq(conversationTurns.id, targetTurn.id),
+            eq(conversationTurns.conversationId, targetTurn.conversationId),
             eq(conversationTurns.upstreamTaskId, input.localTaskId),
             eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
           ),
-        )
-    ).map((turn) => turn.conversationId);
-    if (boundConversationIds.length > 0) {
+        );
+    }
+    const conversationStatus =
+      effectiveStatus === "succeeded"
+        ? "completed"
+        : ["failed", "cancelled", "attention_required"].includes(
+              effectiveStatus,
+            )
+          ? "error"
+          : effectiveStatus === "queued"
+            ? "pending"
+            : "running";
+    if (targetTurn) {
       await tx
         .update(conversations)
         .set({
@@ -1096,7 +1220,7 @@ async function updateTaskState(input: {
             ? { completedAt: new Date() }
             : { completedAt: null }),
         })
-        .where(inArray(conversations.id, boundConversationIds));
+        .where(eq(conversations.id, targetTurn.conversationId));
     }
   });
 }
@@ -1581,14 +1705,21 @@ async function reconcileUnknownCreate(input: {
   });
 }
 
-async function latestGeneralChatTurnOutputState(input: {
+async function latestGeneralChatTurnSettlementContext(input: {
   userId: number;
   localTaskId: string;
+  operationId: string;
 }) {
   const db = await requireDb();
   const turn = (
     await db
-      .select({ id: conversationTurns.id })
+      .select({
+        id: conversationTurns.id,
+        conversationId: conversationTurns.conversationId,
+        status: conversationTurns.status,
+        attachmentFileIds: conversationTurns.attachmentFileIds,
+        metadata: conversationTurns.metadata,
+      })
       .from(conversationTurns)
       .where(
         and(
@@ -1600,21 +1731,87 @@ async function latestGeneralChatTurnOutputState(input: {
       .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
       .limit(1)
   )[0];
-  if (!turn) return { hasTurn: false, hasOutput: false };
-  const output = (
-    await db
-      .select({ id: messages.id })
-      .from(messages)
+  if (!turn) return null;
+  const metadata = turn.metadata ?? {};
+  const promptSha256 =
+    typeof metadata.promptSha256 === "string" ? metadata.promptSha256 : null;
+  const providerAttachmentFileIds = Array.isArray(
+    metadata.providerAttachmentFileIds,
+  )
+    ? metadata.providerAttachmentFileIds.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  const providerEventWatermark = Array.isArray(metadata.providerEventWatermark)
+    ? metadata.providerEventWatermark.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  if (
+    metadata.agentTaskId !== input.localTaskId ||
+    metadata.operationId !== input.operationId ||
+    !promptSha256 ||
+    metadata.attachmentManifestHash !==
+      requestHash(sortedUnique(turn.attachmentFileIds ?? []))
+  ) {
+    throw new ChatV2HttpError("CURRENT_TURN_SETTLEMENT_METADATA_INVALID", 409);
+  }
+  const outputRows = await db
+    .select({ id: messages.id, metadata: messages.metadata })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.turnId, turn.id),
+        eq(messages.role, "assistant"),
+        isNull(messages.deletedAt),
+      ),
+    );
+  const output = outputRows.filter((row) => {
+    const generalChat =
+      row.metadata?.generalChat &&
+      typeof row.metadata.generalChat === "object" &&
+      !Array.isArray(row.metadata.generalChat)
+        ? (row.metadata.generalChat as Record<string, unknown>)
+        : null;
+    return (
+      generalChat?.serverOwned === true &&
+      generalChat.kind === "assistant_projection" &&
+      generalChat.agentTaskId === input.localTaskId &&
+      generalChat.turnId === turn.id
+    );
+  });
+  return {
+    id: turn.id,
+    conversationId: turn.conversationId,
+    status: turn.status,
+    promptSha256,
+    providerAttachmentFileIds,
+    providerEventWatermark,
+    outputCount: output.length,
+    hasOutput: output.length > 0,
+  };
+}
+
+async function latestGeneralChatTurnLifecycle(input: {
+  userId: number;
+  localTaskId: string;
+}) {
+  return (
+    await (
+      await requireDb()
+    )
+      .select({ status: conversationTurns.status })
+      .from(conversationTurns)
       .where(
         and(
-          eq(messages.turnId, turn.id),
-          eq(messages.role, "assistant"),
-          isNull(messages.deletedAt),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+          eq(conversationTurns.upstreamTaskId, input.localTaskId),
         ),
       )
+      .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
       .limit(1)
   )[0];
-  return { hasTurn: true, hasOutput: Boolean(output) };
 }
 
 async function syncTask(
@@ -1624,11 +1821,12 @@ async function syncTask(
   let owned = await findOwnedTask(input);
   if (
     !options.forceProjection &&
-    ["succeeded", "failed", "cancelled", "attention_required"].includes(
-      owned.operation.status,
-    )
+    ["succeeded", "cancelled"].includes(owned.operation.status)
   ) {
-    return owned;
+    const latestTurn = await latestGeneralChatTurnLifecycle(input);
+    if (!latestTurn || ["completed", "cancelled"].includes(latestTurn.status)) {
+      return owned;
+    }
   }
   const credential = await getDecryptedCredentialForAccountById(
     input.userId,
@@ -1652,53 +1850,77 @@ async function syncTask(
       client.taskDetail(owned.task.providerTaskId),
     ]);
     await persistProviderEvents({ ...owned, events });
-    const state = latestManusV2TaskState(events) ?? detail.status ?? "running";
-    const output = await cachedOutput(owned.task.id);
-    const latestTurnOutput = await latestGeneralChatTurnOutputState(input);
-    const hasCurrentOutput = latestTurnOutput.hasTurn
-      ? latestTurnOutput.hasOutput
-      : output.length > 0;
-    let status: AgentOperation["status"] = "running";
-    let errorCode: string | null = null;
-    let resultDeadlineAt = owned.task.resultDeadlineAt;
-    if (["error", "failed", "cancelled"].includes(state)) {
-      status = state === "cancelled" ? "cancelled" : "failed";
-      errorCode = "PROVIDER_TASK_FAILED";
-    } else if (
-      ["completed", "succeeded", "success", "finished", "done"].includes(state)
-    ) {
-      if (hasCurrentOutput) {
-        status = "succeeded";
-      } else {
-        resultDeadlineAt ??= new Date(Date.now() + RESULT_GRACE_MS);
-        status =
-          Date.now() >= resultDeadlineAt.getTime()
-            ? "failed"
-            : "result_pending";
-        errorCode = status === "failed" ? "RESULT_MISSING" : null;
-      }
-    } else if (state === "stopped") {
-      if (hasCurrentOutput) {
-        status = "succeeded";
-      } else {
-        resultDeadlineAt ??= new Date(Date.now() + RESULT_GRACE_MS);
-        status =
-          Date.now() >= resultDeadlineAt.getTime()
-            ? "failed"
-            : "result_pending";
-        errorCode = status === "failed" ? "RESULT_MISSING" : null;
-      }
-    } else if (state === "waiting") {
-      status = "running";
-    }
+    const currentTurn = await latestGeneralChatTurnSettlementContext({
+      ...input,
+      operationId: owned.operation.id,
+    });
+    const currentEvidence = currentTurn
+      ? currentGeneralChatTurnProviderEvidence({
+          events,
+          promptSha256: currentTurn.promptSha256,
+          providerAttachmentFileIds: currentTurn.providerAttachmentFileIds,
+          providerEventWatermark: currentTurn.providerEventWatermark,
+        })
+      : {
+          binding: "pending" as const,
+          events: [],
+          eventStatus: null,
+          hasUserStop: false,
+          errorType: null,
+          errorContent: null,
+        };
+    const nowMs = Date.now();
+    const settlement = settleGeneralChatTurn({
+      previousStatus: owned.operation.status,
+      currentTurnAlreadyCompleted: currentTurn?.status === "completed",
+      binding: currentEvidence.binding,
+      detailStatus: detail.status,
+      eventStatus: currentEvidence.eventStatus,
+      hasUserStop: currentEvidence.hasUserStop,
+      hasCurrentOutput: currentTurn?.hasOutput ?? false,
+      resultDeadlineAtMs: owned.task.resultDeadlineAt?.getTime() ?? null,
+      nowMs,
+      graceMs: RESULT_GRACE_MS,
+    });
     await updateTaskState({
       operationId: owned.operation.id,
       localTaskId: owned.task.id,
-      status,
-      providerState: state,
-      errorCode,
-      resultDeadlineAt,
+      status: settlement.status,
+      providerState: settlement.providerState,
+      errorCode: settlement.errorCode,
+      resultDeadlineAt:
+        settlement.resultDeadlineAtMs === null
+          ? null
+          : new Date(settlement.resultDeadlineAtMs),
+      ...(currentTurn
+        ? {
+            turnId: currentTurn.id,
+            conversationId: currentTurn.conversationId,
+          }
+        : {}),
     });
+    const settlementLog = {
+      localTaskId: owned.task.id,
+      turnId: currentTurn?.id ?? null,
+      conversationId: currentTurn?.conversationId ?? null,
+      detailStatus: detail.status ?? null,
+      currentEventStatus: currentEvidence.eventStatus,
+      eventBinding: currentEvidence.binding,
+      currentOutputCount: currentTurn?.outputCount ?? 0,
+      selectedStatus: settlement.status,
+      providerState: settlement.providerState,
+      partialResult: settlement.partialResult,
+      conflict: settlement.conflict,
+      errorType: currentEvidence.errorType,
+    };
+    if (settlement.conflict && settlement.status !== "result_pending") {
+      console.warn(
+        "[FrontMindV2] general-chat settlement conflict resolved by task.detail",
+        settlementLog,
+      );
+    } else {
+      console.info("[FrontMindV2] general-chat settlement", settlementLog);
+    }
     owned = await findOwnedTask(input);
   } catch (error) {
     // Cached local messages and artifacts remain authoritative when a retired
@@ -2219,6 +2441,7 @@ async function sendProviderMessage(input: {
   prompt: string;
   localAssetIds: readonly string[];
   turnId: string;
+  conversationId: string;
 }) {
   if (!input.task.providerTaskId) {
     throw new ChatV2HttpError("TASK_NOT_READY", 409, true);
@@ -2329,6 +2552,8 @@ async function sendProviderMessage(input: {
         status: "attention_required",
         providerState: "attention_required",
         errorCode: "SEND_RECONCILE_EVIDENCE_MISSING",
+        turnId: input.turnId,
+        conversationId: input.conversationId,
       });
       return false;
     }
@@ -2374,6 +2599,8 @@ async function sendProviderMessage(input: {
         status: "attention_required",
         providerState: "attention_required",
         errorCode: "SEND_RECONCILE_CONFLICT",
+        turnId: input.turnId,
+        conversationId: input.conversationId,
       });
       return false;
     }
@@ -2387,6 +2614,8 @@ async function sendProviderMessage(input: {
       status: "running",
       providerState: "outcome_unknown",
       errorCode: "SEND_OUTCOME_UNKNOWN",
+      turnId: input.turnId,
+      conversationId: input.conversationId,
     });
     return false;
   };
@@ -2628,6 +2857,8 @@ async function sendProviderMessage(input: {
     providerState: "running",
     errorCode: null,
     resultDeadlineAt: null,
+    turnId: input.turnId,
+    conversationId: input.conversationId,
   });
 }
 
@@ -3367,6 +3598,7 @@ router.post("/tasks/:localTaskId/messages", async (req, res) => {
       prompt: value.prompt,
       localAssetIds: value.localAssetIds,
       turnId: reservedTurn.turn.id,
+      conversationId: reservedTurn.persistedConversationId,
     });
     owned = await syncTask({
       userId: req.frontmindUser.id,

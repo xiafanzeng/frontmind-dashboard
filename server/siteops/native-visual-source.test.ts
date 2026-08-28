@@ -27,6 +27,7 @@ import {
   createVisualSelectionBundleV6Artifact,
   normalizeTwentyFirstNativeTemplateArchive,
   normalizeTwentyFirstNativeSource,
+  prepareLegacyNativeTemplateCandidate,
   prepareNativeTemplateCandidate,
   readNativeSourceArchive,
   readVisualSelectionBundleArtifact,
@@ -158,8 +159,27 @@ async function completeTemplateArchive(
   });
 }
 
+async function renderedTemplateFixture(input: {
+  sourceArchive: Buffer;
+  signal: AbortSignal;
+}) {
+  if (input.signal.aborted) throw input.signal.reason;
+  await readNativeSourceArchive(input.sourceArchive);
+  const hash = Buffer.from(digest(input.sourceArchive), "hex");
+  return sharp({
+    create: {
+      width: 160,
+      height: 100,
+      channels: 3,
+      background: { r: hash[0]!, g: hash[1]!, b: hash[2]! },
+    },
+  })
+    .png()
+    .toBuffer();
+}
+
 describe("21st native visual source", () => {
-  it("keeps every V6 source archive within the Manus inline attachment boundary", () => {
+  it("keeps every V6 source archive within the bounded Manus upload boundary", () => {
     expect(() =>
       assertVisualSelectionBundleV6SourceArchiveSize(
         Buffer.alloc(VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES),
@@ -327,10 +347,20 @@ describe("21st native visual source", () => {
 
   it("binds shared-repository Hirael archives to distinct opaque slug entrypoints and hashes", async () => {
     const zip = new JSZip();
-    zip.file("hirael/package.json", JSON.stringify({ private: true }));
+    zip.file(
+      "hirael/package.json",
+      JSON.stringify({
+        private: true,
+        dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+      }),
+    );
+    zip.file(
+      "hirael/app/page.tsx",
+      "export default function Registry(){return <main>Registry shell</main>}",
+    );
     zip.file(
       "hirael/registry/hirael/templates/agency-landing/agency-landing.tsx",
-      "export default function Agency(){return <main>Agency</main>}",
+      'import "./styles.css"; export default function Agency(){return <main className="agency">Agency</main>}',
     );
     zip.file(
       "hirael/registry/hirael/templates/agency-landing/styles.css",
@@ -338,7 +368,7 @@ describe("21st native visual source", () => {
     );
     zip.file(
       "hirael/registry/hirael/templates/velorah/velorah.tsx",
-      "export default function Velorah(){return <main>Velorah</main>}",
+      'import "./styles.css"; export default function Velorah(){return <main className="velorah">Velorah</main>}',
     );
     zip.file(
       "hirael/registry/hirael/templates/velorah/styles.css",
@@ -367,6 +397,7 @@ describe("21st native visual source", () => {
             contrast: 0,
           },
         }),
+        renderPreview: renderedTemplateFixture,
       });
     const agency = await prepare("hirael-agency-landing");
     const velorah = await prepare("hirael-velorah");
@@ -395,13 +426,10 @@ describe("21st native visual source", () => {
     expect(agencyRetry.sourceArchiveSha256).toBe(agency.sourceArchiveSha256);
   });
 
-  it("freezes a complete Template and its official preview without compiling or mirroring its internals", async () => {
-    const providerArchive = await completeTemplateArchive("vite_react", {
-      consoleError: true,
-      remoteFonts: true,
-    });
-    const officialPreview = Buffer.from("official-template-preview");
+  it("freezes the complete Template ZIP only after rendering its derived controlled build", async () => {
+    const providerArchive = await completeTemplateArchive("vite_react");
     let previewFetches = 0;
+    let renderedArchiveSha256: string | null = null;
     const prepared = await prepareNativeTemplateCandidate({
       templateId: "inert-complete-template",
       slug: "inert-complete-template",
@@ -415,10 +443,10 @@ describe("21st native visual source", () => {
         return {
           finalUrl: url,
           mimeType: "image/png" as const,
-          buffer: officialPreview,
+          buffer: Buffer.from("unused-marketplace-preview"),
           width: 1200,
           height: 800,
-          sha256: digest(officialPreview),
+          sha256: digest("unused-marketplace-preview"),
           visualSignals: {
             dominantHex: "#000000",
             brightness: 0,
@@ -427,26 +455,76 @@ describe("21st native visual source", () => {
         };
       },
       fetchRemoteStyleAsset: async () => {
-        throw new Error("candidate preparation must not mirror Template CSS");
+        throw new Error("fixture has no remote Template CSS");
+      },
+      renderPreview: async (input) => {
+        renderedArchiveSha256 = digest(input.sourceArchive);
+        return renderedTemplateFixture(input);
       },
     });
-    expect(previewFetches).toBe(1);
+    expect(previewFetches).toBe(0);
+    expect(renderedArchiveSha256).not.toBeNull();
     expect(prepared).toMatchObject({
       sourceFormat: "provider_archive_v1",
       framework: "vite_react",
       styleTokens: {
         schemaVersion: 1,
         derivation: "normalized-preview-bounded-source-v1",
-        previewSha256: digest(officialPreview),
+        previewSha256: prepared.previewSha256,
         sourceTreeSha256: prepared.sourceTreeSha256,
-        dominantHex: "#000000",
-        canvasTone: "dark",
+        dominantHex: expect.stringMatching(/^#[a-f0-9]{6}$/u),
         contrast: "low",
         typeSystem: "display_sans",
         density: "spacious",
       },
     });
-    expect(prepared.preview.equals(officialPreview)).toBe(true);
+    expect(prepared.preview.length).toBeGreaterThan(0);
+    const frozen = await JSZip.loadAsync(prepared.sourceArchive, {
+      checkCRC32: true,
+    });
+    const frozenProvider = await frozen
+      .file("provider-source.zip")!
+      .async("nodebuffer");
+    expect(frozenProvider.equals(providerArchive)).toBe(true);
+    expect(digest(frozenProvider)).toBe(digest(providerArchive));
+  });
+
+  it("retains the 2.5 opaque Template and Marketplace preview semantics for immutable replay", async () => {
+    const providerArchive = await completeTemplateArchive("vite_react");
+    const marketplacePreview = await sharp({
+      create: {
+        width: 160,
+        height: 100,
+        channels: 3,
+        background: { r: 36, g: 68, b: 112 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const prepared = await prepareLegacyNativeTemplateCandidate({
+      templateId: "legacy-template",
+      slug: "legacy-template",
+      version: "2".repeat(40),
+      archive: providerArchive,
+      expectedArchiveSha256: digest(providerArchive),
+      previewUrl: "https://cdn.21st.dev/templates/legacy-template.png",
+      signal: new AbortController().signal,
+      fetchRemoteAsset: async ({ url }) => ({
+        finalUrl: url,
+        mimeType: "image/png" as const,
+        buffer: marketplacePreview,
+        width: 1200,
+        height: 800,
+        sha256: digest(marketplacePreview),
+        visualSignals: {
+          dominantHex: "#000000",
+          brightness: 0,
+          contrast: 0,
+        },
+      }),
+    });
+    expect(prepared.sourceFormat).toBe("provider_archive_v1");
+    expect(prepared.preview.equals(marketplacePreview)).toBe(true);
     const wrapper = await JSZip.loadAsync(prepared.sourceArchive);
     expect(wrapper.file("provider-source.zip")).not.toBeNull();
   });
@@ -470,7 +548,7 @@ describe("21st native visual source", () => {
     ).rejects.toThrow("NATIVE_TEMPLATE_SOURCE_UNSAFE");
   });
 
-  it("deterministically omits an unreferenced repository documentation symlink", async () => {
+  it("rejects even an unreferenced documentation symlink before compiling a candidate", async () => {
     const zip = new JSZip();
     zip.file(
       "template/app/page.tsx",
@@ -484,7 +562,7 @@ describe("21st native visual source", () => {
       type: "nodebuffer",
       platform: "UNIX",
     });
-    const prepare = () =>
+    await expect(
       prepareNativeTemplateCandidate({
         templateId: "safe-doc-link",
         slug: "safe-doc-link",
@@ -506,27 +584,9 @@ describe("21st native visual source", () => {
             contrast: 0,
           },
         }),
-      });
-    const first = await prepare();
-    const second = await prepare();
-    expect(second.sourceTreeSha256).toBe(first.sourceTreeSha256);
-    expect(second.sourceArchiveSha256).toBe(first.sourceArchiveSha256);
-    const wrapper = await JSZip.loadAsync(first.sourceArchive);
-    const manifest = JSON.parse(
-      await wrapper
-        .file("frontmind-provider-template-source-v1.json")!
-        .async("string"),
-    ) as { providerArchiveSha256: string };
-    const sanitizedProviderArchive = await wrapper
-      .file("provider-source.zip")!
-      .async("nodebuffer");
-    expect(manifest.providerArchiveSha256).toBe(
-      digest(sanitizedProviderArchive),
-    );
-    expect(manifest.providerArchiveSha256).not.toBe(digest(providerArchive));
-    const sanitized = await JSZip.loadAsync(sanitizedProviderArchive);
-    expect(sanitized.file("template/CLAUDE.md")).toBeNull();
-    expect(sanitized.file("template/AGENTS.md")).not.toBeNull();
+        renderPreview: renderedTemplateFixture,
+      }),
+    ).rejects.toThrow("NATIVE_TEMPLATE_SOURCE_UNSAFE");
   });
 
   it("rejects a documentation symlink referenced by runtime source", async () => {
@@ -1300,7 +1360,7 @@ describe("21st native visual source", () => {
     );
   }, 45_000);
 
-  it("round-trips V6 opaque Template archives and returns the untouched selected ZIP to Manus", async () => {
+  it("round-trips V6 compiled Template archives and returns the complete Provider ZIP to Manus", async () => {
     const sourceArchives = new Map<string, Buffer>();
     const providerArchives = new Map<string, Buffer>();
     const candidates = [];
@@ -1330,9 +1390,10 @@ describe("21st native visual source", () => {
             contrast: 0,
           },
         }),
+        renderPreview: renderedTemplateFixture,
       });
-      sourceArchives.set(id, prepared.sourceArchive);
       providerArchives.set(id, providerArchive);
+      sourceArchives.set(id, prepared.sourceArchive);
       candidates.push({
         id,
         sampleId: id,
@@ -1345,7 +1406,7 @@ describe("21st native visual source", () => {
         providerTemplateId: `template-${label}`,
         providerSlug: `template-${label.toLowerCase()}`,
         providerVersion: `commit-${label.toLowerCase()}`,
-        sourceFormat: "provider_archive_v1" as const,
+        sourceFormat: prepared.sourceFormat,
         framework: prepared.framework,
         sourceTreeSha256: prepared.sourceTreeSha256,
         sourceArchiveSha256: prepared.sourceArchiveSha256,
@@ -1383,9 +1444,9 @@ describe("21st native visual source", () => {
       framework: "vite_react",
     });
     expect(selected.manifest).toMatchObject({
+      sourceFormat: "provider_archive_v1",
       providerTemplateId: "template-H",
       providerSlug: "template-h",
-      sourceFormat: "provider_archive_v1",
     });
     expect(
       selected.archiveBytes.equals(
@@ -1393,6 +1454,6 @@ describe("21st native visual source", () => {
       ),
     ).toBe(true);
     expect(selected.archiveSha256).toBe(digest(selected.archiveBytes));
-    expect(selected.files).toEqual([]);
+    expect(selected.files).toHaveLength(0);
   }, 45_000);
 });

@@ -38,8 +38,10 @@ import {
   workspaceSiteProfiles,
 } from "../../drizzle/schema";
 import {
+  SITEOPS_DEFAULT_WORKFLOW,
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_MATERIALIZER_V2_6,
+  SITEOPS_MATERIALIZER_V2_7,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
@@ -176,7 +178,10 @@ export function requireAcceptedSiteOpsRebuild(input: {
 }
 
 function siteOpsBuildWorkflowCoordinates(
-  workflow: typeof SITEOPS_MATERIALIZER_V2_5 | typeof SITEOPS_MATERIALIZER_V2_6,
+  workflow:
+    | typeof SITEOPS_MATERIALIZER_V2_5
+    | typeof SITEOPS_MATERIALIZER_V2_6
+    | typeof SITEOPS_MATERIALIZER_V2_7,
 ) {
   return {
     workflowUpstreamVersion: workflow.upstreamVersion,
@@ -188,7 +193,7 @@ function siteOpsBuildWorkflowCoordinates(
 }
 
 export function currentSiteOpsBuildWorkflowCoordinates() {
-  return siteOpsBuildWorkflowCoordinates(SITEOPS_MATERIALIZER_V2_6);
+  return siteOpsBuildWorkflowCoordinates(SITEOPS_DEFAULT_WORKFLOW);
 }
 
 export function isSiteOpsOperationReplay(
@@ -806,6 +811,12 @@ const nativeTemplateSelectionMetadataSchema = z
     previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     sourceDirectory: z.literal("source"),
     entrypoint: z.string().trim().min(1).max(240),
+    workflowVersion: z
+      .enum([
+        SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+        SITEOPS_MATERIALIZER_V2_7.frontMindVersion,
+      ])
+      .optional(),
   })
   .passthrough();
 
@@ -819,6 +830,22 @@ export function isNativeVisualSelectionMetadata(value: unknown) {
       record.renderer === "twenty_first_native_react_v1") ||
     nativeTemplateSelectionMetadataSchema.safeParse(record).success
   );
+}
+
+export function siteOpsWorkflowForVisualSelectionMetadata(value: unknown) {
+  const nativeTemplate = nativeTemplateSelectionMetadataSchema.safeParse(value);
+  if (nativeTemplate.success) {
+    // V6 existed before workflow 2.7. Historical rows intentionally have no
+    // workflowVersion and must retain their original 2.5 Native semantics.
+    return nativeTemplate.data.workflowVersion ===
+      SITEOPS_MATERIALIZER_V2_7.frontMindVersion
+      ? SITEOPS_MATERIALIZER_V2_7
+      : SITEOPS_MATERIALIZER_V2_5;
+  }
+  if (isNativeVisualSelectionMetadata(value)) {
+    return SITEOPS_MATERIALIZER_V2_5;
+  }
+  return SITEOPS_MATERIALIZER_V2_6;
 }
 
 export function freezeSiteOpsReferenceBlueprint(input: {
@@ -3260,7 +3287,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
 }
 
 export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
-  if (workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion) {
+  if (workflowVersion !== SITEOPS_DEFAULT_WORKFLOW.frontMindVersion) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "视觉检索使用的建站合同已升级，请重新检索视觉方向后再继续。",
@@ -3273,6 +3300,112 @@ export function createVisualSearchOperationInput(
   input: VisualSearchOperationInput,
 ) {
   return visualSearchOperationInputSchema.parse(input);
+}
+
+export function siteOpsVisualCycleWorkflowVersion(
+  frozenInputs: readonly unknown[],
+) {
+  const parsedInputs = frozenInputs.map((value) =>
+    visualSearchOperationInputSchema.safeParse(value),
+  );
+  if (
+    parsedInputs.length < 1 ||
+    parsedInputs.some((result) => !result.success)
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮视觉候选的冻结工作流无法核验，请重置后重新检索。",
+      409,
+    );
+  }
+  const workflows = new Set(
+    parsedInputs.map((result) => result.data!.workflowVersion),
+  );
+  if (workflows.size !== 1) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮视觉候选的冻结工作流不一致，请重置后重新检索。",
+      409,
+    );
+  }
+  const workflowVersion = [...workflows][0];
+  if (
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮视觉候选使用的历史工作流无法继续，请重置后重新检索。",
+      409,
+    );
+  }
+  return workflowVersion;
+}
+
+async function frozenSupplementalVisualWorkflowVersion(
+  tx: any,
+  input: {
+    batches: readonly { engineerNote: string | null }[];
+    projectId: string;
+    userId: number;
+    knowledgeSnapshotId: string;
+    credentialId: string;
+    credentialVersion: number;
+  },
+) {
+  const operationIds = input.batches.map((batch) => {
+    const value = batch.engineerNote?.startsWith(
+      TWENTY_FIRST_OPERATION_MARKER_PREFIX,
+    )
+      ? batch.engineerNote.slice(TWENTY_FIRST_OPERATION_MARKER_PREFIX.length)
+      : "";
+    if (!uuidSchema.safeParse(value).success) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "现有视觉候选缺少冻结工作流坐标，请重置后重新检索。",
+        409,
+      );
+    }
+    return value;
+  });
+  const uniqueOperationIds = [...new Set(operationIds)];
+  const rows = await tx
+    .select({ id: siteOperations.id, input: siteOperations.input })
+    .from(siteOperations)
+    .where(
+      and(
+        inArray(siteOperations.id, uniqueOperationIds),
+        eq(siteOperations.projectId, input.projectId),
+        eq(siteOperations.userId, input.userId),
+        eq(siteOperations.kind, "visual_search"),
+        eq(siteOperations.provider, "21st"),
+        eq(siteOperations.status, "succeeded"),
+      ),
+    );
+  if (rows.length !== uniqueOperationIds.length) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "现有视觉候选的冻结工作流无法核验，请重置后重新检索。",
+      409,
+    );
+  }
+  const frozenInputs = rows.map((row: { input: unknown }) => row.input);
+  for (const frozenInput of frozenInputs) {
+    const parsed = visualSearchOperationInputSchema.parse(frozenInput);
+    if (
+      parsed.knowledgeSnapshotId !== input.knowledgeSnapshotId ||
+      parsed.credentialId !== input.credentialId ||
+      parsed.credentialVersion !== input.credentialVersion
+    ) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "现有视觉候选与当前知识库或检索凭据不一致，请重置后重新检索。",
+        409,
+      );
+    }
+  }
+  return siteOpsVisualCycleWorkflowVersion(frozenInputs);
 }
 
 async function createActionTurn(
@@ -3703,7 +3836,10 @@ async function handleVisualSearch(
     }
   }
   const currentPublishedBatches = await tx
-    .select({ id: websiteStyleSampleBatches.id })
+    .select({
+      id: websiteStyleSampleBatches.id,
+      engineerNote: websiteStyleSampleBatches.engineerNote,
+    })
     .from(websiteStyleSampleBatches)
     .where(
       and(
@@ -3795,13 +3931,24 @@ async function handleVisualSearch(
     | 1
     | 2
     | 3;
+  const workflowVersion =
+    mode === "initial"
+      ? SITEOPS_DEFAULT_WORKFLOW.frontMindVersion
+      : await frozenSupplementalVisualWorkflowVersion(tx, {
+          batches: currentPublishedBatches,
+          projectId: input.project.id,
+          userId: input.actor.id,
+          knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+          credentialId: credential.id,
+          credentialVersion: credential.version,
+        });
   const admissionRevision = input.project.revision + 1;
   const operationPayload = createVisualSearchOperationInput({
     schemaVersion: 2,
     knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
     credentialId: credential.id,
     credentialVersion: credential.version,
-    workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+    workflowVersion,
     mode,
     page,
     admissionRevision,
@@ -4077,6 +4224,9 @@ async function selectVisualSample(
     unknown
   >;
   const nativeVisual = isNativeVisualSelectionMetadata(selectedMetadataRecord);
+  const selectedWorkflow = siteOpsWorkflowForVisualSelectionMetadata(
+    selectedMetadataRecord,
+  );
   if (!nativeVisual) {
     const selectedEvidence = visualEvidenceV1Schema.safeParse(
       selectedMetadata.visualEvidence,
@@ -4259,9 +4409,7 @@ async function selectVisualSample(
     knowledgeSnapshotId: snapshot.id,
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
-    ...siteOpsBuildWorkflowCoordinates(
-      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_6,
-    ),
+    ...siteOpsBuildWorkflowCoordinates(selectedWorkflow),
     twentyFirstCredentialId: credential.id,
     twentyFirstCredentialVersion: credential.version,
     styleSampleId: selected.sample.id,
@@ -4283,9 +4431,7 @@ async function selectVisualSample(
       ...(parentBuildId ? { childBuildId: buildId, parentBuildId } : {}),
       styleSampleId: selected.sample.id,
       delegated: input.delegated,
-      workflowVersion: nativeVisual
-        ? SITEOPS_MATERIALIZER_V2_5.frontMindVersion
-        : SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+      workflowVersion: selectedWorkflow.frontMindVersion,
       ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },
@@ -4489,6 +4635,8 @@ async function handleRevision(
     unknown
   >;
   const nativeVisual = isNativeVisualSelectionMetadata(styleMetadata);
+  const selectedWorkflow =
+    siteOpsWorkflowForVisualSelectionMetadata(styleMetadata);
   const derivedReferenceBlueprint = nativeVisual
     ? null
     : freezeSiteOpsReferenceBlueprint({
@@ -4550,9 +4698,7 @@ async function handleRevision(
     // A revision is a new immutable build. Freeze the current workflow,
     // starter and materializer as one coordinate set instead of pairing the
     // current host runtime with a historical parent's contract.
-    ...siteOpsBuildWorkflowCoordinates(
-      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_6,
-    ),
+    ...siteOpsBuildWorkflowCoordinates(selectedWorkflow),
     twentyFirstCredentialId: parent.twentyFirstCredentialId,
     twentyFirstCredentialVersion: parent.twentyFirstCredentialVersion,
     styleSampleId: parent.styleSampleId,
@@ -4570,9 +4716,7 @@ async function handleRevision(
     payload: {
       ...input.payload,
       childBuildId: buildId,
-      workflowVersion: nativeVisual
-        ? SITEOPS_MATERIALIZER_V2_5.frontMindVersion
-        : SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+      workflowVersion: selectedWorkflow.frontMindVersion,
       ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },

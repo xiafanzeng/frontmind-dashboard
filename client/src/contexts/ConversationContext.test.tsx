@@ -2,8 +2,10 @@ import React from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { knowledgeBaseUserMessagePublicId } from "@shared/knowledge-base-message";
+import { generalChatTerminalMessagePublicId } from "@shared/frontmind-general-chat-terminal";
 import {
   ConversationProvider,
+  appendOrUpsertConversationMessage,
   applyKnowledgeBaseObservation,
   conversationSyncErrorMessage,
   currentKnowledgeBaseReplySnapshot,
@@ -18,6 +20,40 @@ import {
   useConversation,
   type Conversation,
 } from "./ConversationContext";
+
+describe("general-chat terminal message upsert", () => {
+  it("atomically replaces the same deterministic notice and leaves ordinary duplicate repair unchanged", () => {
+    const terminalId = generalChatTerminalMessagePublicId({
+      conversationId: "conversation-1",
+      taskId: "task-1",
+      errorCode: "PARTIAL_RESULT_PRESERVED",
+    });
+    const first = {
+      id: terminalId,
+      role: "assistant" as const,
+      content: "旧提示",
+      timestamp: 1,
+    };
+    const next = appendOrUpsertConversationMessage([first], {
+      ...first,
+      content: "部分结果已保留",
+      timestamp: 2,
+    });
+    expect(next).toEqual([
+      expect.objectContaining({
+        id: terminalId,
+        content: "部分结果已保留",
+        timestamp: 2,
+      }),
+    ]);
+
+    const ordinary = appendOrUpsertConversationMessage(
+      [{ ...first, id: "ordinary" }],
+      { ...first, id: "ordinary", content: "第二条" },
+    );
+    expect(ordinary.map(({ id }) => id)).toEqual(["ordinary", "ordinary~2"]);
+  });
+});
 
 describe("conversation sync errors", () => {
   it("promises preservation for both transport and business write failures", () => {

@@ -48,6 +48,7 @@ import {
 } from "@shared/knowledge-base-output";
 import { uniquifyOrderedIds } from "@shared/ordered-id";
 import type { GeneralChatDispatchMetadata } from "@shared/frontmind-general-chat-dispatch";
+import { GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX } from "@shared/frontmind-general-chat-terminal";
 import {
   dispatchKnowledgeBaseProgressUpdated,
   reconcileKnowledgeBaseObservation,
@@ -277,6 +278,33 @@ export function repairConversationMessageIds(
   });
 }
 
+/**
+ * Terminal notices are the sole browser-authored message class with an
+ * idempotency key shared by send, recovery polling, hydration, and incident
+ * repair. Upsert this narrow namespace atomically; all other local messages
+ * retain the historical append-and-repair behavior.
+ */
+export function appendOrUpsertConversationMessage(
+  messages: readonly LocalMessage[],
+  message: LocalMessage,
+) {
+  if (!message.id.startsWith(GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX)) {
+    return repairConversationMessageIds([...messages, message]);
+  }
+  const existingIndex = messages.findIndex(
+    (candidate) => candidate.id === message.id,
+  );
+  if (existingIndex < 0) {
+    return repairConversationMessageIds([...messages, message]);
+  }
+  const nextMessages = messages.filter(
+    (candidate, index) =>
+      candidate.id !== message.id || index === existingIndex,
+  );
+  nextMessages[existingIndex] = message;
+  return repairConversationMessageIds(nextMessages);
+}
+
 export function isServerOwnedKnowledgeBaseMessage(message: LocalMessage) {
   return message.knowledgeBase?.serverOwned === true;
 }
@@ -475,10 +503,10 @@ function conversationReducer(
           c.id === action.payload.conversationId
             ? {
                 ...c,
-                messages: repairConversationMessageIds([
-                  ...c.messages,
+                messages: appendOrUpsertConversationMessage(
+                  c.messages,
                   action.payload.message,
-                ]),
+                ),
                 updatedAt: Date.now(),
               }
             : c,

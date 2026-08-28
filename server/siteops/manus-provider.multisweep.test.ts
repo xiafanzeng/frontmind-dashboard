@@ -30,6 +30,8 @@ import {
   NATIVE_REJECTED_CANDIDATE_RECONCILIATION_MS,
   createNativeRejectedCandidateV1,
   createManusSiteOpsProviderHandler,
+  nativeSourceAttachmentTransport,
+  nativeSourceSystemPromptForWorkflow,
   nativeTemplateCoordinateDirective,
 } from "./manus-provider";
 import { siteOpsArtifactIdForIdempotency } from "./artifact-store";
@@ -38,6 +40,8 @@ import {
   createNativeSourceArchive,
   createVisualSelectionBundleV5Artifact,
   normalizeTwentyFirstNativeSource,
+  SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
+  SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
 } from "./native-visual-source";
 
 const sha256 = (value: Buffer | string) =>
@@ -108,6 +112,70 @@ describe("native Template coordinates", () => {
         candidate: { sourceFormat: "normalized_v1" },
       } as never),
     ).toBeNull();
+  });
+
+  it("binds a normalized V6 Template to its exact compiled source coordinates", () => {
+    const sourceArchiveSha256 = sha256("normalized-template-archive");
+    const sourceTreeSha256 = sha256("normalized-template-tree");
+    const directive = nativeTemplateCoordinateDirective({
+      bundle: { schemaVersion: 6 },
+      candidate: {
+        sourceFormat: "normalized_v1",
+        providerTemplateId: "twenty-first/template-one",
+        providerSlug: "template-one",
+        providerVersion: "commit-one",
+        sourceDirectory: "source",
+        framework: "vite_react",
+        entrypoint: "src/App.tsx",
+        sourceArchiveSha256,
+        sourceTreeSha256,
+      },
+      manifest: {
+        providerItemKey: "t:twenty-first/template-one:template-one",
+        providerVersion: "commit-one",
+        entrypoint: "src/App.tsx",
+        sourceTreeSha256,
+      },
+    } as never);
+    expect(directive).not.toBeNull();
+    const encoded = directive!.attachment.file_data.split(",", 2)[1]!;
+    expect(
+      JSON.parse(Buffer.from(encoded, "base64").toString("utf8")),
+    ).toMatchObject({
+      schemaVersion: 1,
+      sourceFormat: "normalized_v1",
+      providerSlug: "template-one",
+      sourceDirectory: "source",
+      entrypoint: "src/App.tsx",
+      sourceArchiveSha256,
+      sourceTreeSha256,
+    });
+    expect(directive!.promptInstruction).toContain("production build 验证");
+  });
+
+  it("uses inline bytes through 20 MiB and provider file IDs above it", () => {
+    expect(nativeSourceAttachmentTransport(20 * 1024 * 1024)).toBe("inline");
+    expect(nativeSourceAttachmentTransport(20 * 1024 * 1024 + 1)).toBe(
+      "provider_file",
+    );
+  });
+
+  it("uses the 2.7 adaptation prompt without changing historical 2.5 instructions", () => {
+    expect(
+      nativeSourceSystemPromptForWorkflow(
+        SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
+      ),
+    ).toContain("页面目的 × 用户问题 × 企业事实 × CTA");
+    expect(
+      nativeSourceSystemPromptForWorkflow(
+        SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
+      ),
+    ).toContain("不得把模板改造成通用卡片站");
+    expect(
+      nativeSourceSystemPromptForWorkflow(
+        SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
+      ),
+    ).toContain("不是视觉设计师");
   });
 });
 

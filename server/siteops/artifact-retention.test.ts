@@ -1,3 +1,5 @@
+import type { SQL } from "drizzle-orm";
+import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -37,6 +39,41 @@ describe("SiteOps artifact retention", () => {
     await expect(isSiteOpsArtifactReferenced(database, assetId)).resolves.toBe(
       true,
     );
+  });
+
+  it("pins the V4 realization recorded in style metadata as well as the direct reference asset", async () => {
+    let sampleReferenceWhere: SQL | null = null;
+    let styleSampleQueryCount = 0;
+    const database = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: (condition: SQL) => ({
+            limit: async () => {
+              if (table === localAssets) return [{ id: assetId }];
+              if (table === websiteStyleSamples) {
+                styleSampleQueryCount += 1;
+                if (styleSampleQueryCount === 1) return [];
+                sampleReferenceWhere = condition;
+                return [{ id: "sample-v4" }];
+              }
+              return [];
+            },
+          }),
+        }),
+      }),
+    } as never;
+
+    await expect(isSiteOpsArtifactReferenced(database, assetId)).resolves.toBe(
+      true,
+    );
+    expect(sampleReferenceWhere).not.toBeNull();
+    const query = new MySqlDialect().sqlToQuery(sampleReferenceWhere!);
+    expect(query.sql).toContain("$.realizationPreviewLocalAssetId");
+    expect(query.sql).toContain("$.referenceBlueprint.previewLocalAssetId");
+    expect(query.sql).toContain(
+      "$.referenceBlueprint.referencePreviewLocalAssetId",
+    );
+    expect(query.params.filter((value) => value === assetId)).toHaveLength(3);
   });
 
   it("pins selection bundles and every immutable build artifact", async () => {

@@ -1,7 +1,7 @@
 /**
  * Enhanced useSendMessage Hook with retry mechanism and streaming support
- * Features: Safe retry for uploads/polling, streaming responses,
- *           upload progress tracking, race-condition-free sequential polling,
+ * Features: Safe retry for uploads, streaming responses,
+ *           upload progress tracking, durable handoff to global polling,
  *           identity-aware output reconciliation for multi-turn conversations,
  *           per-message model override (agentProfile parameter),
  *           credit event bus emission on task completion for real-time refresh.
@@ -12,7 +12,6 @@ import {
   createResponseLogicTask,
   createKnowledgeBaseTurnTask,
   reserveKnowledgeBaseTurnWithAttachments,
-  retrieveTask,
   stageKnowledgeBaseTurnAttachment,
   uploadChatLocalAsset,
   uploadKnowledgeBaseLocalAsset,
@@ -31,6 +30,11 @@ import {
   type UploadRetentionReceipt,
 } from "@/lib/frontmind-api";
 import type { GeneralChatDispatchMetadata } from "@shared/frontmind-general-chat-dispatch";
+import {
+  GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE,
+  GENERAL_CHAT_PARTIAL_RESULT_MESSAGE,
+  generalChatTerminalMessagePublicId,
+} from "@shared/frontmind-general-chat-terminal";
 import {
   useConversation,
   type Attachment,
@@ -64,12 +68,6 @@ export {
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY = 1000; // 1 second
 const MAX_RETRY_DELAY = 10000; // 10 seconds
-
-export function getTaskPollDelay(elapsedMs: number) {
-  if (elapsedMs < 5 * 60 * 1000) return 3_000;
-  if (elapsedMs < 30 * 60 * 1000) return 10_000;
-  return 30_000;
-}
 
 interface RetryConfig {
   maxRetries: number;
@@ -179,6 +177,34 @@ function getFailureDisplayMessage(errorMsg: string) {
   return classifyFailure(errorMsg) === "attachment"
     ? "历史任务的附件与当前服务凭证不兼容。"
     : errorMsg;
+}
+
+function generalChatTaskError(response: TaskResponse) {
+  return response.error;
+}
+
+function generalChatTaskErrorCode(response: TaskResponse) {
+  const error = generalChatTaskError(response);
+  if (error?.partialResult === true) {
+    return GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE;
+  }
+  return error?.code?.trim() || "TASK_FAILED";
+}
+
+function generalChatDispatchErrorCode(error: unknown) {
+  const candidate = error as { code?: unknown; status?: unknown } | null;
+  if (
+    typeof candidate?.code === "string" &&
+    /^[A-Z0-9_:-]{1,128}$/u.test(candidate.code)
+  ) {
+    return candidate.code;
+  }
+  const status = Number(candidate?.status);
+  if (Number.isInteger(status) && status >= 400 && status <= 599) {
+    return `HTTP_${status}`;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return `DISPATCH_${classifyFailure(message).toUpperCase()}`;
 }
 
 export function readResponseLogicTaskStartFailure(
@@ -376,23 +402,15 @@ export function useSendMessage() {
     flushConversation,
   } = useConversation();
 
-  // Use a ref to track whether polling should continue.
-  const pollingActiveRef = useRef(false);
-  const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sendInFlightRef = useRef(false);
   const activeConvRef = useRef(activeConversation);
   activeConvRef.current = activeConversation;
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const terminalMessageIdsRef = useRef(new Set<string>());
   const pendingGeneralChatDispatchRef = useRef(
     new Map<string, FrozenGeneralChatDispatchEnvelope>(),
   );
-
-  // Store context functions in refs so polling closures always use the latest versions
-  const updateStatusRef = useRef(updateStatus);
-  updateStatusRef.current = updateStatus;
-  const updateAssistantMessagesRef = useRef(updateAssistantMessages);
-  updateAssistantMessagesRef.current = updateAssistantMessages;
-  const addMessageRef = useRef(addMessage);
-  addMessageRef.current = addMessage;
 
   const [isRetrying, setIsRetrying] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
@@ -439,13 +457,39 @@ export function useSendMessage() {
     replaceKnowledgeBaseAttachmentAttempt(null);
   }, [replaceKnowledgeBaseAttachmentAttempt]);
 
-  const stopPolling = useCallback(() => {
-    pollingActiveRef.current = false;
-    if (pollingTimeoutRef.current) {
-      clearTimeout(pollingTimeoutRef.current);
-      pollingTimeoutRef.current = null;
-    }
-  }, []);
+  // Kept as a compatibility no-op for callers compiled against the old Hook
+  // surface. Ordinary running tasks are polled exclusively by useResumePolling.
+  const stopPolling = useCallback(() => {}, []);
+
+  const addGeneralChatTerminalMessage = useCallback(
+    (input: {
+      conversationId: string;
+      taskId: string;
+      errorCode: string;
+      content: string;
+      timestamp?: number;
+    }) => {
+      const messageId = generalChatTerminalMessagePublicId(input);
+      const conversation = stateRef.current.conversations.find(
+        ({ id }) => id === input.conversationId,
+      );
+      if (
+        terminalMessageIdsRef.current.has(messageId) ||
+        conversation?.messages.some((message) => message.id === messageId)
+      ) {
+        return false;
+      }
+      terminalMessageIdsRef.current.add(messageId);
+      addMessage(input.conversationId, {
+        id: messageId,
+        role: "assistant",
+        content: input.content,
+        timestamp: input.timestamp ?? Date.now(),
+      });
+      return true;
+    },
+    [addMessage],
+  );
 
   useEffect(() => {
     const attempt = knowledgeBaseAttachmentAttemptRef.current;
@@ -518,217 +562,6 @@ export function useSendMessage() {
       uploadedKnowledgeBaseReceiptsRef.current.clear();
     },
     [],
-  );
-
-  /**
-   * Sequential polling: waits for each request to finish before scheduling the next.
-   */
-  const startPolling = useCallback(
-    (
-      taskId: string,
-      convId: string,
-      responseStartedAt: number,
-      retryConfig: RetryConfig,
-      baselineOutputLength: number,
-      historicalOutputIds: readonly string[],
-      modelName?: string,
-    ) => {
-      // Stop any existing polling first
-      stopPolling();
-      pollingActiveRef.current = true;
-
-      let pollCount = 0;
-      let lastNewOutputLen = 0;
-      let completionHandled = false;
-      let consecutiveErrors = 0;
-      const MAX_CONSECUTIVE_ERRORS = 10;
-
-      const pollOnce = async () => {
-        if (!pollingActiveRef.current || completionHandled) return;
-
-        try {
-          pollCount++;
-
-          const updated = await withRetry(() => retrieveTask(taskId), {
-            ...retryConfig,
-            maxRetries: 2,
-          });
-
-          if (!pollingActiveRef.current || completionHandled) return;
-
-          // Ordinary-chat polling is intentionally isolated from the KB
-          // coordinator and may continue rendering raw task output.
-          // Slice only NEW output items
-          if (updated.output && updated.output.length > 0) {
-            const newOutput = sliceNewOutput(
-              updated.output,
-              baselineOutputLength,
-              historicalOutputIds,
-            );
-
-            if (newOutput.length > 0) {
-              try {
-                const assistantMsgs = projectTaskOutputMessages({
-                  output: updated.output,
-                  baselineOutputLength,
-                  historicalOutputIds,
-                  responseStartedAt,
-                  modelName,
-                  knowledgeBase: false,
-                });
-                if (assistantMsgs.length > 0) {
-                  updateAssistantMessagesRef.current(convId, assistantMsgs);
-                }
-              } catch (parseErr) {
-                console.error(
-                  "[Polling] Error parsing output messages:",
-                  parseErr,
-                );
-              }
-              if (newOutput.length !== lastNewOutputLen) {
-                console.log(
-                  `[Polling] New output items: ${newOutput.length}, ` +
-                    `total output: ${updated.output.length}, baseline: ${baselineOutputLength}`,
-                );
-                lastNewOutputLen = newOutput.length;
-              }
-            }
-          }
-
-          // Normalize status
-          const normalizedStatus =
-            updated.status === "failed" ? "error" : updated.status;
-
-          updateStatusRef.current(convId, normalizedStatus as any, {
-            taskId: updated.id,
-          });
-
-          if (normalizedStatus === "completed" && !completionHandled) {
-            completionHandled = true;
-            stopPolling();
-            const completedAt = Date.now();
-            const elapsedSec = (completedAt - responseStartedAt) / 1000;
-
-            const totalOutputLength = updated.output?.length || 0;
-
-            updateStatusRef.current(convId, "completed", {
-              completedAt,
-              lastKnownOutputLength: totalOutputLength,
-            });
-
-            // Final parse of output — this is the authoritative final set.
-            // The regular polling section above already parsed the same output,
-            // but we do it once more here to ensure we have the complete set
-            // and to attach elapsedTime to the last message.
-            if (updated.output && updated.output.length > 0) {
-              const newOutput = sliceNewOutput(
-                updated.output,
-                baselineOutputLength,
-                historicalOutputIds,
-              );
-
-              if (newOutput.length > 0) {
-                try {
-                  const finalMsgs = projectTaskOutputMessages({
-                    output: updated.output,
-                    baselineOutputLength,
-                    historicalOutputIds,
-                    responseStartedAt,
-                    modelName,
-                    knowledgeBase: false,
-                  });
-                  if (finalMsgs.length > 0) {
-                    finalMsgs[finalMsgs.length - 1].elapsedTime = elapsedSec;
-                    updateAssistantMessagesRef.current(convId, finalMsgs);
-                  }
-                } catch (parseErr) {
-                  console.error(
-                    "[Polling] Error parsing final output messages:",
-                    parseErr,
-                  );
-                }
-              }
-            }
-
-            toast.success("任务已完成", {
-              description: `本次处理耗时 ${elapsedSec.toFixed(1)}s，结果已同步到当前内容流程。`,
-              duration: 3200,
-            });
-
-            // Emit credit refresh event on task completion
-            creditEventBus.emit();
-            return;
-          }
-
-          if (normalizedStatus === "error" && !completionHandled) {
-            completionHandled = true;
-            stopPolling();
-            const completedAt = Date.now();
-
-            const totalOutputLength = updated.output?.length || 0;
-
-            updateStatusRef.current(convId, "error", {
-              completedAt,
-              lastKnownOutputLength: totalOutputLength,
-            });
-            const errorMsg = updated.error?.message || "任务执行出错";
-            const failureAdvice = getFailureAdvice(errorMsg);
-            const displayError = getFailureDisplayMessage(errorMsg);
-            toast.error("任务执行失败", {
-              description: failureAdvice,
-            });
-            addMessageRef.current(convId, {
-              id: `msg-err-${Date.now()}`,
-              role: "assistant",
-              content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
-              timestamp: Date.now(),
-            });
-
-            // Emit credit refresh event even on error (credits may have been consumed)
-            creditEventBus.emit();
-            return;
-          }
-
-          consecutiveErrors = 0;
-        } catch (err: any) {
-          console.error("Polling error:", err);
-          consecutiveErrors++;
-
-          if (!pollingActiveRef.current || completionHandled) return;
-
-          if (pollCount > 3 && err.message?.includes("404")) {
-            stopPolling();
-            updateStatusRef.current(convId, "error", {
-              completedAt: Date.now(),
-            });
-            toast.error("任务不存在或已被删除");
-            creditEventBus.emit();
-            return;
-          }
-
-          if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-            stopPolling();
-            const completedAt = Date.now();
-            updateStatusRef.current(convId, "error", { completedAt });
-            toast.error("连续多次请求失败，已停止轮询");
-            return;
-          }
-        }
-
-        if (pollingActiveRef.current && !completionHandled) {
-          pollingTimeoutRef.current = setTimeout(
-            pollOnce,
-            getTaskPollDelay(Date.now() - responseStartedAt),
-          );
-        }
-      };
-
-      pollingTimeoutRef.current = setTimeout(
-        pollOnce,
-        getTaskPollDelay(Date.now() - responseStartedAt),
-      );
-    },
-    [stopPolling],
   );
 
   /**
@@ -1826,7 +1659,8 @@ export function useSendMessage() {
             return true;
           }
 
-          const effectiveStatus = response.status;
+          const effectiveStatus =
+            response.status === "failed" ? "error" : response.status;
           const totalInitialOutputLength = response.output?.length || 0;
           const initialStatusIsTerminal =
             effectiveStatus === "completed" || effectiveStatus === "error";
@@ -1844,11 +1678,13 @@ export function useSendMessage() {
               : {}),
           });
 
-          toast.success("任务已创建", {
-            description:
-              "FrontMind 已开始处理，结果会自动出现在当前内容流程中。",
-            duration: 3200,
-          });
+          if (effectiveStatus === "running" || effectiveStatus === "pending") {
+            toast.success("任务已创建", {
+              description:
+                "FrontMind 已开始处理，结果会自动出现在当前内容流程中。",
+              duration: 3200,
+            });
+          }
 
           // Ordinary tasks may render running output. Knowledge-base text is
           // shown only after the server validates the exact revision/leaf pair.
@@ -1888,19 +1724,9 @@ export function useSendMessage() {
             });
           }
 
-          // Ordinary chat keeps its local sequential poller. Knowledge-base
-          // sends returned above and are owned exclusively by the provider coordinator.
-          if (effectiveStatus === "running" || effectiveStatus === "pending") {
-            startPolling(
-              response.id,
-              convId,
-              responseStartedAt,
-              retryConfig,
-              baselineOutputLength,
-              historicalOutputIds,
-              agentProfile,
-            );
-          }
+          // A running ordinary task is now handed off through persisted
+          // conversation state. useResumePolling is the only continuing poll
+          // owner across send, focus, refresh, and hydration.
 
           if (effectiveStatus === "completed") {
             const completedAt = Date.now();
@@ -1942,6 +1768,43 @@ export function useSendMessage() {
             });
 
             // Emit credit refresh event on immediate completion
+            creditEventBus.emit();
+          }
+
+          if (effectiveStatus === "error") {
+            const completedAt = Date.now();
+            const error = generalChatTaskError(response);
+            const partialResult = error?.partialResult === true;
+            const errorMsg = error?.message || "任务执行出错";
+            const failureAdvice = getFailureAdvice(errorMsg);
+            const displayError = getFailureDisplayMessage(errorMsg);
+
+            updateStatus(convId, "error", {
+              completedAt,
+              startedAt: responseStartedAt,
+              lastKnownOutputLength: totalInitialOutputLength,
+              ...(response.clearTaskPointer
+                ? { clearTaskPointer: true }
+                : { taskId: response.id, previousResponseId: response.id }),
+            });
+            const terminalNoticeAdded = addGeneralChatTerminalMessage({
+              conversationId: convId,
+              taskId: response.id,
+              errorCode: generalChatTaskErrorCode(response),
+              content: partialResult
+                ? GENERAL_CHAT_PARTIAL_RESULT_MESSAGE
+                : `❌ 错误: ${displayError}\n\n${failureAdvice}`,
+              timestamp: completedAt,
+            });
+            if (terminalNoticeAdded && partialResult) {
+              toast.warning("任务未完整结束", {
+                description: "部分结果已保留。",
+              });
+            } else if (terminalNoticeAdded) {
+              toast.error("任务执行失败", {
+                description: failureAdvice,
+              });
+            }
             creditEventBus.emit();
           }
         } catch (err: any) {
@@ -2166,13 +2029,19 @@ export function useSendMessage() {
           const errorMsg = err.message || "请求失败";
           const failureAdvice = getFailureAdvice(errorMsg);
           const displayError = getFailureDisplayMessage(errorMsg);
-          toast.error("发送失败", { description: failureAdvice });
-          addMessage(convId, {
-            id: `msg-err-${Date.now()}`,
-            role: "assistant",
+          const terminalNoticeAdded = addGeneralChatTerminalMessage({
+            conversationId: convId,
+            taskId:
+              generalChatDispatch?.localTaskId ??
+              conv?.taskId ??
+              `request:${userMessage.id}`,
+            errorCode: generalChatDispatchErrorCode(err),
             content: `❌ 错误: ${displayError}\n\n${failureAdvice}`,
             timestamp: Date.now(),
           });
+          if (terminalNoticeAdded) {
+            toast.error("发送失败", { description: failureAdvice });
+          }
           return false;
         }
         return true;
@@ -2188,8 +2057,7 @@ export function useSendMessage() {
       updateAssistantMessages,
       updateTitle,
       createConversation,
-      stopPolling,
-      startPolling,
+      addGeneralChatTerminalMessage,
       registerKnowledgeBaseConversation,
       wakeKnowledgeBaseConversation,
       commitKnowledgeBaseObservation,

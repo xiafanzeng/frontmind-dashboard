@@ -11,7 +11,10 @@ import {
   packageEsaStaticAssets,
   type EsaDirectApi,
 } from "./esa-provider";
-import { SITEOPS_MATERIALIZER_V2_5 } from "../../shared/siteops";
+import {
+  SITEOPS_MATERIALIZER_V2_5,
+  SITEOPS_MATERIALIZER_V2_7,
+} from "../../shared/siteops";
 
 const operation = {
   id: "10000000-0000-4000-8000-000000000001",
@@ -1359,89 +1362,95 @@ describe("direct ESA SiteOps provider", () => {
     expect(api.createAssetsCodeVersion).not.toHaveBeenCalled();
   });
 
-  it("rebuilds a V5 source with the native production runtime", async () => {
-    const digest = (value: Buffer | string) =>
-      createHash("sha256").update(value).digest("hex");
-    const archive = new JSZip();
-    archive.file(
-      "package.json",
-      JSON.stringify({
-        type: "module",
-        dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
-      }),
-    );
-    archive.file(
-      "index.html",
-      '<!doctype html><div id="root"></div><script type="module" src="/src/main.tsx"></script>',
-    );
-    archive.file(
-      "src/main.tsx",
-      'import React from "react";import{createRoot}from"react-dom/client";createRoot(document.getElementById("root")!).render(<main>官网</main>);',
-    );
-    const sourceZip = await archive.generateAsync({ type: "nodebuffer" });
-    const sourceSha256 = digest(sourceZip);
-    const contractJson = Buffer.from(
-      JSON.stringify({
-        contractKind: "twenty_first_native_build_contract",
-        renderer: "twenty_first_native_react_v1",
-      }),
-    );
-    const qaJson = Buffer.from(
-      JSON.stringify({ passed: true, mode: "production" }),
-    );
-    const nativeOutput = {
-      contractJson,
-      contractSha256: digest(contractJson),
-      sourceZip,
-      sourceSha256,
-      distZip: Buffer.from("native-production-dist"),
-      distSha256: digest("native-production-dist"),
-      qaJson,
-      qaSha256: digest(qaJson),
-      visualQaZip: Buffer.from("native-production-qa"),
-      visualQaSha256: digest("native-production-qa"),
-      provenanceJson: Buffer.from("{}\n"),
-      provenanceSha256: digest("{}\n"),
-      buildDelivery: {
-        renderMode: "twenty_first_native",
-        qaStatus: "passed",
-        warningCodes: [],
-      },
-    };
-    const materializeNativeProduction = vi.fn(async (input: any) => {
-      expect(input.validatedSource.sourceZip.equals(sourceZip)).toBe(true);
-      expect(input.canonicalOrigin).toBe("https://example.com");
-      expect(input.target).toBe("global_excluding_cn");
-      return nativeOutput as never;
-    });
-    const materializeProduction = vi.fn();
+  it.each([
+    SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+    SITEOPS_MATERIALIZER_V2_7.frontMindVersion,
+  ])(
+    "rebuilds Native workflow %s with the native production runtime",
+    async (workflowVersion) => {
+      const digest = (value: Buffer | string) =>
+        createHash("sha256").update(value).digest("hex");
+      const archive = new JSZip();
+      archive.file(
+        "package.json",
+        JSON.stringify({
+          type: "module",
+          dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+        }),
+      );
+      archive.file(
+        "index.html",
+        '<!doctype html><div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+      );
+      archive.file(
+        "src/main.tsx",
+        'import React from "react";import{createRoot}from"react-dom/client";createRoot(document.getElementById("root")!).render(<main>官网</main>);',
+      );
+      const sourceZip = await archive.generateAsync({ type: "nodebuffer" });
+      const sourceSha256 = digest(sourceZip);
+      const contractJson = Buffer.from(
+        JSON.stringify({
+          contractKind: "twenty_first_native_build_contract",
+          renderer: "twenty_first_native_react_v1",
+        }),
+      );
+      const qaJson = Buffer.from(
+        JSON.stringify({ passed: true, mode: "production" }),
+      );
+      const nativeOutput = {
+        contractJson,
+        contractSha256: digest(contractJson),
+        sourceZip,
+        sourceSha256,
+        distZip: Buffer.from("native-production-dist"),
+        distSha256: digest("native-production-dist"),
+        qaJson,
+        qaSha256: digest(qaJson),
+        visualQaZip: Buffer.from("native-production-qa"),
+        visualQaSha256: digest("native-production-qa"),
+        provenanceJson: Buffer.from("{}\n"),
+        provenanceSha256: digest("{}\n"),
+        buildDelivery: {
+          renderMode: "twenty_first_native",
+          qaStatus: "passed",
+          warningCodes: [],
+        },
+      };
+      const materializeNativeProduction = vi.fn(async (input: any) => {
+        expect(input.validatedSource.sourceZip.equals(sourceZip)).toBe(true);
+        expect(input.canonicalOrigin).toBe("https://example.com");
+        expect(input.target).toBe("global_excluding_cn");
+        return nativeOutput as never;
+      });
+      const materializeProduction = vi.fn();
 
-    const output = await materializeSiteOpsProductionSource({
-      sourceZip,
-      sourceSha256,
-      build: {
-        id: "13000000-0000-4000-8000-000000000013",
-        projectId: operation.projectId,
-        knowledgeSnapshotId: "11000000-0000-4000-8000-000000000011",
-        workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
-        selectionHash: "a".repeat(64),
-        brief: {},
-      },
-      target: "global_excluding_cn",
-      canonicalOrigin: "https://example.com",
-      materializeProduction: materializeProduction as never,
-      materializeNativeProduction: materializeNativeProduction as never,
-      signal: new AbortController().signal,
-    });
+      const output = await materializeSiteOpsProductionSource({
+        sourceZip,
+        sourceSha256,
+        build: {
+          id: "13000000-0000-4000-8000-000000000013",
+          projectId: operation.projectId,
+          knowledgeSnapshotId: "11000000-0000-4000-8000-000000000011",
+          workflowVersion,
+          selectionHash: "a".repeat(64),
+          brief: {},
+        },
+        target: "global_excluding_cn",
+        canonicalOrigin: "https://example.com",
+        materializeProduction: materializeProduction as never,
+        materializeNativeProduction: materializeNativeProduction as never,
+        signal: new AbortController().signal,
+      });
 
-    expect(materializeProduction).not.toHaveBeenCalled();
-    expect(materializeNativeProduction).toHaveBeenCalledTimes(1);
-    expect(output).toMatchObject({
-      sourceSha256,
-      distSha256: nativeOutput.distSha256,
-      qaSha256: nativeOutput.visualQaSha256,
-    });
-  });
+      expect(materializeProduction).not.toHaveBeenCalled();
+      expect(materializeNativeProduction).toHaveBeenCalledTimes(1);
+      expect(output).toMatchObject({
+        sourceSha256,
+        distSha256: nativeOutput.distSha256,
+        qaSha256: nativeOutput.visualQaSha256,
+      });
+    },
+  );
 
   it("recreates a deleted Routine, deploys the frozen version, and restores the exact relation", async () => {
     enableEsaTestRuntime();

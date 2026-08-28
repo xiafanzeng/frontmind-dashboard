@@ -42,6 +42,16 @@ import {
 } from "./remote-preview";
 
 export const SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION = "2.5.0" as const;
+export const SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION = "2.7.0" as const;
+
+/** Native 2.5 remains readable for immutable replay; every newly admitted
+ * complete-Template operation uses 2.7. */
+export function isSiteOpsNativeVisualWorkflowVersion(workflowVersion: string) {
+  return (
+    workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION ||
+    workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
+  );
+}
 export const VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE = "application/zip" as const;
 export const VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES = 25 * 1024 * 1024;
 export const VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE = "application/zip" as const;
@@ -206,7 +216,7 @@ export type PreparedNativeTemplateCandidate = PreparedNativeVisualCandidate & {
   templateSlug: string;
   framework: NativeTemplateFramework;
   sourceDirectory: typeof NATIVE_SOURCE_DIRECTORY;
-  sourceFormat: "provider_archive_v1";
+  sourceFormat: "normalized_v1" | "provider_archive_v1";
   styleTokens: VisualCandidateStyleTokensV1;
 };
 
@@ -4023,13 +4033,183 @@ export async function prepareNativeVisualCandidate(input: {
   };
 }
 
-/** Worker-facing V6 catalog boundary. Complete Provider archives are inert
- * candidate data: validate and bind the immutable ZIP coordinate, but do not
- * normalize, install, execute or compile it. The official Marketplace preview
- * is the choice image. Once selected, the untouched Provider ZIP is sent to
- * Manus; only Manus' returned site source crosses the existing hard safety and
- * compile boundary. */
+async function renderedPreviewVisualSignals(preview: Buffer) {
+  const stats = await sharp(preview, {
+    failOn: "error",
+    limitInputPixels: 20_000_000,
+  })
+    .stats()
+    .catch((error) => {
+      throw new NativeVisualSourceError("NATIVE_PREVIEW_RENDER_FAILED", error);
+    });
+  const channels = stats.channels.slice(0, 3);
+  const brightness =
+    channels.reduce((sum, channel) => sum + channel.mean, 0) /
+    Math.max(1, channels.length);
+  const contrast =
+    channels.reduce((sum, channel) => sum + channel.stdev, 0) /
+    Math.max(1, channels.length);
+  return {
+    dominantHex: `#${[stats.dominant.r, stats.dominant.g, stats.dominant.b]
+      .map((value) => Math.round(value).toString(16).padStart(2, "0"))
+      .join("")}`,
+    brightness,
+    contrast,
+  };
+}
+
+/** Worker-facing V6 catalog boundary. Every admitted 2.7 Template keeps the
+ * complete Provider ZIP as its immutable source input. FrontMind derives a
+ * controlled build view from that exact ZIP, mirrors its static media, then
+ * completes production build and browser checks. The Marketplace screenshot
+ * is never substituted for build evidence, while Manus still receives the
+ * complete original project rather than the host-only build closure. */
 export async function prepareNativeTemplateCandidate(input: {
+  templateId: string | number;
+  slug: string;
+  version: string | null;
+  archive: Uint8Array;
+  expectedArchiveSha256?: string;
+  sourceSubdirectory?: string | null;
+  previewUrl?: string | null;
+  signal: AbortSignal;
+  fetchRemoteAsset?: typeof fetchSafeVisualPreview;
+  fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
+  renderPreview?: typeof renderNativeReactSourcePreview;
+}): Promise<PreparedNativeTemplateCandidate> {
+  if (input.signal.aborted) throw input.signal.reason;
+  const templateId = cleanTemplateCoordinate(
+    input.templateId,
+    "NATIVE_TEMPLATE_ID_INVALID",
+  );
+  const templateSlug = cleanTemplateCoordinate(
+    input.slug,
+    "NATIVE_TEMPLATE_SLUG_INVALID",
+  );
+  const providerVersion = cleanVersion(input.version);
+  if (input.version !== null && !providerVersion) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_VERSION_INVALID");
+  }
+  const downloadedProviderArchive = Buffer.from(input.archive);
+  const inspected = await inspectOpaqueProviderTemplateArchive({
+    archive: downloadedProviderArchive,
+    expectedSha256: input.expectedArchiveSha256,
+  });
+  const providerArchive = inspected.providerArchive;
+  // 2.7 freezes the complete project. A ZIP that required symlink removal is
+  // not that exact safe project and therefore cannot enter the candidate pool.
+  if (!providerArchive.equals(downloadedProviderArchive)) {
+    throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
+  }
+  const sourceSubdirectory = normalizedTemplateRootHint(
+    input.sourceSubdirectory,
+  );
+  const coordinate = opaqueTemplateEntrypoint({
+    paths: inspected.paths,
+    slug: templateSlug,
+    sourceSubdirectory,
+  });
+  const sourceTreeSha256 = canonicalSha256({
+    schemaVersion: 1,
+    sourceFormat: "provider_archive_v1",
+    providerTemplateId: templateId,
+    providerSlug: templateSlug,
+    providerVersion,
+    sourceSubdirectory,
+    framework: coordinate.framework,
+    entrypoint: coordinate.entrypoint,
+    providerArchiveSha256: inspected.providerArchiveSha256,
+  });
+  const normalized = await normalizeTwentyFirstNativeTemplateArchive({
+    templateId,
+    slug: templateSlug,
+    version: providerVersion,
+    archive: providerArchive,
+    expectedArchiveSha256: inspected.providerArchiveSha256,
+    sourceSubdirectory,
+  });
+  const source = await mirrorNativeStaticMedia({
+    source: normalized,
+    signal: input.signal,
+    fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
+    fetchRemoteStyleAsset:
+      input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
+  });
+  const buildArchive = await createNativeSourceArchive(source);
+  const preview = await (input.renderPreview ?? renderNativeReactSourcePreview)(
+    {
+      sourceArchive: buildArchive,
+      signal: input.signal,
+    },
+  );
+  const styleSignals = deriveOpaqueTemplateStyleSignals(
+    source.files.map((file) => ({ ...file, symlink: false })),
+    {
+      sourceSubdirectory: null,
+      entrypoint: source.entrypoint,
+    },
+  );
+  const previewSignals = await renderedPreviewVisualSignals(preview);
+  const previewSha256 = sha256(preview);
+  const styleTokens = visualCandidateStyleTokensV1Schema.parse({
+    schemaVersion: 1,
+    derivation: "normalized-preview-bounded-source-v1",
+    previewSha256,
+    sourceTreeSha256,
+    dominantHex: previewSignals.dominantHex.toLowerCase(),
+    canvasTone: previewSignals.brightness < 128 ? "dark" : "light",
+    contrast:
+      previewSignals.contrast >= 60
+        ? "high"
+        : previewSignals.contrast < 35
+          ? "low"
+          : "balanced",
+    typeSystem: styleSignals.typeSystem,
+    density: styleSignals.density,
+  });
+  const sourceArchive = await createProviderTemplateSourceArchive({
+    manifest: {
+      schemaVersion: 1,
+      sourceFormat: "provider_archive_v1",
+      providerTemplateId: templateId,
+      providerSlug: templateSlug,
+      providerVersion,
+      sourceSubdirectory,
+      framework: coordinate.framework,
+      sourceDirectory: NATIVE_SOURCE_DIRECTORY,
+      entrypoint: coordinate.entrypoint,
+      providerArchiveSha256: inspected.providerArchiveSha256,
+      sourceTreeSha256,
+    },
+    providerArchive,
+  });
+  return {
+    providerItemKey: `t:${templateId}:${templateSlug}`,
+    providerVersion,
+    entrypoint: coordinate.entrypoint,
+    demoEntrypoint: coordinate.entrypoint,
+    dependencies: [],
+    htmlEntrypoint: CONTROLLED_HTML_ENTRYPOINT,
+    appEntrypoint: CONTROLLED_APP_ENTRYPOINT,
+    files: [],
+    sourceTreeSha256,
+    templateId,
+    templateSlug,
+    framework: coordinate.framework,
+    sourceDirectory: NATIVE_SOURCE_DIRECTORY,
+    sourceFormat: "provider_archive_v1",
+    sourceArchive,
+    sourceArchiveSha256: sha256(sourceArchive),
+    preview,
+    previewSha256,
+    styleTokens,
+  };
+}
+
+/** Exact 2.5 V6 preparation retained for immutable replay. New 2.7
+ * operations must use prepareNativeTemplateCandidate above so their previews
+ * are produced by the frozen source build rather than this Marketplace image. */
+export async function prepareLegacyNativeTemplateCandidate(input: {
   templateId: string | number;
   slug: string;
   version: string | null;
