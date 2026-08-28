@@ -149,6 +149,36 @@ describe("useResumePolling ordinary-task boundary", () => {
     );
   });
 
+  it("applies an empty authoritative projection so an ambiguous current turn is hidden", async () => {
+    mocks.hydrated = true;
+    mocks.conversations[0] = {
+      ...mocks.conversations[0],
+      messages: [
+        { id: "user", role: "user", content: "当前轮", timestamp: 1 },
+        {
+          id: "stale-projection",
+          role: "assistant",
+          content: "待重新归属",
+          timestamp: 2,
+        },
+      ],
+    };
+    mocks.retrieveTask.mockResolvedValue({
+      id: "task-1",
+      status: "running",
+      output: [],
+    });
+    mocks.projectTaskOutputMessages.mockReturnValue([]);
+
+    renderHook(() => useResumePolling());
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+
+    expect(mocks.projectTaskOutputMessages).toHaveBeenCalledWith(
+      expect.objectContaining({ output: [] }),
+    );
+    expect(mocks.updateAssistantMessages).toHaveBeenCalledWith("ordinary", []);
+  });
+
   it("keeps partial output and emits one deterministic notice across focus polling", async () => {
     mocks.hydrated = true;
     mocks.retrieveTask.mockResolvedValue({

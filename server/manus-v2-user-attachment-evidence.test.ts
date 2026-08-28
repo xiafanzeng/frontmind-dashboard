@@ -10,6 +10,7 @@ import {
   generalChatProviderEvidenceHasUniqueMatch,
   isGeneralChatProviderAttachmentAddressPublic,
   parseGeneralChatProviderAttachmentEvidence,
+  readGeneralChatProviderAttachmentWithDefaultsForTests,
   resolveManusV2GeneralChatUserEventEvidence,
   type GeneralChatLocalAttachmentManifestItem,
   type GeneralChatProviderAttachmentEvidence,
@@ -126,12 +127,27 @@ describe("Manus v2 general-chat user attachment evidence", () => {
     ["127.0.0.1", false],
     ["169.254.169.254", false],
     ["10.0.0.1", false],
+    ["192.88.99.1", false],
     ["::1", false],
+    ["::192.168.1.1", false],
     ["::ffff:127.0.0.1", false],
+    ["::ffff:0:192.168.1.1", false],
+    ["64:ff9b:1::c0a8:101", false],
+    ["100::1", false],
+    ["100:0:0:1::1", false],
+    ["2001::1", false],
+    ["2001:2::1", false],
+    ["2001:5::1", false],
+    ["2001:10::1", false],
+    ["2001:20::1", false],
+    ["2002:7f00:1::", false],
+    ["3fff::1", false],
+    ["5f00::1", false],
     ["fc00::1", false],
     ["fe80::1", false],
     ["2001:db8::1", false],
     ["8.8.8.8", true],
+    ["::ffff:8.8.8.8", true],
     ["2606:4700:4700::1111", true],
   ])("classifies DNS address %s as public=%s", (address, expected) => {
     expect(isGeneralChatProviderAttachmentAddressPublic(address)).toBe(
@@ -294,6 +310,199 @@ describe("Manus v2 general-chat user attachment evidence", () => {
       }),
     ).resolves.toMatchObject({ kind: "match" });
     expect(readUrl).toHaveBeenCalledOnce();
+  });
+
+  it("deduplicates one semantic attachment mirrored with refreshed signing coordinates", async () => {
+    const bytes = Buffer.from("refreshed signed mirror");
+    const readUrl = readerFor({ "/input/a.png": bytes });
+    await expect(
+      resolveManusV2GeneralChatUserEventEvidence({
+        event: event({
+          attachments: [
+            {
+              type: "image",
+              url: signedUrl,
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+          ],
+          contentAttachments: [
+            {
+              type: "image",
+              url: "https://files.manuscdn.com/input/a.png?Signature=fresh&Policy=new&variant=original",
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+          ],
+        }),
+        promptSha256: digest("analyze"),
+        expectedAttachmentFileIds: ["file-1"],
+        localAttachmentManifest: [localFile("file-1", bytes)],
+        readUrl,
+      }),
+    ).resolves.toMatchObject({ kind: "match" });
+    expect(readUrl).toHaveBeenCalledOnce();
+  });
+
+  it("does not collapse repeated signed descriptors within one Provider representation", async () => {
+    const bytes = Buffer.from("repeated signed descriptor");
+    const readUrl = vi.fn();
+    await expect(
+      resolveManusV2GeneralChatUserEventEvidence({
+        event: event({
+          attachments: [
+            {
+              type: "image",
+              url: signedUrl,
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+            {
+              type: "image",
+              url: "https://files.manuscdn.com/input/a.png?Signature=fresh&Policy=new&variant=original",
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+          ],
+        }),
+        promptSha256: digest("analyze"),
+        expectedAttachmentFileIds: ["file-1"],
+        localAttachmentManifest: [localFile("file-1", bytes)],
+        readUrl,
+      }),
+    ).resolves.toMatchObject({
+      kind: "mismatch",
+      code: "ATTACHMENT_COUNT_MISMATCH",
+    });
+    expect(readUrl).not.toHaveBeenCalled();
+  });
+
+  it("rejects a repeated file id within one Provider representation", async () => {
+    const readUrl = vi.fn();
+    await expect(
+      resolveManusV2GeneralChatUserEventEvidence({
+        event: event({
+          attachments: [
+            {
+              type: "file",
+              file_id: "provider-file-1",
+              filename: "one.png",
+              mime_type: "image/png",
+            },
+            {
+              type: "file",
+              file_id: "provider-file-1",
+              filename: "one.png",
+              mime_type: "image/png",
+            },
+          ],
+        }),
+        promptSha256: digest("analyze"),
+        expectedAttachmentFileIds: ["provider-file-1"],
+        localAttachmentManifest: [
+          localFile("provider-file-1", Buffer.from("image")),
+        ],
+        readUrl,
+      }),
+    ).resolves.toMatchObject({
+      kind: "unresolved",
+      code: "ATTACHMENT_DESCRIPTOR_CONFLICT",
+    });
+    expect(readUrl).not.toHaveBeenCalled();
+  });
+
+  it("requires mirrored signed descriptors to pair one-to-one across representations", async () => {
+    const bytes = Buffer.from("ambiguous signed mirrors");
+    const readUrl = vi.fn();
+    await expect(
+      resolveManusV2GeneralChatUserEventEvidence({
+        event: event({
+          attachments: [
+            {
+              type: "image",
+              url: signedUrl,
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+          ],
+          contentAttachments: [
+            {
+              type: "image",
+              url: "https://files.manuscdn.com/input/a.png?Signature=one&variant=original",
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+            {
+              type: "image",
+              url: "https://files.manuscdn.com/input/a.png?Signature=two&variant=original",
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+          ],
+        }),
+        promptSha256: digest("analyze"),
+        expectedAttachmentFileIds: ["file-1"],
+        localAttachmentManifest: [localFile("file-1", bytes)],
+        readUrl,
+      }),
+    ).resolves.toMatchObject({
+      kind: "mismatch",
+      code: "ATTACHMENT_COUNT_MISMATCH",
+    });
+    expect(readUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "semantic query",
+      {
+        url: "https://files.manuscdn.com/input/a.png?Signature=fresh&variant=thumbnail",
+        filename: "image.png",
+        mime_type: "image/png",
+      },
+    ],
+    [
+      "filename",
+      {
+        url: "https://files.manuscdn.com/input/a.png?Signature=fresh&variant=original",
+        filename: "different.png",
+        mime_type: "image/png",
+      },
+    ],
+    [
+      "MIME",
+      {
+        url: "https://files.manuscdn.com/input/a.png?Signature=fresh&variant=original",
+        filename: "image.png",
+        mime_type: "image/jpeg",
+      },
+    ],
+  ])("keeps a mirrored %s conflict fail-closed", async (_label, mirror) => {
+    const bytes = Buffer.from("conflicting signed mirror");
+    const readUrl = vi.fn();
+    await expect(
+      resolveManusV2GeneralChatUserEventEvidence({
+        event: event({
+          attachments: [
+            {
+              type: "image",
+              url: signedUrl,
+              filename: "image.png",
+              mime_type: "image/png",
+            },
+          ],
+          contentAttachments: [{ type: "image", ...mirror }],
+        }),
+        promptSha256: digest("analyze"),
+        expectedAttachmentFileIds: ["file-1"],
+        localAttachmentManifest: [localFile("file-1", bytes)],
+        readUrl,
+      }),
+    ).resolves.toMatchObject({
+      kind: "mismatch",
+      code: "ATTACHMENT_COUNT_MISMATCH",
+    });
+    expect(readUrl).not.toHaveBeenCalled();
   });
 
   it("does not merge different URL-only resources across attachments and content", async () => {
@@ -463,6 +672,33 @@ describe("Manus v2 general-chat user attachment evidence", () => {
     });
   });
 
+  it("enforces the per-file limit on a chunked body without Content-Length", async () => {
+    const mebibyte = Buffer.alloc(1024 * 1024, 0x61);
+    const readUrl = vi.fn(async () => ({
+      body: (async function* () {
+        for (let index = 0; index < 100; index += 1) yield mebibyte;
+        yield Buffer.from([0x62]);
+      })(),
+      contentLength: null,
+    }));
+    await expect(
+      resolveManusV2GeneralChatUserEventEvidence({
+        event: event({
+          contentAttachments: [{ type: "file", url: signedUrl }],
+        }),
+        promptSha256: digest("analyze"),
+        expectedAttachmentFileIds: ["file-1"],
+        localAttachmentManifest: [
+          localFile("file-1", Buffer.from("local image")),
+        ],
+        readUrl,
+      }),
+    ).resolves.toMatchObject({
+      kind: "unresolved",
+      code: "ATTACHMENT_DOWNLOAD_LIMIT",
+    });
+  });
+
   it("turns native premature-close stream errors into unresolved evidence", async () => {
     const bytes = Buffer.from("image");
     const readUrl = vi.fn(async () => ({
@@ -570,6 +806,189 @@ describe("Manus v2 general-chat user attachment evidence", () => {
       });
     }
     expect(readUrl).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("default Manus CDN attachment reader", () => {
+  function readerInput(overrides: Partial<{ signal: AbortSignal }> = {}) {
+    return {
+      url: signedUrl,
+      signal: overrides.signal ?? new AbortController().signal,
+      maxBytes: 1024,
+      timeoutMs: 500,
+    };
+  }
+
+  function responseBody(value = "image") {
+    return (async function* () {
+      yield Buffer.from(value);
+    })();
+  }
+
+  it("pins a validated public DNS answer and disables redirects and proxies", async () => {
+    const lookup = vi.fn(async () => [
+      { address: "8.8.8.8", family: 4 },
+      { address: "2606:4700:4700::1111", family: 6 },
+    ]);
+    let pinned: Array<{ address: string; family: number }> | null = null;
+    let pinnedIpv6: { address: string; family: number } | null = null;
+    const get = vi.fn(async (_url, options) => {
+      expect(options.maxRedirects).toBe(0);
+      expect(options.proxy).toBe(false);
+      expect(options.maxContentLength).toBe(1024);
+      expect(options.maxBodyLength).toBe(1024);
+      expect(options.validateStatus?.(200)).toBe(true);
+      expect(options.validateStatus?.(302)).toBe(false);
+      const agentLookup = (
+        options.httpsAgent as {
+          options: {
+            lookup: (
+              hostname: string,
+              lookupOptions: { all?: boolean },
+              callback: (
+                error: Error | null,
+                addresses: Array<{ address: string; family: number }>,
+              ) => void,
+            ) => void;
+          };
+        }
+      ).options.lookup;
+      await new Promise<void>((resolve, reject) => {
+        agentLookup("files.manuscdn.com", { all: true }, (error, addresses) => {
+          if (error) return reject(error);
+          pinned = addresses;
+          resolve();
+        });
+      });
+      const scalarLookup = agentLookup as unknown as (
+        hostname: string,
+        lookupOptions: { all?: false; family?: number },
+        callback: (
+          error: Error | null,
+          address: string,
+          family: number,
+        ) => void,
+      ) => void;
+      await new Promise<void>((resolve, reject) => {
+        scalarLookup(
+          "files.manuscdn.com",
+          { family: 6 },
+          (error, address, family) => {
+            if (error) return reject(error);
+            pinnedIpv6 = { address, family };
+            resolve();
+          },
+        );
+      });
+      return {
+        data: responseBody(),
+        headers: { "content-length": "5", "content-type": "image/png" },
+      };
+    });
+
+    await expect(
+      readGeneralChatProviderAttachmentWithDefaultsForTests(readerInput(), {
+        lookup,
+        get,
+      }),
+    ).resolves.toMatchObject({ contentLength: 5, contentType: "image/png" });
+    expect(lookup).toHaveBeenCalledWith("files.manuscdn.com", {
+      all: true,
+      verbatim: true,
+    });
+    expect(get).toHaveBeenCalledOnce();
+    expect(pinned).toEqual([
+      { address: "8.8.8.8", family: 4 },
+      { address: "2606:4700:4700::1111", family: 6 },
+    ]);
+    expect(pinnedIpv6).toEqual({
+      address: "2606:4700:4700::1111",
+      family: 6,
+    });
+  });
+
+  it("rejects a mixed public/private DNS answer before opening HTTP", async () => {
+    const lookup = vi.fn(async () => [
+      { address: "8.8.8.8", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ]);
+    const get = vi.fn();
+    await expect(
+      readGeneralChatProviderAttachmentWithDefaultsForTests(readerInput(), {
+        lookup,
+        get,
+      }),
+    ).rejects.toMatchObject({ code: "UNSAFE_DNS_RESULT" });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("aborts a stalled DNS lookup before opening HTTP", async () => {
+    const lookup = vi.fn(() => new Promise<never>(() => undefined));
+    const get = vi.fn();
+    const controller = new AbortController();
+    const pending = readGeneralChatProviderAttachmentWithDefaultsForTests(
+      readerInput({ signal: controller.signal }),
+      { lookup, get },
+    );
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: "ERR_CANCELED" });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("rejects a 302 response without following it", async () => {
+    const lookup = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]);
+    const get = vi.fn(async (_url, options) => {
+      expect(options.maxRedirects).toBe(0);
+      expect(options.validateStatus?.(302)).toBe(false);
+      throw Object.assign(new Error("redirect rejected"), {
+        code: "ERR_BAD_RESPONSE",
+        response: { status: 302 },
+      });
+    });
+    await expect(
+      readGeneralChatProviderAttachmentWithDefaultsForTests(readerInput(), {
+        lookup,
+        get,
+      }),
+    ).rejects.toMatchObject({ response: { status: 302 } });
+    expect(get).toHaveBeenCalledOnce();
+  });
+
+  it("propagates the total abort signal through the pinned request", async () => {
+    const lookup = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]);
+    const get = vi.fn(
+      (_url, options) =>
+        new Promise<never>((_resolve, reject) => {
+          const signal = options.signal as AbortSignal;
+          const aborted = () =>
+            reject(
+              Object.assign(new Error("aborted"), { code: "ERR_CANCELED" }),
+            );
+          if (signal.aborted) aborted();
+          else signal.addEventListener("abort", aborted, { once: true });
+        }),
+    );
+    const result = await resolveManusV2GeneralChatUserEventEvidence({
+      event: event({
+        contentAttachments: [{ type: "file", url: signedUrl }],
+      }),
+      promptSha256: digest("analyze"),
+      expectedAttachmentFileIds: ["file-1"],
+      localAttachmentManifest: [
+        localFile("file-1", Buffer.from("local image")),
+      ],
+      totalTimeoutMs: 10,
+      readUrl: (input) =>
+        readGeneralChatProviderAttachmentWithDefaultsForTests(input, {
+          lookup,
+          get,
+        }),
+    });
+    expect(result).toMatchObject({
+      kind: "unresolved",
+      code: "ATTACHMENT_DOWNLOAD_TIMEOUT",
+    });
+    expect(get).toHaveBeenCalledOnce();
   });
 });
 

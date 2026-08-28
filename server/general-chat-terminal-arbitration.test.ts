@@ -401,6 +401,24 @@ describe("ordinary-chat current-turn terminal arbitration", () => {
     ).toBe("running");
   });
 
+  it("treats running/waiting and stopped/completed as semantic equivalents", () => {
+    expect(
+      settleGeneralChatTurn({
+        ...baseSettlement,
+        detailStatus: "running",
+        eventStatus: "waiting",
+      }),
+    ).toMatchObject({ status: "running", conflict: false });
+    expect(
+      settleGeneralChatTurn({
+        ...baseSettlement,
+        detailStatus: "stopped",
+        eventStatus: "completed",
+        hasCurrentOutput: true,
+      }),
+    ).toMatchObject({ status: "succeeded", conflict: false });
+  });
+
   it("settles natural stopped with authoritative current-turn output", () => {
     expect(
       settleGeneralChatTurn({
@@ -481,16 +499,52 @@ describe("ordinary-chat current-turn terminal arbitration", () => {
       conflict: true,
       resultDeadlineAtMs: 11_000,
     });
-    expect(
-      settleGeneralChatTurn({
-        ...baseSettlement,
-        detailStatus: "stopped",
-        eventStatus: "error",
-        hasCurrentOutput: true,
-        resultDeadlineAtMs: first.resultDeadlineAtMs,
-        nowMs: 11_000,
-      }),
-    ).toMatchObject({ status: "succeeded", conflict: true });
+    const settled = settleGeneralChatTurn({
+      ...baseSettlement,
+      detailStatus: "stopped",
+      eventStatus: "error",
+      hasCurrentOutput: true,
+      resultDeadlineAtMs: first.resultDeadlineAtMs,
+      nowMs: 11_000,
+    });
+    expect(settled).toMatchObject({
+      status: "succeeded",
+      conflict: true,
+      resultDeadlineAtMs: null,
+    });
+  });
+
+  it("does not restart an expired conflict window on later observations", () => {
+    const first = settleGeneralChatTurn({
+      ...baseSettlement,
+      detailStatus: "running",
+      eventStatus: "error",
+    });
+    const second = settleGeneralChatTurn({
+      ...baseSettlement,
+      detailStatus: "running",
+      eventStatus: "error",
+      resultDeadlineAtMs: first.resultDeadlineAtMs,
+      nowMs: 11_000,
+    });
+    const third = settleGeneralChatTurn({
+      ...baseSettlement,
+      detailStatus: "running",
+      eventStatus: "error",
+      resultDeadlineAtMs: second.resultDeadlineAtMs,
+      nowMs: 12_000,
+    });
+    expect(first.status).toBe("result_pending");
+    expect(second).toMatchObject({
+      status: "running",
+      conflict: true,
+      resultDeadlineAtMs: 11_000,
+    });
+    expect(third).toMatchObject({
+      status: "running",
+      conflict: true,
+      resultDeadlineAtMs: 11_000,
+    });
   });
 
   it("keeps a completed current turn monotonic under a later out-of-order error", () => {

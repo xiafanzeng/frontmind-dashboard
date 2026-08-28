@@ -358,9 +358,25 @@ const NATURAL_COMPLETION = new Set([
 ]);
 const PROVIDER_FAILURE = new Set(["error", "failed"]);
 const PROVIDER_CANCEL = new Set(["cancelled", "canceled"]);
+const PROVIDER_NON_TERMINAL = new Set([
+  "created",
+  "pending",
+  "queued",
+  "running",
+  "waiting",
+]);
 
 function normalizedStatus(value: string | null) {
   return value?.trim().toLowerCase() || null;
+}
+
+function semanticStatus(value: string | null) {
+  if (!value) return null;
+  if (PROVIDER_NON_TERMINAL.has(value)) return "running";
+  if (NATURAL_COMPLETION.has(value)) return "completed";
+  if (PROVIDER_FAILURE.has(value)) return "failed";
+  if (PROVIDER_CANCEL.has(value)) return "cancelled";
+  return `unknown:${value}`;
 }
 
 /**
@@ -407,7 +423,9 @@ export function settleGeneralChatTurn(input: {
   }
 
   const detailEventConflict = Boolean(
-    detailStatus && eventStatus && detailStatus !== eventStatus,
+    detailStatus &&
+      eventStatus &&
+      semanticStatus(detailStatus) !== semanticStatus(eventStatus),
   );
   let resultDeadlineAtMs = input.resultDeadlineAtMs;
   if (detailEventConflict) {
@@ -470,7 +488,10 @@ export function settleGeneralChatTurn(input: {
       providerState: selectedState,
       errorCode: null,
       partialResult: false,
-      resultDeadlineAtMs: null,
+      // Preserve an expired conflict deadline while the same contradictory
+      // evidence remains. Clearing it here would restart the grace window on
+      // the next GET and make settlement oscillate forever.
+      resultDeadlineAtMs: detailEventConflict ? resultDeadlineAtMs : null,
       conflict: detailEventConflict,
     };
   }
@@ -480,7 +501,7 @@ export function settleGeneralChatTurn(input: {
       providerState: selectedState,
       errorCode: "PROVIDER_TASK_CANCELLED",
       partialResult: false,
-      resultDeadlineAtMs: null,
+      resultDeadlineAtMs: detailEventConflict ? resultDeadlineAtMs : null,
       conflict: detailEventConflict,
     };
   }
@@ -491,7 +512,7 @@ export function settleGeneralChatTurn(input: {
           providerState: selectedState,
           errorCode: GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE,
           partialResult: true,
-          resultDeadlineAtMs: null,
+          resultDeadlineAtMs: detailEventConflict ? resultDeadlineAtMs : null,
           conflict: detailEventConflict,
         }
       : {
@@ -499,7 +520,7 @@ export function settleGeneralChatTurn(input: {
           providerState: selectedState,
           errorCode: "PROVIDER_TASK_FAILED",
           partialResult: false,
-          resultDeadlineAtMs: null,
+          resultDeadlineAtMs: detailEventConflict ? resultDeadlineAtMs : null,
           conflict: detailEventConflict,
         };
   }
@@ -538,7 +559,7 @@ export function settleGeneralChatTurn(input: {
     providerState: selectedState,
     errorCode: null,
     partialResult: false,
-    resultDeadlineAtMs: null,
+    resultDeadlineAtMs: detailEventConflict ? resultDeadlineAtMs : null,
     conflict: detailEventConflict,
   };
 }

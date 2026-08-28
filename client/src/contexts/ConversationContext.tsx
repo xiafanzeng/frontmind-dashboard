@@ -499,18 +499,28 @@ function conversationReducer(
     case "ADD_MESSAGE": {
       return {
         ...state,
-        conversations: state.conversations.map((c) =>
-          c.id === action.payload.conversationId
-            ? {
-                ...c,
-                messages: appendOrUpsertConversationMessage(
-                  c.messages,
-                  action.payload.message,
-                ),
-                updatedAt: Date.now(),
-              }
-            : c,
-        ),
+        conversations: state.conversations.map((c) => {
+          if (c.id !== action.payload.conversationId) return c;
+          const isTerminalNotice = action.payload.message.id.startsWith(
+            GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX,
+          );
+          return {
+            ...c,
+            messages: appendOrUpsertConversationMessage(
+              c.messages,
+              action.payload.message,
+            ),
+            // Old clients could tombstone a transient terminal notice while a
+            // partial result recovered. Reviving that deterministic ID must
+            // also remove the stale tombstone or cloud sync would hide it.
+            deletedMessageIds: isTerminalNotice
+              ? c.deletedMessageIds?.filter(
+                  (messageId) => messageId !== action.payload.message.id,
+                )
+              : c.deletedMessageIds,
+            updatedAt: Date.now(),
+          };
+        }),
       };
     }
     case "UPDATE_STATUS": {
@@ -573,8 +583,16 @@ function conversationReducer(
             }
           }
 
-          // Keep everything up to and including the last user message
+          // Keep everything up to and including the last user message.
           const kept = messages.slice(0, lastUserIdx + 1);
+          // Terminal notices are local state about settlement, not Provider
+          // projection rows. Empty/ambiguous output must clear the latter
+          // without deleting the former.
+          const terminalNotices = messages
+            .slice(lastUserIdx + 1)
+            .filter((message) =>
+              message.id.startsWith(GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX),
+            );
 
           // Only filter out messages that were manually deleted by the user
           const deletedIds = new Set(c.deletedMessageIds || []);
@@ -586,12 +604,20 @@ function conversationReducer(
             if (m.isStepsPlaceholder) return true;
             return true;
           });
+          const incomingIds = new Set(newMessages.map((message) => message.id));
+          const preservedTerminalNotices = terminalNotices.filter(
+            (message) => !incomingIds.has(message.id),
+          );
 
           // Provider output IDs can be reused across two user turns. Preserve
           // both turns and deterministically disambiguate the local/database ID.
           return {
             ...c,
-            messages: repairConversationMessageIds([...kept, ...newMessages]),
+            messages: repairConversationMessageIds([
+              ...kept,
+              ...newMessages,
+              ...preservedTerminalNotices,
+            ]),
             updatedAt: Date.now(),
           };
         }),
@@ -749,10 +775,16 @@ function conversationReducer(
             messages: c.messages.filter(
               (m) => m.id !== action.payload.messageId,
             ),
-            deletedMessageIds: [
-              ...(c.deletedMessageIds || []),
-              action.payload.messageId,
-            ],
+            // Deterministic terminal notices are transient system state. A
+            // successful re-probe removes them without recording a permanent
+            // user deletion that would suppress the same ID on recovery.
+            deletedMessageIds: action.payload.messageId.startsWith(
+              GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX,
+            )
+              ? c.deletedMessageIds?.filter(
+                  (messageId) => messageId !== action.payload.messageId,
+                )
+              : [...(c.deletedMessageIds || []), action.payload.messageId],
             updatedAt: Date.now(),
           };
         }),

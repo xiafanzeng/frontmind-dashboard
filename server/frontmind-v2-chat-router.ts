@@ -628,6 +628,7 @@ function assistantText(event: ManusV2MessageEvent) {
 type GeneralChatProjectionTurn = {
   id: string;
   conversationId: string;
+  messageSequence: number;
   attachmentFileIds: string[];
   metadata: Record<string, unknown>;
 };
@@ -642,10 +643,19 @@ async function generalChatProjectionTurns(input: {
     .select({
       id: conversationTurns.id,
       conversationId: conversationTurns.conversationId,
+      messageSequence: messages.sequence,
       attachmentFileIds: conversationTurns.attachmentFileIds,
       metadata: conversationTurns.metadata,
     })
     .from(conversationTurns)
+    .innerJoin(
+      messages,
+      and(
+        eq(messages.turnId, conversationTurns.id),
+        eq(messages.conversationId, conversationTurns.conversationId),
+        eq(messages.role, "user"),
+      ),
+    )
     .where(
       and(
         eq(conversationTurns.userId, input.userId),
@@ -654,7 +664,7 @@ async function generalChatProjectionTurns(input: {
       ),
     )
     .orderBy(
-      conversationTurns.createdAt,
+      messages.sequence,
       conversationTurns.id,
     )) as GeneralChatProjectionTurn[];
 }
@@ -734,6 +744,7 @@ async function generalChatLocalAttachmentManifest(input: {
   const turn: GeneralChatProjectionTurn = {
     id: "manifest-only",
     conversationId: "manifest-only",
+    messageSequence: 0,
     attachmentFileIds: [...input.localAssetIds],
     metadata: {},
   };
@@ -775,15 +786,9 @@ function uniqueLatestProjectionTurn(
   turns: readonly GeneralChatProjectionTurn[],
 ) {
   if (turns.length === 0) return null;
-  const candidates = turns.filter((candidate) => {
-    const candidateWatermark = new Set(projectionTurnWatermark(candidate));
-    return turns.every((other) =>
-      projectionTurnWatermark(other).every((eventId) =>
-        candidateWatermark.has(eventId),
-      ),
-    );
-  });
-  return candidates.length === 1 ? candidates[0]! : null;
+  return turns.reduce((latest, candidate) =>
+    candidate.messageSequence > latest.messageSequence ? candidate : latest,
+  );
 }
 
 function providerEventTurnAssignments(
@@ -1785,7 +1790,10 @@ async function cachedOutput(taskId: string) {
       .orderBy(agentEvents.providerTimestampMs, agentEvents.id),
     turnIds.length
       ? db
-          .select({ metadata: messages.metadata })
+          .select({
+            metadata: messages.metadata,
+            sequence: messages.sequence,
+          })
           .from(messages)
           .where(
             and(
@@ -1794,27 +1802,40 @@ async function cachedOutput(taskId: string) {
               isNull(messages.deletedAt),
             ),
           )
+          .orderBy(messages.sequence)
       : Promise.resolve([]),
   ]);
-  const visibleEventIds = new Set(
-    projectedMessages.flatMap(({ metadata }) => {
-      const generalChat =
-        metadata?.generalChat &&
-        typeof metadata.generalChat === "object" &&
-        !Array.isArray(metadata.generalChat)
-          ? (metadata.generalChat as Record<string, unknown>)
-          : null;
-      return generalChat?.serverOwned === true &&
-        generalChat.kind === "assistant_projection" &&
-        generalChat.agentTaskId === taskId &&
-        typeof metadata?.upstreamOutputId === "string"
-        ? [metadata.upstreamOutputId]
-        : [];
-    }),
-  );
-  return rows.flatMap((row) => {
+  const visibleEventSequences = new Map<string, number>();
+  for (const { metadata, sequence } of projectedMessages) {
+    const generalChat =
+      metadata?.generalChat &&
+      typeof metadata.generalChat === "object" &&
+      !Array.isArray(metadata.generalChat)
+        ? (metadata.generalChat as Record<string, unknown>)
+        : null;
+    if (
+      generalChat?.serverOwned === true &&
+      generalChat.kind === "assistant_projection" &&
+      generalChat.agentTaskId === taskId &&
+      typeof metadata?.upstreamOutputId === "string"
+    ) {
+      visibleEventSequences.set(metadata.upstreamOutputId, sequence);
+    }
+  }
+  // Provider timestamps can collide. Durable conversation sequence is
+  // assigned while walking Provider rank, so it is the authoritative DTO
+  // order and remains stable when the same projection ID is restored.
+  const visibleRows = rows
+    .filter((row) => visibleEventSequences.has(row.id))
+    .sort(
+      (left, right) =>
+        visibleEventSequences.get(left.id)! -
+          visibleEventSequences.get(right.id)! ||
+        left.id.localeCompare(right.id),
+    );
+  return visibleRows.flatMap((row) => {
     const payload = row.normalizedPayload ?? {};
-    if (payload.kind !== "provider_event" || !visibleEventIds.has(row.id)) {
+    if (payload.kind !== "provider_event") {
       return [];
     }
     const content = [];
@@ -1906,11 +1927,24 @@ async function updateTaskState(input: {
     throw new ChatV2HttpError("TASK_STATE_TURN_BOUNDARY_INVALID", 500);
   }
   const db = await requireDb();
-  await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
     const explicitBoundary =
       input.turnId && input.conversationId
         ? { id: input.turnId, conversationId: input.conversationId }
         : null;
+    if (explicitBoundary) {
+      const lockedConversation = (
+        await tx
+          .select({ id: conversations.id })
+          .from(conversations)
+          .where(eq(conversations.id, explicitBoundary.conversationId))
+          .limit(1)
+          .for("update")
+      )[0];
+      if (!lockedConversation) {
+        throw new ChatV2HttpError("TASK_STATE_TURN_BOUNDARY_MISMATCH", 409);
+      }
+    }
     const targetTurn = explicitBoundary
       ? (
           await tx
@@ -1918,8 +1952,17 @@ async function updateTaskState(input: {
               id: conversationTurns.id,
               conversationId: conversationTurns.conversationId,
               status: conversationTurns.status,
+              messageSequence: messages.sequence,
             })
             .from(conversationTurns)
+            .innerJoin(
+              messages,
+              and(
+                eq(messages.turnId, conversationTurns.id),
+                eq(messages.conversationId, conversationTurns.conversationId),
+                eq(messages.role, "user"),
+              ),
+            )
             .where(
               and(
                 eq(conversationTurns.id, explicitBoundary.id),
@@ -1940,23 +1983,70 @@ async function updateTaskState(input: {
               id: conversationTurns.id,
               conversationId: conversationTurns.conversationId,
               status: conversationTurns.status,
+              messageSequence: messages.sequence,
             })
             .from(conversationTurns)
+            .innerJoin(
+              messages,
+              and(
+                eq(messages.turnId, conversationTurns.id),
+                eq(messages.conversationId, conversationTurns.conversationId),
+                eq(messages.role, "user"),
+              ),
+            )
             .where(
               and(
                 eq(conversationTurns.upstreamTaskId, input.localTaskId),
                 eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
               ),
             )
-            .orderBy(
-              desc(conversationTurns.createdAt),
-              desc(conversationTurns.id),
-            )
+            .orderBy(desc(messages.sequence), desc(conversationTurns.id))
             .limit(1)
             .for("update")
         )[0];
     if (explicitBoundary && !targetTurn) {
       throw new ChatV2HttpError("TASK_STATE_TURN_BOUNDARY_MISMATCH", 409);
+    }
+    if (explicitBoundary && targetTurn) {
+      // The conversation row is locked before this query, matching turn
+      // reservation lock order. A newer bound user message therefore cannot
+      // appear between the latest-turn check and the state writes below.
+      const latestBoundTurn = (
+        await tx
+          .select({
+            id: conversationTurns.id,
+            messageSequence: messages.sequence,
+          })
+          .from(conversationTurns)
+          .innerJoin(
+            messages,
+            and(
+              eq(messages.turnId, conversationTurns.id),
+              eq(messages.conversationId, conversationTurns.conversationId),
+              eq(messages.role, "user"),
+            ),
+          )
+          .where(
+            and(
+              eq(
+                conversationTurns.conversationId,
+                explicitBoundary.conversationId,
+              ),
+              eq(conversationTurns.upstreamTaskId, input.localTaskId),
+              eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+            ),
+          )
+          .orderBy(desc(messages.sequence), desc(conversationTurns.id))
+          .limit(1)
+          .for("update")
+      )[0];
+      if (!latestBoundTurn || latestBoundTurn.id !== targetTurn.id) {
+        // A background GET may have read this turn immediately before the
+        // next user message reserved a newer one. The old settlement is now
+        // irrelevant: leave every task/operation/conversation row untouched
+        // and let the caller return the newly authoritative state.
+        return { applied: false as const, superseded: true as const };
+      }
     }
     const lockedOperation = (
       await tx
@@ -2073,6 +2163,7 @@ async function updateTaskState(input: {
         })
         .where(eq(conversations.id, targetTurn.conversationId));
     }
+    return { applied: true as const, superseded: false as const };
   });
 }
 
@@ -2591,10 +2682,19 @@ async function latestGeneralChatTurnSettlementContext(input: {
         id: conversationTurns.id,
         conversationId: conversationTurns.conversationId,
         status: conversationTurns.status,
+        messageSequence: messages.sequence,
         attachmentFileIds: conversationTurns.attachmentFileIds,
         metadata: conversationTurns.metadata,
       })
       .from(conversationTurns)
+      .innerJoin(
+        messages,
+        and(
+          eq(messages.turnId, conversationTurns.id),
+          eq(messages.conversationId, conversationTurns.conversationId),
+          eq(messages.role, "user"),
+        ),
+      )
       .where(
         and(
           eq(conversationTurns.userId, input.userId),
@@ -2602,7 +2702,7 @@ async function latestGeneralChatTurnSettlementContext(input: {
           eq(conversationTurns.upstreamTaskId, input.localTaskId),
         ),
       )
-      .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
+      .orderBy(desc(messages.sequence), desc(conversationTurns.id))
       .limit(1)
   )[0];
   if (!turn) return null;
@@ -2674,8 +2774,19 @@ async function latestGeneralChatTurnLifecycle(input: {
     await (
       await requireDb()
     )
-      .select({ status: conversationTurns.status })
+      .select({
+        status: conversationTurns.status,
+        messageSequence: messages.sequence,
+      })
       .from(conversationTurns)
+      .innerJoin(
+        messages,
+        and(
+          eq(messages.turnId, conversationTurns.id),
+          eq(messages.conversationId, conversationTurns.conversationId),
+          eq(messages.role, "user"),
+        ),
+      )
       .where(
         and(
           eq(conversationTurns.userId, input.userId),
@@ -2683,7 +2794,7 @@ async function latestGeneralChatTurnLifecycle(input: {
           eq(conversationTurns.upstreamTaskId, input.localTaskId),
         ),
       )
-      .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
+      .orderBy(desc(messages.sequence), desc(conversationTurns.id))
       .limit(1)
   )[0];
 }
@@ -2758,7 +2869,7 @@ async function syncTask(input: { userId: number; localTaskId: string }) {
       nowMs,
       graceMs: RESULT_GRACE_MS,
     });
-    await updateTaskState({
+    const stateUpdate = await updateTaskState({
       operationId: owned.operation.id,
       localTaskId: owned.task.id,
       status: settlement.status,
@@ -2775,6 +2886,9 @@ async function syncTask(input: { userId: number; localTaskId: string }) {
           }
         : {}),
     });
+    if (stateUpdate.superseded) {
+      return findOwnedTask(input);
+    }
     const settlementLog = {
       localTaskId: owned.task.id,
       turnId: currentTurn?.id ?? null,

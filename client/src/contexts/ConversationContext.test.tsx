@@ -1087,6 +1087,127 @@ describe("ConversationProvider cloud hydration", () => {
     expect(current?.deletedMessageIds).toContain("settled-user");
   });
 
+  it("hides an empty current-turn projection, preserves its terminal notice, and restores the same ID once", async () => {
+    const terminalId = generalChatTerminalMessagePublicId({
+      conversationId: "projection-recovery",
+      taskId: "task-1",
+      errorCode: "PARTIAL_RESULT_PRESERVED",
+    });
+    const projection = {
+      id: "projection-1",
+      upstreamOutputId: "event-row-1",
+      role: "assistant" as const,
+      content: "可恢复结果",
+      timestamp: 2,
+      generalChat: {
+        schemaVersion: 1 as const,
+        kind: "assistant_projection" as const,
+        turnId: "turn-1",
+        agentTaskId: "task-1",
+        providerEventId: "provider-event-1",
+        serverOwned: true as const,
+      },
+    };
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [
+        {
+          ...conversation("projection-recovery"),
+          executionKind: "general_chat_v2",
+          taskId: "task-1",
+          messages: [
+            {
+              id: "user-1",
+              role: "user",
+              content: "当前轮",
+              timestamp: 1,
+            },
+            projection,
+            {
+              id: terminalId,
+              role: "assistant",
+              content: "部分结果已保留",
+              timestamp: 3,
+            },
+          ],
+        },
+      ],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => {
+      result.current.updateAssistantMessages("projection-recovery", []);
+    });
+    expect(
+      result.current.state.conversations
+        .find((item) => item.id === "projection-recovery")
+        ?.messages.map((message) => message.id),
+    ).toEqual(["user-1", terminalId]);
+
+    act(() => {
+      result.current.updateAssistantMessages("projection-recovery", [
+        projection,
+      ]);
+      result.current.updateAssistantMessages("projection-recovery", [
+        projection,
+      ]);
+    });
+    expect(
+      result.current.state.conversations
+        .find((item) => item.id === "projection-recovery")
+        ?.messages.map((message) => message.id),
+    ).toEqual(["user-1", "projection-1", terminalId]);
+  });
+
+  it("removes and revives a deterministic terminal notice without a tombstone", async () => {
+    const terminalId = generalChatTerminalMessagePublicId({
+      conversationId: "terminal-recovery",
+      taskId: "task-1",
+      errorCode: "PARTIAL_RESULT_PRESERVED",
+    });
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [
+        {
+          ...conversation("terminal-recovery"),
+          deletedMessageIds: [terminalId],
+          messages: [],
+        },
+      ],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    const notice = {
+      id: terminalId,
+      role: "assistant" as const,
+      content: "部分结果已保留",
+      timestamp: 1,
+    };
+    act(() => result.current.addMessage("terminal-recovery", notice));
+    let current = result.current.state.conversations.find(
+      (item) => item.id === "terminal-recovery",
+    );
+    expect(current?.messages.map((message) => message.id)).toEqual([
+      terminalId,
+    ]);
+    expect(current?.deletedMessageIds ?? []).not.toContain(terminalId);
+
+    act(() => result.current.deleteMessage("terminal-recovery", terminalId));
+    current = result.current.state.conversations.find(
+      (item) => item.id === "terminal-recovery",
+    );
+    expect(current?.messages).toEqual([]);
+    expect(current?.deletedMessageIds ?? []).not.toContain(terminalId);
+
+    act(() => result.current.addMessage("terminal-recovery", notice));
+    current = result.current.state.conversations.find(
+      (item) => item.id === "terminal-recovery",
+    );
+    expect(current?.messages.map((message) => message.id)).toEqual([
+      terminalId,
+    ]);
+  });
+
   it("keeps a reset-discarded conversation out of a late and subsequent cloud hydration", async () => {
     const stale = {
       ...conversation("reset-discarded"),

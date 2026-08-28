@@ -115,35 +115,35 @@ async function checkAndUpdateOrdinaryTask(
     const normalizedStatus =
       taskData.status === "failed" ? "error" : taskData.status;
 
-    if (taskData.output?.length) {
-      const lastUserIndex = conversation.messages.reduce(
-        (latest, message, index) => (message.role === "user" ? index : latest),
-        -1,
-      );
-      const historicalMessages =
-        lastUserIndex >= 0
-          ? conversation.messages.slice(0, lastUserIndex)
-          : conversation.messages;
-      const messages = projectTaskOutputMessages({
-        output: taskData.output,
-        baselineOutputLength: conversation.lastKnownOutputLength || 0,
-        historicalOutputIds: collectAssistantOutputIds(historicalMessages),
-        responseStartedAt: conversation.startedAt || conversation.createdAt,
-        modelName: [...conversation.messages]
-          .reverse()
-          .find((message) => message.role === "assistant" && message.modelName)
-          ?.modelName,
-        knowledgeBase: false,
-      });
-      if (messages.length) {
-        if (normalizedStatus === "completed") {
-          messages[messages.length - 1].elapsedTime =
-            (Date.now() - (conversation.startedAt || conversation.createdAt)) /
-            1000;
-        }
-        updateAssistantMessages(conversation.id, messages);
-      }
+    const lastUserIndex = conversation.messages.reduce(
+      (latest, message, index) => (message.role === "user" ? index : latest),
+      -1,
+    );
+    const historicalMessages =
+      lastUserIndex >= 0
+        ? conversation.messages.slice(0, lastUserIndex)
+        : conversation.messages;
+    const messages = projectTaskOutputMessages({
+      output: taskData.output ?? [],
+      baselineOutputLength: conversation.lastKnownOutputLength || 0,
+      historicalOutputIds: collectAssistantOutputIds(historicalMessages),
+      responseStartedAt: conversation.startedAt || conversation.createdAt,
+      modelName: [...conversation.messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.modelName)
+        ?.modelName,
+      knowledgeBase: false,
+    });
+    if (messages.length && normalizedStatus === "completed") {
+      messages[messages.length - 1].elapsedTime =
+        (Date.now() - (conversation.startedAt || conversation.createdAt)) /
+        1000;
     }
+    // An empty authoritative projection is meaningful: the server may have
+    // temporarily hidden this turn while its Provider binding is ambiguous.
+    // Replacing with [] removes only this turn's projected assistants; the
+    // reducer keeps the deterministic terminal notice separately.
+    updateAssistantMessages(conversation.id, messages);
 
     if (normalizedStatus === "completed") {
       const completedAt = Date.now();

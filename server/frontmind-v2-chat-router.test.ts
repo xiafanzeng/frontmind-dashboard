@@ -344,6 +344,19 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
     expect(updateSource).toContain(
       "eq(conversationTurns.conversationId, targetTurn.conversationId)",
     );
+    expect(updateSource).toContain(
+      "return { applied: false as const, superseded: true as const }",
+    );
+    expect(updateSource).toContain(
+      "return { applied: true as const, superseded: false as const }",
+    );
+    expect(
+      updateSource.indexOf(
+        "return { applied: false as const, superseded: true as const }",
+      ),
+    ).toBeLessThan(updateSource.indexOf("const lockedOperation"));
+    expect(updateSource).toContain("desc(messages.sequence)");
+    expect(updateSource).toContain('eq(messages.role, "user")');
     expect(updateSource).not.toContain("inArray(conversations.id");
     expect(persistenceSource).toContain("generalChatProviderEventEvidence");
     expect(persistenceSource).toContain("status_update:");
@@ -351,6 +364,10 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
     expect(persistenceSource).toContain("user_stop:");
     expect(settlementSource).toContain("providerEventWatermark");
     expect(settlementSource).toContain("latestGeneralChatTurnLifecycle");
+    expect(settlementSource).toContain("if (stateUpdate.superseded)");
+    expect(settlementSource).toContain("return findOwnedTask(input)");
+    expect(settlementSource).toContain("desc(messages.sequence)");
+    expect(settlementSource).not.toContain("desc(conversationTurns.createdAt)");
     expect(settlementSource).toContain(
       '["completed", "cancelled"].includes(latestTurn.status)',
     );
@@ -516,10 +533,16 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
   });
 
   it("returns no error for complete success and marks preserved partial output", () => {
+    const outputSource = serverSource.slice(
+      serverSource.indexOf("async function cachedOutput"),
+      serverSource.indexOf("function publicStatus"),
+    );
     const dtoSource = serverSource.slice(
       serverSource.indexOf("async function taskDto"),
       serverSource.indexOf("async function updateTaskState"),
     );
+    expect(outputSource).toContain("visibleEventSequences");
+    expect(outputSource).toContain(".orderBy(messages.sequence)");
     expect(dtoSource).toContain('status === "error" && operation.errorCode');
     expect(dtoSource).toContain("GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE");
     expect(dtoSource).toContain("partialResult: true");

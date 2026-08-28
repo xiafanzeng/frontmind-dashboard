@@ -3,7 +3,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { Agent as HttpsAgent } from "node:https";
 import { isIP } from "node:net";
 
-import axios from "axios";
+import axios, { type AxiosRequestConfig } from "axios";
 
 import { stripFrontMindGeneralChatOperationContract } from "../shared/frontmind-general-chat-contract";
 import { upstreamTaskRecord } from "./upstream-task-adapter";
@@ -117,6 +117,26 @@ export type GeneralChatProviderAttachmentReader = (input: {
   contentLength?: number | null;
   contentType?: string | null;
 }>;
+
+type GeneralChatProviderAttachmentLookup = (
+  hostname: string,
+  options: { all: true; verbatim: true },
+) => Promise<Array<{ address: string; family: number }>>;
+
+type GeneralChatProviderAttachmentHttpResponse = {
+  data: AsyncIterable<Uint8Array | string>;
+  headers: Record<string, unknown>;
+};
+
+type GeneralChatProviderAttachmentHttpGet = (
+  url: string,
+  options: AxiosRequestConfig,
+) => Promise<GeneralChatProviderAttachmentHttpResponse>;
+
+export type GeneralChatProviderAttachmentDefaultReaderTestDependencies = {
+  lookup: GeneralChatProviderAttachmentLookup;
+  get: GeneralChatProviderAttachmentHttpGet;
+};
 
 type ProviderAttachmentDescriptor = {
   url: string | null;
@@ -373,14 +393,21 @@ function attachmentRecordCoordinates(record: Record<string, unknown>) {
   };
 }
 
-function normalizedCompleteAttachmentUrl(value: string | null) {
+function normalizedAttachmentUrlIdentity(value: string | null) {
   if (!value) return null;
   try {
-    const parsed = new URL(value);
-    parsed.hash = "";
-    return parsed.toString();
+    return generalChatProviderAttachmentDescriptor(value);
   } catch {
-    return value;
+    // Unsafe descriptors must survive de-duplication so the resolver can
+    // classify them as unresolved before any network request. Identical wire
+    // mirrors may still collapse, but never with a safe descriptor.
+    try {
+      const parsed = new URL(value);
+      parsed.hash = "";
+      return `unsafe:${parsed.toString()}`;
+    } catch {
+      return `unsafe:${value}`;
+    }
   }
 }
 
@@ -398,9 +425,13 @@ function attachmentRecords(event: Record<string, unknown>) {
   if (event.type !== "user_message") return [];
   const message = upstreamTaskRecord(event.user_message);
   const rawRecords = [
-    ...(Array.isArray(message?.attachments) ? message.attachments : []),
-    ...(Array.isArray(message?.content) ? message.content : []),
-  ].flatMap((value) => {
+    ...(Array.isArray(message?.attachments)
+      ? message.attachments.map((value) => ({ source: "attachments", value }))
+      : []),
+    ...(Array.isArray(message?.content)
+      ? message.content.map((value) => ({ source: "content", value }))
+      : []),
+  ].flatMap(({ source, value }) => {
     const record = upstreamTaskRecord(value);
     if (!record) return [];
     const type = safeOptionalString(record.type, 64)?.toLowerCase();
@@ -423,30 +454,41 @@ function attachmentRecords(event: Record<string, unknown>) {
       nested !== null;
     return !hasFileCoordinate && (type === "text" || "text" in record)
       ? []
-      : [record];
+      : [{ record, source }];
   });
   const selected: Array<{
     record: Record<string, unknown>;
+    source: string;
     coordinates: ReturnType<typeof attachmentRecordCoordinates>;
     normalizedUrl: string | null;
+    mirroredAcrossSources: boolean;
   }> = [];
-  for (const record of rawRecords) {
+  for (const { record, source } of rawRecords) {
     const coordinates = attachmentRecordCoordinates(record);
-    const normalizedUrl = normalizedCompleteAttachmentUrl(coordinates.url);
+    const normalizedUrl = normalizedAttachmentUrlIdentity(coordinates.url);
     if (coordinates.fileId) {
-      if (
-        selected.some(
-          (candidate) => candidate.coordinates.fileId === coordinates.fileId,
-        )
-      ) {
+      const exactMirror = selected.find(
+        (candidate) =>
+          candidate.source !== source &&
+          !candidate.mirroredAcrossSources &&
+          candidate.coordinates.fileId === coordinates.fileId &&
+          attachmentAuxiliaryCoordinatesAgree(
+            candidate.coordinates,
+            coordinates,
+          ),
+      );
+      if (exactMirror) {
+        exactMirror.mirroredAcrossSources = true;
         continue;
       }
       // When the richer mirror carries a file id, it replaces only a
-      // compatible URL-only mirror. Distinct file ids always remain distinct,
-      // even when Provider happens to expose the same URL for both.
-      for (let index = selected.length - 1; index >= 0; index -= 1) {
-        const candidate = selected[index]!;
-        if (
+      // compatible record from the other Provider representation. Records in
+      // one representation are never collapsed: repeated attachments may be
+      // intentional and ambiguity must remain fail-closed.
+      const mirrorIndex = selected.findIndex((candidate) => {
+        return (
+          candidate.source !== source &&
+          !candidate.mirroredAcrossSources &&
           !candidate.coordinates.fileId &&
           normalizedUrl &&
           candidate.normalizedUrl === normalizedUrl &&
@@ -454,27 +496,50 @@ function attachmentRecords(event: Record<string, unknown>) {
             candidate.coordinates,
             coordinates,
           )
-        ) {
-          selected.splice(index, 1);
-        }
+        );
+      });
+      if (mirrorIndex >= 0) {
+        selected.splice(mirrorIndex, 1, {
+          record,
+          source,
+          coordinates,
+          normalizedUrl,
+          mirroredAcrossSources: true,
+        });
+        continue;
       }
-      selected.push({ record, coordinates, normalizedUrl });
+      selected.push({
+        record,
+        source,
+        coordinates,
+        normalizedUrl,
+        mirroredAcrossSources: false,
+      });
       continue;
     }
-    if (
-      normalizedUrl &&
-      selected.some(
-        (candidate) =>
-          candidate.normalizedUrl === normalizedUrl &&
-          attachmentAuxiliaryCoordinatesAgree(
-            candidate.coordinates,
-            coordinates,
-          ),
-      )
-    ) {
+    const mirror = normalizedUrl
+      ? selected.find(
+          (candidate) =>
+            candidate.source !== source &&
+            !candidate.mirroredAcrossSources &&
+            candidate.normalizedUrl === normalizedUrl &&
+            attachmentAuxiliaryCoordinatesAgree(
+              candidate.coordinates,
+              coordinates,
+            ),
+        )
+      : undefined;
+    if (mirror) {
+      mirror.mirroredAcrossSources = true;
       continue;
     }
-    selected.push({ record, coordinates, normalizedUrl });
+    selected.push({
+      record,
+      source,
+      coordinates,
+      normalizedUrl,
+      mirroredAcrossSources: false,
+    });
   }
   return selected.map(({ record }) => record);
 }
@@ -530,6 +595,7 @@ function publicIpv4(address: string) {
     (a === 172 && b! >= 16 && b! <= 31) ||
     (a === 192 && b === 0 && c === 0) ||
     (a === 192 && b === 0 && c === 2) ||
+    (a === 192 && b === 88 && c === 99) ||
     (a === 192 && b === 168) ||
     (a === 198 && (b === 18 || b === 19)) ||
     (a === 198 && b === 51 && c === 100) ||
@@ -537,6 +603,46 @@ function publicIpv4(address: string) {
     a! >= 224
   );
 }
+
+function ipv6PrefixMatches(
+  words: readonly number[],
+  prefix: readonly number[],
+  prefixBits: number,
+) {
+  const completeWords = Math.floor(prefixBits / 16);
+  for (let index = 0; index < completeWords; index += 1) {
+    if (words[index] !== prefix[index]) return false;
+  }
+  const remainingBits = prefixBits % 16;
+  if (remainingBits === 0) return true;
+  const mask = (0xffff << (16 - remainingBits)) & 0xffff;
+  return (words[completeWords]! & mask) === (prefix[completeWords]! & mask);
+}
+
+const NON_PUBLIC_IPV6_PREFIXES = [
+  // Deprecated IPv4-compatible and IPv4-translatable forms. IPv4-mapped
+  // addresses are handled separately below so their embedded IPv4 address is
+  // classified using the complete IPv4 policy.
+  { prefix: [0, 0, 0, 0, 0, 0, 0, 0], bits: 96 }, // ::/96
+  { prefix: [0, 0, 0, 0, 0xffff, 0, 0, 0], bits: 96 }, // ::ffff:0:0:0/96
+  { prefix: [0x0064, 0xff9b, 0, 0, 0, 0, 0, 0], bits: 96 }, // NAT64 WKP
+  { prefix: [0x0064, 0xff9b, 1, 0, 0, 0, 0, 0], bits: 48 }, // NAT64 local-use
+  { prefix: [0x0100, 0, 0, 0, 0, 0, 0, 0], bits: 64 }, // discard-only
+  { prefix: [0x0100, 0, 0, 1, 0, 0, 0, 0], bits: 64 }, // dummy prefix
+  { prefix: [0x2001, 0, 0, 0, 0, 0, 0, 0], bits: 23 }, // IETF assignments
+  { prefix: [0x2001, 0, 0, 0, 0, 0, 0, 0], bits: 32 }, // Teredo
+  { prefix: [0x2001, 2, 0, 0, 0, 0, 0, 0], bits: 48 }, // benchmarking
+  { prefix: [0x2001, 0x0010, 0, 0, 0, 0, 0, 0], bits: 28 }, // ORCHID
+  { prefix: [0x2001, 0x0020, 0, 0, 0, 0, 0, 0], bits: 28 }, // ORCHIDv2
+  { prefix: [0x2001, 0x0db8, 0, 0, 0, 0, 0, 0], bits: 32 }, // documentation
+  { prefix: [0x2002, 0, 0, 0, 0, 0, 0, 0], bits: 16 }, // 6to4
+  { prefix: [0x3fff, 0, 0, 0, 0, 0, 0, 0], bits: 20 }, // documentation
+  { prefix: [0x5f00, 0, 0, 0, 0, 0, 0, 0], bits: 16 }, // SRv6 SIDs
+  { prefix: [0xfc00, 0, 0, 0, 0, 0, 0, 0], bits: 7 }, // unique-local
+  { prefix: [0xfe80, 0, 0, 0, 0, 0, 0, 0], bits: 10 }, // link-local
+  { prefix: [0xfec0, 0, 0, 0, 0, 0, 0, 0], bits: 10 }, // site-local
+  { prefix: [0xff00, 0, 0, 0, 0, 0, 0, 0], bits: 8 }, // multicast
+] as const;
 
 function ipv6Words(address: string) {
   const normalized = address.toLowerCase().split("%")[0]!;
@@ -576,31 +682,58 @@ export function isGeneralChatProviderAttachmentAddressPublic(address: string) {
       }`,
     );
   }
-  return !(
-    words.every((word) => word === 0) ||
-    (words.slice(0, 7).every((word) => word === 0) && words[7] === 1) ||
-    (words[0]! & 0xfe00) === 0xfc00 ||
-    (words[0]! & 0xffc0) === 0xfe80 ||
-    (words[0]! & 0xffc0) === 0xfec0 ||
-    (words[0]! & 0xff00) === 0xff00 ||
-    (words[0] === 0x2001 && words[1] === 0x0db8) ||
-    (words[0] === 0x0064 && words[1] === 0xff9b)
+  // Public CDN endpoints must use currently assignable global-unicast space.
+  // This also rejects deprecated IPv4-compatible, translation, local, and
+  // reserved address families before considering narrower IANA exceptions.
+  if (!ipv6PrefixMatches(words, [0x2000, 0, 0, 0, 0, 0, 0, 0], 3)) {
+    return false;
+  }
+  return !NON_PUBLIC_IPV6_PREFIXES.some(({ prefix, bits }) =>
+    ipv6PrefixMatches(words, prefix, bits),
   );
 }
 
 async function defaultAttachmentReader(
   input: Parameters<GeneralChatProviderAttachmentReader>[0],
+  dependencies?: Partial<GeneralChatProviderAttachmentDefaultReaderTestDependencies>,
 ): ReturnType<GeneralChatProviderAttachmentReader> {
   const descriptor = generalChatProviderAttachmentDescriptor(input.url);
   const parsed = new URL(descriptor);
-  const addresses = await dnsLookup(parsed.hostname, {
-    all: true,
-    verbatim: true,
+  const lookupOptions = { all: true, verbatim: true } as const;
+  const abortedLookupError = () =>
+    Object.assign(new Error("Manus CDN DNS lookup aborted"), {
+      code: "ERR_CANCELED",
+    });
+  if (input.signal.aborted) throw abortedLookupError();
+  const lookupPromise = dependencies?.lookup
+    ? dependencies.lookup(parsed.hostname, lookupOptions)
+    : dnsLookup(parsed.hostname, lookupOptions);
+  const addresses = await new Promise<
+    Array<{ address: string; family: number }>
+  >((resolve, reject) => {
+    const aborted = () => {
+      input.signal.removeEventListener("abort", aborted);
+      reject(abortedLookupError());
+    };
+    input.signal.addEventListener("abort", aborted, { once: true });
+    if (input.signal.aborted) aborted();
+    void lookupPromise.then(
+      (result) => {
+        input.signal.removeEventListener("abort", aborted);
+        resolve(result);
+      },
+      (error) => {
+        input.signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
   });
   if (
     !addresses.length ||
     addresses.some(
-      ({ address }) => !isGeneralChatProviderAttachmentAddressPublic(address),
+      ({ address, family }) =>
+        isIP(address) !== family ||
+        !isGeneralChatProviderAttachmentAddressPublic(address),
     )
   ) {
     throw Object.assign(new Error("Unsafe Manus CDN DNS result"), {
@@ -609,11 +742,46 @@ async function defaultAttachmentReader(
   }
   const selected = addresses[0]!;
   const httpsAgent = new HttpsAgent({
-    lookup: (_hostname, _options, callback) => {
-      callback(null, selected.address, selected.family);
+    lookup: (hostname, options, callback) => {
+      if (hostname.toLowerCase().replace(/\.$/u, "") !== parsed.hostname) {
+        callback(
+          Object.assign(new Error("Unexpected Manus CDN lookup hostname"), {
+            code: "ENOTFOUND",
+          }),
+          selected.address,
+          selected.family,
+        );
+        return;
+      }
+      const requestedFamily =
+        typeof options === "number" ? options : options?.family;
+      const eligibleAddresses =
+        requestedFamily === 4 || requestedFamily === 6
+          ? addresses.filter(({ family }) => family === requestedFamily)
+          : addresses;
+      if (!eligibleAddresses.length) {
+        callback(
+          Object.assign(new Error("No validated Manus CDN address family"), {
+            code: "ENOTFOUND",
+          }),
+          selected.address,
+          selected.family,
+        );
+        return;
+      }
+      if (typeof options === "object" && options?.all) {
+        const allCallback = callback as unknown as (
+          error: NodeJS.ErrnoException | null,
+          results: Array<{ address: string; family: number }>,
+        ) => void;
+        allCallback(null, eligibleAddresses);
+        return;
+      }
+      const eligible = eligibleAddresses[0]!;
+      callback(null, eligible.address, eligible.family);
     },
   });
-  const response = await axios.get(input.url, {
+  const requestOptions: AxiosRequestConfig = {
     responseType: "stream",
     signal: input.signal,
     timeout: input.timeoutMs,
@@ -623,7 +791,10 @@ async function defaultAttachmentReader(
     maxContentLength: input.maxBytes,
     maxBodyLength: input.maxBytes,
     validateStatus: (status) => status === 200,
-  });
+  };
+  const response = dependencies?.get
+    ? await dependencies.get(input.url, requestOptions)
+    : await axios.get(input.url, requestOptions);
   const rawLength = response.headers["content-length"];
   const parsedLength = Number(
     Array.isArray(rawLength) ? rawLength[0] : rawLength,
@@ -640,6 +811,15 @@ async function defaultAttachmentReader(
       255,
     ),
   };
+}
+
+/** Narrow dependency seam for deterministic security tests; production uses
+ * defaultAttachmentReader directly and cannot supply these dependencies. */
+export function readGeneralChatProviderAttachmentWithDefaultsForTests(
+  input: Parameters<GeneralChatProviderAttachmentReader>[0],
+  dependencies: GeneralChatProviderAttachmentDefaultReaderTestDependencies,
+) {
+  return defaultAttachmentReader(input, dependencies);
 }
 
 export function classifyGeneralChatAttachmentStreamError(error: unknown) {
@@ -793,6 +973,16 @@ export async function resolveManusV2GeneralChatUserEventEvidence(input: {
       return {
         kind: "unresolved",
         code: "ATTACHMENT_DESCRIPTOR_MISSING",
+        evidence: null,
+      };
+    }
+    if (observedAttachments.length !== observedFileIds.length) {
+      // Cross-representation mirrors have already been paired one-to-one.
+      // A remaining duplicate file id therefore represents two records in
+      // one Provider representation and cannot prove a unique attachment set.
+      return {
+        kind: "unresolved",
+        code: "ATTACHMENT_DESCRIPTOR_CONFLICT",
         evidence: null,
       };
     }
