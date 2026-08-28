@@ -3220,6 +3220,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
     projectId: string;
     userId: number;
     knowledgeSnapshotId: string;
+    workflowVersion: string;
   },
 ) {
   const operationId = input.engineerNote?.startsWith(
@@ -3253,11 +3254,12 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
   );
   if (
     !frozen.success ||
-    frozen.data.knowledgeSnapshotId !== input.knowledgeSnapshotId
+    frozen.data.knowledgeSnapshotId !== input.knowledgeSnapshotId ||
+    frozen.data.workflowVersion !== input.workflowVersion
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "视觉批次与当前知识库或检索凭据不一致，请重新检索。",
+      "视觉批次与当前知识库、工作流或检索凭据不一致，请重新检索。",
       409,
     );
   }
@@ -3287,10 +3289,14 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
 }
 
 export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
-  if (workflowVersion !== SITEOPS_DEFAULT_WORKFLOW.frontMindVersion) {
+  if (
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion
+  ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "视觉检索使用的建站合同已升级，请重新检索视觉方向后再继续。",
+      "视觉检索使用的历史建站合同无法继续，请重新检索视觉方向后再继续。",
       409,
     );
   }
@@ -4283,6 +4289,7 @@ async function selectVisualSample(
     projectId: input.project.id,
     userId: input.actor.id,
     knowledgeSnapshotId: snapshot.id,
+    workflowVersion: selectedWorkflow.frontMindVersion,
   });
   const aiCredential = await ensureActiveCustomerAiCredential(
     tx,

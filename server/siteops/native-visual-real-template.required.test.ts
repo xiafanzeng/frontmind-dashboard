@@ -61,7 +61,7 @@ async function realTemplateZip() {
 }
 
 describe("required sanitized real Vite Template preparation", () => {
-  it("validates and freezes the untouched provider ZIP with its Marketplace preview", async () => {
+  it("validates, builds, renders, and freezes the untouched provider ZIP", async () => {
     const { archive, files: fixture } = await realTemplateZip();
     const fixturePaths = fixture.map((file) => file.path);
     expect(fixturePaths).toEqual(
@@ -135,7 +135,7 @@ describe("required sanitized real Vite Template preparation", () => {
       },
     });
 
-    expect(previewFetches).toBe(1);
+    expect(previewFetches).toBe(0);
     expect(unexpectedRemoteFetches).toBe(0);
     expect(prepared).toMatchObject({
       templateId: "sanitized-real-vite-landing",
@@ -152,8 +152,8 @@ describe("required sanitized real Vite Template preparation", () => {
     const screenshot = await sharp(prepared.preview).metadata();
     expect(screenshot).toMatchObject({
       format: "png",
-      width: 1200,
-      height: 800,
+      width: 1440,
+      height: 1000,
     });
 
     const frozen = await JSZip.loadAsync(prepared.sourceArchive, {

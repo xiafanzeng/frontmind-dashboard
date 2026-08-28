@@ -46,7 +46,7 @@ export function getResumePollDelay(elapsedMs: number) {
   return 30_000;
 }
 
-// Manus may briefly report `error` while its authoritative task detail is still
+// The upstream provider may briefly report `error` while its authoritative task detail is still
 // converging to `stopped/completed`. Keep the one global poll owner alive for a
 // bounded GET-only re-probe window; never reset this anchor on repeated errors.
 export const ORDINARY_TERMINAL_REPROBE_WINDOW_MS = 2 * 60 * 1000;

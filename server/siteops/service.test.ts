@@ -930,9 +930,9 @@ describe("SiteOps core contracts", () => {
     });
   });
 
-  it("requires a selected visual board to match the current workflow", () => {
+  it("accepts frozen historical boards while rejecting unknown workflows", () => {
     expect(() => assertCurrentVisualWorkflowVersion("0.0.0")).toThrow(
-      "视觉检索使用的建站合同已升级",
+      "历史建站合同无法继续",
     );
     expect(() =>
       assertCurrentVisualWorkflowVersion(
@@ -943,12 +943,17 @@ describe("SiteOps core contracts", () => {
       assertCurrentVisualWorkflowVersion(
         SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
       ),
-    ).toThrow("视觉检索使用的建站合同已升级");
+    ).not.toThrow();
+    expect(() =>
+      assertCurrentVisualWorkflowVersion(
+        SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+      ),
+    ).not.toThrow();
     expect(() =>
       assertCurrentVisualWorkflowVersion(
         SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
       ),
-    ).toThrow("视觉检索使用的建站合同已升级");
+    ).toThrow("历史建站合同无法继续");
   });
 
   it("keeps supplemental visual pages on the cycle's frozen workflow", () => {
@@ -1853,6 +1858,7 @@ describe("SiteOps core contracts", () => {
         projectId: "40000000-0000-4000-8000-000000000004",
         userId: 42,
         knowledgeSnapshotId: snapshotId,
+        workflowVersion: SITEOPS_DEFAULT_WORKFLOW.frontMindVersion,
       }),
     ).resolves.toMatchObject({ id: pinnedCredentialId, version: 7 });
   });
