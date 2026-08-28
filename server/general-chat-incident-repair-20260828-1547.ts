@@ -1,6 +1,7 @@
 import { and, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
 
 import {
+  agentEvents,
   agentOperations,
   agentTasks,
   artifacts,
@@ -8,7 +9,9 @@ import {
   conversations,
   conversationTurns,
   deliveryProjectAssignments,
+  localAssets,
   messages,
+  providerFileLeases,
 } from "../drizzle/schema";
 import { getDecryptedCredentialForAccountById } from "./auth-service";
 import { getDb } from "./db";
@@ -20,7 +23,10 @@ import {
   GENERAL_CHAT_TERMINAL_1547_PARTIAL_MESSAGE,
   GENERAL_CHAT_TERMINAL_1547_REPAIR_ID,
   GENERAL_CHAT_TERMINAL_1547_WINDOW,
+  assertGeneralChatTerminal1547MutationFence,
+  bindGeneralChatTerminal1547LegacyOutputs,
   classifyGeneralChatTerminal1547Outcome,
+  generalChatTerminal1547ProjectionMetadata,
   generalChatTerminal1547StateHash,
   generalChatTerminalMessagePersistedId,
   generalChatTerminalPublicIdFromPersisted,
@@ -46,6 +52,9 @@ type Turn = typeof conversationTurns.$inferSelect;
 type Message = typeof messages.$inferSelect;
 type Attachment = typeof attachments.$inferSelect;
 type Artifact = typeof artifacts.$inferSelect;
+type AgentEvent = typeof agentEvents.$inferSelect;
+type LocalAsset = typeof localAssets.$inferSelect;
+type ProviderFileLease = typeof providerFileLeases.$inferSelect;
 
 type ProviderClient = Pick<ManusV2Client, "taskDetail" | "listAllMessages">;
 
@@ -71,9 +80,18 @@ export type GeneralChatTerminal1547RepairFacts = {
   task: Task;
   conversation: Conversation;
   turn: Turn;
+  taskTurns: Turn[];
   userMessage: Message;
   outputMessages: Message[];
+  outputAgentEvents: AgentEvent[];
+  taskAgentEvents: AgentEvent[];
+  outputBindings: Array<{
+    message: Message;
+    agentEvent: AgentEvent;
+  }>;
   inputAttachments: Attachment[];
+  inputAssets: LocalAsset[];
+  inputFileLeases: ProviderFileLease[];
   outputArtifacts: Artifact[];
   legacyErrors: Message[];
   terminalNotice: Message | null;
@@ -112,6 +130,43 @@ function sameStrings(left: readonly string[], right: readonly string[]) {
   const a = sortedUnique(left);
   const b = sortedUnique(right);
   return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function rowsById<T extends { id: string }>(rows: readonly T[]) {
+  return [...rows].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function localMutationFence(input: {
+  operation: Operation;
+  task: Task;
+  conversation: Conversation;
+  turn: Turn;
+  taskTurns: Turn[];
+  userMessage: Message;
+  incidentMessages: Message[];
+  terminalNotice: Message | null;
+  inputAttachments: Attachment[];
+  inputAssets: LocalAsset[];
+  inputFileLeases: ProviderFileLease[];
+  taskAgentEvents: AgentEvent[];
+  outputArtifacts: Artifact[];
+}) {
+  return {
+    operation: input.operation,
+    task: input.task,
+    conversation: input.conversation,
+    turn: input.turn,
+    latestTurnId: input.taskTurns[0]?.id ?? null,
+    taskTurns: rowsById(input.taskTurns),
+    userMessage: input.userMessage,
+    incidentMessages: rowsById(input.incidentMessages),
+    terminalNotice: input.terminalNotice,
+    inputAttachments: rowsById(input.inputAttachments),
+    inputAssets: rowsById(input.inputAssets),
+    inputFileLeases: rowsById(input.inputFileLeases),
+    taskAgentEvents: rowsById(input.taskAgentEvents),
+    outputArtifacts: rowsById(input.outputArtifacts),
+  };
 }
 
 function projectionIdentity(message: Message): ProjectionIdentity | null {
@@ -226,18 +281,23 @@ async function locateIncidentCandidate(db: Db) {
   for (const conversationId of new Set(
     incidentMessages
       .filter((message) =>
-        GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(message.content as never),
+        GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(
+          message.content as never,
+        ),
       )
       .map((message) => message.conversationId),
   )) {
     const rows = incidentMessages.filter(
       (message) =>
         message.conversationId === conversationId &&
-        GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(message.content as never),
+        GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(
+          message.content as never,
+        ),
     );
     if (
       GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.every(
-        (content) => rows.filter((message) => message.content === content).length === 1,
+        (content) =>
+          rows.filter((message) => message.content === content).length === 1,
       ) &&
       rows.length === GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.length
     ) {
@@ -245,29 +305,29 @@ async function locateIncidentCandidate(db: Db) {
     }
   }
 
-  const identities = incidentMessages.flatMap((message) => {
-    const identity = projectionIdentity(message);
-    return identity &&
-      message.deletedAt === null &&
-      errorConversations.has(message.conversationId) &&
-      metadataHasInlineImage(message)
-      ? [{ ...identity, conversationId: message.conversationId }]
-      : [];
-  });
-  const identityKeys = sortedUnique(
-    identities.map(
-      (identity) =>
-        `${identity.conversationId}\0${identity.agentTaskId}\0${identity.turnId}`,
-    ),
+  const conversationId = requiredExactlyOne(
+    [...errorConversations],
+    "CANDIDATE_NOT_UNIQUE",
   );
-  const key = requiredExactlyOne(identityKeys, "CANDIDATE_NOT_UNIQUE");
-  const [conversationId, localTaskId, turnId] = key.split("\0");
-  if (!conversationId || !localTaskId || !turnId) fail("CANDIDATE_INVALID");
-  return { conversationId, localTaskId, turnId, incidentMessages };
+  return { conversationId, incidentMessages };
 }
 
 async function loadLocalFacts(db: Db) {
   const candidate = await locateIncidentCandidate(db);
+  const conversation = requiredExactlyOne(
+    await db
+      .select()
+      .from(conversations)
+      .where(eq(conversations.id, candidate.conversationId)),
+    "CONVERSATION_NOT_FOUND",
+  );
+  if (
+    !conversation.upstreamTaskId ||
+    conversation.previousResponseId !== conversation.upstreamTaskId ||
+    conversation.deletedAt !== null
+  ) {
+    fail("CONVERSATION_POINTER_MISMATCH");
+  }
   const joined = requiredExactlyOne(
     await db
       .select({ operation: agentOperations, task: agentTasks })
@@ -276,23 +336,32 @@ async function loadLocalFacts(db: Db) {
         agentOperations,
         eq(agentOperations.id, agentTasks.operationId),
       )
-      .where(eq(agentTasks.id, candidate.localTaskId)),
+      .where(eq(agentTasks.id, conversation.upstreamTaskId)),
     "TASK_NOT_FOUND",
   );
-  const conversation = requiredExactlyOne(
-    await db
-      .select()
-      .from(conversations)
-      .where(eq(conversations.id, candidate.conversationId)),
-    "CONVERSATION_NOT_FOUND",
-  );
-  const turn = requiredExactlyOne(
-    await db
-      .select()
-      .from(conversationTurns)
-      .where(eq(conversationTurns.id, candidate.turnId)),
-    "TURN_NOT_FOUND",
-  );
+  const taskTurns = await db
+    .select()
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.conversationId, conversation.id),
+        eq(conversationTurns.userId, conversation.userId),
+        eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+        eq(conversationTurns.upstreamTaskId, joined.task.id),
+      ),
+    )
+    .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id));
+  const turn = taskTurns[0];
+  if (!turn) fail("TURN_NOT_FOUND");
+  if (
+    taskTurns[1] &&
+    taskTurns[1]!.createdAt.getTime() === turn.createdAt.getTime()
+  ) {
+    fail("TURN_NOT_UNIQUE");
+  }
+  if (!["failed", "completed"].includes(turn.status)) {
+    fail("TURN_STATUS_MISMATCH");
+  }
   const metadata = turn.metadata ?? {};
   if (
     joined.operation.scope !== "managed_user" ||
@@ -350,29 +419,42 @@ async function loadLocalFacts(db: Db) {
     "USER_MESSAGE_NOT_UNIQUE",
   );
   if (userMessage.deletedAt !== null) fail("USER_MESSAGE_DELETED");
-  const outputMessages = (
-    await db
-      .select()
-      .from(messages)
-      .where(
-        and(
-          eq(messages.conversationId, conversation.id),
-          eq(messages.turnId, turn.id),
-          eq(messages.userId, joined.operation.accountUserId),
-          eq(messages.role, "assistant"),
+  if (sha256(userMessage.content) !== metadata.promptSha256) {
+    fail("USER_MESSAGE_PROMPT_MISMATCH");
+  }
+  const outputMessages = candidate.incidentMessages
+    .filter(
+      (message) =>
+        message.conversationId === conversation.id &&
+        message.userId === joined.operation.accountUserId &&
+        message.role === "assistant" &&
+        message.deletedAt === null &&
+        !GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(
+          message.content as never,
         ),
-      )
-      .orderBy(messages.sequence, messages.id)
-  ).filter((message) => {
-    const identity = projectionIdentity(message);
-    return (
-      message.deletedAt === null &&
-      identity?.agentTaskId === joined.task.id &&
-      identity.turnId === turn.id
+    )
+    .sort(
+      (left, right) =>
+        left.sequence - right.sequence || left.id.localeCompare(right.id),
     );
-  });
-  if (outputMessages.length === 0 || !outputMessages.some(metadataHasInlineImage)) {
+  if (
+    outputMessages.length === 0 ||
+    !outputMessages.some(metadataHasInlineImage)
+  ) {
     fail("OUTPUT_MISSING");
+  }
+  if (
+    outputMessages.some((message) => {
+      const identity = projectionIdentity(message);
+      return (
+        (message.turnId !== null && message.turnId !== turn.id) ||
+        (identity !== null &&
+          (identity.agentTaskId !== joined.task.id ||
+            identity.turnId !== turn.id))
+      );
+    })
+  ) {
+    fail("OUTPUT_SCOPE_MISMATCH");
   }
   const inputAttachments = await db
     .select()
@@ -389,15 +471,91 @@ async function loadLocalFacts(db: Db) {
   );
   if (
     inputAttachments.length === 0 ||
-    inputAttachments.some(
-      (attachment) =>
-        attachment.deletedAt !== null || attachment.kind !== "image",
-    ) ||
+    inputAttachments.some((attachment) => attachment.deletedAt !== null) ||
     !sameStrings(persistedLocalAssetIds, turn.attachmentFileIds)
   ) {
     fail("INPUT_ATTACHMENT_MISMATCH");
   }
-  const artifactIds = sortedUnique(outputMessages.flatMap(artifactIdsFromMessage));
+  const inputAssets = await db
+    .select()
+    .from(localAssets)
+    .where(inArray(localAssets.id, persistedLocalAssetIds));
+  if (
+    inputAssets.length !== persistedLocalAssetIds.length ||
+    inputAssets.some(
+      (asset) =>
+        asset.scope !== "managed_user" ||
+        asset.accountUserId !== joined.operation.accountUserId ||
+        asset.presalesProjectId !== null ||
+        !asset.mimeType.toLowerCase().startsWith("image/"),
+    )
+  ) {
+    fail("INPUT_ASSET_MISMATCH");
+  }
+  const providerAttachmentFileIds = stringArray(
+    metadata.providerAttachmentFileIds,
+  );
+  const inputFileLeases = await db
+    .select()
+    .from(providerFileLeases)
+    .where(
+      and(
+        inArray(providerFileLeases.localAssetId, persistedLocalAssetIds),
+        eq(
+          providerFileLeases.apiCredentialId,
+          joined.operation.apiCredentialId,
+        ),
+      ),
+    );
+  const currentInputFileLeases = inputFileLeases.filter(
+    (lease) =>
+      lease.credentialVersion === joined.operation.credentialVersion &&
+      lease.uploadState === "uploaded" &&
+      lease.providerFileId !== null &&
+      providerAttachmentFileIds.includes(lease.providerFileId),
+  );
+  if (
+    currentInputFileLeases.length !== persistedLocalAssetIds.length ||
+    !sameStrings(
+      currentInputFileLeases.map((lease) => lease.localAssetId),
+      persistedLocalAssetIds,
+    ) ||
+    !sameStrings(
+      currentInputFileLeases.flatMap((lease) =>
+        lease.providerFileId ? [lease.providerFileId] : [],
+      ),
+      providerAttachmentFileIds,
+    )
+  ) {
+    fail("INPUT_FILE_LEASE_MISMATCH");
+  }
+  const upstreamOutputIds = outputMessages.flatMap((message) =>
+    typeof message.metadata?.upstreamOutputId === "string"
+      ? [message.metadata.upstreamOutputId]
+      : [],
+  );
+  if (upstreamOutputIds.length !== outputMessages.length) {
+    fail("OUTPUT_EVENT_ID_MISSING");
+  }
+  const taskAgentEvents = await db
+    .select()
+    .from(agentEvents)
+    .where(eq(agentEvents.taskId, joined.task.id))
+    .orderBy(agentEvents.providerTimestampMs, agentEvents.id);
+  const outputAgentEvents = taskAgentEvents.filter((event) =>
+    upstreamOutputIds.includes(event.id),
+  );
+  bindGeneralChatTerminal1547LegacyOutputs({
+    messages: outputMessages,
+    agentEvents: outputAgentEvents,
+    localTaskId: joined.task.id,
+    currentTurnOutputEventIds: outputAgentEvents.map(
+      (event) => event.providerEventId,
+    ),
+  });
+  const artifactIds = sortedUnique(
+    outputMessages.flatMap(artifactIdsFromMessage),
+  );
   if (artifactIds.length === 0) fail("OUTPUT_ARTIFACT_MISSING");
   const outputArtifacts = await db
     .select()
@@ -409,7 +567,10 @@ async function loadLocalFacts(db: Db) {
       (artifact) =>
         artifact.operationId !== joined.operation.id ||
         artifact.taskId !== joined.task.id ||
-        artifact.validationState !== "valid",
+        artifact.validationState !== "valid" ||
+        !outputAgentEvents.some(
+          (event) => event.providerEventId === artifact.sourceEventId,
+        ),
     )
   ) {
     fail("OUTPUT_ARTIFACT_MISMATCH");
@@ -417,13 +578,22 @@ async function loadLocalFacts(db: Db) {
   const legacyErrors = candidate.incidentMessages.filter(
     (message) =>
       message.conversationId === conversation.id &&
-      GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(message.content as never),
+      GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(
+        message.content as never,
+      ),
   );
   if (
     legacyErrors.length !== GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.length ||
     GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.some(
       (content) =>
-        legacyErrors.filter((message) => message.content === content).length !== 1,
+        legacyErrors.filter((message) => message.content === content).length !==
+        1,
+    ) ||
+    legacyErrors.some(
+      (message) =>
+        message.userId !== joined.operation.accountUserId ||
+        message.role !== "assistant" ||
+        (message.turnId !== null && message.turnId !== turn.id),
     )
   ) {
     fail("LEGACY_ERROR_MISMATCH");
@@ -447,9 +617,14 @@ async function loadLocalFacts(db: Db) {
     task: joined.task,
     conversation,
     turn,
+    taskTurns,
     userMessage,
     outputMessages,
+    outputAgentEvents,
+    taskAgentEvents,
     inputAttachments,
+    inputAssets,
+    inputFileLeases: currentInputFileLeases,
     outputArtifacts,
     legacyErrors,
     terminalNotice: terminalNotice ?? null,
@@ -471,9 +646,7 @@ export async function inspectGeneralChatTerminal1547Repair(
   ) {
     fail("CREDENTIAL_UNAVAILABLE");
   }
-  const client = (
-    dependencies.createProviderClient ?? createProviderClient
-  )({
+  const client = (dependencies.createProviderClient ?? createProviderClient)({
     apiKey: credential.apiKey,
     accountUserId: local.operation.accountUserId!,
   });
@@ -492,10 +665,25 @@ export async function inspectGeneralChatTerminal1547Repair(
     detailStatus: provider.detail.status,
     currentTurnEvents: selection.events,
   });
-  const persistedProviderEventIds = local.outputMessages.map(
-    (message) => projectionIdentity(message)!.providerEventId,
+  const boundOutputs = bindGeneralChatTerminal1547LegacyOutputs({
+    messages: local.outputMessages,
+    agentEvents: local.outputAgentEvents,
+    localTaskId: local.task.id,
+    currentTurnOutputEventIds: outcome.outputEventIds,
+  });
+  const agentEventsById = new Map(
+    local.outputAgentEvents.map((event) => [event.id, event]),
   );
-  if (!sameStrings(outcome.outputEventIds, persistedProviderEventIds)) {
+  const messagesById = new Map(
+    local.outputMessages.map((message) => [message.id, message]),
+  );
+  const outputBindings = boundOutputs.map((binding) => ({
+    message: messagesById.get(binding.messageId)!,
+    agentEvent: agentEventsById.get(binding.localEventId)!,
+  }));
+  if (
+    outputBindings.some((binding) => !binding.message || !binding.agentEvent)
+  ) {
     fail("OUTPUT_EVENT_MISMATCH");
   }
   const chosenOutcome =
@@ -538,6 +726,18 @@ export async function inspectGeneralChatTerminal1547Repair(
     turnId: local.turn.id,
     userId: local.operation.accountUserId!,
   });
+  const outputMessagesProjected = outputBindings.every(
+    ({ message, agentEvent }) => {
+      const identity = projectionIdentity(message);
+      return (
+        message.turnId === local.turn.id &&
+        identity?.turnId === local.turn.id &&
+        identity.agentTaskId === local.task.id &&
+        identity.providerEventId === agentEvent.providerEventId &&
+        message.metadata?.upstreamOutputId === agentEvent.id
+      );
+    },
+  );
   const completedState =
     local.operation.status === "succeeded" &&
     local.operation.errorCode === null &&
@@ -549,6 +749,7 @@ export async function inspectGeneralChatTerminal1547Repair(
     local.conversation.status === "completed" &&
     local.conversation.upstreamTaskId === local.task.id &&
     local.conversation.previousResponseId === local.task.id &&
+    outputMessagesProjected &&
     activeLegacyErrors.length === 0 &&
     legacyErrorsTombstoned &&
     tombstones.has(terminalNoticePublicId) &&
@@ -563,6 +764,7 @@ export async function inspectGeneralChatTerminal1547Repair(
     local.conversation.status === "error" &&
     local.conversation.upstreamTaskId === local.task.id &&
     local.conversation.previousResponseId === local.task.id &&
+    outputMessagesProjected &&
     activeLegacyErrors.length === 0 &&
     legacyErrorsTombstoned &&
     !tombstones.has(terminalNoticePublicId) &&
@@ -586,7 +788,9 @@ export async function inspectGeneralChatTerminal1547Repair(
       eventStatus: outcome.eventStatus,
       errorType: outcome.errorType,
       userStop: outcome.userStop,
-      currentTurnEventIdsSha256: selection.events.map((event) => sha256(event.id)),
+      currentTurnEventIdsSha256: selection.events.map((event) =>
+        sha256(event.id),
+      ),
       outputEventIdsSha256: outcome.outputEventIds.map(sha256),
       chosenOutcome,
     },
@@ -596,6 +800,7 @@ export async function inspectGeneralChatTerminal1547Repair(
       taskProviderState: local.task.providerState,
       turnStatus: local.turn.status,
       turnErrorCode: local.turn.errorCode,
+      taskTurnIdsSha256: local.taskTurns.map((item) => sha256(item.id)),
       conversationStatus: local.conversation.status,
       legacyErrors: local.legacyErrors.map((message) => ({
         idSha256: sha256(message.id),
@@ -610,9 +815,45 @@ export async function inspectGeneralChatTerminal1547Repair(
             deleted: local.terminalNotice.deletedAt !== null,
           }
         : null,
-      outputMessageIdsSha256: local.outputMessages.map((message) => sha256(message.id)),
-      inputAttachmentIdsSha256: local.inputAttachments.map((item) => sha256(item.id)),
-      outputArtifactIdsSha256: local.outputArtifacts.map((item) => sha256(item.id)),
+      outputMessageIdsSha256: local.outputMessages.map((message) =>
+        sha256(message.id),
+      ),
+      outputBindings: outputBindings.map(({ message, agentEvent }) => ({
+        messageIdSha256: sha256(message.id),
+        localEventIdSha256: sha256(agentEvent.id),
+        providerEventIdSha256: sha256(agentEvent.providerEventId),
+      })),
+      taskAgentEventIdsSha256: local.taskAgentEvents.map((item) =>
+        sha256(item.id),
+      ),
+      outputMessagesProjected,
+      inputAttachmentIdsSha256: local.inputAttachments.map((item) =>
+        sha256(item.id),
+      ),
+      inputAssetIdsSha256: local.inputAssets.map((item) => sha256(item.id)),
+      inputFileLeaseIdsSha256: local.inputFileLeases.map((item) =>
+        sha256(item.id),
+      ),
+      outputArtifactIdsSha256: local.outputArtifacts.map((item) =>
+        sha256(item.id),
+      ),
+      mutationFenceSha256: generalChatTerminal1547StateHash(
+        localMutationFence({
+          operation: local.operation,
+          task: local.task,
+          conversation: local.conversation,
+          turn: local.turn,
+          taskTurns: local.taskTurns,
+          userMessage: local.userMessage,
+          incidentMessages: [...local.outputMessages, ...local.legacyErrors],
+          terminalNotice: local.terminalNotice,
+          inputAttachments: local.inputAttachments,
+          inputAssets: local.inputAssets,
+          inputFileLeases: local.inputFileLeases,
+          taskAgentEvents: local.taskAgentEvents,
+          outputArtifacts: local.outputArtifacts,
+        }),
+      ),
     },
     complete,
   };
@@ -630,6 +871,7 @@ export async function inspectGeneralChatTerminal1547Repair(
   return {
     userId: local.operation.accountUserId!,
     ...local,
+    outputBindings,
     providerDetail: provider.detail,
     providerEvents: provider.events,
     currentTurnEventIds: selection.events.map((event) => event.id),
@@ -690,6 +932,24 @@ export async function isGeneralChatTerminal1547RepairLocallyComplete(
       turnId: local.turn.id,
       userId: local.operation.accountUserId!,
     });
+    const agentEventsById = new Map(
+      local.outputAgentEvents.map((event) => [event.id, event]),
+    );
+    const outputMessagesProjected = local.outputMessages.every((message) => {
+      const upstreamOutputId = message.metadata?.upstreamOutputId;
+      const event =
+        typeof upstreamOutputId === "string"
+          ? agentEventsById.get(upstreamOutputId)
+          : undefined;
+      const identity = projectionIdentity(message);
+      return Boolean(
+        event &&
+          message.turnId === local.turn.id &&
+          identity?.turnId === local.turn.id &&
+          identity.agentTaskId === local.task.id &&
+          identity.providerEventId === event.providerEventId,
+      );
+    });
     const completed =
       local.operation.status === "succeeded" &&
       local.operation.errorCode === null &&
@@ -701,6 +961,7 @@ export async function isGeneralChatTerminal1547RepairLocallyComplete(
       local.conversation.status === "completed" &&
       local.conversation.upstreamTaskId === local.task.id &&
       local.conversation.previousResponseId === local.task.id &&
+      outputMessagesProjected &&
       local.conversation.deletedMessageIds.includes(terminalNoticePublicId) &&
       !validNotice;
     const partial =
@@ -713,6 +974,7 @@ export async function isGeneralChatTerminal1547RepairLocallyComplete(
       local.conversation.status === "error" &&
       local.conversation.upstreamTaskId === local.task.id &&
       local.conversation.previousResponseId === local.task.id &&
+      outputMessagesProjected &&
       !local.conversation.deletedMessageIds.includes(terminalNoticePublicId) &&
       validNotice;
     return completed || partial;
@@ -773,28 +1035,25 @@ async function applyGeneralChatTerminal1547Repair(
     ) {
       fail("APPLY_IDENTITY_CHANGED");
     }
-    const lockedErrors = await tx
-      .select()
-      .from(messages)
-      .where(inArray(messages.id, facts.legacyErrors.map((message) => message.id)))
-      .for("update");
-    if (
-      lockedErrors.length !== GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.length ||
-      lockedErrors.some(
-        (message) =>
-          message.conversationId !== facts.conversation.id ||
-          message.userId !== facts.userId ||
-          message.role !== "assistant" ||
-          !GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(message.content as never),
-      )
-    ) {
-      fail("APPLY_LEGACY_ERROR_CHANGED");
+    if (lockedConversation.projectAssignmentId) {
+      requiredExactlyOne(
+        await tx
+          .select({ id: deliveryProjectAssignments.id })
+          .from(deliveryProjectAssignments)
+          .where(
+            and(
+              eq(
+                deliveryProjectAssignments.id,
+                lockedConversation.projectAssignmentId,
+              ),
+              eq(deliveryProjectAssignments.engineerUserId, facts.userId),
+            ),
+          )
+          .limit(1)
+          .for("update"),
+        "APPLY_PROJECT_SCOPE_CHANGED",
+      );
     }
-    await tx
-      .update(messages)
-      .set({ deletedAt: now })
-      .where(inArray(messages.id, lockedErrors.map((message) => message.id)));
-
     const terminalNoticeId = generalChatTerminalMessagePersistedId({
       userId: facts.userId,
       projectAssignmentId: facts.conversation.projectAssignmentId,
@@ -802,6 +1061,213 @@ async function applyGeneralChatTerminal1547Repair(
       localTaskId: facts.task.id,
       errorCode: GENERAL_CHAT_TERMINAL_1547_ERROR_CODE,
     });
+    const lockedTaskTurns = await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.conversationId, facts.conversation.id),
+          eq(conversationTurns.userId, facts.userId),
+          eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+          eq(conversationTurns.upstreamTaskId, facts.task.id),
+        ),
+      )
+      .orderBy(desc(conversationTurns.createdAt), desc(conversationTurns.id))
+      .for("update");
+    if (lockedTaskTurns[0]?.id !== facts.turn.id) {
+      fail("APPLY_LATEST_TURN_CHANGED");
+    }
+    const lockedUserMessage = requiredExactlyOne(
+      await tx
+        .select()
+        .from(messages)
+        .where(eq(messages.id, facts.userMessage.id))
+        .limit(1)
+        .for("update"),
+      "APPLY_USER_MESSAGE_MISSING",
+    );
+    const lockedIncidentMessages = await tx
+      .select()
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, facts.conversation.id),
+          eq(messages.userId, facts.userId),
+          eq(messages.role, "assistant"),
+          gte(messages.sentAt, GENERAL_CHAT_TERMINAL_1547_WINDOW.start),
+          lt(messages.sentAt, GENERAL_CHAT_TERMINAL_1547_WINDOW.end),
+        ),
+      )
+      .orderBy(messages.sentAt, messages.id)
+      .for("update");
+    const lockedAttachments = await tx
+      .select()
+      .from(attachments)
+      .where(
+        and(
+          eq(attachments.conversationId, facts.conversation.id),
+          eq(attachments.messageId, facts.userMessage.id),
+          eq(attachments.userId, facts.userId),
+        ),
+      )
+      .for("update");
+    const inputAssetIds = facts.inputAssets.map((asset) => asset.id);
+    const lockedAssets = await tx
+      .select()
+      .from(localAssets)
+      .where(inArray(localAssets.id, inputAssetIds))
+      .for("update");
+    const lockedProviderAttachmentFileIds = stringArray(
+      lockedTurn.metadata?.providerAttachmentFileIds,
+    );
+    const lockedFileLeases = (
+      await tx
+        .select()
+        .from(providerFileLeases)
+        .where(
+          and(
+            inArray(providerFileLeases.localAssetId, inputAssetIds),
+            eq(
+              providerFileLeases.apiCredentialId,
+              facts.operation.apiCredentialId,
+            ),
+          ),
+        )
+        .for("update")
+    ).filter(
+      (lease) =>
+        lease.credentialVersion === lockedOperation.credentialVersion &&
+        lease.uploadState === "uploaded" &&
+        lease.providerFileId !== null &&
+        lockedProviderAttachmentFileIds.includes(lease.providerFileId),
+    );
+    const lockedTaskAgentEvents = await tx
+      .select()
+      .from(agentEvents)
+      .where(eq(agentEvents.taskId, facts.task.id))
+      .orderBy(agentEvents.providerTimestampMs, agentEvents.id)
+      .for("update");
+    const lockedArtifacts = await tx
+      .select()
+      .from(artifacts)
+      .where(
+        inArray(
+          artifacts.id,
+          facts.outputArtifacts.map((artifact) => artifact.id),
+        ),
+      )
+      .for("update");
+    const lockedTerminalNotice =
+      (
+        await tx
+          .select()
+          .from(messages)
+          .where(eq(messages.id, terminalNoticeId))
+          .limit(1)
+          .for("update")
+      )[0] ?? null;
+    assertGeneralChatTerminal1547MutationFence(
+      localMutationFence({
+        operation: facts.operation,
+        task: facts.task,
+        conversation: facts.conversation,
+        turn: facts.turn,
+        taskTurns: facts.taskTurns,
+        userMessage: facts.userMessage,
+        incidentMessages: [...facts.outputMessages, ...facts.legacyErrors],
+        terminalNotice: facts.terminalNotice,
+        inputAttachments: facts.inputAttachments,
+        inputAssets: facts.inputAssets,
+        inputFileLeases: facts.inputFileLeases,
+        taskAgentEvents: facts.taskAgentEvents,
+        outputArtifacts: facts.outputArtifacts,
+      }),
+      localMutationFence({
+        operation: lockedOperation,
+        task: lockedTask,
+        conversation: lockedConversation,
+        turn: lockedTurn,
+        taskTurns: lockedTaskTurns,
+        userMessage: lockedUserMessage,
+        incidentMessages: lockedIncidentMessages,
+        terminalNotice: lockedTerminalNotice,
+        inputAttachments: lockedAttachments,
+        inputAssets: lockedAssets,
+        inputFileLeases: lockedFileLeases,
+        taskAgentEvents: lockedTaskAgentEvents,
+        outputArtifacts: lockedArtifacts,
+      }),
+    );
+    const outputBindingsByMessageId = new Map(
+      facts.outputBindings.map((binding) => [binding.message.id, binding]),
+    );
+    const outputIds = new Set(
+      facts.outputBindings.map((binding) => binding.message.id),
+    );
+    const lockedOutputs = lockedIncidentMessages.filter((message) =>
+      outputIds.has(message.id),
+    );
+    if (
+      lockedOutputs.length !== facts.outputBindings.length ||
+      lockedOutputs.some((message) => {
+        const binding = outputBindingsByMessageId.get(message.id);
+        return (
+          !binding ||
+          message.conversationId !== facts.conversation.id ||
+          message.userId !== facts.userId ||
+          message.role !== "assistant" ||
+          message.deletedAt !== null ||
+          message.metadata?.upstreamOutputId !== binding.agentEvent.id
+        );
+      })
+    ) {
+      fail("APPLY_OUTPUT_CHANGED");
+    }
+    const errorIds = new Set(facts.legacyErrors.map((message) => message.id));
+    const lockedErrors = lockedIncidentMessages.filter((message) =>
+      errorIds.has(message.id),
+    );
+    if (
+      lockedErrors.length !== GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.length ||
+      lockedErrors.some(
+        (message) =>
+          message.conversationId !== facts.conversation.id ||
+          message.userId !== facts.userId ||
+          message.role !== "assistant" ||
+          !GENERAL_CHAT_TERMINAL_1547_LEGACY_ERRORS.includes(
+            message.content as never,
+          ),
+      )
+    ) {
+      fail("APPLY_LEGACY_ERROR_CHANGED");
+    }
+    for (const message of lockedOutputs) {
+      const binding = outputBindingsByMessageId.get(message.id)!;
+      await tx
+        .update(messages)
+        .set({
+          turnId: facts.turn.id,
+          metadata: generalChatTerminal1547ProjectionMetadata({
+            metadata: message.metadata ?? null,
+            turnId: facts.turn.id,
+            localTaskId: facts.task.id,
+            localEventId: binding.agentEvent.id,
+            providerEventId: binding.agentEvent.providerEventId,
+          }),
+          deletedAt: null,
+        })
+        .where(eq(messages.id, message.id));
+    }
+    await tx
+      .update(messages)
+      .set({ deletedAt: now })
+      .where(
+        inArray(
+          messages.id,
+          lockedErrors.map((message) => message.id),
+        ),
+      );
+
     const scopedPublicId = (persistedResourceId: string) =>
       generalChatTerminalPublicIdFromPersisted({
         userId: facts.userId,
@@ -824,7 +1290,11 @@ async function applyGeneralChatTerminal1547Repair(
         .where(eq(agentOperations.id, facts.operation.id));
       await tx
         .update(agentTasks)
-        .set({ providerState: "stopped", resultDeadlineAt: null, updatedAt: now })
+        .set({
+          providerState: "stopped",
+          resultDeadlineAt: null,
+          updatedAt: now,
+        })
         .where(eq(agentTasks.id, facts.task.id));
       await tx
         .update(conversationTurns)
@@ -896,14 +1366,7 @@ async function applyGeneralChatTerminal1547Repair(
         version: sql`${conversations.version} + 1`,
       })
       .where(eq(conversations.id, facts.conversation.id));
-    const existingNotice = (
-      await tx
-        .select()
-        .from(messages)
-        .where(eq(messages.id, terminalNoticeId))
-        .limit(1)
-        .for("update")
-    )[0] as Message | undefined;
+    const existingNotice = lockedTerminalNotice ?? undefined;
     const terminalMetadata = {
       errorCode: GENERAL_CHAT_TERMINAL_1547_ERROR_CODE,
       partialResult: true,

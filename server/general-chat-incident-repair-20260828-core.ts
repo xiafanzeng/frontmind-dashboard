@@ -171,6 +171,174 @@ export function recoveredImageMessagePublicId(localTaskId: string) {
   return `msg-recovered-general-chat-${sha256(localTaskId).slice(0, 24)}`;
 }
 
+export function recoveredTextMessagePublicId(input: {
+  operationId: string;
+  localTaskId: string;
+}) {
+  return `msg-recovered-general-chat-${sha256(
+    `${input.operationId}\0${input.localTaskId}`,
+  ).slice(0, 24)}`;
+}
+
+export function recoveredTextConversationPublicId(input: {
+  operationId: string;
+  localTaskId: string;
+}) {
+  return `recovered-general-chat-${sha256(
+    `${input.operationId}\0${input.localTaskId}`,
+  ).slice(0, 24)}`;
+}
+
+export type GeneralChatIncidentTextConversationCandidate = {
+  id: string;
+  publicId: string;
+  userId: number;
+  apiCredentialId: string | null;
+  projectAssignmentId: string | null;
+  deleted: boolean;
+};
+
+export type GeneralChatIncidentTextMessageCandidate = {
+  id: string;
+  publicId: string;
+  conversationId: string;
+  userId: number;
+  role: string;
+  normalizedContent: string;
+  deleted: boolean;
+  attachmentCount: number;
+  metadata: Record<string, unknown> | null;
+};
+
+export type GeneralChatIncidentTextBindingPlan =
+  | {
+      kind: "conversation_ambiguous";
+      conversationCandidateCount: number;
+    }
+  | {
+      kind: "message_not_unique" | "recovered_message_conflict";
+      conversationId: string;
+      conversationPublicId: string;
+      messageCandidateCount: number;
+    }
+  | {
+      kind: "selected";
+      conversationId: string;
+      conversationPublicId: string;
+      messageId: string | null;
+      messagePublicId: string;
+      source: "original" | "recovered";
+      conversationEvidence: "matched" | "missing";
+    };
+
+function incidentJsonHash(value: unknown) {
+  return sha256(JSON.stringify(value));
+}
+
+/**
+ * Resolve a lost text turn without using timestamps as identity. The original
+ * operation request hash proves the conversation. The original idempotency
+ * hash is used only when the browser message survived; otherwise a stable
+ * incident message id is planned from the operation/task pair.
+ */
+export function planGeneralChatIncidentTextBinding(input: {
+  userId: number;
+  apiCredentialId: string;
+  operationId: string;
+  localTaskId: string;
+  operationRequestHash: string;
+  idempotencyKeyHash: string;
+  publicProfile: string;
+  prompt: string;
+  conversations: readonly GeneralChatIncidentTextConversationCandidate[];
+  messages: readonly GeneralChatIncidentTextMessageCandidate[];
+}): GeneralChatIncidentTextBindingPlan {
+  const conversations = input.conversations.filter(
+    (candidate) =>
+      !candidate.deleted &&
+      candidate.userId === input.userId &&
+      candidate.projectAssignmentId === null &&
+      (candidate.apiCredentialId === null ||
+        candidate.apiCredentialId === input.apiCredentialId) &&
+      incidentJsonHash({
+        conversationId: candidate.publicId,
+        prompt: input.prompt,
+        localAssetIds: [],
+        modelProfile: input.publicProfile,
+      }) === input.operationRequestHash,
+  );
+  if (conversations.length > 1) {
+    return {
+      kind: "conversation_ambiguous",
+      conversationCandidateCount: conversations.length,
+    };
+  }
+  const recoveredConversationPublicId = recoveredTextConversationPublicId({
+    operationId: input.operationId,
+    localTaskId: input.localTaskId,
+  });
+  const conversation = {
+    id: persistedIdForManagedUser({
+      userId: input.userId,
+      publicId: recoveredConversationPublicId,
+    }),
+    publicId: recoveredConversationPublicId,
+  };
+  const recoveredPublicId = recoveredTextMessagePublicId({
+    operationId: input.operationId,
+    localTaskId: input.localTaskId,
+  });
+  const recoveredRows = input.messages.filter(
+    (candidate) => candidate.publicId === recoveredPublicId,
+  );
+  if (
+    recoveredRows.some((candidate) => {
+      const metadata = candidate.metadata ?? {};
+      return (
+        candidate.conversationId !== conversation.id ||
+        candidate.userId !== input.userId ||
+        candidate.role !== "user" ||
+        candidate.deleted ||
+        candidate.attachmentCount !== 0 ||
+        candidate.normalizedContent !== input.prompt ||
+        metadata.incidentRecovery !== GENERAL_CHAT_INCIDENT_REPAIR_ID ||
+        metadata.incidentRecoveryOperationIdSha256 !==
+          sha256(input.operationId) ||
+        metadata.incidentRecoveryTaskIdSha256 !== sha256(input.localTaskId) ||
+        metadata.incidentRecoveryRequestHash !== input.operationRequestHash ||
+        metadata.incidentRecoveryIdempotencyKeyHash !==
+          input.idempotencyKeyHash ||
+        metadata.incidentRecoveryPromptSha256 !== sha256(input.prompt)
+      );
+    })
+  ) {
+    return {
+      kind: "recovered_message_conflict",
+      conversationId: conversation.id,
+      conversationPublicId: conversation.publicId,
+      messageCandidateCount: recoveredRows.length,
+    };
+  }
+  if (recoveredRows.length > 1) {
+    return {
+      kind: "message_not_unique",
+      conversationId: conversation.id,
+      conversationPublicId: conversation.publicId,
+      messageCandidateCount: recoveredRows.length,
+    };
+  }
+  const selected = recoveredRows[0];
+  return {
+    kind: "selected",
+    conversationId: conversation.id,
+    conversationPublicId: conversation.publicId,
+    messageId: selected?.id ?? null,
+    messagePublicId: selected?.publicId ?? recoveredPublicId,
+    source: "recovered",
+    conversationEvidence: conversations.length === 1 ? "matched" : "missing",
+  };
+}
+
 export function recoveredImageAttachmentPublicId(localTaskId: string) {
   return `att-recovered-general-chat-${sha256(localTaskId).slice(0, 24)}`;
 }
@@ -183,6 +351,116 @@ export function generalChatTurnOperationKey(input: {
   return `chat-turn:${sha256(
     `${input.userId}\0${input.conversationPublicId}\0${input.clientRequestId}`,
   )}`;
+}
+
+export function generalChatIncidentConversationNeedsSettlement(input: {
+  actual: {
+    apiCredentialId: string | null;
+    upstreamTaskId: string | null;
+    previousResponseId: string | null;
+    status: string;
+    lastKnownOutputLength: number;
+    completedAt: Date | null;
+    updatedAt: Date;
+  };
+  expected: {
+    apiCredentialId: string;
+    upstreamTaskId: string;
+    previousResponseId: string;
+    status: string;
+    lastKnownOutputLength: number;
+    completedAt: Date;
+    updatedAt: Date;
+  };
+}) {
+  const epochSecond = (value: Date | null) =>
+    value ? Math.floor(value.getTime() / 1_000) : null;
+  return (
+    input.actual.apiCredentialId !== input.expected.apiCredentialId ||
+    input.actual.upstreamTaskId !== input.expected.upstreamTaskId ||
+    input.actual.previousResponseId !== input.expected.previousResponseId ||
+    input.actual.status !== input.expected.status ||
+    input.actual.lastKnownOutputLength !==
+      input.expected.lastKnownOutputLength ||
+    epochSecond(input.actual.completedAt) !==
+      epochSecond(input.expected.completedAt) ||
+    epochSecond(input.actual.updatedAt) !==
+      epochSecond(input.expected.updatedAt)
+  );
+}
+
+export function generalChatIncidentAssistantProjectionMatches(input: {
+  actual: {
+    content: string;
+    sentAt: Date;
+    deleted: boolean;
+    conversationId: string;
+    turnId: string | null;
+    userId: number;
+    role: string;
+    upstreamOutputId: unknown;
+    generalChat: Record<string, unknown> | null;
+  };
+  expected: {
+    content: string;
+    sentAt: Date;
+    conversationId: string;
+    turnId: string;
+    userId: number;
+    upstreamOutputId: string;
+    taskId: string;
+    providerEventId: string;
+  };
+}) {
+  const epochSecond = (value: Date) => Math.floor(value.getTime() / 1_000);
+  const generalChat = input.actual.generalChat;
+  return (
+    input.actual.content === input.expected.content &&
+    epochSecond(input.actual.sentAt) === epochSecond(input.expected.sentAt) &&
+    !input.actual.deleted &&
+    input.actual.conversationId === input.expected.conversationId &&
+    input.actual.turnId === input.expected.turnId &&
+    input.actual.userId === input.expected.userId &&
+    input.actual.role === "assistant" &&
+    input.actual.upstreamOutputId === input.expected.upstreamOutputId &&
+    generalChat?.schemaVersion === 1 &&
+    generalChat.kind === "assistant_projection" &&
+    generalChat.turnId === input.expected.turnId &&
+    generalChat.agentTaskId === input.expected.taskId &&
+    generalChat.providerEventId === input.expected.providerEventId &&
+    generalChat.serverOwned === true
+  );
+}
+
+export function countGeneralChatIncidentArtifactReferences(
+  metadataRows: readonly (Record<string, unknown> | null | undefined)[],
+  artifactUrl: string,
+) {
+  return metadataRows.reduce((count, metadata) => {
+    const inlineImages = Array.isArray(metadata?.inlineImages)
+      ? metadata.inlineImages
+      : [];
+    const outputFiles = Array.isArray(metadata?.outputFiles)
+      ? metadata.outputFiles
+      : [];
+    return (
+      count +
+      inlineImages.filter(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          !Array.isArray(item) &&
+          (item as Record<string, unknown>).src === artifactUrl,
+      ).length +
+      outputFiles.filter(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          !Array.isArray(item) &&
+          (item as Record<string, unknown>).fileUrl === artifactUrl,
+      ).length
+    );
+  }, 0);
 }
 
 export function publicIdFromPersistedId(input: {

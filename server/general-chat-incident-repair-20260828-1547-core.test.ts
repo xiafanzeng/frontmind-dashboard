@@ -6,7 +6,10 @@ import { generalChatTerminalMessagePublicId } from "../shared/frontmind-general-
 import type { ManusV2MessageEvent } from "./manus-v2-client";
 import {
   GENERAL_CHAT_TERMINAL_1547_ERROR_CODE,
+  assertGeneralChatTerminal1547MutationFence,
+  bindGeneralChatTerminal1547LegacyOutputs,
   classifyGeneralChatTerminal1547Outcome,
+  generalChatTerminal1547ProjectionMetadata,
   generalChatTerminalMessagePersistedId,
   generalChatTerminalPublicIdFromPersisted,
   isGeneralChatTerminal1547Command,
@@ -129,8 +132,18 @@ describe("general-chat 15:47 terminal incident repair core", () => {
         { user_message: { content: "旧轮" } },
         0,
       ),
-      event("old-error", "error_message", { error_message: { error_type: "old" } }, 1),
-      event("old-status", "status_update", { status_update: { agent_status: "error" } }, 2),
+      event(
+        "old-error",
+        "error_message",
+        { error_message: { error_type: "old" } },
+        1,
+      ),
+      event(
+        "old-status",
+        "status_update",
+        { status_update: { agent_status: "error" } },
+        2,
+      ),
       event(
         "current-user",
         "user_message",
@@ -144,8 +157,18 @@ describe("general-chat 15:47 terminal incident repair core", () => {
         },
         3,
       ),
-      event("current-output", "assistant_message", { assistant_message: { content: "done" } }, 4),
-      event("current-stopped", "status_update", { status_update: { agent_status: "stopped" } }, 5),
+      event(
+        "current-output",
+        "assistant_message",
+        { assistant_message: { content: "done" } },
+        4,
+      ),
+      event(
+        "current-stopped",
+        "status_update",
+        { status_update: { agent_status: "stopped" } },
+        5,
+      ),
     ];
     const selected = selectGeneralChatTerminal1547TurnEvents({
       events: [...events].reverse(),
@@ -170,6 +193,157 @@ describe("general-chat 15:47 terminal incident repair core", () => {
       outputEventIds: ["current-output"],
       userStop: false,
     });
+  });
+
+  it("binds the real legacy snapshot shape through upstreamOutputId and upgrades it idempotently", () => {
+    const messages = [
+      {
+        id: "legacy-output-text",
+        metadata: { upstreamOutputId: "local-event-text" },
+      },
+      {
+        id: "legacy-output-image",
+        metadata: {
+          upstreamOutputId: "local-event-image",
+          inlineImages: [{ src: "/api/frontmind/v2/artifacts/image/content" }],
+        },
+      },
+    ];
+    const agentEvents = [
+      {
+        id: "local-event-text",
+        taskId: "local-task",
+        providerEventId: "provider-event-text",
+        eventType: "assistant_message",
+        normalizedPayload: { kind: "provider_event", text: "done" },
+      },
+      {
+        id: "local-event-image",
+        taskId: "local-task",
+        providerEventId: "provider-event-image",
+        eventType: "assistant_message",
+        normalizedPayload: { kind: "provider_event", artifacts: [{}] },
+      },
+    ];
+    expect(
+      bindGeneralChatTerminal1547LegacyOutputs({
+        messages,
+        agentEvents,
+        localTaskId: "local-task",
+        currentTurnOutputEventIds: [
+          "provider-event-text",
+          "provider-event-image",
+        ],
+      }),
+    ).toEqual([
+      {
+        messageId: "legacy-output-text",
+        localEventId: "local-event-text",
+        providerEventId: "provider-event-text",
+      },
+      {
+        messageId: "legacy-output-image",
+        localEventId: "local-event-image",
+        providerEventId: "provider-event-image",
+      },
+    ]);
+
+    const first = generalChatTerminal1547ProjectionMetadata({
+      metadata: messages[1]!.metadata,
+      turnId: "latest-failed-turn",
+      localTaskId: "local-task",
+      localEventId: "local-event-image",
+      providerEventId: "provider-event-image",
+    });
+    const rerun = generalChatTerminal1547ProjectionMetadata({
+      metadata: first,
+      turnId: "latest-failed-turn",
+      localTaskId: "local-task",
+      localEventId: "local-event-image",
+      providerEventId: "provider-event-image",
+    });
+    expect(rerun).toEqual(first);
+    expect(rerun.inlineImages).toEqual(messages[1]!.metadata.inlineImages);
+    expect(rerun.generalChat).toEqual({
+      schemaVersion: 1,
+      kind: "assistant_projection",
+      turnId: "latest-failed-turn",
+      agentTaskId: "local-task",
+      providerEventId: "provider-event-image",
+      serverOwned: true,
+    });
+  });
+
+  it("rejects legacy output rows that do not bijectively match current-turn Provider evidence", () => {
+    const base = {
+      messages: [
+        {
+          id: "legacy-output",
+          metadata: { upstreamOutputId: "local-event" },
+        },
+      ],
+      agentEvents: [
+        {
+          id: "local-event",
+          taskId: "local-task",
+          providerEventId: "provider-event",
+          eventType: "assistant_message",
+          normalizedPayload: { kind: "provider_event" },
+        },
+      ],
+      localTaskId: "local-task",
+    };
+    expect(() =>
+      bindGeneralChatTerminal1547LegacyOutputs({
+        ...base,
+        currentTurnOutputEventIds: ["other-turn-output"],
+      }),
+    ).toThrow("OUTPUT_EVENT_MISMATCH");
+    expect(() =>
+      bindGeneralChatTerminal1547LegacyOutputs({
+        ...base,
+        agentEvents: [{ ...base.agentEvents[0]!, taskId: "other-task" }],
+        currentTurnOutputEventIds: ["provider-event"],
+      }),
+    ).toThrow("OUTPUT_EVENT_MISMATCH");
+  });
+
+  it("rejects preview-to-lock drift in critical rows, latest turn, and dependent evidence", () => {
+    const preview = {
+      operation: {
+        id: "operation",
+        status: "failed",
+        errorCode: "RESULT_MISSING",
+      },
+      task: { id: "task", providerState: "stopped" },
+      conversation: { id: "conversation", status: "error", version: 4 },
+      turn: { id: "latest-turn", status: "failed" },
+      latestTurnId: "latest-turn",
+      outputs: [{ id: "output", turnId: null }],
+      attachments: [{ id: "attachment", kind: "file" }],
+      events: [{ id: "event", providerEventId: "provider-output" }],
+    };
+    expect(() =>
+      assertGeneralChatTerminal1547MutationFence(preview, {
+        ...preview,
+        conversation: { ...preview.conversation, version: 5 },
+      }),
+    ).toThrow("LOCAL_STATE_CHANGED");
+    expect(() =>
+      assertGeneralChatTerminal1547MutationFence(preview, {
+        ...preview,
+        latestTurnId: "concurrent-turn",
+      }),
+    ).toThrow("LOCAL_STATE_CHANGED");
+    expect(() =>
+      assertGeneralChatTerminal1547MutationFence(preview, {
+        ...preview,
+        outputs: [{ id: "output", turnId: "concurrent-turn" }],
+      }),
+    ).toThrow("LOCAL_STATE_CHANGED");
+    expect(() =>
+      assertGeneralChatTerminal1547MutationFence(preview, preview),
+    ).not.toThrow();
   });
 
   it("keeps true error output as partial and distinguishes failure and user stop", () => {
@@ -305,8 +479,8 @@ describe("general-chat 15:47 terminal incident repair core", () => {
     expect(legacyApply).toHaveBeenCalledWith("legacy-hash");
     expect(terminalApply).toHaveBeenCalledWith("terminal-hash");
     expect(results).toEqual([
-      { incident: "legacy", applied: true },
-      { incident: "terminal-1547", applied: true },
+      { incident: "legacy", applied: true, errorCode: null },
+      { incident: "terminal-1547", applied: true, errorCode: null },
     ]);
   });
 
@@ -330,8 +504,61 @@ describe("general-chat 15:47 terminal incident repair core", () => {
     expect(legacyPreview).not.toHaveBeenCalled();
     expect(terminalApply).toHaveBeenCalledWith("terminal-hash");
     expect(results).toEqual([
-      { incident: "legacy", applied: false },
-      { incident: "terminal-1547", applied: true },
+      { incident: "legacy", applied: false, errorCode: null },
+      { incident: "terminal-1547", applied: true, errorCode: null },
+    ]);
+  });
+
+  it("isolates a failed incident step, continues terminal repair, and reports a safe error code", async () => {
+    const terminalApply = vi.fn(async () => ({ applied: true }));
+    const results = await runOrderedGeneralChatIncidentRepairSteps([
+      {
+        incident: "legacy-sync-loss",
+        isLocallyComplete: async () => false,
+        preview: async () => {
+          throw new Error("GENERAL_CHAT_INCIDENT_LEGACY_CANDIDATE_AMBIGUOUS");
+        },
+        apply: vi.fn(),
+      },
+      {
+        incident: "terminal-1547",
+        isLocallyComplete: async () => false,
+        preview: async () => ({ complete: false, stateHash: "terminal-hash" }),
+        apply: terminalApply,
+      },
+    ]);
+    expect(terminalApply).toHaveBeenCalledWith("terminal-hash");
+    expect(results).toEqual([
+      {
+        incident: "legacy-sync-loss",
+        applied: false,
+        errorCode: "LEGACY_CANDIDATE_AMBIGUOUS",
+      },
+      {
+        incident: "terminal-1547",
+        applied: true,
+        errorCode: null,
+      },
+    ]);
+  });
+
+  it("does not expose arbitrary incident-step exception text", async () => {
+    const results = await runOrderedGeneralChatIncidentRepairSteps([
+      {
+        incident: "legacy-sync-loss",
+        isLocallyComplete: async () => {
+          throw new Error("database detail with private values");
+        },
+        preview: vi.fn(),
+        apply: vi.fn(),
+      },
+    ]);
+    expect(results).toEqual([
+      {
+        incident: "legacy-sync-loss",
+        applied: false,
+        errorCode: "UNKNOWN",
+      },
     ]);
   });
 });

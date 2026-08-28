@@ -32,9 +32,13 @@ import { getUpstreamBaseUrl } from "./upstream-config";
 import {
   GENERAL_CHAT_INCIDENT_REPAIR_ID,
   GENERAL_CHAT_INCIDENT_WINDOWS,
+  countGeneralChatIncidentArtifactReferences,
   deterministicIncidentUuid,
+  generalChatIncidentAssistantProjectionMatches,
+  generalChatIncidentConversationNeedsSettlement,
   generalChatIncidentStateHash,
   generalChatTurnOperationKey,
+  planGeneralChatIncidentTextBinding,
   planGeneralChatIncidentMessageSequence,
   readGeneralChatIncidentProviderMessages,
   runStateBoundGeneralChatIncidentRepair,
@@ -43,6 +47,8 @@ import {
   recoveredImageAttachmentPublicId,
   recoveredImageConversationPublicId,
   recoveredImageMessagePublicId,
+  recoveredTextConversationPublicId,
+  recoveredTextMessagePublicId,
   sha256,
   type GeneralChatIncidentRepairCommand,
   type GeneralChatIncidentRepairSummary,
@@ -82,10 +88,13 @@ type OperationFact = {
 type TextBinding = {
   slot: "text1020" | "text1027";
   fact: OperationFact;
-  conversation: Conversation;
-  message: Message;
+  conversation: Conversation | null;
+  conversationId: string;
+  message: Message | null;
   conversationPublicId: string;
   messagePublicId: string;
+  messageSource: "original" | "recovered";
+  conversationEvidence: "matched" | "missing";
 };
 
 type ImageBinding = {
@@ -321,83 +330,159 @@ async function loadTextBinding(input: {
   ) {
     fail(`${input.slot.toUpperCase()}_TEXT_PROMPT_MISMATCH`);
   }
-  const window = GENERAL_CHAT_INCIDENT_WINDOWS[input.slot];
-  const rows = await input.db
-    .select({ conversation: conversations, message: messages })
-    .from(messages)
-    .innerJoin(conversations, eq(conversations.id, messages.conversationId))
+  const userId = input.fact.operation.accountUserId!;
+  const conversationRows = await input.db
+    .select()
+    .from(conversations)
     .where(
       and(
-        eq(messages.userId, input.fact.operation.accountUserId!),
-        eq(messages.role, "user"),
-        isNull(messages.deletedAt),
-        isNull(conversations.deletedAt),
+        eq(conversations.userId, userId),
         isNull(conversations.projectAssignmentId),
-        gte(messages.sentAt, window.start),
-        lt(messages.sentAt, window.end),
+      ),
+    )
+    .orderBy(conversations.id);
+  const conversationCandidates = conversationRows.flatMap((conversation) => {
+    try {
+      return [
+        {
+          id: conversation.id,
+          publicId: publicIdFromPersistedId({
+            userId,
+            persistedId: conversation.id,
+          }),
+          userId: conversation.userId,
+          apiCredentialId: conversation.apiCredentialId,
+          projectAssignmentId: conversation.projectAssignmentId,
+          deleted: conversation.deletedAt !== null,
+        },
+      ];
+    } catch {
+      return [];
+    }
+  });
+  const planInput = {
+    userId,
+    apiCredentialId: input.fact.operation.apiCredentialId,
+    operationId: input.fact.operation.id,
+    localTaskId: input.fact.task.id,
+    operationRequestHash: input.fact.operation.requestHash,
+    idempotencyKeyHash: input.fact.operation.idempotencyKeyHash,
+    publicProfile: input.fact.operation.publicProfile,
+    prompt: input.fact.prompt,
+    conversations: conversationCandidates,
+  };
+  const conversationPlan = planGeneralChatIncidentTextBinding({
+    ...planInput,
+    messages: [],
+  });
+  if (conversationPlan.kind === "conversation_ambiguous") {
+    fail(`${input.slot.toUpperCase()}_CONVERSATION_AMBIGUOUS`);
+  }
+  const conversation =
+    conversationRows.find(
+      (candidate) => candidate.id === conversationPlan.conversationId,
+    ) ?? null;
+  const recoveredMessageId = persistedIdForManagedUser({
+    userId,
+    publicId: recoveredTextMessagePublicId({
+      operationId: input.fact.operation.id,
+      localTaskId: input.fact.task.id,
+    }),
+  });
+  const conversationMessages = await input.db
+    .select()
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, conversationPlan.conversationId),
+        eq(messages.userId, userId),
+        eq(messages.role, "user"),
       ),
     )
     .orderBy(messages.sentAt, messages.id);
-  const candidates = rows.filter(({ conversation, message }) => {
+  const recoveredElsewhere = conversationMessages.some(
+    (message) => message.id === recoveredMessageId,
+  )
+    ? []
+    : await input.db
+        .select()
+        .from(messages)
+        .where(eq(messages.id, recoveredMessageId));
+  const candidateMessages = [...conversationMessages, ...recoveredElsewhere];
+  const attachmentRows = candidateMessages.length
+    ? await input.db
+        .select({ messageId: attachments.messageId })
+        .from(attachments)
+        .where(
+          and(
+            inArray(
+              attachments.messageId,
+              candidateMessages.map((message) => message.id),
+            ),
+            isNull(attachments.deletedAt),
+          ),
+        )
+    : [];
+  const messageCandidates = candidateMessages.flatMap((message) => {
     try {
-      const conversationPublicId = publicIdFromPersistedId({
-        userId: input.fact.operation.accountUserId!,
-        persistedId: conversation.id,
-      });
-      const messagePublicId = publicIdFromPersistedId({
-        userId: input.fact.operation.accountUserId!,
-        persistedId: message.id,
-      });
-      const content = stripFrontMindGeneralChatOperationContract(
-        message.content,
-      ).trim();
-      return (
-        conversation.userId === input.fact.operation.accountUserId &&
-        (conversation.apiCredentialId === null ||
-          conversation.apiCredentialId ===
-            input.fact.operation.apiCredentialId) &&
-        sha256(`${input.fact.operation.accountUserId}\0${messagePublicId}`) ===
-          input.fact.operation.idempotencyKeyHash &&
-        content === input.fact.prompt &&
-        requestHash({
-          conversationId: conversationPublicId,
-          prompt: content,
-          localAssetIds: [],
-          modelProfile: input.fact.operation.publicProfile,
-        }) === input.fact.operation.requestHash
-      );
+      return [
+        {
+          id: message.id,
+          publicId: publicIdFromPersistedId({
+            userId,
+            persistedId: message.id,
+          }),
+          conversationId: message.conversationId,
+          userId: message.userId,
+          role: message.role,
+          normalizedContent: stripFrontMindGeneralChatOperationContract(
+            message.content,
+          ).trim(),
+          deleted: message.deletedAt !== null,
+          attachmentCount: attachmentRows.filter(
+            (attachment) => attachment.messageId === message.id,
+          ).length,
+          metadata:
+            message.metadata && typeof message.metadata === "object"
+              ? (message.metadata as Record<string, unknown>)
+              : null,
+        },
+      ];
     } catch {
-      return false;
+      return [];
     }
   });
-  const selected = requireExactlyOne(
-    candidates,
-    `${input.slot.toUpperCase()}_MESSAGE_NOT_UNIQUE`,
-  );
-  const attached = await input.db
-    .select({ id: attachments.id })
-    .from(attachments)
-    .where(
-      and(
-        eq(attachments.messageId, selected.message.id),
-        isNull(attachments.deletedAt),
-      ),
-    );
-  if (attached.length !== 0)
-    fail(`${input.slot.toUpperCase()}_ATTACHMENT_PRESENT`);
+  const selectedPlan = planGeneralChatIncidentTextBinding({
+    ...planInput,
+    messages: messageCandidates,
+  });
+  if (selectedPlan.kind === "conversation_ambiguous") {
+    fail(`${input.slot.toUpperCase()}_CONVERSATION_AMBIGUOUS`);
+  }
+  if (selectedPlan.kind === "recovered_message_conflict") {
+    fail(`${input.slot.toUpperCase()}_MESSAGE_IDEMPOTENCY_CONFLICT`);
+  }
+  if (selectedPlan.kind === "message_not_unique") {
+    fail(`${input.slot.toUpperCase()}_MESSAGE_NOT_UNIQUE`);
+  }
+  if (selectedPlan.kind !== "selected") {
+    fail(`${input.slot.toUpperCase()}_MESSAGE_BINDING_INVALID`);
+  }
+  const selectedMessage = selectedPlan.messageId
+    ? (candidateMessages.find(
+        (candidate) => candidate.id === selectedPlan.messageId,
+      ) ?? null)
+    : null;
   return {
     slot: input.slot,
     fact: input.fact,
-    conversation: selected.conversation,
-    message: selected.message,
-    conversationPublicId: publicIdFromPersistedId({
-      userId: input.fact.operation.accountUserId!,
-      persistedId: selected.conversation.id,
-    }),
-    messagePublicId: publicIdFromPersistedId({
-      userId: input.fact.operation.accountUserId!,
-      persistedId: selected.message.id,
-    }),
+    conversation,
+    conversationId: selectedPlan.conversationId,
+    message: selectedMessage,
+    conversationPublicId: selectedPlan.conversationPublicId,
+    messagePublicId: selectedPlan.messagePublicId,
+    messageSource: selectedPlan.source,
+    conversationEvidence: selectedPlan.conversationEvidence,
   } satisfies TextBinding;
 }
 
@@ -546,6 +631,49 @@ function assistantProjectionText(event: ManusV2MessageEvent) {
   ).trim();
 }
 
+function textBindingMessageId(userId: number, binding: TextBinding) {
+  return persistedIdForManagedUser({
+    userId,
+    publicId: binding.messagePublicId,
+  });
+}
+
+function textIncidentRecoveryMetadata(binding: TextBinding) {
+  return {
+    modelName: binding.fact.operation.publicProfile,
+    incidentRecovery: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+    incidentRecoveryOperationIdSha256: sha256(binding.fact.operation.id),
+    incidentRecoveryTaskIdSha256: sha256(binding.fact.task.id),
+    incidentRecoveryRequestHash: binding.fact.operation.requestHash,
+    incidentRecoveryIdempotencyKeyHash:
+      binding.fact.operation.idempotencyKeyHash,
+    incidentRecoveryPromptSha256: sha256(binding.fact.prompt),
+  };
+}
+
+function imageIncidentRecoveryMetadata(binding: ImageBinding) {
+  return {
+    modelName: binding.fact.operation.publicProfile,
+    incidentRecovery: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+    incidentRecoveryOperationIdSha256: sha256(binding.fact.operation.id),
+    incidentRecoveryTaskIdSha256: sha256(binding.fact.task.id),
+    incidentRecoveryRequestHash: binding.fact.operation.requestHash,
+    incidentRecoveryIdempotencyKeyHash:
+      binding.fact.operation.idempotencyKeyHash,
+    incidentRecoveryPromptSha256: sha256(binding.fact.prompt),
+  };
+}
+
+function textIncidentRecoveryMetadataMatches(
+  metadata: Message["metadata"],
+  binding: TextBinding,
+) {
+  const expected = textIncidentRecoveryMetadata(binding);
+  return Object.entries(expected).every(
+    ([key, value]) => metadata?.[key] === value,
+  );
+}
+
 function expectedTurnForBinding(input: {
   userId: number;
   binding: TextBinding | ImageBinding;
@@ -567,7 +695,7 @@ function expectedTurnForBinding(input: {
   }
   return turnInsert({
     userId: input.userId,
-    conversationId: input.binding.conversation.id,
+    conversationId: input.binding.conversationId,
     conversationPublicId: input.binding.conversationPublicId,
     clientRequestId: input.binding.messagePublicId,
     fact: input.binding.fact,
@@ -623,7 +751,7 @@ function assistantExpectations(input: {
             userId: input.userId,
             publicId: binding.conversationPublicId,
           })
-        : binding.conversation.id;
+        : binding.conversationId;
     return binding.fact.expectedAssistantEventIds.map((providerEventId) => {
       const event = requireExactlyOne(
         binding.fact.providerEvents.filter(
@@ -708,7 +836,10 @@ function planConversationSequence(input: {
   );
   const userEvents = new Map<string, ManusV2MessageEvent>();
   for (const binding of input.text) {
-    userEvents.set(binding.message.id, binding.fact.createEvent);
+    userEvents.set(
+      textBindingMessageId(binding.fact.operation.accountUserId!, binding),
+      binding.fact.createEvent,
+    );
   }
   userEvents.set(
     persistedIdForManagedUser({
@@ -815,12 +946,16 @@ async function resequenceIncidentConversations(
     publicId: facts.image.conversationPublicId,
   });
   await db.transaction(async (tx) => {
-    await resequenceConversation({
-      executor: tx,
-      conversationId: facts.text[0].conversation.id,
-      text: facts.text,
-      image: facts.image,
-    });
+    for (const conversationId of new Set(
+      facts.text.map((binding) => binding.conversationId),
+    )) {
+      await resequenceConversation({
+        executor: tx,
+        conversationId,
+        text: facts.text,
+        image: facts.image,
+      });
+    }
     await resequenceConversation({
       executor: tx,
       conversationId: imageConversationId,
@@ -843,9 +978,18 @@ async function resequenceIncidentConversations(
   });
 }
 
-function recoveredImageTitle(image: ImageBinding) {
-  const titleSource = image.fact.prompt.replace(/\s+/gu, " ").trim();
+function recoveredImageTitleFromPrompt(prompt: string) {
+  const titleSource = prompt.replace(/\s+/gu, " ").trim();
   return `已恢复 · ${titleSource.slice(0, 20)}${titleSource.length > 20 ? "…" : ""}`;
+}
+
+function recoveredImageTitle(image: ImageBinding) {
+  return recoveredImageTitleFromPrompt(image.fact.prompt);
+}
+
+function recoveredTextTitle(text: TextBinding) {
+  const localTime = text.slot === "text1020" ? "10:20" : "10:27";
+  return `已恢复 · ${localTime} · ${text.fact.prompt.slice(0, 20)}`;
 }
 
 async function inspectRecoveryPersistence(input: {
@@ -896,43 +1040,57 @@ async function inspectRecoveryPersistence(input: {
       ),
     );
 
-  const textConversationId = input.text[0].conversation.id;
+  const textConversationIds = input.text.map(
+    (binding) => binding.conversationId,
+  );
   const imageConversationId = persistedIdForManagedUser({
     userId: input.userId,
     publicId: input.image.conversationPublicId,
   });
-  const latestText = [...input.text].sort(
-    (left, right) =>
-      right.fact.operation.createdAt.getTime() -
-      left.fact.operation.createdAt.getTime(),
-  )[0]!;
   const conversationRows = await input.db
     .select()
     .from(conversations)
     .where(
-      inArray(conversations.id, [textConversationId, imageConversationId]),
+      inArray(conversations.id, [...textConversationIds, imageConversationId]),
     );
-  const textConversation = conversationRows.find(
-    (row) => row.id === textConversationId,
-  );
   const imageConversation = conversationRows.find(
     (row) => row.id === imageConversationId,
   );
-  if (!textConversation) fail("TEXT_CONVERSATION_MISSING");
-  const textConversationExact =
-    textConversation.userId === input.userId &&
-    textConversation.projectAssignmentId === null &&
-    textConversation.apiCredentialId ===
-      latestText.fact.operation.apiCredentialId &&
-    textConversation.upstreamTaskId === latestText.fact.task.id &&
-    textConversation.previousResponseId === latestText.fact.task.id &&
-    textConversation.status ===
-      operationStatusToConversationStatus(latestText.fact.operation.status) &&
-    textConversation.lastKnownOutputLength ===
-      latestText.fact.expectedAssistantEventIds.length &&
-    epochSecond(textConversation.completedAt) ===
-      epochSecond(latestText.fact.operation.updatedAt) &&
-    textConversation.deletedAt === null;
+  let textConversationExact = true;
+  for (const binding of input.text) {
+    const row = conversationRows.find(
+      (candidate) => candidate.id === binding.conversationId,
+    );
+    if (!row) {
+      textConversationExact = false;
+      continue;
+    }
+    const recoveredIdentityExact =
+      row.title === recoveredTextTitle(binding) &&
+      row.taskUrl === null &&
+      sameJson(row.deletedMessageIds, []) &&
+      epochSecond(row.startedAt) ===
+        epochSecond(binding.fact.operation.createdAt) &&
+      epochSecond(row.createdAt) ===
+        epochSecond(eventTime(binding.fact.createEvent));
+    if (
+      row.userId !== input.userId ||
+      row.projectAssignmentId !== null ||
+      row.apiCredentialId !== binding.fact.operation.apiCredentialId ||
+      row.upstreamTaskId !== binding.fact.task.id ||
+      row.previousResponseId !== binding.fact.task.id ||
+      row.status !==
+        operationStatusToConversationStatus(binding.fact.operation.status) ||
+      row.lastKnownOutputLength !==
+        binding.fact.expectedAssistantEventIds.length ||
+      epochSecond(row.completedAt) !==
+        epochSecond(binding.fact.operation.updatedAt) ||
+      row.deletedAt !== null ||
+      !recoveredIdentityExact
+    ) {
+      fail(`${binding.slot.toUpperCase()}_CONVERSATION_IDEMPOTENCY_CONFLICT`);
+    }
+  }
   let imageConversationExact = false;
   if (imageConversation) {
     if (
@@ -969,7 +1127,7 @@ async function inspectRecoveryPersistence(input: {
     publicId: input.image.messagePublicId,
   });
   const userMessageIds = [
-    ...input.text.map((binding) => binding.message.id),
+    ...input.text.map((binding) => textBindingMessageId(input.userId, binding)),
     imageMessageId,
   ];
   const userRows = await input.db
@@ -990,15 +1148,19 @@ async function inspectRecoveryPersistence(input: {
     );
   let userMessagesExact = true;
   for (const binding of input.text) {
+    const expectedMessageId = textBindingMessageId(input.userId, binding);
     const row = userRows.find(
-      (candidate) => candidate.id === binding.message.id,
+      (candidate) => candidate.id === expectedMessageId,
     );
     const expectedTurnId = deterministicIncidentUuid(
       `turn:${binding.fact.operation.id}`,
     );
-    if (!row) fail(`${binding.slot.toUpperCase()}_MESSAGE_MISSING`);
+    if (!row) {
+      userMessagesExact = false;
+      continue;
+    }
     if (
-      row.conversationId !== binding.conversation.id ||
+      row.conversationId !== binding.conversationId ||
       row.userId !== input.userId ||
       row.role !== "user" ||
       row.deletedAt !== null
@@ -1008,14 +1170,12 @@ async function inspectRecoveryPersistence(input: {
     userMessagesExact &&=
       row.turnId === expectedTurnId &&
       row.content === binding.fact.prompt &&
-      stripFrontMindGeneralChatOperationContract(row.content) === row.content;
+      stripFrontMindGeneralChatOperationContract(row.content) === row.content &&
+      textIncidentRecoveryMetadataMatches(row.metadata, binding);
   }
   const imageUserMessage = userRows.find((row) => row.id === imageMessageId);
   if (imageUserMessage) {
-    const expectedMetadata = {
-      modelName: input.image.fact.operation.publicProfile,
-      incidentRecovery: GENERAL_CHAT_INCIDENT_REPAIR_ID,
-    };
+    const expectedMetadata = imageIncidentRecoveryMetadata(input.image);
     if (
       imageUserMessage.conversationId !== imageConversationId ||
       imageUserMessage.userId !== input.userId ||
@@ -1154,12 +1314,18 @@ async function inspectRecoveryPersistence(input: {
     perSlot.text1027 ===
       GENERAL_CHAT_INCIDENT_WINDOWS.text1027.providerAssistantMessages &&
     artifactLinkCount === 1;
-  const textSequenceCanonical = await conversationSequenceIsCanonical({
-    db: input.db,
-    conversationId: textConversationId,
-    text: input.text,
-    image: input.image,
-  });
+  const textSequenceCanonical = (
+    await Promise.all(
+      textConversationIds.map((conversationId) =>
+        conversationSequenceIsCanonical({
+          db: input.db,
+          conversationId,
+          text: input.text,
+          image: input.image,
+        }),
+      ),
+    )
+  ).every(Boolean);
   const imageSequenceCanonical = imageConversation
     ? await conversationSequenceIsCanonical({
         db: input.db,
@@ -1236,13 +1402,15 @@ function incidentState(input: {
     operations: operationState,
     textBindings: input.text.map((binding) => ({
       slot: binding.slot,
-      conversationIdSha256: sha256(binding.conversation.id),
-      messageIdSha256: sha256(binding.message.id),
-      messageContentSha256: sha256(binding.message.content),
-      currentTaskIdSha256: binding.conversation.upstreamTaskId
+      conversationIdSha256: sha256(binding.conversationId),
+      messageIdSha256: sha256(textBindingMessageId(input.userId, binding)),
+      messageContentSha256: sha256(binding.fact.prompt),
+      messageSource: binding.messageSource,
+      conversationEvidence: binding.conversationEvidence,
+      currentTaskIdSha256: binding.conversation?.upstreamTaskId
         ? sha256(binding.conversation.upstreamTaskId)
         : null,
-      currentPreviousResponseIdSha256: binding.conversation.previousResponseId
+      currentPreviousResponseIdSha256: binding.conversation?.previousResponseId
         ? sha256(binding.conversation.previousResponseId)
         : null,
     })),
@@ -1289,6 +1457,10 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
       return false;
     }
     const taskIds = operationRows.map((row) => row.task.id);
+    const cachedIncidentEvents = await db
+      .select()
+      .from(agentEvents)
+      .where(inArray(agentEvents.taskId, taskIds));
     const incidentTurnIds = operationRows.map((row) =>
       deterministicIncidentUuid(`turn:${row.operation.id}`),
     );
@@ -1312,6 +1484,14 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
             (value): value is string => typeof value === "string",
           )
         : [];
+      const createEventTimestampMs = metadata.providerCreateEventTimestampMs;
+      const cachedCreateEvents = cachedIncidentEvents.filter(
+        (event) =>
+          event.taskId === row.task.id &&
+          event.providerEventId === metadata.providerCreateEventId &&
+          event.eventType === "user_message" &&
+          event.normalizedPayload?.kind === "provider_event",
+      );
       if (
         !turn ||
         turn.userId !== userId ||
@@ -1330,6 +1510,12 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
         metadata.agentTaskId !== row.task.id ||
         metadata.operationId !== row.operation.id ||
         metadata.userMessageId !== turn.clientRequestId ||
+        typeof createEventTimestampMs !== "number" ||
+        !Number.isSafeInteger(createEventTimestampMs) ||
+        cachedCreateEvents.length !== 1 ||
+        eventTime({
+          timestamp: Number(cachedCreateEvents[0]!.providerTimestampMs),
+        } as ManusV2MessageEvent).getTime() !== createEventTimestampMs ||
         new Set(watermark).size !== watermark.length ||
         watermark.length !==
           GENERAL_CHAT_INCIDENT_WINDOWS[slot].providerAssistantMessages
@@ -1348,8 +1534,28 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
       userId,
       publicId: imageConversationPublicId,
     });
+    const text1020ConversationId = persistedIdForManagedUser({
+      userId,
+      publicId: recoveredTextConversationPublicId({
+        operationId: operationRows[0]!.operation.id,
+        localTaskId: operationRows[0]!.task.id,
+      }),
+    });
+    const text1027ConversationId = persistedIdForManagedUser({
+      userId,
+      publicId: recoveredTextConversationPublicId({
+        operationId: operationRows[2]!.operation.id,
+        localTaskId: operationRows[2]!.task.id,
+      }),
+    });
     if (
-      text1020.conversationId !== text1027.conversationId ||
+      text1020.conversationId !== text1020ConversationId ||
+      text1027.conversationId !== text1027ConversationId ||
+      new Set([
+        text1020ConversationId,
+        text1027ConversationId,
+        imageConversationId,
+      ]).size !== 3 ||
       image1022.conversationId !== imageConversationId ||
       image1022.clientRequestId !==
         recoveredImageMessagePublicId(operationRows[1]!.task.id) ||
@@ -1362,30 +1568,39 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
       .from(conversations)
       .where(
         inArray(conversations.id, [
-          text1020.conversationId,
+          text1020ConversationId,
+          text1027ConversationId,
           imageConversationId,
         ]),
       );
-    if (conversationRows.length !== 2) return false;
-    const latestText = operationRows[2]!;
-    const textConversation = conversationRows.find(
-      (row) => row.id === text1020.conversationId,
+    if (conversationRows.length !== 3) return false;
+    const text1020Conversation = conversationRows.find(
+      (row) => row.id === text1020ConversationId,
+    );
+    const text1027Conversation = conversationRows.find(
+      (row) => row.id === text1027ConversationId,
     );
     const imageConversation = conversationRows.find(
       (row) => row.id === imageConversationId,
     );
     if (
-      !textConversation ||
+      !text1020Conversation ||
+      !text1027Conversation ||
       !imageConversation ||
-      textConversation.userId !== userId ||
+      text1020Conversation.userId !== userId ||
+      text1027Conversation.userId !== userId ||
       imageConversation.userId !== userId ||
-      textConversation.projectAssignmentId !== null ||
+      text1020Conversation.projectAssignmentId !== null ||
+      text1027Conversation.projectAssignmentId !== null ||
       imageConversation.projectAssignmentId !== null ||
-      textConversation.upstreamTaskId !== latestText.task.id ||
-      textConversation.previousResponseId !== latestText.task.id ||
+      text1020Conversation.upstreamTaskId !== operationRows[0]!.task.id ||
+      text1020Conversation.previousResponseId !== operationRows[0]!.task.id ||
+      text1027Conversation.upstreamTaskId !== operationRows[2]!.task.id ||
+      text1027Conversation.previousResponseId !== operationRows[2]!.task.id ||
       imageConversation.upstreamTaskId !== operationRows[1]!.task.id ||
       imageConversation.previousResponseId !== operationRows[1]!.task.id ||
-      textConversation.deletedAt !== null ||
+      text1020Conversation.deletedAt !== null ||
+      text1027Conversation.deletedAt !== null ||
       imageConversation.deletedAt !== null
     ) {
       return false;
@@ -1404,6 +1619,12 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
     if (userRows.length !== 3) return false;
     for (const [index, turn] of targetTurns.entries()) {
       const operation = operationRows[index]!.operation;
+      const task = operationRows[index]!.task;
+      const conversationRow = [
+        text1020Conversation,
+        imageConversation,
+        text1027Conversation,
+      ][index]!;
       const messageRow: Message | undefined = userRows.find(
         (candidate) =>
           candidate.id ===
@@ -1416,7 +1637,34 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
         userId,
         persistedId: turn.conversationId,
       });
-      const localAssetIds = sortedUnique(turn.attachmentFileIds);
+      const metadata = messageRow?.metadata ?? {};
+      const deterministicMessageIdMatches =
+        index === 1
+          ? turn.clientRequestId === recoveredImageMessagePublicId(task.id)
+          : turn.clientRequestId ===
+            recoveredTextMessagePublicId({
+              operationId: operation.id,
+              localTaskId: task.id,
+            });
+      const recoveredMessageIdentity =
+        deterministicMessageIdMatches &&
+        metadata.incidentRecovery === GENERAL_CHAT_INCIDENT_REPAIR_ID &&
+        metadata.incidentRecoveryOperationIdSha256 === sha256(operation.id) &&
+        metadata.incidentRecoveryTaskIdSha256 === sha256(task.id) &&
+        metadata.incidentRecoveryRequestHash === operation.requestHash &&
+        metadata.incidentRecoveryIdempotencyKeyHash ===
+          operation.idempotencyKeyHash &&
+        metadata.incidentRecoveryPromptSha256 ===
+          sha256(messageRow?.content ?? "");
+      const createEventTimestampMs = Number(
+        turn.metadata.providerCreateEventTimestampMs,
+      );
+      const expectedTitle =
+        index === 1
+          ? recoveredImageTitleFromPrompt(messageRow?.content ?? "")
+          : `已恢复 · ${index === 0 ? "10:20" : "10:27"} · ${(
+              messageRow?.content ?? ""
+            ).slice(0, 20)}`;
       if (
         !messageRow ||
         messageRow.turnId !== turn.id ||
@@ -1427,14 +1675,30 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
         stripFrontMindGeneralChatOperationContract(messageRow.content) !==
           messageRow.content ||
         sha256(messageRow.content) !== turn.metadata.promptSha256 ||
-        sha256(`${userId}\0${turn.clientRequestId}`) !==
-          operation.idempotencyKeyHash ||
-        requestHash({
-          conversationId: conversationPublicId,
-          prompt: messageRow.content,
-          localAssetIds,
-          modelProfile: operation.publicProfile,
-        }) !== operation.requestHash ||
+        metadata.modelName !== operation.publicProfile ||
+        !recoveredMessageIdentity ||
+        !Number.isSafeInteger(createEventTimestampMs) ||
+        epochSecond(messageRow.sentAt) !==
+          epochSecond(new Date(createEventTimestampMs)) ||
+        epochSecond(messageRow.createdAt) !==
+          epochSecond(new Date(createEventTimestampMs)) ||
+        conversationRow.apiCredentialId !== operation.apiCredentialId ||
+        conversationRow.title !== expectedTitle ||
+        conversationRow.status !==
+          operationStatusToConversationStatus(operation.status) ||
+        conversationRow.taskUrl !== null ||
+        conversationRow.lastKnownOutputLength !==
+          GENERAL_CHAT_INCIDENT_WINDOWS[slots[index]!]
+            .providerAssistantMessages ||
+        !sameJson(conversationRow.deletedMessageIds, []) ||
+        epochSecond(conversationRow.startedAt) !==
+          epochSecond(operation.createdAt) ||
+        epochSecond(conversationRow.completedAt) !==
+          epochSecond(operation.updatedAt) ||
+        epochSecond(conversationRow.createdAt) !==
+          epochSecond(new Date(createEventTimestampMs)) ||
+        epochSecond(conversationRow.updatedAt) !==
+          epochSecond(operation.updatedAt) ||
         turn.operationKey !==
           generalChatTurnOperationKey({
             userId,
@@ -1511,15 +1775,29 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
     const attachmentRows = await db
       .select()
       .from(attachments)
-      .where(eq(attachments.id, imageAttachmentId));
+      .where(
+        and(
+          inArray(attachments.messageId, userMessageIds),
+          isNull(attachments.deletedAt),
+        ),
+      );
+    const imageAttachment = attachmentRows.find(
+      (attachment) => attachment.id === imageAttachmentId,
+    );
     if (
       attachmentRows.length !== 1 ||
-      attachmentRows[0]!.userId !== userId ||
-      attachmentRows[0]!.conversationId !== imageConversationId ||
-      attachmentRows[0]!.messageId !== imageMessageId ||
-      attachmentRows[0]!.kind !== "image" ||
-      attachmentRows[0]!.upstreamFileId !== image1022.attachmentFileIds[0] ||
-      attachmentRows[0]!.deletedAt !== null
+      !imageAttachment ||
+      imageAttachment.userId !== userId ||
+      imageAttachment.conversationId !== imageConversationId ||
+      imageAttachment.messageId !== imageMessageId ||
+      imageAttachment.apiCredentialId !==
+        operationRows[1]!.operation.apiCredentialId ||
+      imageAttachment.kind !== "image" ||
+      imageAttachment.fileName !== localAsset.filename ||
+      imageAttachment.mimeType !== localAsset.mimeType ||
+      imageAttachment.sizeBytes !== localAsset.sizeBytes ||
+      imageAttachment.upstreamFileId !== image1022.attachmentFileIds[0] ||
+      imageAttachment.deletedAt !== null
     ) {
       return false;
     }
@@ -1537,10 +1815,7 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
         }),
       );
     });
-    const cachedAssistantEvents = await db
-      .select()
-      .from(agentEvents)
-      .where(inArray(agentEvents.taskId, taskIds));
+    const cachedAssistantEvents = cachedIncidentEvents;
     const assistantRows = await db
       .select()
       .from(messages)
@@ -1571,23 +1846,45 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
         !Array.isArray(row.metadata.generalChat)
           ? (row.metadata.generalChat as Record<string, unknown>)
           : null;
+      const expectedContent = String(cached[0]?.normalizedPayload?.text ?? "");
+      const expectedSentAt = cached[0]
+        ? eventTime({
+            timestamp: Number(cached[0].providerTimestampMs),
+          } as ManusV2MessageEvent)
+        : null;
+      const projectionMatches = Boolean(
+        row &&
+          cached[0] &&
+          expectedSentAt &&
+          generalChatIncidentAssistantProjectionMatches({
+            actual: {
+              content: row.content,
+              sentAt: row.sentAt,
+              deleted: row.deletedAt !== null,
+              conversationId: row.conversationId,
+              turnId: row.turnId,
+              userId: row.userId,
+              role: row.role,
+              upstreamOutputId: row.metadata?.upstreamOutputId,
+              generalChat,
+            },
+            expected: {
+              content: expectedContent,
+              sentAt: expectedSentAt,
+              conversationId: expected.turn.conversationId,
+              turnId: expected.turn.id,
+              userId,
+              upstreamOutputId: cached[0].id,
+              taskId: expected.taskId,
+              providerEventId: expected.providerEventId,
+            },
+          }),
+      );
       if (
         !row ||
-        row.conversationId !== expected.turn.conversationId ||
-        row.turnId !== expected.turn.id ||
-        row.userId !== userId ||
-        row.role !== "assistant" ||
-        row.deletedAt !== null ||
         cached.length !== 1 ||
-        row.metadata?.upstreamOutputId !== cached[0]!.id ||
-        stripFrontMindGeneralChatOperationContract(row.content) !==
-          row.content ||
-        generalChat?.schemaVersion !== 1 ||
-        generalChat.kind !== "assistant_projection" ||
-        generalChat.turnId !== expected.turn.id ||
-        generalChat.agentTaskId !== expected.taskId ||
-        generalChat.providerEventId !== expected.providerEventId ||
-        generalChat.serverOwned !== true
+        !projectionMatches ||
+        stripFrontMindGeneralChatOperationContract(row.content) !== row.content
       ) {
         return false;
       }
@@ -1601,19 +1898,32 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
       .from(messages)
       .where(
         inArray(messages.conversationId, [
-          text1020.conversationId,
+          text1020ConversationId,
+          text1027ConversationId,
           imageConversationId,
         ]),
       )
       .orderBy(asc(messages.conversationId), asc(messages.sequence));
     for (const conversationId of [
-      text1020.conversationId,
+      text1020ConversationId,
+      text1027ConversationId,
       imageConversationId,
     ]) {
       const rows = allConversationMessages.filter(
         (row) => row.conversationId === conversationId,
       );
-      if (rows.some((row, index) => row.sequence !== index)) return false;
+      const expectedCount =
+        conversationId === text1020ConversationId
+          ? 3
+          : conversationId === text1027ConversationId
+            ? 2
+            : 3;
+      if (
+        rows.length !== expectedCount ||
+        rows.some((row, index) => row.sequence !== index)
+      ) {
+        return false;
+      }
     }
     const artifactRows = await db
       .select()
@@ -1639,14 +1949,10 @@ export async function isGeneralChatIncidentRepairLocallyComplete(
     const artifactUrl = `/api/frontmind/v2/artifacts/${encodeURIComponent(
       artifactRows[0]!.id,
     )}/content`;
-    const artifactLinks = assistantRows.reduce((count, row) => {
-      const inlineImages = Array.isArray(row.metadata?.inlineImages)
-        ? row.metadata.inlineImages
-        : [];
-      return (
-        count + inlineImages.filter((item) => item?.src === artifactUrl).length
-      );
-    }, 0);
+    const artifactLinks = countGeneralChatIncidentArtifactReferences(
+      assistantRows.map((row) => row.metadata),
+      artifactUrl,
+    );
     return artifactLinks === 1;
   } catch {
     return false;
@@ -1709,8 +2015,16 @@ export async function inspectGeneralChatIncidentRepair(
     fact: facts[2]!,
     slot: "text1027",
   });
-  if (text1020.conversation.id !== text1027.conversation.id) {
-    fail("TEXT_CONVERSATION_MISMATCH");
+  const recoveredConversationIds = new Set([
+    text1020.conversationId,
+    text1027.conversationId,
+    persistedIdForManagedUser({
+      userId,
+      publicId: image1022.conversationPublicId,
+    }),
+  ]);
+  if (recoveredConversationIds.size !== 3) {
+    fail("RECOVERED_CONVERSATION_ID_CONFLICT");
   }
   const persistence = await inspectRecoveryPersistence({
     db,
@@ -1742,7 +2056,7 @@ export async function inspectGeneralChatIncidentRepair(
     counts: {
       operations: 3,
       tasks: 3,
-      conversations: 2,
+      conversations: 3,
       turns: 3,
       userMessages: 3,
       assistantMessages: expectedAssistantMessages,
@@ -1792,6 +2106,10 @@ function turnInsert(input: {
       attachmentManifestHash: requestHash(localAssetIds),
       providerAttachmentFileIds: input.fact.providerAttachmentFileIds,
       providerEventWatermark: input.fact.expectedAssistantEventIds,
+      providerCreateEventId: input.fact.createEvent.id,
+      providerCreateEventTimestampMs: eventTime(
+        input.fact.createEvent,
+      ).getTime(),
       incidentRecovery: GENERAL_CHAT_INCIDENT_REPAIR_ID,
       sequenceFinalized: input.sequenceFinalized ?? false,
     },
@@ -1840,55 +2158,152 @@ async function insertOrVerifyTurn(
 
 async function applyBindings(db: Db, facts: GeneralChatIncidentRepairFacts) {
   await db.transaction(async (tx) => {
-    const textConversationId = facts.text[0].conversation.id;
-    await tx
-      .select({ id: conversations.id })
-      .from(conversations)
-      .where(eq(conversations.id, textConversationId))
-      .limit(1)
-      .for("update");
     for (const binding of facts.text) {
+      const existingConversation = (
+        await tx
+          .select()
+          .from(conversations)
+          .where(eq(conversations.id, binding.conversationId))
+          .limit(1)
+          .for("update")
+      )[0] as Conversation | undefined;
+      if (!existingConversation) {
+        const expectedRecoveredPublicId = recoveredTextConversationPublicId({
+          operationId: binding.fact.operation.id,
+          localTaskId: binding.fact.task.id,
+        });
+        if (
+          binding.conversation !== null ||
+          binding.conversationPublicId !== expectedRecoveredPublicId
+        ) {
+          fail(`${binding.slot.toUpperCase()}_CONVERSATION_DISAPPEARED`);
+        }
+        await tx.insert(conversations).values({
+          id: binding.conversationId,
+          userId: facts.userId,
+          apiCredentialId: binding.fact.operation.apiCredentialId,
+          projectAssignmentId: null,
+          title: recoveredTextTitle(binding),
+          status: operationStatusToConversationStatus(
+            binding.fact.operation.status,
+          ),
+          upstreamTaskId: binding.fact.task.id,
+          previousResponseId: binding.fact.task.id,
+          lastKnownOutputLength: binding.fact.expectedAssistantEventIds.length,
+          version: 1,
+          startedAt: binding.fact.operation.createdAt,
+          completedAt: binding.fact.operation.updatedAt,
+          createdAt: eventTime(binding.fact.createEvent),
+          updatedAt: binding.fact.operation.updatedAt,
+        });
+      } else if (
+        existingConversation.userId !== facts.userId ||
+        existingConversation.projectAssignmentId !== null ||
+        existingConversation.deletedAt !== null ||
+        existingConversation.title !== recoveredTextTitle(binding) ||
+        (existingConversation.upstreamTaskId !== null &&
+          existingConversation.upstreamTaskId !== binding.fact.task.id)
+      ) {
+        fail(`${binding.slot.toUpperCase()}_CONVERSATION_IDEMPOTENCY_CONFLICT`);
+      }
       const turn = turnInsert({
         userId: facts.userId,
-        conversationId: binding.conversation.id,
+        conversationId: binding.conversationId,
         conversationPublicId: binding.conversationPublicId,
         clientRequestId: binding.messagePublicId,
         fact: binding.fact,
         localAssetIds: [],
       });
       const turnId = await insertOrVerifyTurn(tx, turn);
-      await tx
-        .update(messages)
-        .set({ turnId, content: binding.fact.prompt })
-        .where(
-          and(
-            eq(messages.id, binding.message.id),
-            eq(messages.conversationId, binding.conversation.id),
-            eq(messages.userId, facts.userId),
-            eq(messages.role, "user"),
-          ),
-        );
-    }
-    const latestText = [...facts.text].sort(
-      (left, right) =>
-        right.fact.operation.createdAt.getTime() -
-        left.fact.operation.createdAt.getTime(),
-    )[0]!;
-    await tx
-      .update(conversations)
-      .set({
-        apiCredentialId: latestText.fact.operation.apiCredentialId,
-        upstreamTaskId: latestText.fact.task.id,
-        previousResponseId: latestText.fact.task.id,
+      const messageId = textBindingMessageId(facts.userId, binding);
+      const existingTextMessages = (await tx
+        .select()
+        .from(messages)
+        .where(eq(messages.conversationId, binding.conversationId))
+        .for("update")) as Message[];
+      const existing = existingTextMessages.find(
+        (message) => message.id === messageId,
+      );
+      const metadata = {
+        ...(existing?.metadata ?? {}),
+        ...textIncidentRecoveryMetadata(binding),
+      };
+      if (!existing) {
+        if (binding.message !== null || binding.messageSource !== "recovered") {
+          fail(`${binding.slot.toUpperCase()}_MESSAGE_DISAPPEARED`);
+        }
+        const nextTextSequence =
+          existingTextMessages.reduce(
+            (maximum, message) => Math.max(maximum, message.sequence),
+            -1,
+          ) + 1;
+        if (
+          !Number.isSafeInteger(nextTextSequence) ||
+          nextTextSequence > 2_147_483_647
+        ) {
+          fail("TEXT_MESSAGE_SEQUENCE_INVALID");
+        }
+        await tx.insert(messages).values({
+          id: messageId,
+          conversationId: binding.conversationId,
+          turnId,
+          userId: facts.userId,
+          role: "user",
+          content: binding.fact.prompt,
+          sequence: nextTextSequence,
+          metadata,
+          sentAt: eventTime(binding.fact.createEvent),
+          createdAt: eventTime(binding.fact.createEvent),
+        });
+      } else if (
+        existing.conversationId !== binding.conversationId ||
+        existing.userId !== facts.userId ||
+        existing.role !== "user" ||
+        existing.deletedAt !== null ||
+        stripFrontMindGeneralChatOperationContract(existing.content).trim() !==
+          binding.fact.prompt
+      ) {
+        fail(`${binding.slot.toUpperCase()}_MESSAGE_IDENTITY_CONFLICT`);
+      } else {
+        await tx
+          .update(messages)
+          .set({ turnId, content: binding.fact.prompt, metadata })
+          .where(
+            and(
+              eq(messages.id, messageId),
+              eq(messages.conversationId, binding.conversationId),
+              eq(messages.userId, facts.userId),
+              eq(messages.role, "user"),
+            ),
+          );
+      }
+      const expectedSettlement = {
+        apiCredentialId: binding.fact.operation.apiCredentialId,
+        upstreamTaskId: binding.fact.task.id,
+        previousResponseId: binding.fact.task.id,
         status: operationStatusToConversationStatus(
-          latestText.fact.operation.status,
+          binding.fact.operation.status,
         ),
-        lastKnownOutputLength: latestText.fact.expectedAssistantEventIds.length,
-        completedAt: latestText.fact.operation.updatedAt,
-        updatedAt: latestText.fact.operation.updatedAt,
-        version: sql`${conversations.version} + 1`,
-      })
-      .where(eq(conversations.id, textConversationId));
+        lastKnownOutputLength: binding.fact.expectedAssistantEventIds.length,
+        completedAt: binding.fact.operation.updatedAt,
+        updatedAt: binding.fact.operation.updatedAt,
+      };
+      if (
+        existingConversation &&
+        generalChatIncidentConversationNeedsSettlement({
+          actual: existingConversation,
+          expected: expectedSettlement,
+        })
+      ) {
+        await tx
+          .update(conversations)
+          .set({
+            ...expectedSettlement,
+            version: sql`${conversations.version} + 1`,
+          })
+          .where(eq(conversations.id, binding.conversationId));
+      }
+    }
 
     const image = facts.image;
     const imageConversationId = persistedIdForManagedUser({
@@ -1956,8 +2371,7 @@ async function applyBindings(db: Db, facts: GeneralChatIncidentRepairFacts) {
         content: image.fact.prompt,
         sequence: 0,
         metadata: {
-          modelName: image.fact.operation.publicProfile,
-          incidentRecovery: GENERAL_CHAT_INCIDENT_REPAIR_ID,
+          ...imageIncidentRecoveryMetadata(image),
         },
         sentAt: eventTime(image.fact.createEvent),
         createdAt: eventTime(image.fact.createEvent),
@@ -2008,23 +2422,38 @@ async function applyBindings(db: Db, facts: GeneralChatIncidentRepairFacts) {
     const imageTurnId = await insertOrVerifyTurn(tx, imageTurn);
     await tx
       .update(messages)
-      .set({ turnId: imageTurnId })
-      .where(eq(messages.id, imageMessageId));
-    await tx
-      .update(conversations)
       .set({
-        apiCredentialId: image.fact.operation.apiCredentialId,
-        upstreamTaskId: image.fact.task.id,
-        previousResponseId: image.fact.task.id,
-        status: operationStatusToConversationStatus(
-          image.fact.operation.status,
-        ),
-        lastKnownOutputLength: image.fact.expectedAssistantEventIds.length,
-        completedAt: image.fact.operation.updatedAt,
-        updatedAt: image.fact.operation.updatedAt,
-        version: sql`${conversations.version} + 1`,
+        turnId: imageTurnId,
+        metadata: {
+          ...(existingMessage?.metadata ?? {}),
+          ...imageIncidentRecoveryMetadata(image),
+        },
       })
-      .where(eq(conversations.id, imageConversationId));
+      .where(eq(messages.id, imageMessageId));
+    const expectedImageSettlement = {
+      apiCredentialId: image.fact.operation.apiCredentialId,
+      upstreamTaskId: image.fact.task.id,
+      previousResponseId: image.fact.task.id,
+      status: operationStatusToConversationStatus(image.fact.operation.status),
+      lastKnownOutputLength: image.fact.expectedAssistantEventIds.length,
+      completedAt: image.fact.operation.updatedAt,
+      updatedAt: image.fact.operation.updatedAt,
+    };
+    if (
+      existingConversation &&
+      generalChatIncidentConversationNeedsSettlement({
+        actual: existingConversation,
+        expected: expectedImageSettlement,
+      })
+    ) {
+      await tx
+        .update(conversations)
+        .set({
+          ...expectedImageSettlement,
+          version: sql`${conversations.version} + 1`,
+        })
+        .where(eq(conversations.id, imageConversationId));
+    }
   });
 }
 

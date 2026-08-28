@@ -154,6 +154,121 @@ export type GeneralChatTerminal1547TurnSelection = {
   events: ManusV2MessageEvent[];
 };
 
+export type GeneralChatTerminal1547LegacyOutputBinding = {
+  messageId: string;
+  localEventId: string;
+  providerEventId: string;
+};
+
+/**
+ * Legacy browser snapshots predate `metadata.generalChat`. Their durable
+ * `upstreamOutputId` still points at exactly one agent_events row, which is a
+ * stronger identity than content or timestamp heuristics. Require a complete
+ * bijection with the Provider events selected for the current turn.
+ */
+export function bindGeneralChatTerminal1547LegacyOutputs(input: {
+  messages: readonly {
+    id: string;
+    metadata: Record<string, unknown> | null;
+  }[];
+  agentEvents: readonly {
+    id: string;
+    taskId: string;
+    providerEventId: string;
+    eventType: string;
+    normalizedPayload: Record<string, unknown>;
+  }[];
+  localTaskId: string;
+  currentTurnOutputEventIds: readonly string[];
+}): GeneralChatTerminal1547LegacyOutputBinding[] {
+  if (input.messages.length === 0) {
+    throw new Error("GENERAL_CHAT_TERMINAL_1547_OUTPUT_MISSING");
+  }
+  const eventsByLocalId = new Map(
+    input.agentEvents.map((event) => [event.id, event]),
+  );
+  if (eventsByLocalId.size !== input.agentEvents.length) {
+    throw new Error("GENERAL_CHAT_TERMINAL_1547_OUTPUT_EVENT_NOT_UNIQUE");
+  }
+  const seenLocalEventIds = new Set<string>();
+  const bindings = input.messages.map((message) => {
+    const localEventId = message.metadata?.upstreamOutputId;
+    if (
+      typeof localEventId !== "string" ||
+      !localEventId ||
+      seenLocalEventIds.has(localEventId)
+    ) {
+      throw new Error("GENERAL_CHAT_TERMINAL_1547_OUTPUT_EVENT_NOT_UNIQUE");
+    }
+    seenLocalEventIds.add(localEventId);
+    const event = eventsByLocalId.get(localEventId);
+    if (
+      !event ||
+      event.taskId !== input.localTaskId ||
+      event.eventType !== "assistant_message" ||
+      event.normalizedPayload.kind !== "provider_event"
+    ) {
+      throw new Error("GENERAL_CHAT_TERMINAL_1547_OUTPUT_EVENT_MISMATCH");
+    }
+    return {
+      messageId: message.id,
+      localEventId,
+      providerEventId: event.providerEventId,
+    };
+  });
+  const expected = [...new Set(input.currentTurnOutputEventIds)].sort();
+  const actual = [
+    ...new Set(bindings.map((item) => item.providerEventId)),
+  ].sort();
+  if (
+    expected.length !== input.currentTurnOutputEventIds.length ||
+    actual.length !== bindings.length ||
+    expected.length !== actual.length ||
+    expected.some((eventId, index) => eventId !== actual[index])
+  ) {
+    throw new Error("GENERAL_CHAT_TERMINAL_1547_OUTPUT_EVENT_MISMATCH");
+  }
+  return bindings;
+}
+
+export function generalChatTerminal1547ProjectionMetadata(input: {
+  metadata: Record<string, unknown> | null;
+  turnId: string;
+  localTaskId: string;
+  localEventId: string;
+  providerEventId: string;
+}) {
+  return {
+    ...(input.metadata ?? {}),
+    upstreamOutputId: input.localEventId,
+    generalChat: {
+      schemaVersion: 1,
+      kind: "assistant_projection",
+      turnId: input.turnId,
+      agentTaskId: input.localTaskId,
+      providerEventId: input.providerEventId,
+      serverOwned: true,
+    },
+  } as const;
+}
+
+/**
+ * The command-level expected hash closes preview-to-command drift. This
+ * second fence closes command-inspect-to-transaction drift by comparing the
+ * exact local rows again after they have been locked and before any write.
+ */
+export function assertGeneralChatTerminal1547MutationFence(
+  expected: unknown,
+  locked: unknown,
+) {
+  if (
+    generalChatTerminal1547StateHash(expected) !==
+    generalChatTerminal1547StateHash(locked)
+  ) {
+    throw new Error("GENERAL_CHAT_TERMINAL_1547_LOCAL_STATE_CHANGED");
+  }
+}
+
 /**
  * Bind exactly one Provider user event to the persisted turn. Watermark ids
  * are the immutable pre-send boundary, while prompt/attachment hashes bind
@@ -240,7 +355,9 @@ export function classifyGeneralChatTerminal1547Outcome(input: {
     }
     if (errorType === null && event.type === "error_message") {
       const error = record(event.error_message);
-      errorType = boundedString(error?.error_type ?? error?.type ?? error?.code);
+      errorType = boundedString(
+        error?.error_type ?? error?.type ?? error?.code,
+      );
     }
   }
   const userStop = input.currentTurnEvents.some(
@@ -249,7 +366,8 @@ export function classifyGeneralChatTerminal1547Outcome(input: {
   const outputEventIds = input.currentTurnEvents
     .filter((event) => event.type === "assistant_message")
     .map((event) => event.id);
-  const detailStatus = boundedString(input.detailStatus, 64)?.toLowerCase() ?? null;
+  const detailStatus =
+    boundedString(input.detailStatus, 64)?.toLowerCase() ?? null;
   let kind: GeneralChatTerminal1547Outcome["kind"];
   if (userStop) {
     kind = "cancelled";
@@ -272,7 +390,10 @@ export function classifyGeneralChatTerminal1547Outcome(input: {
   };
 }
 
-export async function readGeneralChatTerminal1547ProviderEvidence<TDetail, TEvents>(
+export async function readGeneralChatTerminal1547ProviderEvidence<
+  TDetail,
+  TEvents,
+>(
   client: {
     taskDetail(taskId: string): Promise<TDetail>;
     listAllMessages(input: {
@@ -316,6 +437,13 @@ export async function runStateBoundGeneralChatTerminal1547Repair<
   return { before, applied: true, after };
 }
 
+function generalChatIncidentStepFailureCode(error: unknown) {
+  const raw = error instanceof Error ? error.message : "";
+  return /^GENERAL_CHAT_(?:TERMINAL_1547|INCIDENT)_[A-Z0-9_]+$/u.test(raw)
+    ? generalChatTerminal1547FailureCode(error)
+    : "UNKNOWN";
+}
+
 export async function runOrderedGeneralChatIncidentRepairSteps(
   steps: readonly {
     incident: string;
@@ -324,16 +452,28 @@ export async function runOrderedGeneralChatIncidentRepairSteps(
     apply(expectedStateHash: string): Promise<{ applied: boolean }>;
   }[],
 ) {
-  const results: Array<{ incident: string; applied: boolean }> = [];
+  const results: Array<{
+    incident: string;
+    applied: boolean;
+    errorCode: string | null;
+  }> = [];
   for (const step of steps) {
     let applied = false;
-    if (!(await step.isLocallyComplete())) {
-      const preview = await step.preview();
-      if (!preview.complete) {
-        applied = (await step.apply(preview.stateHash)).applied;
+    try {
+      if (!(await step.isLocallyComplete())) {
+        const preview = await step.preview();
+        if (!preview.complete) {
+          applied = (await step.apply(preview.stateHash)).applied;
+        }
       }
+      results.push({ incident: step.incident, applied, errorCode: null });
+    } catch (error) {
+      results.push({
+        incident: step.incident,
+        applied: false,
+        errorCode: generalChatIncidentStepFailureCode(error),
+      });
     }
-    results.push({ incident: step.incident, applied });
   }
   return results;
 }

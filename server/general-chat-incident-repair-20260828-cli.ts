@@ -169,9 +169,7 @@ export async function runGeneralChatIncidentRepairCli(
     connection = await acquireLock();
     if (terminal1547) {
       const result = await executeGeneralChatTerminal1547Repair(
-        command as ReturnType<
-          typeof parseGeneralChatTerminal1547RepairCommand
-        >,
+        command as ReturnType<typeof parseGeneralChatTerminal1547RepairCommand>,
       );
       const lockReleased = await releaseLock(connection);
       connection = null;
@@ -334,6 +332,9 @@ async function runAutomaticAttempt() {
     ]);
     for (const result of results) {
       console.info("[GeneralChatIncidentRepair] incident_complete", result);
+    }
+    if (results.some((result) => result.errorCode !== null)) {
+      fail("STEP_RETRY_REQUIRED");
     }
   } finally {
     const released = await releaseLock(connection);
