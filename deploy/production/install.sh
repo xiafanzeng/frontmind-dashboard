@@ -34,6 +34,15 @@ docker compose version >/dev/null || die "DOCKER_COMPOSE_V2_REQUIRED"
 [[ $(grep -Fxc -- "# frontmind-production-controller-version: ${CONTROLLER_VERSION}" \
   "$SCRIPT_DIR/controller/frontmind-deploy-controller" || true) == 1 ]] \
   || die "PRODUCTION_CONTROLLER_TEMPLATE_VERSION_REJECTED"
+grep -Fq -- 'seed_static_template_catalog' \
+  "$SCRIPT_DIR/controller/frontmind-deploy-controller" \
+  && grep -Fq -- '/app/dist/seed-static-template-catalog.js' \
+    "$SCRIPT_DIR/controller/frontmind-deploy-controller" \
+  && grep -Fq -- 'STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS=1800' \
+    "$SCRIPT_DIR/controller/frontmind-deploy-controller" \
+  && grep -Fq -- 'PRODUCTION_STATIC_TEMPLATE_CATALOG_SEED_FAILED' \
+    "$SCRIPT_DIR/controller/frontmind-deploy-controller" \
+  || die "PRODUCTION_CONTROLLER_TEMPLATE_CATALOG_SEED_REJECTED"
 
 dashboard_public_key="$(read_deploy_public_key "$dashboard_public_key_file")" \
   || die "DEPLOY_PUBLIC_KEY_REJECTED:${dashboard_public_key_file}"

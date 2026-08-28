@@ -198,6 +198,16 @@ describe("production controller atomic updater", () => {
     expect(installedController).toContain("dashboard_siteops_worker_matches");
     expect(installedController).toContain("start_application_runtime");
     expect(installedController).toContain("stop_application_runtime");
+    expect(installedController).toContain("seed_static_template_catalog");
+    expect(installedController).toContain(
+      "/app/dist/seed-static-template-catalog.js",
+    );
+    expect(installedController).toContain(
+      "STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS=1800",
+    );
+    expect(installedController).toContain(
+      "PRODUCTION_STATIC_TEMPLATE_CATALOG_SEED_FAILED",
+    );
     expect(installedController).toContain(
       'SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTROLLER="frontmind-production-controller-v6"',
     );

@@ -62,6 +62,7 @@ type HarnessOptions = {
   bootstrapped?: boolean;
   currentDigest?: string;
   composeUpFailureAt?: number;
+  catalogSeedExit?: number;
   foreignContractContainer?: boolean;
   contractResultMode?:
     | "exact"
@@ -180,6 +181,7 @@ async function harness(options: HarnessOptions = {}) {
     bootstrapped = true,
     currentDigest = baselineDigest,
     composeUpFailureAt = 0,
+    catalogSeedExit = 0,
     foreignContractContainer = false,
     contractResultMode = "exact",
   } = options;
@@ -376,6 +378,9 @@ if [[ "\${1:-}" == login ]]; then
   printf '%s\n' "registry-config $DOCKER_CONFIG" >>"$TEST_LOG"
   printf '%s\n' '{"auths":{"ghcr.io":{"auth":"redacted-test-value"}}}' >"$DOCKER_CONFIG/config.json"
   exit 0
+fi
+if [[ "$args" == *" /app/dist/seed-static-template-catalog.js "* ]]; then
+  exit "\${TEST_CATALOG_SEED_EXIT:-0}"
 fi
 if [[ "$args" == *" image inspect "*"org.opencontainers.image.revision"* ]]; then echo "$TEST_SOURCE_SHA"; exit 0; fi
 if [[ "$args" == *" image inspect "*"net.frontmind.runtime.roles"* ]]; then
@@ -647,6 +652,7 @@ fi
     TEST_RESTORE_MODE: restoreMode,
     TEST_LOCAL_IMAGE_DIGESTS: localImageDigests.join(","),
     TEST_COMPOSE_UP_FAILURE_AT: String(composeUpFailureAt),
+    TEST_CATALOG_SEED_EXIT: String(catalogSeedExit),
     TEST_CONTRACT_CONTAINER: contractContainer,
     TEST_MIGRATION_STARTED: migrationStarted,
     TEST_MIGRATION_TAIL: migrationTail,
@@ -706,6 +712,44 @@ afterEach(async () => {
 });
 
 describe("deploy controller shell contract", () => {
+  it("preloads the immutable Dashboard Template catalog before database planning or rollout", async () => {
+    const test = await harness();
+    const result = test.run();
+    expect(result.status, result.stderr).toBe(0);
+
+    const commands = await readFile(test.log, "utf8");
+    const seed = commands.indexOf(
+      "run --rm --no-deps -T --entrypoint node dashboard /app/dist/seed-static-template-catalog.js",
+    );
+    const plan = commands.indexOf("release-db-plan plan --json");
+    const rollout = commands.indexOf(" up -d ");
+    expect(seed).toBeGreaterThan(-1);
+    expect(plan).toBeGreaterThan(seed);
+    expect(rollout).toBeGreaterThan(seed);
+    expect(result.stderr).toContain("STATIC_TEMPLATE_CATALOG_SEED_OK");
+  });
+
+  it("keeps the previous Dashboard running when catalog preload fails", async () => {
+    const test = await harness({ catalogSeedExit: 51 });
+    const result = test.run();
+    expect(result.status).toBe(78);
+    expect(result.stderr).toContain(
+      "PRODUCTION_STATIC_TEMPLATE_CATALOG_SEED_FAILED",
+    );
+
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).toContain(
+      "run --rm --no-deps -T --entrypoint node dashboard /app/dist/seed-static-template-catalog.js",
+    );
+    expect(commands).not.toContain("release-db-plan plan --json");
+    expect(commands).not.toContain(" up -d ");
+    expect(commands).not.toContain(" stop dashboard");
+    expect(JSON.parse(await readFile(test.state, "utf8"))).toMatchObject({
+      currentDigest: baselineDigest,
+      lastResult: { status: "success" },
+    });
+  });
+
   it("uses the forced deploy stdin token only in a temporary registry config", async () => {
     const test = await harness();
     const result = test.runForced();
@@ -798,6 +842,7 @@ describe("deploy controller shell contract", () => {
     });
     const commands = await readFile(test.log, "utf8");
     expect(commands).toContain(`docker pull ${websiteImage}`);
+    expect(commands).not.toContain("seed-static-template-catalog.js");
     expect(commands).not.toContain("release-db-");
     expect(commands).not.toContain("mysql");
     expect(commands).not.toContain("mysqldump");

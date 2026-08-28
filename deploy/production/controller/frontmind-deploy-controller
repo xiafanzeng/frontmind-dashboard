@@ -9,6 +9,7 @@ readonly DEPLOY_TIMEOUT_SECONDS=120
 readonly CANDIDATE_READY_BUDGET_SECONDS=90
 readonly RELEASE_DB_READ_TIMEOUT_SECONDS=90
 readonly RELEASE_DB_MIGRATE_TIMEOUT_SECONDS=1800
+readonly STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS=1800
 readonly SITEOPS_ALIDNS_OAUTH_CONTRACT_JOURNAL_HASH="60b3ba7ba8fb92bbb2ecc2a62db1c13f549f26cc375d44eb2ee218459e50bc5f"
 readonly SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH="00c5395ab580f7dddef1ad743445561943b9fc28c0858a3c72eea5417cb7c52f"
 readonly SITEOPS_ALIDNS_OAUTH_FINAL_APPLIED_JOURNAL_HASH="e71230f0691ddd2a7d3d7b1a19d069775720ff999b445e86f60be902137a17db"
@@ -847,6 +848,22 @@ compose_before_deadline() {
     --project-directory "$COMPOSE_DIR" \
     --env-file "$environment_file" \
     -f "$COMPOSE_FILE" "$@"
+}
+
+seed_static_template_catalog() {
+  local environment_file="$1"
+  [[ $service == "dashboard" ]] || return 0
+  log "STATIC_TEMPLATE_CATALOG_SEED_START service=${service} source=${source_sha}"
+  timeout --foreground --signal=TERM --kill-after=30s \
+    "${STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS}s" docker compose \
+    --project-directory "$COMPOSE_DIR" \
+    --env-file "$environment_file" \
+    -f "$COMPOSE_FILE" \
+    run --rm --no-deps -T \
+    --entrypoint node dashboard \
+    /app/dist/seed-static-template-catalog.js >/dev/null \
+    || return 1
+  log "STATIC_TEMPLATE_CATALOG_SEED_OK service=${service} source=${source_sha}"
 }
 
 dashboard_image_supports_split_runtime() {
@@ -2173,6 +2190,11 @@ fi
 
 candidate_env="$(mktemp)"
 make_compose_env "$candidate_env" "$image"
+
+if [[ $mode != "bootstrap-state" ]]; then
+  seed_static_template_catalog "$candidate_env" \
+    || die "PRODUCTION_STATIC_TEMPLATE_CATALOG_SEED_FAILED" 78
+fi
 
 if (( coupled_stack_mode == 1 )); then
   prepare_coupled_stack \

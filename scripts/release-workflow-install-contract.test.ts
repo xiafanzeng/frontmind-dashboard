@@ -142,6 +142,54 @@ describe("release workflow source-ordering contracts", () => {
     );
   });
 
+  it("packages and preloads the immutable SiteOps Template catalog before production rollout", async () => {
+    const [builder, dockerfile, controller, updater, installerSource] =
+      await Promise.all([
+        readFile(productionBundleBuilder, "utf8"),
+        readFile(dashboardDockerfile, "utf8"),
+        readFile(productionController, "utf8"),
+        readFile(controllerUpdater, "utf8"),
+        readFile(installer, "utf8"),
+      ]);
+
+    expect(builder).toContain(
+      '"server/siteops/seed-static-template-catalog.ts"',
+    );
+    expect(dockerfile).toContain(
+      "test -s dist/seed-static-template-catalog.js",
+    );
+    expect(dockerfile).toContain(
+      "test -s /app/dist/seed-static-template-catalog.js",
+    );
+    expect(controller).toContain("seed_static_template_catalog");
+    expect(controller).toContain(
+      "STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS=1800",
+    );
+    expect(controller).toContain("/app/dist/seed-static-template-catalog.js");
+    const execution = controller.slice(
+      controller.lastIndexOf('candidate_env="$(mktemp)"'),
+    );
+    expect(execution.indexOf("seed_static_template_catalog")).toBeGreaterThan(
+      execution.indexOf('make_compose_env "$candidate_env" "$image"'),
+    );
+    expect(execution.indexOf("seed_static_template_catalog")).toBeLessThan(
+      execution.indexOf("prepare_coupled_stack"),
+    );
+    expect(execution.indexOf("seed_static_template_catalog")).toBeLessThan(
+      execution.indexOf('log "DATABASE_PLAN_START"'),
+    );
+    for (const contract of [updater, installerSource]) {
+      expect(contract).toContain("seed_static_template_catalog");
+      expect(contract).toContain("/app/dist/seed-static-template-catalog.js");
+      expect(contract).toContain(
+        "STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS=1800",
+      );
+      expect(contract).toContain(
+        "PRODUCTION_STATIC_TEMPLATE_CATALOG_SEED_FAILED",
+      );
+    }
+  });
+
   it("binds the one ordinary production build directly to github.sha", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const buildJob = workflow.slice(

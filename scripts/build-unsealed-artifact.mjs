@@ -72,6 +72,7 @@ run("pnpm", [
     ? ["server/knowledge-base-incident-repair-cli.ts"]
     : []),
   "server/pdf-prepare-worker.ts",
+  "server/siteops/seed-static-template-catalog.ts",
   "scripts/reconcile-siteops-build.ts",
   "scripts/release-db.ts",
   "scripts/verify-presales-file-roundtrip.ts",

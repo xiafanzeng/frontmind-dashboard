@@ -52,6 +52,10 @@ validate_controller() {
     && grep -Fq -- 'dashboard_siteops_worker_matches' "$target" \
     && grep -Fq -- 'start_application_runtime' "$target" \
     && grep -Fq -- 'stop_application_runtime' "$target" \
+    && grep -Fq -- 'seed_static_template_catalog' "$target" \
+    && grep -Fq -- '/app/dist/seed-static-template-catalog.js' "$target" \
+    && grep -Fq -- 'STATIC_TEMPLATE_CATALOG_SEED_TIMEOUT_SECONDS=1800' "$target" \
+    && grep -Fq -- 'PRODUCTION_STATIC_TEMPLATE_CATALOG_SEED_FAILED' "$target" \
     && grep -Fq -- '60b3ba7ba8fb92bbb2ecc2a62db1c13f549f26cc375d44eb2ee218459e50bc5f' "$target" \
     && grep -Fq -- '00c5395ab580f7dddef1ad743445561943b9fc28c0858a3c72eea5417cb7c52f' "$target" \
     && grep -Fq -- 'e71230f0691ddd2a7d3d7b1a19d069775720ff999b445e86f60be902137a17db' "$target" \
