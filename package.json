@@ -50,7 +50,9 @@
     "runtime:preflight": "node scripts/release-channel.mjs runtime-preflight",
     "verify:presales-file": "node dist/verify-presales-file-roundtrip.js",
     "siteops:workflow:verify": "node scripts/package-siteops-workflow.mjs",
-    "siteops:reconcile-build": "node dist/reconcile-siteops-build.js"
+    "siteops:reconcile-build": "node dist/reconcile-siteops-build.js",
+    "siteops:seed-template-catalog": "node dist/seed-static-template-catalog.js",
+    "siteops:template-catalog:ready": "node dist/seed-static-template-catalog.js --check-active"
   },
   "dependencies": {
     "@21st-dev/cli": "1.16.0",

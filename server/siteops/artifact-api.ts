@@ -16,6 +16,10 @@ import { getDb } from "../db";
 import { readSiteOpsArtifact } from "./artifact-store";
 import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
 import { completeSiteOpsAliyunOAuth } from "./service";
+import {
+  StaticTemplateCatalogError,
+  openStaticTemplateCatalogVersionPreview,
+} from "./static-template-catalog";
 import { customerVisibleStyleBatchStatusCondition } from "./visual-batch-visibility";
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
@@ -617,6 +621,7 @@ async function sendOwnedAsset(input: {
 export const siteOpsArtifactApi = express.Router();
 
 const STYLE_PREVIEW_MIME_TYPES = [
+  "image/avif",
   "image/png",
   "image/jpeg",
   "image/webp",
@@ -848,6 +853,98 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       )
       .limit(1);
     const row = rows[0];
+    const metadata =
+      row?.sourceMetadata &&
+      typeof row.sourceMetadata === "object" &&
+      !Array.isArray(row.sourceMetadata)
+        ? (row.sourceMetadata as Record<string, unknown>)
+        : null;
+    if (
+      metadata?.schemaVersion === 7 &&
+      metadata.renderer === "frontmind_static_template_catalog_v1"
+    ) {
+      const catalogVersion = nonEmptyString(metadata.catalogVersion);
+      const candidateId = nonEmptyString(metadata.catalogCandidateId);
+      const previewAssetId = nonEmptyString(metadata.previewAssetId);
+      const previewSha256 = normalizedSha256(metadata.previewSha256);
+      const previewMimeType = nonEmptyString(metadata.previewMimeType);
+      const providerTemplateId = nonEmptyString(metadata.providerTemplateId);
+      const providerSlug = nonEmptyString(metadata.providerSlug);
+      const sourceAssetId = nonEmptyString(metadata.sourceAssetId);
+      const sourceArchiveSha256 = normalizedSha256(
+        metadata.sourceArchiveSha256,
+      );
+      const catalogPosition = Number(metadata.catalogPosition);
+      const previewWidth = Number(metadata.previewWidth);
+      const previewHeight = Number(metadata.previewHeight);
+      if (
+        row?.localAssetId !== null ||
+        metadata.workflowVersion !== "2.8.0" ||
+        !catalogVersion ||
+        !candidateId ||
+        !previewAssetId ||
+        !previewSha256 ||
+        !previewMimeType ||
+        !STYLE_PREVIEW_MIME_TYPES.includes(
+          previewMimeType as (typeof STYLE_PREVIEW_MIME_TYPES)[number],
+        ) ||
+        !providerTemplateId ||
+        !providerSlug ||
+        !sourceAssetId ||
+        !sourceArchiveSha256 ||
+        !Number.isInteger(catalogPosition) ||
+        !Number.isInteger(previewWidth) ||
+        !Number.isInteger(previewHeight)
+      ) {
+        return notFound(res);
+      }
+      let opened: Awaited<
+        ReturnType<typeof openStaticTemplateCatalogVersionPreview>
+      >;
+      try {
+        opened = await openStaticTemplateCatalogVersionPreview(
+          catalogVersion,
+          candidateId,
+        );
+      } catch (error) {
+        if (error instanceof StaticTemplateCatalogError) {
+          return notFound(res);
+        }
+        throw error;
+      }
+      if (
+        opened.entry.order !== catalogPosition ||
+        opened.entry.providerTemplateId !== providerTemplateId ||
+        opened.entry.providerSlug !== providerSlug ||
+        opened.entry.sourceAssetId !== sourceAssetId ||
+        opened.entry.previewAssetId !== previewAssetId ||
+        opened.entry.previewSha256 !== previewSha256 ||
+        opened.entry.previewMimeType !== previewMimeType ||
+        opened.entry.previewWidth !== previewWidth ||
+        opened.entry.previewHeight !== previewHeight ||
+        opened.entry.sourceSha256 !== sourceArchiveSha256
+      ) {
+        opened.stream.destroy();
+        return notFound(res);
+      }
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.setHeader("Content-Type", opened.entry.previewMimeType);
+      res.setHeader("Content-Length", String(opened.entry.previewBytes));
+      res.setHeader("ETag", `"sha256:${opened.entry.previewSha256}"`);
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename*=UTF-8''${encodeURIComponent(`${candidateId}.${opened.entry.previewMimeType.split("/")[1]}`)}`,
+      );
+      opened.stream.once("error", () => {
+        if (!res.headersSent) {
+          notFound(res);
+          return;
+        }
+        res.destroy();
+      });
+      opened.stream.pipe(res);
+      return;
+    }
     const localAssetId = row?.localAssetId;
     const expectedHash = localAssetId
       ? frozenStylePreviewSha256(localAssetId, row?.sourceMetadata)

@@ -9,7 +9,10 @@ import type {
   SiteOperation,
   SiteProject,
 } from "../../drizzle/schema";
-import type { SiteBrief } from "../../shared/siteops";
+import {
+  visualSelectionBundleV7Schema,
+  type SiteBrief,
+} from "../../shared/siteops";
 import { FRONTMIND_VISUAL_FAMILIES_V3 } from "../../shared/siteops-design";
 import {
   TwentyFirstNativeTemplateError,
@@ -524,6 +527,192 @@ describe("21st SiteOps provider", () => {
     expect(client.withReadOnlySession).not.toHaveBeenCalled();
     expect(persistArtifact).not.toHaveBeenCalled();
     expect(persistBoard).not.toHaveBeenCalled();
+  });
+
+  it("publishes four fixed V7 pages without reading a 21st credential or provider API", async () => {
+    const row = operation();
+    row.input = {
+      schemaVersion: 3,
+      knowledgeSnapshotId: snapshotId,
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      mode: "initial",
+      page: 1,
+      admissionRevision: 4,
+    };
+    const context = providerContext();
+    context.project.revision = 4;
+    context.publishedPageCount = 0;
+    const catalog = {
+      schemaVersion: "frontmind-static-template-catalog-v1" as const,
+      workflowVersion: "2.8.0" as const,
+      catalogVersion: "21st-included-recommended-20260828-v1" as const,
+      pageSize: 8 as const,
+      pageCount: 4 as const,
+      entryCount: 32 as const,
+      entries: Array.from({ length: 32 }, (_, index) => {
+        const order = index + 1;
+        const candidateId = `static-template-${String(order).padStart(2, "0")}-fixture-${order}`;
+        return {
+          order,
+          page: Math.floor(index / 8) + 1,
+          pageIndex: index % 8,
+          candidateId,
+          providerTemplateId: String(800 + order),
+          providerSlug: `fixture-${order}`,
+          providerName: `Fixture ${order}`,
+          providerDescription: `Static fixture ${order}`,
+          providerVersion: order.toString(16).padStart(40, "0"),
+          sourceOwner: "frontmind",
+          sourceRepo: `fixture-${order}`,
+          sourceCommitSha: order.toString(16).padStart(40, "0"),
+          sourceSubdirectory: null,
+          sourceLicense: "MIT" as const,
+          sourceAssetId: `catalog/source/${candidateId}`,
+          sourcePath: `catalog/sources/${candidateId}.zip`,
+          sourceSha256: order.toString(16).padStart(64, "0"),
+          sourceBytes: 1_024 + order,
+          sourceFileCount: 10,
+          sourceExpandedBytes: 2_048 + order,
+          previewAssetId: `catalog/preview/${candidateId}`,
+          previewPath: `catalog/previews/${candidateId}.png`,
+          previewSha256: (order + 100).toString(16).padStart(64, "0"),
+          previewBytes: 512 + order,
+          previewMimeType: "image/png" as const,
+          previewWidth: 1440,
+          previewHeight: 900,
+          tags: ["fixture"],
+        };
+      }),
+    };
+    const getCredential = vi.fn();
+    const withReadOnlySession = vi.fn();
+    const listNativeTemplates = vi.fn();
+    const downloadNativeTemplate = vi.fn();
+    const persistedArtifacts: Array<{ mimeType: string; buffer: Buffer }> = [];
+    const persistStaticTemplateCatalogBoards = vi.fn(async (_db, input) => {
+      expect(input.catalogVersion).toBe(catalog.catalogVersion);
+      expect(input.pages).toHaveLength(4);
+      for (const [index, page] of input.pages.entries()) {
+        expect(page.pageNumber).toBe(index + 1);
+        expect(page.candidates).toHaveLength(8);
+        expect(page.selectionBundle.candidates).toHaveLength(8);
+        expect(
+          page.selectionBundle.candidates.every(
+            (candidate) => !("sourceArchivePath" in candidate),
+          ),
+        ).toBe(true);
+      }
+      return {
+        batchIds: Array.from({ length: 4 }, () => randomUUID()),
+        candidateCount: 32,
+      };
+    });
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      getCredential,
+      client: {
+        withReadOnlySession,
+        listNativeTemplates,
+        downloadNativeTemplate,
+      },
+      loadStaticTemplateCatalog: async () => catalog,
+      persistArtifact: vi.fn(async (input) => {
+        persistedArtifacts.push({
+          mimeType: input.mimeType,
+          buffer: Buffer.from(input.buffer),
+        });
+        return { id: randomUUID(), contentSha256: sha256(input.buffer) };
+      }) as never,
+      persistStaticTemplateCatalogBoards,
+    });
+
+    await expect(
+      handler({ operation: row, signal: new AbortController().signal }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: {
+        candidateCount: 32,
+        workflowVersion: "2.8.0",
+        catalogVersion: catalog.catalogVersion,
+        pageSize: 8,
+        pageCount: 4,
+        availablePages: 4,
+        reservedPages: 0,
+        canGenerateMore: false,
+      },
+    });
+    expect(persistedArtifacts).toHaveLength(4);
+    for (const artifact of persistedArtifacts) {
+      expect(artifact.mimeType).toBe("application/json");
+      expect(
+        visualSelectionBundleV7Schema.parse(
+          JSON.parse(artifact.buffer.toString("utf8")),
+        ).candidates,
+      ).toHaveLength(8);
+    }
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(withReadOnlySession).not.toHaveBeenCalled();
+    expect(listNativeTemplates).not.toHaveBeenCalled();
+    expect(downloadNativeTemplate).not.toHaveBeenCalled();
+  });
+
+  it("recovers the complete four-page V7 catalog as one idempotent result", async () => {
+    const row = operation();
+    row.input = {
+      schemaVersion: 3,
+      knowledgeSnapshotId: snapshotId,
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      mode: "initial",
+      page: 1,
+      admissionRevision: 4,
+    };
+    const context = providerContext();
+    context.project.revision = 4;
+    context.existingBoard = {
+      batchId: "55555555-5555-4555-8555-555555555551",
+      batchIds: [
+        "55555555-5555-4555-8555-555555555551",
+        "55555555-5555-4555-8555-555555555552",
+        "55555555-5555-4555-8555-555555555553",
+        "55555555-5555-4555-8555-555555555554",
+      ],
+      pageCount: 4,
+      candidateCount: 32,
+      selectionBundleHash: "c".repeat(64),
+    };
+    const getCredential = vi.fn();
+    const loadStaticTemplateCatalog = vi.fn();
+    const persistStaticTemplateCatalogBoards = vi.fn();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      getCredential,
+      client: { withReadOnlySession: vi.fn() },
+      loadStaticTemplateCatalog,
+      persistStaticTemplateCatalogBoards,
+    });
+
+    await expect(
+      handler({ operation: row, signal: new AbortController().signal }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: {
+        batchIds: context.existingBoard.batchIds,
+        candidateCount: 32,
+        workflowVersion: "2.8.0",
+        pageSize: 8,
+        pageCount: 4,
+        availablePages: 4,
+        reservedPages: 0,
+        canGenerateMore: false,
+      },
+    });
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(loadStaticTemplateCatalog).not.toHaveBeenCalled();
+    expect(persistStaticTemplateCatalogBoards).not.toHaveBeenCalled();
   });
 
   it("binds nine directed families 1:1 to distinct real search-only 21st references", async () => {

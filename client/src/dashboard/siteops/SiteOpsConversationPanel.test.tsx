@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
+  siteOpsObservationV1Schema,
   siteOpsVisualGenerationProjectionSchema,
   type SiteOpsObservationV1,
 } from "@shared/siteops-contract";
@@ -160,6 +161,25 @@ function visualPage(page: 1 | 2 | 3) {
   } as const;
 }
 
+function staticCatalogPage(page: 1 | 2 | 3 | 4) {
+  return {
+    batchId: `static-catalog-page-${page}`,
+    page,
+    candidates: Array.from({ length: 8 }, (_, index) => {
+      const letter = String.fromCharCode(65 + index);
+      return {
+        id: `static-candidate-${page}-${letter}`,
+        label: letter,
+        title: `固定目录第 ${page} 页 ${letter}`,
+        previewUrl: `/api/site-ops/style-previews/static-${page}-${letter}`,
+        note: null,
+        visualFamily: null,
+        selected: false,
+      };
+    }),
+  } as const;
+}
+
 describe("SiteOpsConversationPanel", () => {
   it("renders one accessible workspace title without the removed stage strip", () => {
     render(<SiteOpsConversationPanel observation={observation()} />);
@@ -235,6 +255,71 @@ describe("SiteOpsConversationPanel", () => {
         failureCategory: "source_incomplete",
       }),
     ).toMatchObject({ failureCategory: "source_incomplete" });
+  });
+
+  it("binds visual page cardinality to the projected workflow version", () => {
+    const legacyPage = visualPage(1);
+    const catalogPage = staticCatalogPage(1);
+    const legacyObservation = observation({
+      visualCandidatePages: [
+        {
+          ...legacyPage,
+          batchId: "00000000-0000-4000-8000-000000000091",
+          candidates: legacyPage.candidates.map((candidate, index) => ({
+            ...candidate,
+            label: String.fromCharCode(65 + index),
+          })),
+        },
+      ],
+    });
+    const catalogObservation = observation({
+      visualCandidatePages: [
+        {
+          ...catalogPage,
+          batchId: "00000000-0000-4000-8000-000000000081",
+          candidates: catalogPage.candidates.slice(),
+        },
+      ],
+      visualGeneration: {
+        status: "idle",
+        targetPage: null,
+        generatedPages: 1,
+        availablePages: 4,
+        reservedPages: 0,
+        maxPages: 4,
+        workflowVersion: "2.8.0",
+        catalogVersion: "twenty-first-static-32-v1",
+        pageSize: 8,
+        pageCount: 4,
+        canGenerateMore: false,
+        canSelectExisting: true,
+      },
+    });
+
+    const parsedLegacy =
+      siteOpsObservationV1Schema.safeParse(legacyObservation);
+    const parsedCatalog =
+      siteOpsObservationV1Schema.safeParse(catalogObservation);
+    expect(
+      parsedLegacy.success,
+      parsedLegacy.success ? "" : JSON.stringify(parsedLegacy.error.issues),
+    ).toBe(true);
+    expect(
+      parsedCatalog.success,
+      parsedCatalog.success ? "" : JSON.stringify(parsedCatalog.error.issues),
+    ).toBe(true);
+    expect(
+      siteOpsObservationV1Schema.safeParse({
+        ...catalogObservation,
+        visualCandidatePages: legacyObservation.visualCandidatePages,
+      }).success,
+    ).toBe(false);
+    expect(
+      siteOpsObservationV1Schema.safeParse({
+        ...legacyObservation,
+        visualCandidatePages: catalogObservation.visualCandidatePages,
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts observations monotonically by project revision then message sequence", () => {
@@ -636,6 +721,74 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
+  it("renders the 2.8 fixed catalog as four local pages of eight without requesting another group", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    const pages = [
+      staticCatalogPage(1),
+      staticCatalogPage(2),
+      staticCatalogPage(3),
+      staticCatalogPage(4),
+    ];
+    const { container } = render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          visualCandidates: pages[0].candidates.slice(),
+          visualCandidatePages: pages.map((page) => ({
+            ...page,
+            candidates: page.candidates.slice(),
+          })),
+          visualGeneration: {
+            status: "idle",
+            targetPage: null,
+            generatedPages: 4,
+            availablePages: 4,
+            reservedPages: 0,
+            maxPages: 4,
+            canGenerateMore: false,
+            canSelectExisting: true,
+            workflowVersion: "2.8.0",
+            catalogVersion: "twenty-first-static-32-v1",
+            pageSize: 8,
+            pageCount: 4,
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "32 个 Template 候选" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("第 1 / 4 页 · 共 32 个")).toBeInTheDocument();
+    expect(screen.getByAltText("A：固定目录第 1 页 A")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "显示下一组 9 个视觉候选" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /获取并冻结下一组/u }),
+    ).not.toBeInTheDocument();
+    expect(
+      container.querySelector(
+        '.siteops-visual-grid[data-catalog-layout="static-32"]',
+      ),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "第 4 页" }));
+    expect(screen.getByAltText("A：固定目录第 4 页 A")).toBeInTheDocument();
+    expect(screen.getByText("第 4 / 4 页 · 共 32 个")).toBeInTheDocument();
+    expect(onAction).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "选择 A" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "select_visual",
+        input: { sampleId: "static-candidate-4-A" },
+        messageId: "message-1",
+        cardKind: "visual_board",
+      }),
+    );
+  });
+
   it.each([
     { pageCount: 1 as const, candidateCount: 9 },
     { pageCount: 2 as const, candidateCount: 18 },
@@ -845,6 +998,77 @@ describe("SiteOpsConversationPanel", () => {
         input: {},
       }),
     );
+  });
+
+  it("surfaces a 2.8 local catalog failure with refresh and reset but never supplemental generation", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "attention_required",
+          },
+          interactionState: "attention_required",
+          visualCandidates: [],
+          visualCandidatePages: [],
+          visualGeneration: {
+            status: "retryable_error",
+            targetPage: null,
+            generatedPages: 0,
+            availablePages: 0,
+            reservedPages: 0,
+            maxPages: 4,
+            canGenerateMore: false,
+            canSelectExisting: false,
+            retryAction: "supplemental",
+            failureCategory: "catalog_unavailable",
+            workflowVersion: "2.8.0",
+            catalogVersion: "twenty-first-static-32-v1",
+            pageSize: 8,
+            pageCount: 4,
+          },
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+            resetSourceBuildId: null,
+          },
+        })}
+        onAction={onAction}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", {
+        name: "固定 Template 目录暂时不可用",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/本地资产尚未就绪或未通过完整性校验/u),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/不会在线生成补充候选/u)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /重新生成 9 个/u }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /下一组 9 个/u }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "刷新固定 Template 目录" }),
+    );
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+    expect(onAction).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "提交官网重置申请" }));
+    expect(
+      screen.getByRole("heading", { name: "申请重置并全新开始" }),
+    ).toBeInTheDocument();
+    expect(onAction).not.toHaveBeenCalled();
   });
 
   it("switches to a newly completed visual page and unlocks its candidates", () => {

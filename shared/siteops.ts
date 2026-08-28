@@ -260,12 +260,33 @@ export const SITEOPS_MATERIALIZER_V2_7 = {
   qaPolicyVersion: "siteops-native-qa-v1",
 } as const;
 
+/** Static Template Catalog 2.8 freezes one FrontMind-owned catalog of 32
+ * complete Template archives. Customer visual-search operations only bind
+ * the immutable catalog coordinates; no provider lookup, download, candidate
+ * compilation or source archive is embedded in the customer selection page. */
+export const SITEOPS_MATERIALIZER_V2_8 = {
+  upstreamVersion: "frontmind-static-template-catalog-v1",
+  upstreamSha256:
+    "772d8938e73213f505dbd7b078a61f2bed9351262d3a429d31a8621b3cc0ce4f",
+  frontMindVersion: "2.8.0",
+  runtimeManifestSha256:
+    "c846027250d6519860a9458696e3e185a2bb14b7863be58b88afb367293983f9",
+  starterVersion: "frontmind-static-template-catalog-v1",
+  starterSha256:
+    "d7a87a67ecb83fc89320c59c97070c18c23af49fa5dde7bbe14f177e2f4e898e",
+  componentLibraryVersion: "frontmind-static-template-catalog-v1",
+  materializerVersion: "2.8.0",
+  materializerSha256:
+    "806e2e87226f454ad6344f2e14d687f997d9716783536a336757113641ec26ce",
+  qaPolicyVersion: "siteops-native-qa-v1",
+} as const;
+
 /** Current host-owned renderer. Historical 2.6 builds and the explicitly
  * labelled native fallback keep using these immutable coordinates. */
 export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_6;
 
 /** Workflow frozen for every newly admitted/reset SiteOps root. */
-export const SITEOPS_DEFAULT_WORKFLOW = SITEOPS_MATERIALIZER_V2_7;
+export const SITEOPS_DEFAULT_WORKFLOW = SITEOPS_MATERIALIZER_V2_8;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -281,6 +302,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_5.frontMindVersion]: SITEOPS_MATERIALIZER_V2_5,
   [SITEOPS_MATERIALIZER_V2_6.frontMindVersion]: SITEOPS_MATERIALIZER_V2_6,
   [SITEOPS_MATERIALIZER_V2_7.frontMindVersion]: SITEOPS_MATERIALIZER_V2_7,
+  [SITEOPS_MATERIALIZER_V2_8.frontMindVersion]: SITEOPS_MATERIALIZER_V2_8,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {
@@ -387,6 +409,7 @@ export const siteOpsNativeTemplateFailureCategorySchema = z.enum([
   "entitlement_required",
   "download_failed",
   "dependency_unsupported",
+  "source_unsafe",
   "compile_failed",
   "browser_unavailable",
   "render_failed",
@@ -1477,8 +1500,136 @@ export const visualSelectionBundleV6Schema = z
     }
   });
 
-/** Immutable V1-V5 artifacts remain readable; the template workflow writes V6. */
+/**
+ * V7 is a lightweight view over the FrontMind-owned static Template catalog.
+ * It deliberately contains only immutable asset/hash coordinates. Complete
+ * source archives remain catalog assets and are read only after selection;
+ * they are never copied into a per-page bundle.
+ */
+export const visualCandidateV7Schema = z
+  .object({
+    id: z.string().trim().min(1).max(191),
+    sampleId: z.string().trim().min(1).max(191),
+    label: z.string().regex(/^[A-H]$/u),
+    title: z.string().trim().min(1).max(300),
+    description: z.string().trim().min(1).max(1_000).nullable(),
+    catalogVersion: z.string().trim().min(1).max(191),
+    catalogPosition: z.number().int().min(1).max(32),
+    catalogCandidateId: z.string().trim().min(1).max(191),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceOwner: z.string().trim().min(1).max(191),
+    sourceRepo: z.string().trim().min(1).max(191),
+    sourceCommitSha: z.string().regex(/^[a-f0-9]{40}$/u),
+    sourceSubdirectory: z.string().trim().min(1).max(1_024).nullable(),
+    sourceLicense: z.enum(["MIT", "Apache-2.0"]),
+    sourceAssetId: z.string().trim().min(1).max(512),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchiveBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(192 * 1024 * 1024),
+    previewAssetId: z.string().trim().min(1).max(512),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    previewMimeType: z.enum([
+      "image/avif",
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+    ]),
+    previewWidth: z.number().int().positive().max(50_000),
+    previewHeight: z.number().int().positive().max(50_000),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.id !== value.sampleId) {
+      context.addIssue({
+        code: "custom",
+        path: ["sampleId"],
+        message: "V7 sample ID must match the canonical candidate ID",
+      });
+    }
+  });
+
+export const visualSelectionBundleV7Schema = z
+  .object({
+    schemaVersion: z.literal(7),
+    renderer: z.literal("frontmind_static_template_catalog_v1"),
+    workflowVersion: z.literal("2.8.0"),
+    catalogVersion: z.string().trim().min(1).max(191),
+    pageNumber: z.number().int().min(1).max(4),
+    pageSize: z.literal(8),
+    pageCount: z.literal(4),
+    displayTarget: z.literal(8),
+    candidates: z.array(visualCandidateV7Schema).length(8),
+    selectedCandidateId: z.string().trim().min(1).max(191).nullable(),
+    delegated: z.boolean().default(false),
+    degradedReasons: z.array(z.string().max(500)).max(30).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const unique = (coordinates: string[], path: string) => {
+      if (new Set(coordinates).size !== coordinates.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates", path],
+          message: `V7 visual ${path} coordinates must be unique`,
+        });
+      }
+    };
+    unique(
+      value.candidates.map((candidate) => candidate.id),
+      "id",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.catalogCandidateId),
+      "catalogCandidateId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.providerTemplateId),
+      "providerTemplateId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sourceArchiveSha256),
+      "sourceArchiveSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.previewSha256),
+      "previewSha256",
+    );
+    if (
+      value.candidates.some(
+        (candidate) =>
+          candidate.catalogVersion !== value.catalogVersion ||
+          Math.ceil(candidate.catalogPosition / value.pageSize) !==
+            value.pageNumber,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["candidates"],
+        message: "V7 candidates must belong to the frozen catalog page",
+      });
+    }
+    if (
+      value.selectedCandidateId !== null &&
+      !value.candidates.some(
+        (candidate) => candidate.sampleId === value.selectedCandidateId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedCandidateId"],
+        message: "Selected V7 visual candidate is absent",
+      });
+    }
+  });
+
+/** Immutable V1-V6 artifacts remain readable; the static catalog writes V7. */
 export const visualSelectionBundleSchema = z.union([
+  visualSelectionBundleV7Schema,
   visualSelectionBundleV6Schema,
   visualSelectionBundleV5Schema,
   visualSelectionBundleV4Schema,
@@ -1633,6 +1784,9 @@ export type VisualSelectionBundleV5 = z.infer<
 >;
 export type VisualSelectionBundleV6 = z.infer<
   typeof visualSelectionBundleV6Schema
+>;
+export type VisualSelectionBundleV7 = z.infer<
+  typeof visualSelectionBundleV7Schema
 >;
 export type VisualCandidateStyleTokensV1 = z.infer<
   typeof visualCandidateStyleTokensV1Schema

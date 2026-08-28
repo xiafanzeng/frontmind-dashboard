@@ -10,9 +10,16 @@ const buildId = "123e4567-e89b-42d3-a456-426614174000";
 const oauthCredentialId = "223e4567-e89b-42d3-a456-426614174000";
 
 const mocks = vi.hoisted(() => ({
+  StaticTemplateCatalogError: class StaticTemplateCatalogError extends Error {
+    constructor(public readonly code: string) {
+      super(code);
+      this.name = "StaticTemplateCatalogError";
+    }
+  },
   completeSiteOpsAliyunOAuth: vi.fn(),
   exchangeAliyunOAuthCode: vi.fn(),
   getDb: vi.fn(),
+  openStaticTemplateCatalogVersionPreview: vi.fn(),
   readSiteOpsArtifact: vi.fn(),
 }));
 
@@ -25,6 +32,11 @@ vi.mock("./aliyun-platform-service", () => ({
 }));
 vi.mock("./service", () => ({
   completeSiteOpsAliyunOAuth: mocks.completeSiteOpsAliyunOAuth,
+}));
+vi.mock("./static-template-catalog", () => ({
+  StaticTemplateCatalogError: mocks.StaticTemplateCatalogError,
+  openStaticTemplateCatalogVersionPreview:
+    mocks.openStaticTemplateCatalogVersionPreview,
 }));
 
 import { publicSiteOpsArtifactError, siteOpsArtifactApi } from "./artifact-api";
@@ -104,6 +116,7 @@ beforeEach(async () => {
     refreshToken: "refresh-token-secret-sentinel",
   });
   mocks.completeSiteOpsAliyunOAuth.mockReset().mockResolvedValue(undefined);
+  mocks.openStaticTemplateCatalogVersionPreview.mockReset();
 });
 
 afterEach(async () => {
@@ -142,6 +155,7 @@ function stylePreviewDatabase(
     renderer: "twenty_first_native_template_v1",
     previewSha256: "b".repeat(64),
   },
+  includeNullAssetRow = false,
 ) {
   return {
     select: () => ({
@@ -149,7 +163,9 @@ function stylePreviewDatabase(
         innerJoin: () => ({
           where: () => ({
             limit: async () =>
-              localAssetId === null ? [] : [{ localAssetId, sourceMetadata }],
+              localAssetId === null && !includeNullAssetRow
+                ? []
+                : [{ localAssetId, sourceMetadata }],
           }),
         }),
       }),
@@ -437,6 +453,32 @@ describe("SiteOps visual sample preview", () => {
   const referenceHash = "a".repeat(64);
   const realizationHash = "d".repeat(64);
 
+  function v7StaticPreviewMetadata(
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    const candidateId = "static-template-01-arfazrll-portfolio";
+    return {
+      schemaVersion: 7,
+      renderer: "frontmind_static_template_catalog_v1",
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      catalogPosition: 1,
+      catalogCandidateId: candidateId,
+      providerTemplateId: "827",
+      providerSlug: "arfazrll-portfolio",
+      sourceAssetId:
+        "21st-included-recommended-20260828-v1/source/static-template-01-arfazrll-portfolio",
+      sourceArchiveSha256: "d".repeat(64),
+      previewAssetId:
+        "21st-included-recommended-20260828-v1/preview/static-template-01-arfazrll-portfolio",
+      previewSha256: "c".repeat(64),
+      previewMimeType: "image/png",
+      previewWidth: 1440,
+      previewHeight: 900,
+      ...overrides,
+    };
+  }
+
   function v4DualPreviewMetadata(
     overrides: Record<string, unknown> = {},
   ): Record<string, unknown> {
@@ -494,8 +536,172 @@ describe("SiteOps visual sample preview", () => {
       userId: 42,
       localAssetId: previewAssetId,
       expectedSha256: "b".repeat(64),
-      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      expectedMimeTypes: [
+        "image/avif",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ],
     });
+  });
+
+  it("serves an authorized V7 preview from the active static catalog without a tenant asset copy", async () => {
+    const candidateId = "static-template-01-arfazrll-portfolio";
+    const staticBytes = Buffer.from("static-template-preview");
+    const staticHash = "c".repeat(64);
+    const sourceHash = "d".repeat(64);
+    const metadata = v7StaticPreviewMetadata();
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(null, metadata, true),
+    );
+    mocks.openStaticTemplateCatalogVersionPreview.mockResolvedValueOnce({
+      entry: {
+        order: 1,
+        providerTemplateId: "827",
+        providerSlug: "arfazrll-portfolio",
+        sourceAssetId: metadata.sourceAssetId,
+        previewAssetId: metadata.previewAssetId,
+        previewSha256: staticHash,
+        previewMimeType: "image/png",
+        previewWidth: 1440,
+        previewHeight: 900,
+        previewBytes: staticBytes.length,
+        sourceSha256: sourceHash,
+      },
+      path: "/static/preview.png",
+      stream: Readable.from([staticBytes]),
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v7-static-sample`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("etag")).toBe(`"sha256:${staticHash}"`);
+    expect(response.headers.get("cache-control")).toBe(
+      "private, no-store, max-age=0",
+    );
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(staticBytes);
+    expect(mocks.openStaticTemplateCatalogVersionPreview).toHaveBeenCalledWith(
+      metadata.catalogVersion,
+      candidateId,
+    );
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+  });
+
+  it("serves a frozen V7 preview after the active catalog switches to a future version", async () => {
+    const candidateId = "static-template-01-arfazrll-portfolio";
+    const catalogVersion = "21st-included-recommended-20260828-v2";
+    const previewAssetId = `${catalogVersion}/preview/${candidateId}`;
+    const sourceAssetId = `${catalogVersion}/source/${candidateId}`;
+    const metadata = v7StaticPreviewMetadata({
+      catalogVersion,
+      previewAssetId,
+      sourceAssetId,
+    });
+    const staticBytes = Buffer.from("frozen-version-preview");
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(null, metadata, true),
+    );
+    mocks.openStaticTemplateCatalogVersionPreview.mockResolvedValueOnce({
+      entry: {
+        order: 1,
+        providerTemplateId: "827",
+        providerSlug: "arfazrll-portfolio",
+        sourceAssetId,
+        previewAssetId,
+        previewSha256: "c".repeat(64),
+        previewMimeType: "image/png",
+        previewWidth: 1440,
+        previewHeight: 900,
+        previewBytes: staticBytes.length,
+        sourceSha256: "d".repeat(64),
+      },
+      path: "/static/catalog-v2/preview.png",
+      stream: Readable.from([staticBytes]),
+    });
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v7-frozen-version-sample`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(staticBytes);
+    expect(mocks.openStaticTemplateCatalogVersionPreview).toHaveBeenCalledWith(
+      catalogVersion,
+      candidateId,
+    );
+  });
+
+  it.each([
+    [
+      "preview asset coordinate",
+      { previewAssetId: "catalog/preview/wrong-candidate" },
+    ],
+    ["source asset coordinate", { sourceAssetId: "catalog/source/wrong" }],
+    ["provider slug", { providerSlug: "wrong-provider-slug" }],
+    ["preview hash", { previewSha256: "e".repeat(64) }],
+    ["source hash", { sourceArchiveSha256: "f".repeat(64) }],
+  ])(
+    "returns 404 when a V7 %s disagrees with the active catalog",
+    async (_label, override) => {
+      const metadata = v7StaticPreviewMetadata(override);
+      const stream = Readable.from([Buffer.from("must-not-leak")]);
+      const destroy = vi.spyOn(stream, "destroy");
+      mocks.getDb.mockResolvedValueOnce(
+        stylePreviewDatabase(null, metadata, true),
+      );
+      mocks.openStaticTemplateCatalogVersionPreview.mockResolvedValueOnce({
+        entry: {
+          order: 1,
+          providerTemplateId: "827",
+          providerSlug: "arfazrll-portfolio",
+          sourceAssetId:
+            "21st-included-recommended-20260828-v1/source/static-template-01-arfazrll-portfolio",
+          previewAssetId:
+            "21st-included-recommended-20260828-v1/preview/static-template-01-arfazrll-portfolio",
+          previewSha256: "c".repeat(64),
+          previewMimeType: "image/png",
+          previewWidth: 1440,
+          previewHeight: 900,
+          previewBytes: 13,
+          sourceSha256: "d".repeat(64),
+        },
+        path: "/static/preview.png",
+        stream,
+      });
+      const origin = await startApp();
+
+      const response = await fetch(
+        `${origin}/api/site-ops/style-previews/v7-coordinate-mismatch`,
+      );
+
+      expect(response.status).toBe(404);
+      expect(destroy).toHaveBeenCalled();
+      expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+    },
+  );
+
+  it("projects static catalog path and hash verification failures as 404", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(null, v7StaticPreviewMetadata(), true),
+    );
+    mocks.openStaticTemplateCatalogVersionPreview.mockRejectedValueOnce(
+      new mocks.StaticTemplateCatalogError(
+        "STATIC_TEMPLATE_CATALOG_ASSET_HASH_MISMATCH",
+      ),
+    );
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v7-static-hash-mismatch`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "NOT_FOUND" });
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
   });
 
   it("serves a V4 reference with its reference hash instead of the distinct realization hash", async () => {
@@ -523,7 +729,12 @@ describe("SiteOps visual sample preview", () => {
       userId: 42,
       localAssetId: previewAssetId,
       expectedSha256: referenceHash,
-      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      expectedMimeTypes: [
+        "image/avif",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ],
     });
   });
 
@@ -552,7 +763,12 @@ describe("SiteOps visual sample preview", () => {
       userId: 42,
       localAssetId: realizationAssetId,
       expectedSha256: realizationHash,
-      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      expectedMimeTypes: [
+        "image/avif",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ],
     });
   });
 
@@ -593,7 +809,12 @@ describe("SiteOps visual sample preview", () => {
       userId: 42,
       localAssetId: previewAssetId,
       expectedSha256: referenceHash,
-      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      expectedMimeTypes: [
+        "image/avif",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ],
     });
   });
 
@@ -666,7 +887,12 @@ describe("SiteOps visual sample preview", () => {
       userId: 42,
       localAssetId: previewAssetId,
       expectedSha256: "c".repeat(64),
-      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      expectedMimeTypes: [
+        "image/avif",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ],
     });
   });
 
@@ -716,7 +942,12 @@ describe("SiteOps visual sample preview", () => {
       userId: 42,
       localAssetId: previewAssetId,
       expectedSha256: undefined,
-      expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      expectedMimeTypes: [
+        "image/avif",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+      ],
     });
   });
 

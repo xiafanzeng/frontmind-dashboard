@@ -119,11 +119,8 @@ import { startSiteOpsWorkerScheduler } from "../siteops/worker";
 import { siteOpsArtifactApi } from "../siteops/artifact-api";
 import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
 import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
+import { getStaticTemplateCatalogReadiness } from "../siteops/static-template-catalog";
 import { startBrandQuestionUniverseWorkerScheduler } from "../brand-question-universe-worker";
-import {
-  runGeneralChatIncidentRepairCli,
-  scheduleAutomaticGeneralChatIncidentRepair20260828,
-} from "../general-chat-incident-repair-20260828-cli";
 import {
   resolveFrontMindRuntimeRole,
   runtimeRoleReadinessRequirements,
@@ -316,7 +313,7 @@ async function startServer() {
       );
       const fileRetention = fileRetentionPreflightEvidence.read();
       const managedUploads = getManagedUploadIntentWorkerReadiness();
-      const [, , , , knowledgeBase] = await Promise.all([
+      const [, , , , knowledgeBase, , templateCatalog] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
         paymentReceiptLedgerReadiness.ready(),
@@ -334,6 +331,7 @@ async function startServer() {
             getKnowledgeBaseInvariantAuditSnapshot().degradedBuildCount,
         }),
         getDedicatedMonitorCredentialReadiness(),
+        getStaticTemplateCatalogReadiness(),
       ]);
       const ready =
         fileRetention?.ready === true &&
@@ -341,6 +339,7 @@ async function startServer() {
           (managedUploads.started === true &&
             managedUploads.storageReady === true)) &&
         knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&
+        templateCatalog.ready === true &&
         migrationState.journal.status === "exact" &&
         migrationState.schema.status === "exact";
       const status = ready ? 200 : 503;
@@ -365,6 +364,13 @@ async function startServer() {
               ? "ok"
               : "unavailable",
         },
+        templateCatalog: {
+          status: templateCatalog.ready ? "ok" : "unavailable",
+          version: templateCatalog.activeCatalogVersion,
+          entryCount: templateCatalog.ready
+            ? templateCatalog.entryCount
+            : 0,
+        },
         // Build-local findings are observable, but never participate in the
         // readiness decision above. Do not expose their internal codes.
         degradedBuildCount: invariantSnapshot.degradedBuildCount,
@@ -378,6 +384,7 @@ async function startServer() {
           fileRetentionReady: fileRetention?.ready ?? false,
           managedUploadsStarted: managedUploads.started,
           managedUploadsStorageReady: managedUploads.storageReady,
+          templateCatalogReady: templateCatalog.ready,
         });
         res.status(status).json({
           ...response,
@@ -537,9 +544,6 @@ async function startServer() {
       runtimeRole,
     });
     if (process.env.NODE_ENV === "production") {
-      if (runtimeRoleServesWeb(runtimeRole)) {
-        scheduleAutomaticGeneralChatIncidentRepair20260828();
-      }
       registerSiteOpsRuntimeProviders();
       if (runtimeRoleRunsSiteOps(runtimeRole)) {
         startSiteOpsWorkerScheduler();
@@ -680,20 +684,6 @@ async function startServer() {
 }
 
 async function main() {
-  if (process.argv[2] === "general-chat-incident-repair-20260828") {
-    const stdoutWrite = process.stdout.write.bind(process.stdout);
-    process.stdout.write = (() => true) as typeof process.stdout.write;
-    process.stderr.write = (() => true) as typeof process.stderr.write;
-    console.log = () => undefined;
-    console.info = () => undefined;
-    console.warn = () => undefined;
-    console.error = () => undefined;
-    console.debug = () => undefined;
-    const result = await runGeneralChatIncidentRepairCli(process.argv.slice(3));
-    stdoutWrite(`${JSON.stringify(result)}\n`);
-    if (!result.success) process.exitCode = 1;
-    return;
-  }
   await startServer();
 }
 

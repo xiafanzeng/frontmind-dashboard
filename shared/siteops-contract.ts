@@ -83,10 +83,15 @@ export const siteOpsVisualCandidateProjectionSchema = z
 export const siteOpsVisualCandidatePageProjectionSchema = z
   .object({
     batchId: z.string().uuid(),
-    page: z.number().int().min(1).max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+    page: z.number().int().min(1).max(4),
     candidates: z
       .array(siteOpsVisualCandidateProjectionSchema)
-      .length(SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE),
+      .refine(
+        (candidates) =>
+          candidates.length === 8 ||
+          candidates.length === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+        "Visual candidate page must contain 8 static or 9 historical candidates",
+      ),
   })
   .strict();
 
@@ -94,27 +99,20 @@ export const siteOpsVisualGenerationProjectionSchema = z
   .object({
     status: z.enum(["idle", "generating", "retryable_error"]).default("idle"),
     targetPage: z
-      .union([z.literal(1), z.literal(2), z.literal(3)])
+      .union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)])
       .nullable()
       .default(null),
-    generatedPages: z
-      .number()
-      .int()
-      .min(0)
-      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
-    availablePages: z
-      .number()
-      .int()
-      .min(0)
-      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
-      .optional(),
-    reservedPages: z
-      .number()
-      .int()
-      .min(0)
-      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
-      .optional(),
-    maxPages: z.literal(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+    generatedPages: z.number().int().min(0).max(4),
+    availablePages: z.number().int().min(0).max(4).optional(),
+    reservedPages: z.number().int().min(0).max(4).optional(),
+    maxPages: z.union([
+      z.literal(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+      z.literal(4),
+    ]),
+    workflowVersion: z.string().trim().min(1).max(32).optional(),
+    catalogVersion: z.string().trim().min(1).max(191).optional(),
+    pageSize: z.union([z.literal(8), z.literal(9)]).optional(),
+    pageCount: z.union([z.literal(3), z.literal(4)]).optional(),
     canGenerateMore: z.boolean(),
     canSelectExisting: z.boolean().default(true),
     retryAction: z.enum(["start", "supplemental"]).nullable().optional(),
@@ -344,7 +342,7 @@ export const siteOpsObservationV1Schema = z
       .default([]),
     visualCandidatePages: z
       .array(siteOpsVisualCandidatePageProjectionSchema)
-      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .max(4)
       .default([]),
     visualGeneration: siteOpsVisualGenerationProjectionSchema.default({
       status: "idle",
@@ -392,7 +390,24 @@ export const siteOpsObservationV1Schema = z
     interactionState: siteOpsInteractionStateSchema,
     latestSequence: z.number().int().nonnegative(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const staticCatalog = value.visualGeneration.workflowVersion === "2.8.0";
+    const expectedPageSize = staticCatalog
+      ? 8
+      : SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+    value.visualCandidatePages.forEach((page, index) => {
+      if (page.candidates.length !== expectedPageSize) {
+        context.addIssue({
+          code: "custom",
+          path: ["visualCandidatePages", index, "candidates"],
+          message: staticCatalog
+            ? "Workflow 2.8 visual pages must contain exactly 8 candidates"
+            : "Historical visual pages must contain exactly 9 candidates",
+        });
+      }
+    });
+  });
 
 export type SiteOpsKnowledgeSnapshot = z.infer<
   typeof siteOpsKnowledgeSnapshotSchema

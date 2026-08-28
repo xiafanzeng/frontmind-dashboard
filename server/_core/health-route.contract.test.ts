@@ -92,6 +92,8 @@ describe("runtime health route contract", () => {
     expect(readiness).toContain("sha: applicationBuildSha");
     expect(readiness).toContain("imageDigest: applicationImageDigest");
     expect(readiness).toContain("migrationState.schema.status");
+    expect(readiness).toContain("templateCatalog.ready === true");
+    expect(readiness).toContain("version: templateCatalog.activeCatalogVersion");
     expect(readiness).toContain("degradedBuildCount:");
     expect(readiness).toContain("violationCount:");
   });

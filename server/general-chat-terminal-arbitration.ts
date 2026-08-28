@@ -7,6 +7,38 @@ import { GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE } from "../shared/frontmind-gene
 
 export type GeneralChatTurnEventBinding = "bound" | "pending" | "ambiguous";
 
+export type GeneralChatResolvedUserEventDisposition = {
+  eventId: string;
+  kind: "match" | "mismatch" | "unresolved";
+};
+
+export type GeneralChatResolvedTurnBinding = {
+  binding: GeneralChatTurnEventBinding;
+  matchedUserEventId: string | null;
+  matchCount: number;
+  unresolvedCount: number;
+};
+
+export type GeneralChatProjectionWatermarkCandidate = {
+  id: string;
+  providerEventWatermark: readonly string[];
+};
+
+export type GeneralChatProjectionSnapshot = {
+  eventIds: readonly string[];
+  snapshotHash: string;
+  maxProviderTimestampMs: number;
+};
+
+export type GeneralChatProjectionClaimState = {
+  generation: number;
+  status: "idle" | "claimed" | "applied";
+  claimToken: string | null;
+  claimStartedAtMs: number | null;
+  claimedSnapshot: GeneralChatProjectionSnapshot | null;
+  appliedSnapshot: GeneralChatProjectionSnapshot | null;
+};
+
 export type GeneralChatTurnProviderEvidence = {
   binding: GeneralChatTurnEventBinding;
   events: ManusV2MessageEvent[];
@@ -82,23 +114,30 @@ export function currentGeneralChatTurnProviderEvidence(input: {
   promptSha256: string;
   providerAttachmentFileIds: readonly string[];
   providerEventWatermark: readonly string[];
+  resolvedBinding?: GeneralChatResolvedTurnBinding;
 }): GeneralChatTurnProviderEvidence {
   const watermark = new Set(input.providerEventWatermark);
   const ordered = orderManusV2EventsByProviderRank(
     input.events.filter((event) => !watermark.has(event.id)),
     "oldest_first",
   );
-  const matchingUserIndexes = ordered.flatMap((event, index) =>
-    manusV2EventMatchesGeneralChatRequest(event, {
-      promptSha256: input.promptSha256,
-      attachmentFileIds: input.providerAttachmentFileIds,
-    })
-      ? [index]
-      : [],
-  );
-  if (matchingUserIndexes.length !== 1) {
+  const matchingUserIndexes = input.resolvedBinding
+    ? ordered.flatMap((event, index) =>
+        event.id === input.resolvedBinding!.matchedUserEventId ? [index] : [],
+      )
+    : ordered.flatMap((event, index) =>
+        manusV2EventMatchesGeneralChatRequest(event, {
+          promptSha256: input.promptSha256,
+          attachmentFileIds: input.providerAttachmentFileIds,
+        })
+          ? [index]
+          : [],
+      );
+  const binding = input.resolvedBinding?.binding;
+  if ((binding && binding !== "bound") || matchingUserIndexes.length !== 1) {
     return {
-      binding: matchingUserIndexes.length > 1 ? "ambiguous" : "pending",
+      binding:
+        binding ?? (matchingUserIndexes.length > 1 ? "ambiguous" : "pending"),
       events: [],
       eventStatus: null,
       hasUserStop: false,
@@ -131,6 +170,182 @@ export function currentGeneralChatTurnProviderEvidence(input: {
     errorType,
     errorContent,
   };
+}
+
+/**
+ * A Provider user event is eligible only after every visible watermark event.
+ * Missing watermark rows are tolerated because Provider history may be
+ * paginated or retained for less time than the Dashboard outbox.
+ */
+export function generalChatProjectionWatermarkScore(input: {
+  providerEventId: string;
+  providerEventIndex: ReadonlyMap<string, number>;
+  providerEventWatermark: readonly string[];
+}): number | null {
+  const watermark = new Set(input.providerEventWatermark);
+  if (watermark.has(input.providerEventId)) return null;
+  const eventIndex = input.providerEventIndex.get(input.providerEventId);
+  if (eventIndex === undefined) return null;
+  for (const watermarkEventId of watermark) {
+    const watermarkIndex = input.providerEventIndex.get(watermarkEventId);
+    if (watermarkIndex !== undefined && watermarkIndex >= eventIndex) {
+      return null;
+    }
+  }
+  return watermark.size;
+}
+
+/**
+ * Select the sole candidate whose watermark is a set-superset of every other
+ * eligible candidate. Cardinality alone is insufficient: equal or non-nested
+ * watermarks are deliberately ambiguous and must not project an answer.
+ */
+export function selectGeneralChatProjectionCandidate(input: {
+  providerEventId: string;
+  providerEventIndex: ReadonlyMap<string, number>;
+  candidates: readonly GeneralChatProjectionWatermarkCandidate[];
+}): GeneralChatProjectionWatermarkCandidate | null {
+  const eligible = input.candidates.filter(
+    (candidate) =>
+      generalChatProjectionWatermarkScore({
+        providerEventId: input.providerEventId,
+        providerEventIndex: input.providerEventIndex,
+        providerEventWatermark: candidate.providerEventWatermark,
+      }) !== null,
+  );
+  const dominant = eligible.filter((candidate) => {
+    const candidateWatermark = new Set(candidate.providerEventWatermark);
+    return eligible.every((other) =>
+      [...new Set(other.providerEventWatermark)].every((eventId) =>
+        candidateWatermark.has(eventId),
+      ),
+    );
+  });
+  return dominant.length === 1 ? dominant[0]! : null;
+}
+
+/**
+ * One proven user event binds a turn only when every other plausible event is
+ * resolved. This prevents an early URL match from projecting while another
+ * signed/descriptor-less Provider event remains unverifiable.
+ */
+export function generalChatTurnBindingFromDispositions(
+  dispositions: readonly GeneralChatResolvedUserEventDisposition[],
+): GeneralChatResolvedTurnBinding {
+  const matches = dispositions.filter((item) => item.kind === "match");
+  const unresolvedCount = dispositions.filter(
+    (item) => item.kind === "unresolved",
+  ).length;
+  if (matches.length > 1) {
+    return {
+      binding: "ambiguous",
+      matchedUserEventId: null,
+      matchCount: matches.length,
+      unresolvedCount,
+    };
+  }
+  if (matches.length === 1 && unresolvedCount === 0) {
+    return {
+      binding: "bound",
+      matchedUserEventId: matches[0]!.eventId,
+      matchCount: 1,
+      unresolvedCount: 0,
+    };
+  }
+  return {
+    binding: "pending",
+    matchedUserEventId: null,
+    matchCount: matches.length,
+    unresolvedCount,
+  };
+}
+
+export function generalChatAssistantProjectionShouldBeVisible(input: {
+  binding: GeneralChatTurnEventBinding;
+  providerEventId: string;
+  assignedProviderEventIds: ReadonlySet<string>;
+}) {
+  return (
+    input.binding === "bound" &&
+    input.assignedProviderEventIds.has(input.providerEventId)
+  );
+}
+
+function projectionSnapshotRelation(
+  candidate: GeneralChatProjectionSnapshot,
+  reference: GeneralChatProjectionSnapshot,
+) {
+  const candidateIds = new Set(candidate.eventIds);
+  const referenceIds = new Set(reference.eventIds);
+  if (![...referenceIds].every((eventId) => candidateIds.has(eventId))) {
+    return "older" as const;
+  }
+  if (candidate.maxProviderTimestampMs < reference.maxProviderTimestampMs) {
+    return "older" as const;
+  }
+  if (candidate.maxProviderTimestampMs > reference.maxProviderTimestampMs) {
+    return "newer" as const;
+  }
+  return candidateIds.size > referenceIds.size
+    ? ("newer" as const)
+    : ("equivalent" as const);
+}
+
+/**
+ * Decide whether a read snapshot may become the task's next projection owner.
+ * A strict superset/newer timestamp may supersede an active claim; an equal
+ * snapshot waits for that owner unless its lease is stale. Incomparable event
+ * sets fail closed as older so a partial Provider read cannot hide new output.
+ */
+export function generalChatProjectionSnapshotClaimDecision(input: {
+  candidate: GeneralChatProjectionSnapshot;
+  state: GeneralChatProjectionClaimState;
+  nowMs: number;
+  staleAfterMs: number;
+}):
+  | { kind: "claim"; generation: number }
+  | { kind: "in_progress" | "stale_candidate"; generation: number } {
+  if (
+    input.state.appliedSnapshot &&
+    projectionSnapshotRelation(input.candidate, input.state.appliedSnapshot) ===
+      "older"
+  ) {
+    return {
+      kind: "stale_candidate",
+      generation: input.state.generation,
+    };
+  }
+  if (input.state.status === "claimed" && input.state.claimedSnapshot) {
+    const relation = projectionSnapshotRelation(
+      input.candidate,
+      input.state.claimedSnapshot,
+    );
+    if (relation === "older") {
+      return {
+        kind: "stale_candidate",
+        generation: input.state.generation,
+      };
+    }
+    const claimFresh =
+      input.state.claimStartedAtMs !== null &&
+      input.nowMs - input.state.claimStartedAtMs < input.staleAfterMs;
+    if (relation === "equivalent" && claimFresh) {
+      return { kind: "in_progress", generation: input.state.generation };
+    }
+  }
+  return { kind: "claim", generation: input.state.generation + 1 };
+}
+
+export function generalChatProjectionClaimMatches(input: {
+  expectedGeneration: number;
+  expectedClaimToken: string;
+  state: GeneralChatProjectionClaimState;
+}) {
+  return (
+    input.state.status === "claimed" &&
+    input.state.generation === input.expectedGeneration &&
+    input.state.claimToken === input.expectedClaimToken
+  );
 }
 
 const NATURAL_COMPLETION = new Set([

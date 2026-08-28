@@ -422,7 +422,17 @@ function visualGenerationProgressPage(item: SiteOpsMessageProjection) {
 function visualGenerationFailureCopy(
   category: SiteOpsVisualFailureCategory | null | undefined,
   hasExistingCandidates: boolean,
+  usesStaticTemplateCatalog = false,
 ) {
+  if (usesStaticTemplateCatalog) {
+    const message =
+      category === "catalog_unavailable"
+        ? "固定 Template 目录的本地资产尚未就绪或未通过完整性校验。"
+        : "固定 Template 目录的本地源码或预览资产暂时无法读取。";
+    return hasExistingCandidates
+      ? `${message}当前已加载的候选仍可选择；也可刷新页面重新读取固定目录。`
+      : `${message}请先刷新页面；若仍失败，可提交官网重置申请后重新进入固定目录。此操作不会在线生成补充候选。`;
+  }
   const suffix = hasExistingCandidates
     ? "当前候选仍可选择，也可稍后重试。"
     : "建站资料已保留，可以直接重试，无需重置。";
@@ -636,6 +646,7 @@ export default function SiteOpsConversationPanel({
   const aliyunRefreshRef = useRef(onRefresh);
   aliyunRefreshRef.current = onRefresh;
   const previousVisualPageCount = useRef(0);
+  const previousStaticCatalogVersion = useRef<string | null>(null);
   const latestAttempt = useMemo(() => {
     const visibleBuilds = observation?.builds.filter(
       (build) => !["cancelled", "superseded"].includes(build.status),
@@ -684,18 +695,35 @@ export default function SiteOpsConversationPanel({
         ]
       : [];
   }, [observation?.visualCandidatePages, observation?.visualCandidates]);
+  const usesStaticTemplateCatalog =
+    observation?.visualGeneration.workflowVersion === "2.8.0";
+  const staticCatalogVersion = usesStaticTemplateCatalog
+    ? (observation.visualGeneration.catalogVersion ?? "2.8.0-pending")
+    : null;
 
   useEffect(() => {
     const count = visualPages.length;
-    if (count > previousVisualPageCount.current) {
+    if (usesStaticTemplateCatalog) {
+      if (previousStaticCatalogVersion.current !== staticCatalogVersion) {
+        setActiveVisualPage(1);
+      } else if (count === 0) {
+        setActiveVisualPage(1);
+      } else {
+        setActiveVisualPage((current) => Math.min(Math.max(current, 1), count));
+      }
+      previousStaticCatalogVersion.current = staticCatalogVersion;
+    } else if (count > previousVisualPageCount.current) {
       setActiveVisualPage(count);
     } else if (count === 0) {
       setActiveVisualPage(1);
     } else {
       setActiveVisualPage((current) => Math.min(Math.max(current, 1), count));
     }
+    if (!usesStaticTemplateCatalog) {
+      previousStaticCatalogVersion.current = null;
+    }
     previousVisualPageCount.current = count;
-  }, [visualPages.length]);
+  }, [staticCatalogVersion, usesStaticTemplateCatalog, visualPages.length]);
 
   useEffect(() => {
     setPreviewOpenError(null);
@@ -1145,6 +1173,13 @@ export default function SiteOpsConversationPanel({
     Math.min(visualGeneration.generatedPages + 1, visualGeneration.maxPages);
   const visualSelectionOpen =
     observation.interactionState === "awaiting_visual_selection";
+  const totalVisualCandidates = visualPages.reduce(
+    (total, page) => total + page.candidates.length,
+    0,
+  );
+  const displayedVisualCandidateCount = usesStaticTemplateCatalog
+    ? totalVisualCandidates
+    : visualPages.length * 9;
   const visualSelectionDisabled =
     interactionLocked ||
     visualGenerationPending ||
@@ -1453,7 +1488,9 @@ export default function SiteOpsConversationPanel({
               <div>
                 <h3 id="siteops-visual-search-title">生成视觉候选</h3>
                 <p>
-                  可先在下方补充转化目标；准备好后将生成九种不同风格的官网方案。
+                  {usesStaticTemplateCatalog
+                    ? "可先在下方补充转化目标；准备好后将展示固定目录中的 32 个完整 Template。"
+                    : "可先在下方补充转化目标；准备好后将生成九种不同风格的官网方案。"}
                 </p>
               </div>
             </div>
@@ -1480,7 +1517,9 @@ export default function SiteOpsConversationPanel({
                   aria-hidden="true"
                 />
               )}
-              生成 9 个视觉候选
+              {usesStaticTemplateCatalog
+                ? "查看 32 个 Template"
+                : "生成 9 个视觉候选"}
             </button>
           </section>
         )}
@@ -1502,7 +1541,8 @@ export default function SiteOpsConversationPanel({
 
       {visualPages.length === 0 &&
         visualGeneration.status === "retryable_error" &&
-        visualGeneration.retryAction === "start" && (
+        (usesStaticTemplateCatalog ||
+          visualGeneration.retryAction === "start") && (
           <section
             className="siteops-snapshot-card"
             aria-labelledby="siteops-visual-retry-title"
@@ -1510,60 +1550,104 @@ export default function SiteOpsConversationPanel({
             <div>
               <AlertCircle size={20} aria-hidden="true" />
               <div>
-                <h3 id="siteops-visual-retry-title">视觉候选生成未完成</h3>
+                <h3 id="siteops-visual-retry-title">
+                  {usesStaticTemplateCatalog
+                    ? "固定 Template 目录暂时不可用"
+                    : "视觉候选生成未完成"}
+                </h3>
                 <p>
                   {visualGenerationFailureCopy(
                     visualGeneration.failureCategory,
                     false,
+                    usesStaticTemplateCatalog,
                   )}
                 </p>
               </div>
             </div>
-            <button
-              type="button"
-              className="siteops-primary-button"
-              disabled={
-                interactionLocked ||
-                visualGenerationPending ||
-                Boolean(upstreamMessage)
-              }
-              onClick={() =>
-                runAction("reselect_visual", {
-                  action: "reselect_visual",
-                  input: {},
-                })
-              }
-            >
-              {visualGenerationPending && (
-                <Loader2
-                  className="siteops-spin"
-                  size={15}
-                  aria-hidden="true"
-                />
-              )}
-              重新生成 9 个视觉候选
-            </button>
+            {usesStaticTemplateCatalog ? (
+              <div className="siteops-inline-actions">
+                {onRefresh && (
+                  <button
+                    type="button"
+                    className="siteops-primary-button"
+                    disabled={refreshing}
+                    onClick={() => onRefresh()}
+                  >
+                    <RefreshCw
+                      className={refreshing ? "siteops-spin" : undefined}
+                      size={15}
+                      aria-hidden="true"
+                    />
+                    刷新固定 Template 目录
+                  </button>
+                )}
+                {observation.rebuildRequest.allowed && (
+                  <button
+                    type="button"
+                    disabled={Boolean(busyAction)}
+                    onClick={() => {
+                      setRebuildError(null);
+                      setRebuildDialogOpen(true);
+                    }}
+                  >
+                    <Wrench size={15} aria-hidden="true" />
+                    提交官网重置申请
+                  </button>
+                )}
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="siteops-primary-button"
+                disabled={
+                  interactionLocked ||
+                  visualGenerationPending ||
+                  Boolean(upstreamMessage)
+                }
+                onClick={() =>
+                  runAction("reselect_visual", {
+                    action: "reselect_visual",
+                    input: {},
+                  })
+                }
+              >
+                {visualGenerationPending && (
+                  <Loader2
+                    className="siteops-spin"
+                    size={15}
+                    aria-hidden="true"
+                  />
+                )}
+                重新生成 9 个视觉候选
+              </button>
+            )}
           </section>
         )}
 
       {visualPages.length > 0 && currentVisualPage && (
         <section
           className="siteops-visual-board"
+          data-catalog-layout={
+            usesStaticTemplateCatalog ? "static-32" : "legacy"
+          }
           aria-labelledby="siteops-visual-title"
         >
           <div className="siteops-board-heading">
             <div>
               <h3 id="siteops-visual-title">
                 {visualSelectionOpen
-                  ? `${visualPages.length * 9} 个视觉候选`
+                  ? usesStaticTemplateCatalog
+                    ? `${totalVisualCandidates} 个 Template 候选`
+                    : `${displayedVisualCandidateCount} 个视觉候选`
                   : "已选择的视觉方案"}
               </h3>
               <p>
-                以下为真实视觉参考；示例图片与文案不会复制到官网，FrontMind
-                将按所选构图与视觉语言使用企业资料完成制作。
+                {usesStaticTemplateCatalog
+                  ? "以下为固定目录中的完整 Template 参考；选中后 FrontMind 将把精确模板源码与企业资料交给 AI 完成适配。"
+                  : "以下为真实视觉参考；示例图片与文案不会复制到官网，FrontMind 将按所选构图与视觉语言使用企业资料完成制作。"}
               </p>
             </div>
-            {visualSelectionOpen && (
+            {visualSelectionOpen && !usesStaticTemplateCatalog && (
               <div className="siteops-inline-actions">
                 <button
                   type="button"
@@ -1611,6 +1695,7 @@ export default function SiteOpsConversationPanel({
                 {visualGenerationFailureCopy(
                   visualGeneration.failureCategory,
                   true,
+                  usesStaticTemplateCatalog,
                 )}
               </span>
             </div>
@@ -1628,7 +1713,11 @@ export default function SiteOpsConversationPanel({
             >
               <button
                 type="button"
-                aria-label="上一组视觉候选"
+                aria-label={
+                  usesStaticTemplateCatalog
+                    ? "上一页视觉候选"
+                    : "上一组视觉候选"
+                }
                 disabled={activeVisualPage <= 1}
                 onClick={() =>
                   setActiveVisualPage((page) => Math.max(1, page - 1))
@@ -1647,20 +1736,26 @@ export default function SiteOpsConversationPanel({
                     }
                     onClick={() => setActiveVisualPage(page.page)}
                   >
-                    第 {page.page} 组
+                    第 {page.page} {usesStaticTemplateCatalog ? "页" : "组"}
                   </button>
                 ))}
               </div>
               <span>
-                {visualGeneration.canGenerateMore
-                  ? remainingFrozenVisualPages > 0
-                    ? `已冻结 ${frozenVisualPages} 组；还可显示 ${remainingFrozenVisualPages} 组`
-                    : "下一组将在完整冻结后显示"
-                  : `${publishedVisualPages * 9} 选 1`}
+                {usesStaticTemplateCatalog
+                  ? `第 ${activeVisualPage} / ${visualGeneration.pageCount} 页 · 共 ${totalVisualCandidates} 个`
+                  : visualGeneration.canGenerateMore
+                    ? remainingFrozenVisualPages > 0
+                      ? `已冻结 ${frozenVisualPages} 组；还可显示 ${remainingFrozenVisualPages} 组`
+                      : "下一组将在完整冻结后显示"
+                    : `${displayedVisualCandidateCount} 选 1`}
               </span>
               <button
                 type="button"
-                aria-label="下一组视觉候选"
+                aria-label={
+                  usesStaticTemplateCatalog
+                    ? "下一页视觉候选"
+                    : "下一组视觉候选"
+                }
                 disabled={activeVisualPage >= visualPages.length}
                 onClick={() =>
                   setActiveVisualPage((page) =>
@@ -1672,7 +1767,12 @@ export default function SiteOpsConversationPanel({
               </button>
             </div>
           )}
-          <div className="siteops-visual-grid">
+          <div
+            className="siteops-visual-grid"
+            data-catalog-layout={
+              usesStaticTemplateCatalog ? "static-32" : "legacy"
+            }
+          >
             {currentVisualPage.candidates.map((candidate) => (
               <VisualCandidateCard
                 key={candidate.id}

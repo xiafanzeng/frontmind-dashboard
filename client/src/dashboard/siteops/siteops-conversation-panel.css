@@ -796,6 +796,10 @@
   gap: 14px;
 }
 
+.siteops-visual-board[data-catalog-layout="static-32"] {
+  width: min(100%, 1280px);
+}
+
 .siteops-visual-pagination {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
@@ -953,6 +957,10 @@
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+}
+
+.siteops-visual-grid[data-catalog-layout="static-32"] {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .siteops-visual-card {
@@ -1214,7 +1222,8 @@
 }
 
 @media (max-width: 900px) {
-  .siteops-visual-grid {
+  .siteops-visual-grid,
+  .siteops-visual-grid[data-catalog-layout="static-32"] {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1229,6 +1238,7 @@
   }
 
   .siteops-visual-grid,
+  .siteops-visual-grid[data-catalog-layout="static-32"],
   .siteops-agent-profile-options,
   .siteops-snapshot-actions,
   .siteops-connection-form,

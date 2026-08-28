@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createReadStream, type ReadStream } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { and, eq, inArray, isNull, or } from "drizzle-orm";
@@ -35,6 +36,7 @@ import {
   type VisualSelectionBundleV4,
   type VisualSelectionBundleV5,
   type VisualSelectionBundleV6,
+  type VisualSelectionBundleV7,
   type VisualCandidateStyleTokensV1,
 } from "../../shared/siteops";
 import { createHostOwnedSiteDesignResultV2 } from "../../shared/siteops-host-design";
@@ -153,6 +155,7 @@ import {
 import {
   SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
   SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
+  SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
   VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
   VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES,
@@ -160,6 +163,11 @@ import {
   isSiteOpsNativeVisualWorkflowVersion,
   selectedNativeSourceArchive,
 } from "./native-visual-source";
+import {
+  openStaticTemplateCatalogVersionSource,
+  requireStaticTemplateCatalogVersion,
+  type StaticTemplateCatalogEntry,
+} from "./static-template-catalog";
 import {
   NativeReactBuildError,
   materializeNativeReactSource,
@@ -1250,7 +1258,27 @@ function isVisualSelectionBundleV6(
   return "schemaVersion" in bundle && bundle.schemaVersion === 6;
 }
 
+function isVisualSelectionBundleV7(
+  bundle: VisualSelectionBundle,
+): bundle is VisualSelectionBundleV7 {
+  return "schemaVersion" in bundle && bundle.schemaVersion === 7;
+}
+
 function visualSelectionQueryHash(bundle: VisualSelectionBundle) {
+  if (isVisualSelectionBundleV7(bundle)) {
+    return canonicalSiteOpsSha256({
+      schemaVersion: 7,
+      workflowVersion: bundle.workflowVersion,
+      catalogVersion: bundle.catalogVersion,
+      pageNumber: bundle.pageNumber,
+      candidates: bundle.candidates.map((candidate) => ({
+        id: candidate.id,
+        catalogCandidateId: candidate.catalogCandidateId,
+        sourceArchiveSha256: candidate.sourceArchiveSha256,
+        previewSha256: candidate.previewSha256,
+      })),
+    });
+  }
   return isVisualSelectionBundleV2(bundle) ||
     isVisualSelectionBundleV3(bundle) ||
     isVisualSelectionBundleV4(bundle) ||
@@ -1266,6 +1294,25 @@ export function selectedVisualPreviewCoordinates(input: {
   samplePreviewLocalAssetId: string;
   evidencePreviewSha256: string;
 }) {
+  if (isVisualSelectionBundleV7(input.bundle)) {
+    const candidate = input.bundle.candidates.find(
+      (item) => item.id === input.candidateId,
+    );
+    if (!candidate || candidate.previewSha256 !== input.evidencePreviewSha256) {
+      throw new SiteOpsManusFailure(
+        "VISUAL_SELECTION_COORDINATES_MISMATCH",
+        "冻结的视觉候选与选择合同坐标不一致。",
+        "failed",
+      );
+    }
+    return {
+      referenceLocalAssetId: input.samplePreviewLocalAssetId,
+      referenceSha256: candidate.previewSha256,
+      realizationLocalAssetId: input.samplePreviewLocalAssetId,
+      realizationSha256: candidate.previewSha256,
+      hasIndependentRealization: false,
+    } as const;
+  }
   const candidate = input.bundle.candidates.find(
     (item) => item.id === input.candidateId,
   );
@@ -3063,7 +3110,189 @@ export function nativeSourceAttachmentIdentityConflicts(input: {
   );
 }
 
-type NativeSelection = Awaited<ReturnType<typeof selectedNativeSourceArchive>>;
+type BufferedNativeSelection = Awaited<
+  ReturnType<typeof selectedNativeSourceArchive>
+>;
+
+type StaticNativeSelection = {
+  bundle: VisualSelectionBundleV7;
+  candidate: VisualSelectionBundleV7["candidates"][number];
+  archiveBytes: Buffer | null;
+  archiveByteLength: number;
+  archiveSha256: string;
+  createArchiveReadStream: () => ReadStream;
+  manifest: VisualSelectionBundleV7["candidates"][number];
+  files: [];
+};
+
+type NativeSelection = BufferedNativeSelection | StaticNativeSelection;
+
+function isStaticNativeSelection(
+  selection: NativeSelection,
+): selection is StaticNativeSelection {
+  return selection.bundle.schemaVersion === 7;
+}
+
+function nativeSelectionByteLength(selection: NativeSelection) {
+  return isStaticNativeSelection(selection)
+    ? selection.archiveByteLength
+    : selection.archiveBytes.length;
+}
+
+function nativeSelectionQueryHash(selection: NativeSelection) {
+  return visualSelectionQueryHash(selection.bundle);
+}
+
+function nativeSelectionInlineBytes(selection: NativeSelection) {
+  if (!selection.archiveBytes) {
+    throw new Error("NATIVE_SOURCE_INLINE_BYTES_MISSING");
+  }
+  return selection.archiveBytes;
+}
+
+function staticCatalogCoordinatesMatch(
+  candidate: VisualSelectionBundleV7["candidates"][number],
+  entry: StaticTemplateCatalogEntry,
+) {
+  return (
+    candidate.catalogCandidateId === entry.candidateId &&
+    candidate.providerTemplateId === entry.providerTemplateId &&
+    candidate.providerSlug === entry.providerSlug &&
+    candidate.providerVersion === entry.providerVersion &&
+    candidate.sourceOwner === entry.sourceOwner &&
+    candidate.sourceRepo === entry.sourceRepo &&
+    candidate.sourceCommitSha === entry.sourceCommitSha &&
+    candidate.sourceSubdirectory === entry.sourceSubdirectory &&
+    candidate.sourceLicense === entry.sourceLicense &&
+    candidate.sourceAssetId === entry.sourceAssetId &&
+    candidate.sourceArchiveSha256 === entry.sourceSha256 &&
+    candidate.sourceArchiveBytes === entry.sourceBytes &&
+    candidate.previewAssetId === entry.previewAssetId &&
+    candidate.previewSha256 === entry.previewSha256 &&
+    candidate.previewMimeType === entry.previewMimeType &&
+    candidate.previewWidth === entry.previewWidth &&
+    candidate.previewHeight === entry.previewHeight
+  );
+}
+
+async function readExactStaticArchive(input: {
+  stream: ReadStream;
+  expectedBytes: number;
+  expectedSha256: string;
+}) {
+  const chunks: Buffer[] = [];
+  const digest = createHash("sha256");
+  let total = 0;
+  for await (const raw of input.stream) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    total += chunk.length;
+    if (
+      total > input.expectedBytes ||
+      total > MANUS_INLINE_ATTACHMENT_MAX_BYTES
+    ) {
+      throw new SiteOpsManusFailure(
+        "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
+        "固定模板源码与目录坐标不一致。",
+        "failed",
+      );
+    }
+    digest.update(chunk);
+    chunks.push(chunk);
+  }
+  if (
+    total !== input.expectedBytes ||
+    digest.digest("hex") !== input.expectedSha256
+  ) {
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
+      "固定模板源码与目录坐标不一致。",
+      "failed",
+    );
+  }
+  return Buffer.concat(chunks, total);
+}
+
+export async function selectedStaticNativeSourceArchive(input: {
+  bundle: VisualSelectionBundleV7;
+  selectedCandidateId: string;
+}): Promise<StaticNativeSelection> {
+  const candidate = input.bundle.candidates.find(
+    (item) => item.id === input.selectedCandidateId,
+  );
+  if (!candidate) {
+    throw new SiteOpsManusFailure(
+      "VISUAL_SELECTED_CANDIDATE_MISSING",
+      "冻结的视觉选择缺少已选模板。",
+      "failed",
+    );
+  }
+  if (
+    input.bundle.workflowVersion !== SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+    candidate.catalogVersion !== input.bundle.catalogVersion
+  ) {
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_CATALOG_VERSION_MISMATCH",
+      "固定模板目录版本与选择坐标不一致。",
+      "failed",
+    );
+  }
+  const frozenCatalog = await requireStaticTemplateCatalogVersion(
+    input.bundle.catalogVersion,
+  );
+  if (frozenCatalog.catalogVersion !== input.bundle.catalogVersion) {
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_CATALOG_VERSION_MISMATCH",
+      "固定模板目录版本与选择坐标不一致。",
+      "failed",
+    );
+  }
+  const catalogEntry = frozenCatalog.entries.find(
+    (entry) => entry.candidateId === candidate.catalogCandidateId,
+  );
+  if (
+    !catalogEntry ||
+    !staticCatalogCoordinatesMatch(candidate, catalogEntry)
+  ) {
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
+      "固定模板源码与目录坐标不一致。",
+      "failed",
+    );
+  }
+  const opened = await openStaticTemplateCatalogVersionSource(
+    input.bundle.catalogVersion,
+    candidate.catalogCandidateId,
+  );
+  if (!staticCatalogCoordinatesMatch(candidate, opened.entry)) {
+    opened.stream.destroy();
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
+      "固定模板源码与目录坐标不一致。",
+      "failed",
+    );
+  }
+  const transport = nativeSourceAttachmentTransport(opened.entry.sourceBytes);
+  let archiveBytes: Buffer | null = null;
+  if (transport === "inline") {
+    archiveBytes = await readExactStaticArchive({
+      stream: opened.stream,
+      expectedBytes: opened.entry.sourceBytes,
+      expectedSha256: opened.entry.sourceSha256,
+    });
+  } else {
+    opened.stream.destroy();
+  }
+  return {
+    bundle: input.bundle,
+    candidate,
+    archiveBytes,
+    archiveByteLength: opened.entry.sourceBytes,
+    archiveSha256: opened.entry.sourceSha256,
+    createArchiveReadStream: () => createReadStream(opened.path),
+    manifest: candidate,
+    files: [],
+  };
+}
 
 const nativeTemplateCoordinateV1Schema = z
   .object({
@@ -3095,6 +3324,21 @@ const normalizedNativeTemplateCoordinateV1Schema = z
   })
   .strict();
 
+const staticNativeTemplateCoordinateV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sourceFormat: z.literal("static_catalog_archive_v1"),
+    catalogVersion: z.string().trim().min(1).max(191),
+    catalogCandidateId: z.string().trim().min(1).max(191),
+    sourceAssetId: z.string().trim().min(1).max(191),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceSubdirectory: z.string().trim().min(1).max(500).nullable(),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
 const FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME =
   "frontmind-selected-template-coordinate-v1.json";
 
@@ -3104,6 +3348,30 @@ const FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME =
  * that contain several templates at one immutable commit.
  */
 export function nativeTemplateCoordinateDirective(source: NativeSelection) {
+  if (isStaticNativeSelection(source)) {
+    const manifest = staticNativeTemplateCoordinateV1Schema.parse({
+      schemaVersion: 1,
+      sourceFormat: "static_catalog_archive_v1",
+      catalogVersion: source.candidate.catalogVersion,
+      catalogCandidateId: source.candidate.catalogCandidateId,
+      sourceAssetId: source.candidate.sourceAssetId,
+      providerTemplateId: source.candidate.providerTemplateId,
+      providerSlug: source.candidate.providerSlug,
+      providerVersion: source.candidate.providerVersion,
+      sourceSubdirectory: source.candidate.sourceSubdirectory,
+      sourceArchiveSha256: source.candidate.sourceArchiveSha256,
+    });
+    const bytes = Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
+    return {
+      manifest,
+      promptInstruction: `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是固定目录中所选完整 Template 的唯一执行坐标。必须使用其中绑定的 catalogCandidateId、providerSlug、sourceSubdirectory、sourceAssetId 和 sourceArchiveSha256，并按原模板源码检查真实入口；不得改选相邻模板、仓库默认首页或重新设计。`,
+      attachment: {
+        filename: FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME,
+        mime_type: "application/json",
+        file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+      } as const,
+    };
+  }
   if (
     source.bundle.schemaVersion !== 6 ||
     !("sourceFormat" in source.candidate)
@@ -3172,20 +3440,20 @@ export function nativeSourceAttachmentTransport(byteLength: number) {
 }
 
 function nativeSourceInlineAttachment(source: NativeSelection) {
+  const archiveBytes = nativeSelectionInlineBytes(source);
   if (source.bundle.schemaVersion === 6) {
-    assertVisualSelectionBundleV6SourceArchiveSize(source.archiveBytes);
+    assertVisualSelectionBundleV6SourceArchiveSize(archiveBytes);
   }
   if (
-    nativeSourceAttachmentTransport(source.archiveBytes.length) !== "inline"
+    nativeSourceAttachmentTransport(nativeSelectionByteLength(source)) !==
+    "inline"
   ) {
     throw new Error("NATIVE_SOURCE_REQUIRES_PROVIDER_FILE_UPLOAD");
   }
   return {
     filename: NATIVE_SOURCE_PROVIDER_FILENAME,
     mime_type: "application/zip",
-    file_data: `data:application/zip;base64,${source.archiveBytes.toString(
-      "base64",
-    )}`,
+    file_data: `data:application/zip;base64,${archiveBytes.toString("base64")}`,
   } as const;
 }
 
@@ -3213,7 +3481,8 @@ function nativeBrandAttachment(
 }
 
 export function nativeSourceSystemPromptForWorkflow(workflowVersion: string) {
-  return workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
+  return workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION ||
+    workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION
     ? TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT
     : TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT;
 }
@@ -3590,6 +3859,9 @@ function nativeFallbackReferenceBlueprint(input: {
   // structure. V6 may refine only bounded palette/type/density coordinates
   // which were independently frozen against both preview and source hashes.
   const heroFamily = "centered_dual_cta" as const;
+  if (isStaticNativeSelection(input.selection)) {
+    throw new Error("STATIC_TEMPLATE_TRUSTED_FALLBACK_UNSUPPORTED");
+  }
   if (isVisualSelectionBundleV5(input.selection.bundle)) {
     const candidate = input.selection.bundle.candidates.find(
       (item) => item.id === input.selection.candidate.id,
@@ -3701,7 +3973,7 @@ async function handleNativeReactSiteBuild(input: {
   const operationToken = `siteops-native-source:${input.operation.id}:${attempt}`;
   const baseSourceSha256 = input.nativeSelection.archiveSha256;
   const runtimeVisual = siteOpsRuntimeVisualEvidenceV1Schema.parse({
-    queryHash: input.nativeSelection.bundle.queryPlanHash,
+    queryHash: nativeSelectionQueryHash(input.nativeSelection),
     selectedCandidateId: input.context.sample.id,
     providerItemKey: input.visualEvidence.providerItemKey,
     visualEvidenceSha256: input.visualEvidence.evidenceSha256,
@@ -3717,16 +3989,13 @@ async function handleNativeReactSiteBuild(input: {
   const providerSourceAttachment = async (
     sourceClient: ManusV2Client,
   ): Promise<ManusV2Attachment> => {
-    if (
-      nativeSourceAttachmentTransport(
-        input.nativeSelection.archiveBytes.length,
-      ) === "inline"
-    ) {
+    const sourceByteLength = nativeSelectionByteLength(input.nativeSelection);
+    if (nativeSourceAttachmentTransport(sourceByteLength) === "inline") {
       return nativeSourceInlineAttachment(input.nativeSelection);
     }
     if (input.nativeSelection.bundle.schemaVersion === 6) {
       assertVisualSelectionBundleV6SourceArchiveSize(
-        input.nativeSelection.archiveBytes,
+        nativeSelectionInlineBytes(input.nativeSelection),
       );
     }
     const prior =
@@ -3737,7 +4006,7 @@ async function handleNativeReactSiteBuild(input: {
     if (
       prior?.status === "uploaded" &&
       prior.sourceArchiveSha256 === baseSourceSha256 &&
-      prior.bytes === input.nativeSelection.archiveBytes.length &&
+      prior.bytes === sourceByteLength &&
       prior.expiresAt - nowSeconds >=
         NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS
     ) {
@@ -3748,17 +4017,27 @@ async function handleNativeReactSiteBuild(input: {
     }
 
     await input.assertExecutionActive();
-    const uploaded = await sourceClient.uploadFile({
-      filename: NATIVE_SOURCE_PROVIDER_FILENAME,
-      bytes: input.nativeSelection.archiveBytes,
-      contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
-      minimumUsableSeconds: NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
-    });
+    const uploaded = await sourceClient.uploadFile(
+      isStaticNativeSelection(input.nativeSelection)
+        ? {
+            filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+            byteLength: sourceByteLength,
+            createReadStream: input.nativeSelection.createArchiveReadStream,
+            contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+            minimumUsableSeconds: NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
+          }
+        : {
+            filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+            bytes: input.nativeSelection.archiveBytes,
+            contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+            minimumUsableSeconds: NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
+          },
+    );
     currentState = transitionProviderState(currentState, {
       stage: currentState?.stage ?? "native_input_ready",
       nativeInputProviderFile: {
         sourceArchiveSha256: baseSourceSha256,
-        bytes: input.nativeSelection.archiveBytes.length,
+        bytes: sourceByteLength,
         filename: NATIVE_SOURCE_PROVIDER_FILENAME,
         fileId: uploaded.fileId,
         expiresAt: uploaded.detail.expiresAt,
@@ -3847,6 +4126,11 @@ async function handleNativeReactSiteBuild(input: {
   const materializeTrustedFallback = async (
     requestedReason: NativeTrustedFallbackReason,
   ): Promise<SiteOpsProviderResult | null> => {
+    // 2.8 owns no host-rendered approximation of the selected full Template.
+    // Keep the immutable visual reference and let the normal recoverable
+    // retry/reset state surface instead of sending V7 through the V6
+    // style-token fallback contract.
+    if (isStaticNativeSelection(input.nativeSelection)) return null;
     const existing = pendingExistingFallback();
     if (existing) return existing;
     if (currentState?.schemaVersion === 2 && currentState.fallbackPreview) {
@@ -3933,7 +4217,7 @@ async function handleNativeReactSiteBuild(input: {
       });
       const fallbackVisual = siteOpsRuntimeVisualEvidenceV2Schema.parse({
         schemaVersion: 2,
-        queryHash: input.nativeSelection.bundle.queryPlanHash,
+        queryHash: nativeSelectionQueryHash(input.nativeSelection),
         selectedCandidateId: input.context.sample.id,
         providerItemKey: input.visualEvidence.providerItemKey,
         visualEvidenceSha256: input.visualEvidence.evidenceSha256,
@@ -6404,18 +6688,32 @@ export function createManusSiteOpsProviderHandler(
         decisions: assetDecisions,
       });
       const metadata = context.sample.sourceMetadata;
-      if (!metadata || !context.sample.previewLocalAssetId)
+      const metadataRecord =
+        metadata && typeof metadata === "object" && !Array.isArray(metadata)
+          ? (metadata as unknown as Record<string, unknown>)
+          : null;
+      const staticTemplateMetadata = Boolean(
+        metadataRecord?.schemaVersion === 7 &&
+          metadataRecord.renderer === "frontmind_static_template_catalog_v1" &&
+          metadataRecord.workflowVersion ===
+            SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+      );
+      if (
+        !metadataRecord ||
+        (!staticTemplateMetadata && !context.sample.previewLocalAssetId)
+      )
         throw new SiteOpsManusFailure(
           "VISUAL_SELECTION_INCOMPLETE",
           "冻结的视觉选择缺少可信元数据。",
           "failed",
         );
-      const metadataRecord = metadata as unknown as Record<string, unknown>;
       const nativeTemplateMetadata =
         metadataRecord.schemaVersion === 6 &&
         metadataRecord.renderer === "twenty_first_native_template_v1";
+      const nativeSourceMetadata =
+        nativeTemplateMetadata || staticTemplateMetadata;
       const documents = safePublicDocuments(context.snapshot);
-      const taxonomy = nativeTemplateMetadata
+      const taxonomy = nativeSourceMetadata
         ? visualTaxonomySchema.parse({
             role: "foundation",
             palette: [],
@@ -6425,15 +6723,7 @@ export function createManusSiteOpsProviderHandler(
             accessibility: [],
           })
         : (() => {
-            const rawTaxonomy = metadata.taxonomy;
-            const parsed = visualTaxonomySchema.parse({
-              role: rawTaxonomy.role,
-              palette: rawTaxonomy.palette,
-              typography: rawTaxonomy.typography,
-              layout: rawTaxonomy.layout,
-              motion: rawTaxonomy.motion,
-              accessibility: rawTaxonomy.accessibility,
-            });
+            const parsed = visualTaxonomySchema.parse(metadataRecord.taxonomy);
             return {
               ...parsed,
               palette: accessibleRuntimePalette(parsed.palette),
@@ -6450,11 +6740,24 @@ export function createManusSiteOpsProviderHandler(
             sourceArchiveSha256: metadataRecord.sourceArchiveSha256,
             previewSha256: metadataRecord.previewSha256,
           })
-        : null;
-      const visualEvidence = nativeTemplateMetadata
+        : staticTemplateMetadata
+          ? canonicalSiteOpsSha256({
+              schemaVersion: 7,
+              workflowVersion: metadataRecord.workflowVersion,
+              catalogVersion: metadataRecord.catalogVersion,
+              catalogCandidateId: metadataRecord.catalogCandidateId,
+              sourceAssetId: metadataRecord.sourceAssetId,
+              sourceArchiveSha256: metadataRecord.sourceArchiveSha256,
+              previewAssetId: metadataRecord.previewAssetId,
+              previewSha256: metadataRecord.previewSha256,
+            })
+          : null;
+      const visualEvidence = nativeSourceMetadata
         ? createVisualEvidenceV1({
             evidenceKind: "catalog_metadata_preview_v1",
-            providerItemKey: `s:template:${templateEvidenceSeed}`,
+            providerItemKey: `${
+              staticTemplateMetadata ? "s:static-template" : "s:template"
+            }:${templateEvidenceSeed}`,
             metadataSha256: templateEvidenceSeed!,
             providerResponseSha256: z
               .string()
@@ -6475,7 +6778,7 @@ export function createManusSiteOpsProviderHandler(
         previewSha256: visualEvidence.previewSha256,
         taxonomyDerivationVersion: visualEvidence.taxonomyDerivationVersion,
       });
-      const metadataProviderItemKey = nativeTemplateMetadata
+      const metadataProviderItemKey = nativeSourceMetadata
         ? visualEvidence.providerItemKey
         : z
             .string()
@@ -6487,7 +6790,7 @@ export function createManusSiteOpsProviderHandler(
         recomposedVisualEvidence.evidenceSha256 !==
           visualEvidence.evidenceSha256 ||
         metadataProviderItemKey !== visualEvidence.providerItemKey ||
-        (!nativeTemplateMetadata &&
+        (!nativeSourceMetadata &&
           context.sample.sourceMetadata?.visualEvidence?.previewSha256 !==
             visualEvidence.previewSha256)
       ) {
@@ -6522,6 +6825,82 @@ export function createManusSiteOpsProviderHandler(
           "冻结的视觉选择合同不存在。",
           "failed",
         );
+      }
+      if (selectionArtifact.row.mimeType === "application/json") {
+        const selection = await readFrozenSelectionBundle({
+          artifact: selectionArtifact,
+          expectedCandidateId: context.sample.id,
+        });
+        if (isVisualSelectionBundleV7(selection.bundle)) {
+          const selectedV7 = selection.bundle.candidates.find(
+            (candidate) => candidate.id === context.sample.id,
+          );
+          const coordinatesMatch = Boolean(
+            staticTemplateMetadata &&
+              selectedV7 &&
+              context.build.workflowVersion ===
+                SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION &&
+              metadataRecord.catalogVersion ===
+                selection.bundle.catalogVersion &&
+              metadataRecord.catalogPosition === selectedV7.catalogPosition &&
+              metadataRecord.catalogCandidateId ===
+                selectedV7.catalogCandidateId &&
+              metadataRecord.providerTemplateId ===
+                selectedV7.providerTemplateId &&
+              metadataRecord.providerSlug === selectedV7.providerSlug &&
+              metadataRecord.providerVersion === selectedV7.providerVersion &&
+              metadataRecord.sourceOwner === selectedV7.sourceOwner &&
+              metadataRecord.sourceRepo === selectedV7.sourceRepo &&
+              metadataRecord.sourceCommitSha === selectedV7.sourceCommitSha &&
+              metadataRecord.sourceSubdirectory ===
+                selectedV7.sourceSubdirectory &&
+              metadataRecord.sourceLicense === selectedV7.sourceLicense &&
+              metadataRecord.sourceAssetId === selectedV7.sourceAssetId &&
+              metadataRecord.sourceArchiveSha256 ===
+                selectedV7.sourceArchiveSha256 &&
+              metadataRecord.sourceArchiveBytes ===
+                selectedV7.sourceArchiveBytes &&
+              metadataRecord.previewAssetId === selectedV7.previewAssetId &&
+              metadataRecord.previewSha256 === selectedV7.previewSha256 &&
+              metadataRecord.previewMimeType === selectedV7.previewMimeType &&
+              metadataRecord.previewWidth === selectedV7.previewWidth &&
+              metadataRecord.previewHeight === selectedV7.previewHeight &&
+              visualEvidence.previewSha256 === selectedV7.previewSha256,
+          );
+          if (!coordinatesMatch) {
+            throw new SiteOpsManusFailure(
+              "VISUAL_SELECTION_COORDINATES_MISMATCH",
+              "固定模板目录与所选视觉候选坐标不一致。",
+              "failed",
+            );
+          }
+          const nativeSelection = await selectedStaticNativeSourceArchive({
+            bundle: selection.bundle,
+            selectedCandidateId: context.sample.id,
+          });
+          return await handleNativeReactSiteBuild({
+            db,
+            operation,
+            signal,
+            assertExecutionActive,
+            client: null,
+            getClient,
+            input,
+            state,
+            context,
+            brief,
+            documents,
+            visualEvidence,
+            taxonomy,
+            brandAsset,
+            nativeSelection,
+            materializeNative,
+            materializeNativeFallback,
+            assetDecisions,
+            persist,
+            readArtifact,
+          });
+        }
       }
       if (
         selectionArtifact.row.mimeType === VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE

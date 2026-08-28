@@ -18,12 +18,14 @@ import {
   parseSiteOpsActionPayload,
   projectSiteOpsVisualGeneration,
   projectSiteOpsObservationStatuses,
+  projectStaticTemplateCatalogVisualReadiness,
   projectSiteOpsExecutionSteps,
   projectSiteOpsBuildDelivery,
   projectSiteOpsBuildProgress,
   projectSiteOpsCurrentResetCycle,
   referenceBlueprintForSiteOpsRevision,
   requireTwentyFirstReferenceAdmission,
+  resolveVisualCatalogObservationCoordinates,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
   runSiteOpsObservationQueries,
@@ -45,6 +47,8 @@ import {
   SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_MATERIALIZER_V2_6,
+  SITEOPS_MATERIALIZER_V2_7,
+  SITEOPS_MATERIALIZER_V2_8,
   SITEOPS_WORKFLOW,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
@@ -126,9 +130,9 @@ describe("SiteOps core contracts", () => {
     expect(
       siteOpsWorkflowForVisualSelectionMetadata({
         ...historicalV6,
-        workflowVersion: SITEOPS_DEFAULT_WORKFLOW.frontMindVersion,
+        workflowVersion: SITEOPS_MATERIALIZER_V2_7.frontMindVersion,
       }).frontMindVersion,
-    ).toBe(SITEOPS_DEFAULT_WORKFLOW.frontMindVersion);
+    ).toBe(SITEOPS_MATERIALIZER_V2_7.frontMindVersion);
     expect(
       isNativeVisualSelectionMetadata({
         schemaVersion: 6,
@@ -1117,6 +1121,134 @@ describe("SiteOps core contracts", () => {
       reservedPages: 1,
       canGenerateMore: true,
     });
+  });
+
+  it("projects the fixed 2.8 catalog as four complete local pages with no supplemental generation", () => {
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "awaiting_visual_selection",
+        generatedPages: 4,
+        availablePages: 4,
+        reservedPages: 0,
+        latestVisualOperation: { status: "succeeded" },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+        workflowVersion: SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
+        catalogVersion: "21st-included-recommended-20260828-v1",
+        pageSize: 8,
+        pageCount: 4,
+      }),
+    ).toMatchObject({
+      status: "idle",
+      generatedPages: 4,
+      availablePages: 4,
+      reservedPages: 0,
+      maxPages: 4,
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      pageSize: 8,
+      pageCount: 4,
+      canGenerateMore: false,
+      canSelectExisting: true,
+    });
+  });
+
+  it("projects a pristine project as the fixed 2.8 catalog before any visual operation exists", () => {
+    const coordinates = resolveVisualCatalogObservationCoordinates({
+      frozenVisualInput: null,
+      hasAnyVisualOperation: false,
+      visibleBatchCount: 0,
+    });
+    expect(coordinates).toMatchObject({
+      pristineVisualCycle: true,
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      staticCatalogVisualCycle: true,
+      pageSize: 8,
+      pageCount: 4,
+      defaultAvailability: { availablePages: 4, reservedPages: 0 },
+    });
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "draft",
+        generatedPages: 0,
+        ...coordinates.defaultAvailability!,
+        latestVisualOperation: null,
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+        workflowVersion: coordinates.workflowVersion,
+        catalogVersion: coordinates.catalogVersion,
+        pageSize: coordinates.pageSize,
+        pageCount: coordinates.pageCount,
+      }),
+    ).toMatchObject({
+      generatedPages: 0,
+      availablePages: 4,
+      reservedPages: 0,
+      maxPages: 4,
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      pageSize: 8,
+      pageCount: 4,
+      canGenerateMore: false,
+    });
+  });
+
+  it("reports visual readiness from the active fixed catalog rather than a legacy 21st credential", () => {
+    expect(
+      projectStaticTemplateCatalogVisualReadiness({
+        workflowVersion: "2.8.0",
+        catalogVersion: "21st-included-recommended-20260828-v1",
+        pageSize: 8,
+        pageCount: 4,
+      }),
+    ).toEqual({ status: "configured", reason: undefined });
+    expect(projectStaticTemplateCatalogVisualReadiness(null)).toEqual({
+      status: "not_configured",
+      reason: "固定 Template 目录尚未就绪，请联系 FrontMind",
+    });
+  });
+
+  it("does not relabel an existing historical visual operation as a pristine 2.8 cycle", () => {
+    expect(
+      resolveVisualCatalogObservationCoordinates({
+        frozenVisualInput: null,
+        hasAnyVisualOperation: true,
+        visibleBatchCount: 0,
+      }),
+    ).toMatchObject({
+      pristineVisualCycle: false,
+      workflowVersion: null,
+      catalogVersion: null,
+      staticCatalogVisualCycle: false,
+      pageSize: 9,
+      pageCount: 3,
+      defaultAvailability: null,
+    });
+  });
+
+  it("keeps all four static pages complete after one batch becomes selected", () => {
+    const batches = Array.from({ length: 4 }, (_, index) => ({
+      id: `static-batch-${index + 1}`,
+      status: index === 1 ? "selected" : "published",
+    }));
+    const candidates = batches.flatMap((batch) =>
+      Array.from({ length: 8 }, () => ({ batchId: batch.id })),
+    );
+
+    expect(
+      completePublishedVisualPageCount({
+        batches,
+        candidates,
+        pageSize: 8,
+        visibleStatuses: ["published", "selected"],
+      }),
+    ).toBe(4);
+    expect(
+      completePublishedVisualPageCount({ batches, candidates, pageSize: 8 }),
+    ).toBe(3);
   });
 
   it("orders same-second visual retries by monotonic admission revision", () => {

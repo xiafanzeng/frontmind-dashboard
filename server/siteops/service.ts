@@ -42,6 +42,7 @@ import {
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_MATERIALIZER_V2_6,
   SITEOPS_MATERIALIZER_V2_7,
+  SITEOPS_MATERIALIZER_V2_8,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
@@ -73,6 +74,13 @@ import {
   referenceBlueprintV4Schema,
   type ReferenceBlueprint,
 } from "../../shared/siteops-design";
+import {
+  STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+  STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+  STATIC_TEMPLATE_CATALOG_VERSION,
+  loadActiveStaticTemplateCatalog,
+  requireActiveStaticTemplateCatalog,
+} from "./static-template-catalog";
 import {
   visualSearchOperationInputSchema,
   type VisualSearchOperationInput,
@@ -181,7 +189,8 @@ function siteOpsBuildWorkflowCoordinates(
   workflow:
     | typeof SITEOPS_MATERIALIZER_V2_5
     | typeof SITEOPS_MATERIALIZER_V2_6
-    | typeof SITEOPS_MATERIALIZER_V2_7,
+    | typeof SITEOPS_MATERIALIZER_V2_7
+    | typeof SITEOPS_MATERIALIZER_V2_8,
 ) {
   return {
     workflowUpstreamVersion: workflow.upstreamVersion,
@@ -820,6 +829,42 @@ const nativeTemplateSelectionMetadataSchema = z
   })
   .passthrough();
 
+export const staticTemplateSelectionMetadataSchema = z
+  .object({
+    schemaVersion: z.literal(7),
+    renderer: z.literal("frontmind_static_template_catalog_v1"),
+    workflowVersion: z.literal("2.8.0"),
+    catalogVersion: z.string().trim().min(1).max(191),
+    catalogPosition: z.number().int().min(1).max(32),
+    catalogCandidateId: z.string().trim().min(1).max(191),
+    providerTemplateId: z.string().trim().min(1).max(191),
+    providerSlug: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    sourceOwner: z.string().trim().min(1).max(191),
+    sourceRepo: z.string().trim().min(1).max(191),
+    sourceCommitSha: z.string().regex(/^[a-f0-9]{40}$/u),
+    sourceSubdirectory: z.string().trim().min(1).max(1_024).nullable(),
+    sourceLicense: z.enum(["MIT", "Apache-2.0"]),
+    sourceAssetId: z.string().trim().min(1).max(512),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchiveBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(192 * 1024 * 1024),
+    previewAssetId: z.string().trim().min(1).max(512),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    previewMimeType: z.enum([
+      "image/avif",
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+    ]),
+    previewWidth: z.number().int().positive().max(50_000),
+    previewHeight: z.number().int().positive().max(50_000),
+  })
+  .passthrough();
+
 export function isNativeVisualSelectionMetadata(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -828,11 +873,15 @@ export function isNativeVisualSelectionMetadata(value: unknown) {
   return (
     (record.schemaVersion === 5 &&
       record.renderer === "twenty_first_native_react_v1") ||
-    nativeTemplateSelectionMetadataSchema.safeParse(record).success
+    nativeTemplateSelectionMetadataSchema.safeParse(record).success ||
+    staticTemplateSelectionMetadataSchema.safeParse(record).success
   );
 }
 
 export function siteOpsWorkflowForVisualSelectionMetadata(value: unknown) {
+  if (staticTemplateSelectionMetadataSchema.safeParse(value).success) {
+    return SITEOPS_MATERIALIZER_V2_8;
+  }
   const nativeTemplate = nativeTemplateSelectionMetadataSchema.safeParse(value);
   if (nativeTemplate.success) {
     // V6 existed before workflow 2.7. Historical rows intentionally have no
@@ -1059,6 +1108,25 @@ async function loadOwnedProject(
   return rows[0] ?? null;
 }
 
+export function projectStaticTemplateCatalogVisualReadiness(
+  catalog: {
+    workflowVersion: string;
+    catalogVersion: string;
+    pageSize: number;
+    pageCount: number;
+  } | null,
+) {
+  const ready =
+    catalog?.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion &&
+    catalog.catalogVersion === STATIC_TEMPLATE_CATALOG_VERSION &&
+    catalog.pageSize === STATIC_TEMPLATE_CATALOG_PAGE_SIZE &&
+    catalog.pageCount === STATIC_TEMPLATE_CATALOG_PAGE_COUNT;
+  return {
+    status: ready ? ("configured" as const) : ("not_configured" as const),
+    reason: ready ? undefined : "固定 Template 目录尚未就绪，请联系 FrontMind",
+  };
+}
+
 async function loadServiceReadiness(
   executor: any,
   input: { projectId: string; userId: number },
@@ -1071,10 +1139,7 @@ async function loadServiceReadiness(
     .from(presalesApiCredentials)
     .where(
       and(
-        inArray(presalesApiCredentials.slot, [
-          "site_builder_21st",
-          "siteops_aliyun_oauth",
-        ]),
+        eq(presalesApiCredentials.slot, "siteops_aliyun_oauth"),
         eq(presalesApiCredentials.status, "active"),
         eq(presalesApiCredentials.validationStatus, "verified"),
       ),
@@ -1103,12 +1168,17 @@ async function loadServiceReadiness(
       ),
     )
     .limit(1);
-  const hasTwentyFirstCredential = platformCredentials.some(
-    (row: { slot: string }) => row.slot === "site_builder_21st",
-  );
   const hasAliyunOAuthCredential = platformCredentials.some(
     (row: { slot: string }) => row.slot === "siteops_aliyun_oauth",
   );
+  let staticTemplateCatalog: Awaited<
+    ReturnType<typeof loadActiveStaticTemplateCatalog>
+  > = null;
+  try {
+    staticTemplateCatalog = await loadActiveStaticTemplateCatalog();
+  } catch {
+    staticTemplateCatalog = null;
+  }
   const hasAiBuilderCredential = aiBuilderCredentials.length > 0;
   const aliyunFeatureEnabled =
     process.env.FRONTMIND_ALIYUN_DOMAIN_ENABLED?.trim() === "1";
@@ -1119,14 +1189,7 @@ async function loadServiceReadiness(
     providerRegistered: siteOpsProviderConfigured("aliyun_esa"),
   });
   return {
-    visuals: {
-      status: hasTwentyFirstCredential
-        ? ("configured" as const)
-        : ("not_configured" as const),
-      reason: hasTwentyFirstCredential
-        ? undefined
-        : "视觉候选服务尚未就绪，请联系 FrontMind",
-    },
+    visuals: projectStaticTemplateCatalogVisualReadiness(staticTemplateCatalog),
     website: {
       status: hasAiBuilderCredential
         ? ("configured" as const)
@@ -1363,6 +1426,8 @@ export function siteOpsVisualSelectionRecovery(input: {
 export function completePublishedVisualPageCount(input: {
   batches: Array<{ id: string; status: string }>;
   candidates: Array<{ batchId: string }>;
+  pageSize?: 8 | 9;
+  visibleStatuses?: readonly string[];
 }) {
   const candidateCountByBatch = new Map<string, number>();
   for (const candidate of input.candidates) {
@@ -1373,10 +1438,51 @@ export function completePublishedVisualPageCount(input: {
   }
   return input.batches.filter(
     (batch) =>
-      batch.status === "published" &&
+      (input.visibleStatuses ?? ["published"]).includes(batch.status) &&
       candidateCountByBatch.get(batch.id) ===
-        SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+        (input.pageSize ?? SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE),
   ).length;
+}
+
+export function resolveVisualCatalogObservationCoordinates(input: {
+  frozenVisualInput: Record<string, unknown> | null;
+  hasAnyVisualOperation: boolean;
+  visibleBatchCount: number;
+}) {
+  const pristineVisualCycle =
+    !input.hasAnyVisualOperation && input.visibleBatchCount === 0;
+  const workflowVersion =
+    typeof input.frozenVisualInput?.workflowVersion === "string"
+      ? input.frozenVisualInput.workflowVersion
+      : pristineVisualCycle
+        ? SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+        : null;
+  const catalogVersion =
+    typeof input.frozenVisualInput?.catalogVersion === "string"
+      ? input.frozenVisualInput.catalogVersion
+      : pristineVisualCycle
+        ? STATIC_TEMPLATE_CATALOG_VERSION
+        : null;
+  const staticCatalogVisualCycle =
+    workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+  return {
+    pristineVisualCycle,
+    workflowVersion,
+    catalogVersion,
+    staticCatalogVisualCycle,
+    pageSize: staticCatalogVisualCycle
+      ? STATIC_TEMPLATE_CATALOG_PAGE_SIZE
+      : SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+    pageCount: staticCatalogVisualCycle
+      ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT
+      : SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+    defaultAvailability: pristineVisualCycle
+      ? {
+          availablePages: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+          reservedPages: 0,
+        }
+      : null,
+  } as const;
 }
 
 export function projectSiteOpsVisualGeneration(input: {
@@ -1388,15 +1494,21 @@ export function projectSiteOpsVisualGeneration(input: {
   hasActiveVisualOperation: boolean;
   hasActiveBuild: boolean;
   hasBuildAttempt: boolean;
+  workflowVersion?: string | null;
+  catalogVersion?: string | null;
+  pageSize?: 8 | 9;
+  pageCount?: 3 | 4;
 }) {
+  const staticCatalogMode =
+    input.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+  const maxPages = staticCatalogMode
+    ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT
+    : SITEOPS_VISUAL_CANDIDATE_MAX_PAGES;
   const hasFrozenAvailability = Number.isInteger(input.availablePages);
   const availablePages = hasFrozenAvailability
     ? Math.max(
         input.generatedPages,
-        Math.min(
-          SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
-          Number(input.availablePages),
-        ),
+        Math.min(maxPages, Number(input.availablePages)),
       )
     : input.generatedPages;
   const reservedPages = Math.max(
@@ -1454,12 +1566,19 @@ export function projectSiteOpsVisualGeneration(input: {
     generatedPages: input.generatedPages,
     availablePages,
     reservedPages,
-    maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+    maxPages,
+    ...(input.workflowVersion
+      ? { workflowVersion: input.workflowVersion }
+      : {}),
+    ...(input.catalogVersion ? { catalogVersion: input.catalogVersion } : {}),
+    ...(input.pageSize ? { pageSize: input.pageSize } : {}),
+    ...(input.pageCount ? { pageCount: input.pageCount } : {}),
     canGenerateMore:
+      !staticCatalogMode &&
       (canSelectExisting || retryableInitialFailure) &&
       (hasFrozenAvailability
         ? input.generatedPages < availablePages
-        : input.generatedPages < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+        : input.generatedPages < maxPages),
     canSelectExisting,
     retryAction: retryableError
       ? input.generatedPages === 0
@@ -2229,6 +2348,32 @@ async function projectObservationOnce(
     timelineOperationRows: rawTimelineOperationRows,
   });
 
+  const frozenVisualOperation = timelineOperationRows
+    .filter((row: { kind: string }) => row.kind === "visual_search")
+    .sort(compareSiteOpsVisualOperationsNewestFirst)
+    .find((row: { input?: unknown }) => {
+      const parsed = row.input as Record<string, unknown> | null | undefined;
+      return typeof parsed?.workflowVersion === "string";
+    });
+  const frozenVisualInput = (frozenVisualOperation?.input ?? null) as Record<
+    string,
+    unknown
+  > | null;
+  const visualCoordinates = resolveVisualCatalogObservationCoordinates({
+    frozenVisualInput,
+    hasAnyVisualOperation: timelineOperationRows.some(
+      (row: { kind: string }) => row.kind === "visual_search",
+    ),
+    visibleBatchCount: batchRows.length,
+  });
+  const {
+    workflowVersion: visualWorkflowVersion,
+    catalogVersion: visualCatalogVersion,
+    staticCatalogVisualCycle,
+    pageSize: visualPageSize,
+    pageCount: visualPageCount,
+  } = visualCoordinates;
+
   const publishedBatchRows = batchRows
     .filter(
       (row: typeof websiteStyleSampleBatches.$inferSelect) =>
@@ -2240,9 +2385,20 @@ async function projectObservationOnce(
         right: typeof websiteStyleSampleBatches.$inferSelect,
       ) => left.ordinal - right.ordinal,
     )
-    .slice(0, SITEOPS_VISUAL_CANDIDATE_MAX_PAGES);
-  const visibleBatchRows =
-    publishedBatchRows.length > 0
+    .slice(0, visualPageCount);
+  const visibleBatchRows = staticCatalogVisualCycle
+    ? batchRows
+        .filter((row: typeof websiteStyleSampleBatches.$inferSelect) =>
+          ["published", "selected"].includes(row.status),
+        )
+        .sort(
+          (
+            left: typeof websiteStyleSampleBatches.$inferSelect,
+            right: typeof websiteStyleSampleBatches.$inferSelect,
+          ) => left.ordinal - right.ordinal,
+        )
+        .slice(0, STATIC_TEMPLATE_CATALOG_PAGE_COUNT)
+    : publishedBatchRows.length > 0
       ? publishedBatchRows
       : batchRows
           .filter(
@@ -2259,11 +2415,20 @@ async function projectObservationOnce(
           .select()
           .from(websiteStyleSamples)
           .where(inArray(websiteStyleSamples.batchId, visibleBatchIds))
-          .limit(SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL)
+          .limit(
+            staticCatalogVisualCycle
+              ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT *
+                  STATIC_TEMPLATE_CATALOG_PAGE_SIZE
+              : SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
+          )
       : [];
   const completePublishedPages = completePublishedVisualPageCount({
-    batches: publishedBatchRows,
+    batches: staticCatalogVisualCycle ? visibleBatchRows : publishedBatchRows,
     candidates: candidateRows,
+    pageSize: visualPageSize,
+    ...(staticCatalogVisualCycle
+      ? { visibleStatuses: ["published", "selected"] }
+      : {}),
   });
   const visualOperationRows = timelineOperationRows
     .filter((row: { kind: string }) => row.kind === "visual_search")
@@ -2301,7 +2466,7 @@ async function projectObservationOnce(
             (row: { status: string }) => row.status === "reserved",
           ).length,
         }
-      : operationPoolAvailability;
+      : (operationPoolAvailability ?? visualCoordinates.defaultAvailability);
   const activeVisualOperationRows = visualOperationRows.filter(
     (row: { status: string }) =>
       ACTIVE_VISUAL_OPERATION_STATUSES.has(row.status),
@@ -2430,7 +2595,7 @@ async function projectObservationOnce(
           ) => left.sortOrder - right.sortOrder,
         )
         .map(projectVisualCandidate);
-      return candidates.length === 9
+      return candidates.length === visualPageSize
         ? [{ batchId: batch.id, page: pageIndex + 1, candidates }]
         : [];
     },
@@ -2461,6 +2626,10 @@ async function projectObservationOnce(
     hasActiveVisualOperation: activeVisualOperationRows.length > 0,
     hasActiveBuild,
     hasBuildAttempt,
+    workflowVersion: visualWorkflowVersion,
+    catalogVersion: visualCatalogVersion,
+    pageSize: visualPageSize,
+    pageCount: visualPageCount,
   });
   const projectedStatuses = projectSiteOpsObservationStatuses({
     projectStatus: input.project.status,
@@ -2542,6 +2711,18 @@ async function projectObservationOnce(
       canSelectExisting: visualGeneration.canSelectExisting,
       retryAction: visualGeneration.retryAction,
       failureCategory: visualGeneration.failureCategory,
+      ...(visualGeneration.workflowVersion
+        ? { workflowVersion: visualGeneration.workflowVersion }
+        : {}),
+      ...(visualGeneration.catalogVersion
+        ? { catalogVersion: visualGeneration.catalogVersion }
+        : {}),
+      ...(visualGeneration.pageSize
+        ? { pageSize: visualGeneration.pageSize }
+        : {}),
+      ...(visualGeneration.pageCount
+        ? { pageCount: visualGeneration.pageCount }
+        : {}),
     },
     executionSteps: projectSiteOpsExecutionSteps({
       operations: timelineOperationRows,
@@ -3264,6 +3445,20 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
     );
   }
   assertCurrentVisualWorkflowVersion(frozen.data.workflowVersion);
+  if (
+    "schemaVersion" in frozen.data &&
+    frozen.data.schemaVersion === 3 &&
+    frozen.data.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+  ) {
+    return null;
+  }
+  if (!("credentialId" in frozen.data)) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "视觉批次缺少可核验的历史检索凭据坐标。",
+      409,
+    );
+  }
   const credentialRows = await tx
     .select({
       id: presalesApiCredentials.id,
@@ -3292,7 +3487,8 @@ export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
   if (
     workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion &&
     workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion &&
-    workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_8.frontMindVersion
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -3338,7 +3534,8 @@ export function siteOpsVisualCycleWorkflowVersion(
   if (
     workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion &&
     workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion &&
-    workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_8.frontMindVersion
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -3401,6 +3598,7 @@ async function frozenSupplementalVisualWorkflowVersion(
     const parsed = visualSearchOperationInputSchema.parse(frozenInput);
     if (
       parsed.knowledgeSnapshotId !== input.knowledgeSnapshotId ||
+      !("credentialId" in parsed) ||
       parsed.credentialId !== input.credentialId ||
       parsed.credentialVersion !== input.credentialVersion
     ) {
@@ -3859,7 +4057,7 @@ async function handleVisualSearch(
         ),
       ),
     )
-    .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+    .limit(STATIC_TEMPLATE_CATALOG_PAGE_COUNT)
     .for("update");
   const activeVisualRows = await tx
     .select({ id: siteOperations.id })
@@ -3882,6 +4080,16 @@ async function handleVisualSearch(
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "当前视觉候选仍在生成，请等待本次生成完成后再试。",
+      409,
+    );
+  }
+  if (
+    input.reselect &&
+    currentPublishedBatches.length >= STATIC_TEMPLATE_CATALOG_PAGE_COUNT
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "固定目录的 32 个完整 Template 已全部展示，请直接选择一个方向。",
       409,
     );
   }
@@ -3914,11 +4122,22 @@ async function handleVisualSearch(
       409,
     );
   }
-  const credential = await ensureActiveProviderCredential(
-    tx,
-    "site_builder_21st",
-  );
+  const mode =
+    currentPublishedBatches.length > 0
+      ? ("supplemental" as const)
+      : ("initial" as const);
+  const page = (mode === "initial" ? 1 : currentPublishedBatches.length + 1) as
+    | 1
+    | 2
+    | 3;
+  const staticCatalog =
+    mode === "initial" ? await requireActiveStaticTemplateCatalog() : null;
+  const credential =
+    mode === "supplemental"
+      ? await ensureActiveProviderCredential(tx, "site_builder_21st")
+      : null;
   if (
+    credential &&
     input.expectedCredential &&
     (credential.version !== input.expectedCredential.version ||
       credential.fingerprint !== input.expectedCredential.fingerprint)
@@ -3929,14 +4148,6 @@ async function handleVisualSearch(
       409,
     );
   }
-  const mode =
-    currentPublishedBatches.length > 0
-      ? ("supplemental" as const)
-      : ("initial" as const);
-  const page = (mode === "initial" ? 1 : currentPublishedBatches.length + 1) as
-    | 1
-    | 2
-    | 3;
   const workflowVersion =
     mode === "initial"
       ? SITEOPS_DEFAULT_WORKFLOW.frontMindVersion
@@ -3945,20 +4156,32 @@ async function handleVisualSearch(
           projectId: input.project.id,
           userId: input.actor.id,
           knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-          credentialId: credential.id,
-          credentialVersion: credential.version,
+          credentialId: credential!.id,
+          credentialVersion: credential!.version,
         });
   const admissionRevision = input.project.revision + 1;
-  const operationPayload = createVisualSearchOperationInput({
-    schemaVersion: 2,
-    knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-    credentialId: credential.id,
-    credentialVersion: credential.version,
-    workflowVersion,
-    mode,
-    page,
-    admissionRevision,
-  });
+  const operationPayload = createVisualSearchOperationInput(
+    mode === "initial"
+      ? {
+          schemaVersion: 3,
+          knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+          workflowVersion: SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
+          catalogVersion: staticCatalog!.catalogVersion,
+          mode: "initial",
+          page: 1,
+          admissionRevision,
+        }
+      : {
+          schemaVersion: 2,
+          knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+          credentialId: credential!.id,
+          credentialVersion: credential!.version,
+          workflowVersion,
+          mode,
+          page,
+          admissionRevision,
+        },
+  );
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
     project: input.project,
@@ -3977,7 +4200,7 @@ async function handleVisualSearch(
     content:
       mode === "supplemental"
         ? `正在生成第 ${page} 组全新视觉候选；前面展示过的参考不会重复。`
-        : "正在生成 9 个视觉候选，完成后会一次展示。",
+        : "正在载入 32 个固定完整 Template，完成后将按四页展示。",
     siteOps: {
       kind: "build_progress",
       subjectId: operationId,
@@ -3985,7 +4208,13 @@ async function handleVisualSearch(
       status: "active",
       payload: {
         stage: "visual_searching",
-        targets: [18, 12, 9],
+        targets:
+          mode === "initial"
+            ? [
+                STATIC_TEMPLATE_CATALOG_PAGE_COUNT *
+                  STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+              ]
+            : [18, 12, 9],
         page,
         mode,
       },
@@ -4112,6 +4341,18 @@ async function selectVisualSample(
     const latestVisualOperation = [...latestVisualRows].sort(
       compareSiteOpsVisualOperationsNewestFirst,
     )[0];
+    const latestVisualInput = latestVisualOperation?.input as
+      | Record<string, unknown>
+      | undefined;
+    const recoveryStaticCatalog =
+      latestVisualInput?.workflowVersion ===
+      SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+    const recoveryPageCount = recoveryStaticCatalog
+      ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT
+      : SITEOPS_VISUAL_CANDIDATE_MAX_PAGES;
+    const recoveryPageSize = recoveryStaticCatalog
+      ? STATIC_TEMPLATE_CATALOG_PAGE_SIZE
+      : SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
     const publishedRows = await tx
       .select({ id: websiteStyleSampleBatches.id })
       .from(websiteStyleSampleBatches)
@@ -4127,7 +4368,7 @@ async function selectVisualSample(
           ),
         ),
       )
-      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .limit(recoveryPageCount)
       .for("update");
     const publishedIds = publishedRows.map((row: { id: string }) => row.id);
     const publishedSamples =
@@ -4136,7 +4377,7 @@ async function selectVisualSample(
             .select({ batchId: websiteStyleSamples.batchId })
             .from(websiteStyleSamples)
             .where(inArray(websiteStyleSamples.batchId, publishedIds))
-            .limit(SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL)
+            .limit(recoveryPageCount * recoveryPageSize)
         : [];
     const samplesPerBatch = new Map<string, number>();
     for (const row of publishedSamples as Array<{ batchId: string }>) {
@@ -4146,7 +4387,7 @@ async function selectVisualSample(
       );
     }
     const completePublishedPages = publishedIds.filter(
-      (id: string) => samplesPerBatch.get(id) === 9,
+      (id: string) => samplesPerBatch.get(id) === recoveryPageSize,
     ).length;
     recoveredSelection = siteOpsVisualSelectionRecovery({
       projectStatus: input.project.status,
@@ -4199,7 +4440,8 @@ async function selectVisualSample(
     );
   if (
     sampleRows.length < 1 ||
-    sampleRows.length > SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL
+    sampleRows.length >
+      STATIC_TEMPLATE_CATALOG_PAGE_COUNT * STATIC_TEMPLATE_CATALOG_PAGE_SIZE
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -4214,9 +4456,13 @@ async function selectVisualSample(
           Number(left.sample.sourceMetadata?.score ?? 0),
       )[0]
     : sampleRows[0];
+  const selectedStaticTemplate =
+    staticTemplateSelectionMetadataSchema.safeParse(
+      selected?.sample.sourceMetadata,
+    );
   if (
-    !selected?.sample.previewLocalAssetId ||
-    !selected.sample.sourceMetadata
+    !selected?.sample.sourceMetadata ||
+    (!selected.sample.previewLocalAssetId && !selectedStaticTemplate.success)
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -4322,18 +4568,23 @@ async function selectVisualSample(
         eq(websiteStyleSampleBatches.status, "published"),
       ),
     );
-  await tx
-    .update(websiteStyleSampleBatches)
-    .set({ status: "superseded", updatedAt: new Date() })
-    .where(
-      and(
-        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
-        eq(websiteStyleSampleBatches.userId, input.actor.id),
-        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-        eq(websiteStyleSampleBatches.status, "published"),
-        ne(websiteStyleSampleBatches.id, selected.batch.id),
-      ),
-    );
+  if (
+    selectedWorkflow.frontMindVersion !==
+    SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+  ) {
+    await tx
+      .update(websiteStyleSampleBatches)
+      .set({ status: "superseded", updatedAt: new Date() })
+      .where(
+        and(
+          eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+          eq(websiteStyleSampleBatches.userId, input.actor.id),
+          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+          eq(websiteStyleSampleBatches.status, "published"),
+          ne(websiteStyleSampleBatches.id, selected.batch.id),
+        ),
+      );
+  }
   const selectedPoolPageRows = await tx
     .select({
       id: visualCandidatePoolPages.id,
@@ -4417,8 +4668,8 @@ async function selectVisualSample(
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
     ...siteOpsBuildWorkflowCoordinates(selectedWorkflow),
-    twentyFirstCredentialId: credential.id,
-    twentyFirstCredentialVersion: credential.version,
+    twentyFirstCredentialId: credential?.id ?? null,
+    twentyFirstCredentialVersion: credential?.version ?? null,
     styleSampleId: selected.sample.id,
     styleRevision: input.project.revision,
     brief: input.project.brief ?? {},
@@ -5331,12 +5582,6 @@ export async function actOnSiteOpsFast(
     input.input,
   ) as Record<string, unknown>;
   const requestHash = hashSiteOpsRequest({ action: input.action, payload });
-  const templateAdmission =
-    input.action === "start_visual_search" || input.action === "reselect_visual"
-      ? requireTwentyFirstReferenceAdmission(
-          await getTwentyFirstCredentialStatus(),
-        )
-      : undefined;
   const db = await requireDb();
   return db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
@@ -5488,7 +5733,6 @@ export async function actOnSiteOpsFast(
         await handleVisualSearch(tx, {
           ...common,
           payload,
-          expectedCredential: templateAdmission,
         });
         break;
       case "reselect_visual":
@@ -5496,7 +5740,6 @@ export async function actOnSiteOpsFast(
           ...common,
           payload,
           reselect: true,
-          expectedCredential: templateAdmission,
         });
         break;
       case "select_visual":

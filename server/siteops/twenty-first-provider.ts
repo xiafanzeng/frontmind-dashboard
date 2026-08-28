@@ -1,5 +1,5 @@
 import { createHash, createHmac, hkdfSync, randomUUID } from "node:crypto";
-import { and, eq, max } from "drizzle-orm";
+import { and, eq, inArray, max } from "drizzle-orm";
 import sharp from "sharp";
 import { z } from "zod";
 
@@ -36,15 +36,18 @@ import {
 import {
   siteBriefSchema,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+  SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
   visualSelectionBundleV4Schema,
   visualSelectionBundleV5Schema,
   visualSelectionBundleV6Schema,
+  visualSelectionBundleV7Schema,
   type SiteBrief,
   type SiteOpsNativeTemplateFailureCategory,
   type VisualSelectionBundleV4,
   type VisualSelectionBundleV5,
   type VisualSelectionBundleV6,
+  type VisualSelectionBundleV7,
 } from "../../shared/siteops";
 import {
   FRONTMIND_VISUAL_FAMILIES_V3,
@@ -67,14 +70,18 @@ import {
 import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
 import {
   SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
+  SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
   isSiteOpsNativeVisualWorkflowVersion,
   VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
   VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES,
   VISUAL_SELECTION_BUNDLE_V6_MIME_TYPE,
+  VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES,
+  VISUAL_SELECTION_BUNDLE_V7_MIME_TYPE,
   assertTwentyFirstNativeSourcePayloadAvailable,
   createVisualSelectionBundleV5Artifact,
   createVisualSelectionBundleV6Artifact,
+  createVisualSelectionBundleV7Artifact,
   classifyNativeTemplateRuntimeFailure,
   classifyNativeVisualFailure,
   prepareLegacyNativeTemplateCandidate,
@@ -86,6 +93,13 @@ import {
   type PreparedNativeTemplateCandidate,
   type PreparedNativeVisualCandidate,
 } from "./native-visual-source";
+import {
+  STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
+  STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+  STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+  requireActiveStaticTemplateCatalog,
+  type StaticTemplateCatalog,
+} from "./static-template-catalog";
 import { registerSiteOpsProviderHandler } from "./providers";
 import { fetchSafeVisualPreview } from "./remote-preview";
 import { renderTrustedVisualCandidatePreviews } from "./react-static-runtime";
@@ -100,6 +114,8 @@ const SENSITIVE_SEARCH_CONTEXT =
 
 type ExistingBoard = {
   batchId: string;
+  batchIds?: string[];
+  pageCount?: number;
   candidateCount: number;
   selectionBundleHash: string | null;
 };
@@ -210,6 +226,33 @@ type NativeTemplateBoardCandidate = {
   entrypoint: string;
 };
 
+type StaticTemplateBoardCandidate = {
+  sampleId: string;
+  optionLabel: string;
+  catalogVersion: string;
+  catalogPosition: number;
+  catalogCandidateId: string;
+  providerTemplateId: string;
+  providerSlug: string;
+  providerVersion: string | null;
+  providerItemKey: string;
+  title: string;
+  description: string | null;
+  sourceOwner: string;
+  sourceRepo: string;
+  sourceCommitSha: string;
+  sourceSubdirectory: string | null;
+  sourceLicense: "MIT" | "Apache-2.0";
+  sourceAssetId: string;
+  sourceArchiveSha256: string;
+  sourceArchiveBytes: number;
+  previewAssetId: string;
+  previewSha256: string;
+  previewMimeType: "image/avif" | "image/jpeg" | "image/png" | "image/webp";
+  previewWidth: number;
+  previewHeight: number;
+};
+
 type BoardCandidate =
   | FrontMindBoardCandidate
   | NativeBoardCandidate
@@ -279,6 +322,14 @@ export type VisualSearchDiagnostics = {
   renderSucceeded: number;
   capacityCandidates: number;
   capacityRequired: number;
+  targetRequired: number;
+  minimumRequired: number;
+  downloaded: number;
+  normalized: number;
+  compiled: number;
+  rendered: number;
+  sourceUnsafe: number;
+  dependencyUnsupported: number;
   capacityPages: number;
   capacitySelected: number;
   capacityRejectedOversize: number;
@@ -335,6 +386,26 @@ export type TwentyFirstBoardPersistenceInput = {
     poolId: string;
     pageNumber: 1 | 2 | 3;
   };
+};
+
+export type StaticTemplateCatalogPagePersistenceInput = {
+  pageNumber: 1 | 2 | 3 | 4;
+  selectionBundle: VisualSelectionBundleV7;
+  selectionBundleArtifact: PreviewArtifact;
+  candidates: StaticTemplateBoardCandidate[];
+};
+
+export type StaticTemplateCatalogBoardsPersistenceInput = {
+  operation: SiteOperation;
+  searchPlan: ResolvedVisualSearchPlan;
+  context: TwentyFirstProviderContext;
+  catalogVersion: string;
+  pages: StaticTemplateCatalogPagePersistenceInput[];
+};
+
+export type StaticTemplateCatalogBoardsPersistenceResult = {
+  batchIds: string[];
+  candidateCount: number;
 };
 
 export type NativeTemplatePoolPagePersistence = {
@@ -404,6 +475,11 @@ export type TwentyFirstProviderDependencies = {
     db: any,
     input: TwentyFirstBoardPersistenceInput,
   ) => Promise<ExistingBoard>;
+  loadStaticTemplateCatalog?: () => Promise<StaticTemplateCatalog>;
+  persistStaticTemplateCatalogBoards?: (
+    db: any,
+    input: StaticTemplateCatalogBoardsPersistenceInput,
+  ) => Promise<StaticTemplateCatalogBoardsPersistenceResult>;
   loadNativeTemplatePoolState?: (input: {
     db: any;
     operation: SiteOperation;
@@ -575,6 +651,14 @@ function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
     renderSucceeded: 0,
     capacityCandidates: 0,
     capacityRequired: 0,
+    targetRequired: 27,
+    minimumRequired: 9,
+    downloaded: 0,
+    normalized: 0,
+    compiled: 0,
+    rendered: 0,
+    sourceUnsafe: 0,
+    dependencyUnsupported: 0,
     capacityPages: 0,
     capacitySelected: 0,
     capacityRejectedOversize: 0,
@@ -764,6 +848,10 @@ const NATIVE_TEMPLATE_FAILURE_CONTRACT = {
     code: "NATIVE_TEMPLATE_DEPENDENCIES_UNAVAILABLE",
     message: "本次完整 Template 使用了当前环境不支持的依赖，请稍后重试。",
   },
+  source_unsafe: {
+    code: "NATIVE_TEMPLATE_SOURCE_UNSAFE",
+    message: "完整 Template 源码未通过硬安全检查，已安全丢弃。",
+  },
   compile_failed: {
     code: "NATIVE_TEMPLATE_COMPILE_UNAVAILABLE",
     message: "本次完整 Template 未能完成本地编译，请稍后重试。",
@@ -782,7 +870,8 @@ const NATIVE_TEMPLATE_FAILURE_CONTRACT = {
   },
   insufficient_live_templates: {
     code: "NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT",
-    message: "本次实时目录中未能凑齐 9 个完整 Template 源码候选，请稍后重试。",
+    message:
+      "本次实时目录的兼容候选少于 9 个，重复重试不会改变结果；请申请重置后使用固定 Template 目录。",
   },
 } as const satisfies Record<
   SiteOpsNativeTemplateFailureCategory,
@@ -822,8 +911,9 @@ function publicTemplateRuntimeCategory(
     case "download_failed":
       return "download_failed";
     case "dependency_unsupported":
-    case "source_unsafe":
       return "dependency_unsupported";
+    case "source_unsafe":
+      return "source_unsafe";
     case "compile_failed":
       return "compile_failed";
     case "browser_unavailable":
@@ -968,6 +1058,8 @@ async function loadDefaultContext(
     );
   }
   const input = visualSearchOperationInputSchema.parse(operation.input);
+  const staticCatalogMode =
+    input.workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION;
   const projectRows = await db
     .select()
     .from(siteProjects)
@@ -1004,15 +1096,18 @@ async function loadDefaultContext(
         ),
       ),
     )
-    .limit(1);
+    .limit(staticCatalogMode ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT : 1);
   let existingBoard: ExistingBoard | null = null;
   if (existingRows[0]) {
+    const existingBatchIds = existingRows.map((row: { id: string }) => row.id);
     const sampleRows = await db
       .select({ id: websiteStyleSamples.id })
       .from(websiteStyleSamples)
-      .where(eq(websiteStyleSamples.batchId, existingRows[0].id));
+      .where(inArray(websiteStyleSamples.batchId, existingBatchIds));
     existingBoard = {
       batchId: existingRows[0].id,
+      batchIds: existingBatchIds,
+      pageCount: existingRows.length,
       candidateCount: sampleRows.length,
       selectionBundleHash: existingRows[0].selectionBundleHash,
     };
@@ -1072,7 +1167,11 @@ async function loadDefaultContext(
     brief: resolveSiteBrief(project, snapshot),
     existingBoard,
     publishedPageCount: [...publishedSamplesByBatch.values()].filter(
-      (sampleCount) => sampleCount === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+      (sampleCount) =>
+        sampleCount ===
+        (staticCatalogMode
+          ? STATIC_TEMPLATE_CATALOG_PAGE_SIZE
+          : SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE),
     ).length,
     previousReferences: {
       providerItemKeys: priorMetadata.flatMap((metadata) =>
@@ -2946,6 +3045,247 @@ async function persistDefaultBoard(
   });
 }
 
+async function persistDefaultStaticTemplateCatalogBoards(
+  db: any,
+  input: StaticTemplateCatalogBoardsPersistenceInput,
+) {
+  if (
+    input.pages.length !== STATIC_TEMPLATE_CATALOG_PAGE_COUNT ||
+    input.pages.some(
+      (page) =>
+        page.candidates.length !== STATIC_TEMPLATE_CATALOG_PAGE_SIZE ||
+        page.selectionBundle.candidates.length !==
+          STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+    )
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "STATIC_TEMPLATE_CATALOG_INCOMPLETE",
+      "FrontMind 固定 Template 目录不完整，请稍后重试。",
+      "attention_required",
+    );
+  }
+  return db.transaction(
+    async (tx: any): Promise<StaticTemplateCatalogBoardsPersistenceResult> => {
+      const projectRows = await tx
+        .select()
+        .from(siteProjects)
+        .where(
+          and(
+            eq(siteProjects.id, input.context.project.id),
+            eq(siteProjects.userId, input.operation.userId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const project = projectRows[0];
+      if (
+        !project ||
+        project.currentKnowledgeSnapshotId !== input.context.snapshot.id ||
+        project.revision !== input.searchPlan.admissionRevision
+      ) {
+        throw visualSearchSuperseded();
+      }
+      const marker = operationMarker(input.operation.id);
+      const existing = await tx
+        .select()
+        .from(websiteStyleSampleBatches)
+        .where(
+          and(
+            eq(websiteStyleSampleBatches.siteProjectId, project.id),
+            eq(websiteStyleSampleBatches.userId, input.operation.userId),
+            eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+            eq(websiteStyleSampleBatches.engineerNote, marker),
+          ),
+        )
+        .for("update");
+      if (existing.length > 0) {
+        if (existing.length !== STATIC_TEMPLATE_CATALOG_PAGE_COUNT) {
+          throw visualSearchSuperseded();
+        }
+        const existingIds = existing.map((row: { id: string }) => row.id);
+        const samples = await tx
+          .select({ id: websiteStyleSamples.id })
+          .from(websiteStyleSamples)
+          .where(inArray(websiteStyleSamples.batchId, existingIds));
+        if (samples.length !== STATIC_TEMPLATE_CATALOG_ENTRY_COUNT) {
+          throw visualSearchSuperseded();
+        }
+        return {
+          batchIds: existingIds,
+          candidateCount: samples.length,
+        };
+      }
+      const operationRows = await tx
+        .select()
+        .from(siteOperations)
+        .where(eq(siteOperations.id, input.operation.id))
+        .limit(1)
+        .for("update");
+      const leasedOperation = operationRows[0];
+      const frozenInput = visualSearchOperationInputSchema.safeParse(
+        leasedOperation?.input,
+      );
+      if (
+        !leasedOperation ||
+        leasedOperation.status !== "running" ||
+        !input.operation.leaseOwner ||
+        leasedOperation.leaseOwner !== input.operation.leaseOwner ||
+        !leasedOperation.leaseExpiresAt ||
+        leasedOperation.leaseExpiresAt.getTime() <= Date.now() ||
+        !frozenInput.success ||
+        !("schemaVersion" in frozenInput.data) ||
+        frozenInput.data.schemaVersion !== 3 ||
+        frozenInput.data.workflowVersion !==
+          SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+        frozenInput.data.catalogVersion !== input.catalogVersion ||
+        frozenInput.data.knowledgeSnapshotId !== input.context.snapshot.id ||
+        canonicalSha256(frozenInput.data) !==
+          canonicalSha256(input.operation.input)
+      ) {
+        throw visualSearchSuperseded();
+      }
+      const currentRows = await tx
+        .select({ id: websiteStyleSampleBatches.id })
+        .from(websiteStyleSampleBatches)
+        .where(
+          and(
+            eq(websiteStyleSampleBatches.siteProjectId, project.id),
+            eq(websiteStyleSampleBatches.userId, input.operation.userId),
+            eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+            eq(websiteStyleSampleBatches.status, "published"),
+          ),
+        )
+        .for("update");
+      if (currentRows.length !== 0) throw visualSearchSuperseded();
+
+      const ordinalRows = await tx
+        .select({ ordinal: max(websiteStyleSampleBatches.ordinal) })
+        .from(websiteStyleSampleBatches)
+        .where(eq(websiteStyleSampleBatches.userId, input.operation.userId));
+      const firstOrdinal = Number(ordinalRows[0]?.ordinal ?? 0) + 1;
+      const now = new Date();
+      const batchIds: string[] = [];
+      for (const page of [...input.pages].sort(
+        (left, right) => left.pageNumber - right.pageNumber,
+      )) {
+        const batchId = randomUUID();
+        batchIds.push(batchId);
+        await tx.insert(websiteStyleSampleBatches).values({
+          id: batchId,
+          userId: input.operation.userId,
+          ticketId: null,
+          sourceKind: "siteops_21st",
+          siteProjectId: project.id,
+          selectionBundleLocalAssetId: page.selectionBundleArtifact.id,
+          selectionBundleHash: page.selectionBundleArtifact.contentSha256,
+          ordinal: firstOrdinal + page.pageNumber - 1,
+          status: "published",
+          engineerNote: marker,
+          publishedByUserId: null,
+          publishedAt: now,
+        });
+        await tx.insert(websiteStyleSamples).values(
+          page.candidates.map((candidate, position) => ({
+            id: candidate.sampleId,
+            batchId,
+            attachmentId: null,
+            previewLocalAssetId: null,
+            sourceMetadata: {
+              schemaVersion: 7,
+              renderer: "frontmind_static_template_catalog_v1" as const,
+              workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+              catalogVersion: candidate.catalogVersion,
+              catalogPosition: candidate.catalogPosition,
+              catalogCandidateId: candidate.catalogCandidateId,
+              providerTemplateId: candidate.providerTemplateId,
+              providerSlug: candidate.providerSlug,
+              providerVersion: candidate.providerVersion,
+              providerItemKey: candidate.providerItemKey,
+              sourceOwner: candidate.sourceOwner,
+              sourceRepo: candidate.sourceRepo,
+              sourceCommitSha: candidate.sourceCommitSha,
+              sourceSubdirectory: candidate.sourceSubdirectory,
+              sourceLicense: candidate.sourceLicense,
+              sourceAssetId: candidate.sourceAssetId,
+              sourceArchiveSha256: candidate.sourceArchiveSha256,
+              sourceArchiveBytes: candidate.sourceArchiveBytes,
+              previewAssetId: candidate.previewAssetId,
+              previewSha256: candidate.previewSha256,
+              previewMimeType: candidate.previewMimeType,
+              previewWidth: candidate.previewWidth,
+              previewHeight: candidate.previewHeight,
+              title: candidate.title,
+              description: candidate.description,
+              rationale:
+                "该候选来自 FrontMind 固定完整 Template 目录；选择后读取同一精确源码归档交由 Manus 适配。",
+            },
+            label: candidate.optionLabel,
+            note: candidate.title,
+            sortOrder: position + 1,
+          })),
+        );
+      }
+      const sequenceRows = await tx
+        .select({ sequence: max(messages.sequence) })
+        .from(messages)
+        .where(eq(messages.conversationId, project.conversationId));
+      await tx.insert(messages).values({
+        id: randomUUID(),
+        conversationId: project.conversationId,
+        turnId: input.operation.conversationTurnId,
+        userId: input.operation.userId,
+        role: "assistant",
+        content: "固定目录中的 32 个完整 Template 已准备完成，请选择一个方向。",
+        sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
+        metadata: {
+          siteOps: {
+            kind: "visual_board",
+            subjectId: batchIds[0],
+            revision: project.revision + 1,
+            status: "active",
+            payload: {
+              batchIds,
+              mode: "initial",
+              page: 1,
+              workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+              catalogVersion: input.catalogVersion,
+              candidateCount: STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
+              pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+              pageCount: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+              degradedReasons: [],
+            },
+          },
+        },
+      });
+      const updated = await tx
+        .update(siteProjects)
+        .set({
+          brief: input.context.brief,
+          status: "awaiting_visual_selection",
+          revision: project.revision + 1,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(siteProjects.id, project.id),
+            eq(siteProjects.revision, project.revision),
+          ),
+        );
+      const affectedRows = Number(
+        (Array.isArray(updated)
+          ? (updated[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+          : (updated as { affectedRows?: unknown } | undefined)
+              ?.affectedRows) ?? 0,
+      );
+      if (affectedRows !== 1) throw visualSearchSuperseded();
+      return {
+        batchIds,
+        candidateCount: STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
+      };
+    },
+  );
+}
+
 function safeProviderFailure(
   error: unknown,
   stage: VisualSearchStage,
@@ -3899,6 +4239,14 @@ function logSafeNativeTemplateStage(input: {
     renderSucceeded: input.diagnostics.renderSucceeded,
     capacityCandidates: input.diagnostics.capacityCandidates,
     capacityRequired: input.diagnostics.capacityRequired,
+    targetRequired: input.diagnostics.targetRequired,
+    minimumRequired: input.diagnostics.minimumRequired,
+    downloaded: input.diagnostics.downloaded,
+    normalized: input.diagnostics.normalized,
+    compiled: input.diagnostics.compiled,
+    rendered: input.diagnostics.rendered,
+    sourceUnsafe: input.diagnostics.sourceUnsafe,
+    dependencyUnsupported: input.diagnostics.dependencyUnsupported,
     capacityPages: input.diagnostics.capacityPages,
     capacitySelected: input.diagnostics.capacitySelected,
     capacityRejectedOversize: input.diagnostics.capacityRejectedOversize,
@@ -4032,6 +4380,10 @@ async function runNativeTemplateVisualSearch(input: {
     NATIVE_TEMPLATE_PREPARATION_LIMIT,
   );
   input.diagnostics.catalogCandidates = catalogWindow.length;
+  input.diagnostics.downloaded = input.diagnostics.templateDownloadsSucceeded;
+  input.diagnostics.normalized = input.diagnostics.sourcePrepared;
+  input.diagnostics.compiled = input.diagnostics.sourcePrepared;
+  input.diagnostics.rendered = input.diagnostics.sourcePrepared;
   logSafeNativeTemplateStage({
     event: "template_catalog",
     operationId: input.operation.id,
@@ -4147,6 +4499,12 @@ async function runNativeTemplateVisualSearch(input: {
           const runtimeCategory = input.signal.aborted
             ? "deadline_exhausted"
             : classifyNativeTemplateRuntimeFailure(error);
+          if (runtimeCategory === "source_unsafe") {
+            input.diagnostics.sourceUnsafe += 1;
+          }
+          if (runtimeCategory === "dependency_unsupported") {
+            input.diagnostics.dependencyUnsupported += 1;
+          }
           rejectNativeTemplate(
             input.diagnostics,
             publicTemplateRuntimeCategory(runtimeCategory),
@@ -4172,6 +4530,10 @@ async function runNativeTemplateVisualSearch(input: {
     }
   }
 
+  input.diagnostics.downloaded = input.diagnostics.templateDownloadsSucceeded;
+  input.diagnostics.normalized = input.diagnostics.sourcePrepared;
+  input.diagnostics.compiled = input.diagnostics.sourcePrepared;
+  input.diagnostics.rendered = input.diagnostics.sourcePrepared;
   logSafeNativeTemplateStage({
     event: "template_download",
     operationId: input.operation.id,
@@ -4225,6 +4587,8 @@ async function runNativeTemplateVisualSearch(input: {
   ).length;
   input.diagnostics.capacityRequired =
     pagesRemaining * SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
+  input.diagnostics.targetRequired = SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL;
+  input.diagnostics.minimumRequired = SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
   input.diagnostics.capacityPages = capacityPlan?.bins.length ?? 0;
   input.diagnostics.capacitySelected = capacityPlan?.current.length ?? 0;
   input.diagnostics.capacityRejectedOversize =
@@ -4552,6 +4916,178 @@ async function runNativeTemplateVisualSearch(input: {
   };
 }
 
+async function runStaticTemplateCatalogVisualSearch(input: {
+  operation: SiteOperation;
+  assertLeaseActive?: () => Promise<void>;
+  context: TwentyFirstProviderContext;
+  searchPlan: ResolvedVisualSearchPlan;
+  catalog: StaticTemplateCatalog;
+  persistArtifact: typeof persistSiteOpsArtifact;
+  persistBoards: (
+    db: any,
+    input: StaticTemplateCatalogBoardsPersistenceInput,
+  ) => Promise<StaticTemplateCatalogBoardsPersistenceResult>;
+  db: any;
+}) {
+  if (
+    input.catalog.entries.length !== STATIC_TEMPLATE_CATALOG_ENTRY_COUNT ||
+    input.catalog.pageSize !== STATIC_TEMPLATE_CATALOG_PAGE_SIZE ||
+    input.catalog.pageCount !== STATIC_TEMPLATE_CATALOG_PAGE_COUNT
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "STATIC_TEMPLATE_CATALOG_INCOMPLETE",
+      "FrontMind 固定 Template 目录不完整，请稍后重试。",
+      "attention_required",
+    );
+  }
+  const sortedEntries = [...input.catalog.entries].sort(
+    (left, right) => left.order - right.order,
+  );
+  if (
+    sortedEntries.some(
+      (entry, index) =>
+        entry.order !== index + 1 ||
+        entry.page !==
+          Math.floor(index / STATIC_TEMPLATE_CATALOG_PAGE_SIZE) + 1 ||
+        entry.pageIndex !== index % STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+    )
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "STATIC_TEMPLATE_CATALOG_COORDINATES_INVALID",
+      "FrontMind 固定 Template 目录坐标无效，请稍后重试。",
+      "attention_required",
+    );
+  }
+  const pages: StaticTemplateCatalogPagePersistenceInput[] = [];
+  for (
+    let pageNumber = 1;
+    pageNumber <= STATIC_TEMPLATE_CATALOG_PAGE_COUNT;
+    pageNumber += 1
+  ) {
+    const entries = sortedEntries.slice(
+      (pageNumber - 1) * STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+      pageNumber * STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+    );
+    const candidates = entries.map(
+      (entry, index): StaticTemplateBoardCandidate => ({
+        sampleId: randomUUID(),
+        optionLabel: String.fromCharCode(65 + index),
+        catalogVersion: input.catalog.catalogVersion,
+        catalogPosition: entry.order,
+        catalogCandidateId: entry.candidateId,
+        providerTemplateId: entry.providerTemplateId,
+        providerSlug: entry.providerSlug,
+        providerVersion: entry.providerVersion,
+        providerItemKey: `template:${entry.providerTemplateId}:${entry.providerSlug}`,
+        title: cleanText(entry.providerName, `Template ${entry.order}`, 300),
+        description: entry.providerDescription
+          ? cleanText(entry.providerDescription, "", 1_000) || null
+          : null,
+        sourceOwner: entry.sourceOwner,
+        sourceRepo: entry.sourceRepo,
+        sourceCommitSha: entry.sourceCommitSha,
+        sourceSubdirectory: entry.sourceSubdirectory,
+        sourceLicense: entry.sourceLicense,
+        sourceAssetId: entry.sourceAssetId,
+        sourceArchiveSha256: entry.sourceSha256,
+        sourceArchiveBytes: entry.sourceBytes,
+        previewAssetId: entry.previewAssetId,
+        previewSha256: entry.previewSha256,
+        previewMimeType: entry.previewMimeType,
+        previewWidth: entry.previewWidth,
+        previewHeight: entry.previewHeight,
+      }),
+    );
+    const selectionBundle = visualSelectionBundleV7Schema.parse({
+      schemaVersion: 7,
+      renderer: "frontmind_static_template_catalog_v1",
+      workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+      catalogVersion: input.catalog.catalogVersion,
+      pageNumber,
+      pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+      pageCount: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+      displayTarget: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+      candidates: candidates.map((candidate) => ({
+        id: candidate.sampleId,
+        sampleId: candidate.sampleId,
+        label: candidate.optionLabel,
+        title: candidate.title,
+        description: candidate.description,
+        catalogVersion: candidate.catalogVersion,
+        catalogPosition: candidate.catalogPosition,
+        catalogCandidateId: candidate.catalogCandidateId,
+        providerTemplateId: candidate.providerTemplateId,
+        providerSlug: candidate.providerSlug,
+        providerVersion: candidate.providerVersion,
+        sourceOwner: candidate.sourceOwner,
+        sourceRepo: candidate.sourceRepo,
+        sourceCommitSha: candidate.sourceCommitSha,
+        sourceSubdirectory: candidate.sourceSubdirectory,
+        sourceLicense: candidate.sourceLicense,
+        sourceAssetId: candidate.sourceAssetId,
+        sourceArchiveSha256: candidate.sourceArchiveSha256,
+        sourceArchiveBytes: candidate.sourceArchiveBytes,
+        previewAssetId: candidate.previewAssetId,
+        previewSha256: candidate.previewSha256,
+        previewMimeType: candidate.previewMimeType,
+        previewWidth: candidate.previewWidth,
+        previewHeight: candidate.previewHeight,
+      })),
+      selectedCandidateId: null,
+      delegated: false,
+      degradedReasons: [],
+    });
+    const bytes = createVisualSelectionBundleV7Artifact(selectionBundle);
+    await assertCommitLeaseActive(input.assertLeaseActive);
+    const artifact = await input.persistArtifact({
+      userId: input.operation.userId,
+      projectId: input.context.project.id,
+      kind: "static-template-selection-bundle",
+      filename: `static-template-selection-${input.operation.id}-p${pageNumber}.json`,
+      mimeType: VISUAL_SELECTION_BUNDLE_V7_MIME_TYPE,
+      buffer: bytes,
+      maxBytes: VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES,
+    });
+    if (artifact.contentSha256 !== sha256Buffer(bytes)) {
+      throw new TwentyFirstProviderFailure(
+        "STATIC_TEMPLATE_SELECTION_HASH_MISMATCH",
+        "FrontMind 固定 Template 目录写入校验失败。",
+        "attention_required",
+      );
+    }
+    pages.push({
+      pageNumber: pageNumber as 1 | 2 | 3 | 4,
+      selectionBundle,
+      selectionBundleArtifact: artifact,
+      candidates,
+    });
+  }
+  await assertCommitLeaseActive(input.assertLeaseActive);
+  const board = await input.persistBoards(input.db, {
+    operation: input.operation,
+    searchPlan: input.searchPlan,
+    context: input.context,
+    catalogVersion: input.catalog.catalogVersion,
+    pages,
+  });
+  return {
+    status: "succeeded" as const,
+    projectStatus: "awaiting_visual_selection" as const,
+    result: {
+      batchIds: board.batchIds,
+      candidateCount: board.candidateCount,
+      workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+      catalogVersion: input.catalog.catalogVersion,
+      pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+      pageCount: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+      availablePages: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+      reservedPages: 0,
+      canGenerateMore: false,
+    },
+    message: "32 个固定完整 Template 已准备完成，请选择一个方向。",
+  };
+}
+
 export function createTwentyFirstSiteOpsProviderHandler(
   dependencies: TwentyFirstProviderDependencies = {},
 ): SiteOpsProviderHandler {
@@ -4577,6 +5113,12 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const persistArtifact =
     dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
+  const loadStaticTemplateCatalog =
+    dependencies.loadStaticTemplateCatalog ??
+    requireActiveStaticTemplateCatalog;
+  const persistStaticTemplateCatalogBoards =
+    dependencies.persistStaticTemplateCatalogBoards ??
+    persistDefaultStaticTemplateCatalogBoards;
   const readArtifact = dependencies.readArtifact ?? readSiteOpsArtifact;
 
   return async ({ operation, signal, assertLeaseActive }) => {
@@ -4587,6 +5129,9 @@ export function createTwentyFirstSiteOpsProviderHandler(
       const parsedInput = visualSearchOperationInputSchema.parse(
         operation.input,
       );
+      const staticCatalogMode =
+        parsedInput.workflowVersion ===
+        SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION;
       const nativeSourceMode = isSiteOpsNativeVisualWorkflowVersion(
         parsedInput.workflowVersion,
       );
@@ -4615,7 +5160,12 @@ export function createTwentyFirstSiteOpsProviderHandler(
       if (context.existingBoard) {
         if (
           context.existingBoard.candidateCount !==
-          SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE
+            (staticCatalogMode
+              ? STATIC_TEMPLATE_CATALOG_ENTRY_COUNT
+              : SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE) ||
+          (staticCatalogMode &&
+            context.existingBoard.pageCount !==
+              STATIC_TEMPLATE_CATALOG_PAGE_COUNT)
         ) {
           throw new TwentyFirstProviderFailure(
             "VISUAL_CANDIDATE_PAGE_INCOMPLETE",
@@ -4624,7 +5174,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
           );
         }
         const restoredPoolState =
-          nativeSourceMode && loadCandidatePoolState
+          nativeSourceMode &&
+          !staticCatalogMode &&
+          "credentialId" in parsedInput &&
+          loadCandidatePoolState
             ? await loadCandidatePoolState({
                 db,
                 operation,
@@ -4640,9 +5193,25 @@ export function createTwentyFirstSiteOpsProviderHandler(
           projectStatus: "awaiting_visual_selection",
           result: {
             batchId: context.existingBoard.batchId,
+            ...(staticCatalogMode && context.existingBoard.batchIds
+              ? { batchIds: context.existingBoard.batchIds }
+              : {}),
             candidateCount: context.existingBoard.candidateCount,
             selectionBundleHash:
               context.existingBoard.selectionBundleHash ?? undefined,
+            ...(staticCatalogMode &&
+            "schemaVersion" in parsedInput &&
+            parsedInput.schemaVersion === 3
+              ? {
+                  workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+                  catalogVersion: parsedInput.catalogVersion,
+                  pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+                  pageCount: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+                  availablePages: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
+                  reservedPages: 0,
+                  canGenerateMore: false,
+                }
+              : {}),
             ...(restoredPoolState
               ? {
                   availablePages: restoredPoolState.availablePages,
@@ -4654,7 +5223,12 @@ export function createTwentyFirstSiteOpsProviderHandler(
         };
       }
       const searchPlan = resolveVisualSearchPlan(parsedInput, context);
-      if (nativeSourceMode && loadCandidatePoolState) {
+      if (
+        nativeSourceMode &&
+        !staticCatalogMode &&
+        "credentialId" in parsedInput &&
+        loadCandidatePoolState
+      ) {
         const poolState = await loadCandidatePoolState({
           db,
           operation,
@@ -4717,7 +5291,45 @@ export function createTwentyFirstSiteOpsProviderHandler(
           };
         }
       }
+      if (staticCatalogMode) {
+        if (
+          !("schemaVersion" in parsedInput) ||
+          parsedInput.schemaVersion !== 3
+        ) {
+          throw new TwentyFirstProviderFailure(
+            "STATIC_TEMPLATE_CATALOG_OPERATION_INVALID",
+            "固定 Template 目录任务坐标无效，请重置后重试。",
+            "attention_required",
+          );
+        }
+        stage = "retrieve_native_sources";
+        const catalog = await loadStaticTemplateCatalog();
+        if (catalog.catalogVersion !== parsedInput.catalogVersion) {
+          throw new TwentyFirstProviderFailure(
+            "STATIC_TEMPLATE_CATALOG_VERSION_MISMATCH",
+            "固定 Template 目录版本已更新，请重置后重试。",
+            "attention_required",
+          );
+        }
+        return await runStaticTemplateCatalogVisualSearch({
+          operation,
+          assertLeaseActive,
+          context,
+          searchPlan,
+          catalog,
+          persistArtifact,
+          persistBoards: persistStaticTemplateCatalogBoards,
+          db,
+        });
+      }
       stage = "load_credential";
+      if (!("credentialId" in parsedInput)) {
+        throw new TwentyFirstProviderFailure(
+          "VISUAL_OPERATION_CONTRACT_MISMATCH",
+          "视觉检索任务合同不一致，请重置后重试。",
+          "attention_required",
+        );
+      }
       const credential = await getCredential(parsedInput.credentialId);
       if (!credential || credential.version !== parsedInput.credentialVersion) {
         throw new TwentyFirstProviderFailure(

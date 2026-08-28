@@ -335,7 +335,7 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
       serverSource.indexOf(
         "async function latestGeneralChatTurnSettlementContext",
       ),
-      serverSource.indexOf("/**\n * Signed-image incident maintenance"),
+      serverSource.indexOf("function persistedConversationResourceId"),
     );
 
     expect(updateSource).toContain("turnId?: string");
@@ -364,6 +364,155 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
     expect(settlementSource).toContain(
       "generalChat.agentTaskId === input.localTaskId",
     );
+  });
+
+  it("persists URL-only evidence before assigning turns and hides stale projections", () => {
+    const evidenceSource = serverSource.slice(
+      serverSource.indexOf("async function ensureProviderEventRows"),
+      serverSource.indexOf("async function cachedOutput"),
+    );
+    const projectionSource = serverSource.slice(
+      serverSource.indexOf("async function persistAssistantProjection"),
+      serverSource.indexOf("const providerAttachmentEvidenceInFlight"),
+    );
+    const preseed = evidenceSource.indexOf("ensureProviderEventRows({");
+    const claim = evidenceSource.indexOf("claimProviderProjectionSnapshot({");
+    const durable = evidenceSource.indexOf(
+      "persistProviderUserEventEvidence({",
+    );
+    const assign = evidenceSource.indexOf(
+      "const eventTurnState = providerEventTurnAssignments(",
+      durable,
+    );
+    const hide = evidenceSource.indexOf(
+      "const applied = await applyProviderProjectionSnapshot({",
+      assign,
+    );
+
+    expect(evidenceSource).toContain(
+      "arbitrateFirstDurableGeneralChatProviderAttachmentEvidence",
+    );
+    expect(evidenceSource).toContain('.for("update")');
+    expect(serverSource).toContain('eq(localAssets.scope, "managed_user")');
+    expect(serverSource).toContain(
+      "eq(localAssets.accountUserId, input.userId)",
+    );
+    expect(serverSource).toContain("localAssets.retainUntil");
+    expect(serverSource).toContain(
+      "bindGeneralChatLocalManifestToProviderFiles(",
+    );
+    expect(preseed).toBeGreaterThanOrEqual(0);
+    expect(claim).toBeGreaterThanOrEqual(0);
+    expect(claim).toBeLessThan(preseed);
+    expect(durable).toBeGreaterThan(preseed);
+    expect(assign).toBeGreaterThan(durable);
+    expect(hide).toBeGreaterThan(assign);
+    expect(evidenceSource).toContain("generalChat?.serverOwned !== true");
+    expect(evidenceSource).toContain(
+      'generalChat.kind !== "assistant_projection"',
+    );
+    expect(evidenceSource).toContain(
+      "generalChat.agentTaskId !== input.taskId",
+    );
+    expect(evidenceSource).toContain(".set({ deletedAt: new Date() })");
+    expect(projectionSource).toContain("deletedAt: null");
+    expect(serverSource).not.toContain("forcedAssistantProjection");
+    expect(serverSource).not.toContain("syncGeneralChatTaskForRepair");
+  });
+
+  it("fences every projection snapshot with one task generation transaction", () => {
+    const claimSource = serverSource.slice(
+      serverSource.indexOf("async function claimProviderProjectionSnapshot"),
+      serverSource.indexOf("async function ensureProviderEventRows"),
+    );
+    const applySource = serverSource.slice(
+      serverSource.indexOf("async function applyProviderProjectionSnapshot"),
+      serverSource.indexOf("async function persistProviderEvents"),
+    );
+    const syncSource = serverSource.slice(
+      serverSource.indexOf("async function syncTask"),
+      serverSource.indexOf("function persistedConversationResourceId"),
+    );
+
+    expect(claimSource).toContain('kind: "local_projection_snapshot"');
+    expect(claimSource).toContain("claimEventIds: snapshot.eventIds");
+    expect(claimSource).toContain("claimSnapshotHash: snapshot.snapshotHash");
+    expect(claimSource).toContain("claimMaxProviderTimestampMs");
+    expect(claimSource).not.toContain("promptSha256");
+    expect(claimSource).not.toContain("providerAttachmentEvidence");
+    expect(claimSource).toContain('.for("update")');
+    expect(applySource).toContain("db.transaction(async (tx)");
+    expect(applySource).toContain('.for("update")');
+    expect(applySource).toContain("generalChatProjectionClaimMatches({");
+    expect(applySource).toContain(
+      "await reconcileAssistantProjectionVisibility({",
+    );
+    expect(applySource).toContain("await persistAssistantProjection({");
+    expect(applySource).toContain('status: "applied"');
+    expect(syncSource).toContain("if (!persisted.applied)");
+  });
+
+  it("stages ordinary Provider payload until the final claim transaction", () => {
+    const persistSource = serverSource.slice(
+      serverSource.indexOf("async function persistProviderEvents"),
+      serverSource.indexOf("async function cachedOutput"),
+    );
+    const applySource = serverSource.slice(
+      serverSource.indexOf("async function applyProviderProjectionSnapshot"),
+      serverSource.indexOf("async function persistProviderEvents"),
+    );
+    const claimCheck = applySource.indexOf(
+      "generalChatProjectionClaimMatches({",
+    );
+    const eventLock = applySource.indexOf(
+      "eq(agentEvents.providerEventId, staged.event.id)",
+    );
+    const payloadWrite = applySource.indexOf(
+      "normalizedPayload: {\n            ...staged.normalizedPayload",
+    );
+    const visibility = applySource.indexOf(
+      "await reconcileAssistantProjectionVisibility({",
+    );
+    const messageWrite = applySource.indexOf(
+      "await persistAssistantProjection({",
+    );
+    const applied = applySource.indexOf('status: "applied"');
+
+    expect(persistSource).toContain(
+      "const stagedEvents: GeneralChatStagedProviderEvent[] = []",
+    );
+    expect(persistSource).toContain("stagedEvents.push({");
+    expect(persistSource).not.toContain("await db.transaction(async (tx)");
+    const preseedSource = serverSource.slice(
+      serverSource.indexOf("async function ensureProviderEventRows"),
+      serverSource.indexOf("async function providerEventRows"),
+    );
+    const preseedDuplicateUpdate = preseedSource.slice(
+      preseedSource.indexOf(".onDuplicateKeyUpdate"),
+    );
+    expect(preseedSource).toContain("set: { providerEventId: event.id }");
+    expect(preseedDuplicateUpdate).not.toContain(
+      "providerTimestampMs: event.timestamp",
+    );
+    expect(claimCheck).toBeGreaterThanOrEqual(0);
+    expect(eventLock).toBeGreaterThan(claimCheck);
+    expect(payloadWrite).toBeGreaterThan(eventLock);
+    expect(visibility).toBeGreaterThan(payloadWrite);
+    expect(messageWrite).toBeGreaterThan(visibility);
+    expect(applied).toBeGreaterThan(messageWrite);
+  });
+
+  it("uses the same match and unresolved disposition for unknown sends", () => {
+    const sendSource = serverSource.slice(
+      serverSource.indexOf("async function sendProviderMessage"),
+      serverSource.indexOf("function sendError"),
+    );
+    expect(sendSource).toContain("await persistProviderEvents({");
+    expect(sendSource).toContain("if (!persisted.applied) return false");
+    expect(sendSource).toContain("persisted.bindings.get(input.turnId)");
+    expect(sendSource).toContain("generalChatProviderEvidenceHasUniqueMatch({");
+    expect(sendSource).toContain("unresolvedCount: binding.unresolvedCount");
+    expect(sendSource).not.toContain("manusV2EventMatchesGeneralChatRequest");
   });
 
   it("returns no error for complete success and marks preserved partial output", () => {

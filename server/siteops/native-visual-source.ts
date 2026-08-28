@@ -15,9 +15,11 @@ import {
   visualCandidateStyleTokensV1Schema,
   visualSelectionBundleV5Schema,
   visualSelectionBundleV6Schema,
+  visualSelectionBundleV7Schema,
   type VisualCandidateStyleTokensV1,
   type VisualSelectionBundleV5,
   type VisualSelectionBundleV6,
+  type VisualSelectionBundleV7,
 } from "../../shared/siteops";
 import {
   canonicalJson,
@@ -43,13 +45,15 @@ import {
 
 export const SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION = "2.5.0" as const;
 export const SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION = "2.7.0" as const;
+export const SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION = "2.8.0" as const;
 
 /** Native 2.5 remains readable for immutable replay; every newly admitted
  * complete-Template operation uses 2.7. */
 export function isSiteOpsNativeVisualWorkflowVersion(workflowVersion: string) {
   return (
     workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION ||
-    workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
+    workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION ||
+    workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION
   );
 }
 export const VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE = "application/zip" as const;
@@ -59,6 +63,8 @@ export const VISUAL_SELECTION_BUNDLE_V6_MAX_BYTES = 100 * 1024 * 1024;
 export const NATIVE_VISUAL_SOURCE_ARCHIVE_MAX_BYTES = 24 * 1024 * 1024;
 export const VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES =
   52 * 1024 * 1024;
+export const VISUAL_SELECTION_BUNDLE_V7_MIME_TYPE = "application/json" as const;
+export const VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES = 512 * 1024;
 export const NATIVE_TEMPLATE_PROVIDER_ARCHIVE_MAX_BYTES = 50 * 1024 * 1024;
 
 const NATIVE_SOURCE_DIRECTORY = "source";
@@ -4452,6 +4458,30 @@ export async function createVisualSelectionBundleV6Artifact(input: {
     throw new NativeVisualSourceError("V6_SELECTION_BUNDLE_TOO_LARGE");
   }
   return bytes;
+}
+
+export function createVisualSelectionBundleV7Artifact(
+  input: VisualSelectionBundleV7,
+) {
+  const bundle = visualSelectionBundleV7Schema.parse(input);
+  const bytes = Buffer.from(`${canonicalJson(bundle)}\n`, "utf8");
+  if (bytes.length < 1 || bytes.length > VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES) {
+    throw new NativeVisualSourceError("V7_SELECTION_BUNDLE_SIZE_INVALID");
+  }
+  return bytes;
+}
+
+export function readVisualSelectionBundleV7Artifact(bytes: Buffer) {
+  if (bytes.length < 1 || bytes.length > VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES) {
+    throw new NativeVisualSourceError("V7_SELECTION_BUNDLE_SIZE_INVALID");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new NativeVisualSourceError("V7_SELECTION_MANIFEST_INVALID");
+  }
+  return visualSelectionBundleV7Schema.parse(parsed);
 }
 
 export async function readVisualSelectionBundleArtifact(bytes: Buffer) {

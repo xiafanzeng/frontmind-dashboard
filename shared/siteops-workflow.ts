@@ -96,8 +96,29 @@ export type VisualSearchOperationInputV2 = z.infer<
   typeof visualSearchOperationInputV2Schema
 >;
 
+/** V3 binds a customer cycle to an already-active FrontMind static catalog.
+ * It has no 21st credential coordinate because the customer request performs
+ * no provider lookup or download. One initial operation publishes all four
+ * catalog pages atomically. */
+export const visualSearchOperationInputV3Schema = z
+  .object({
+    schemaVersion: z.literal(3),
+    knowledgeSnapshotId: z.string().uuid(),
+    workflowVersion: z.literal("2.8.0"),
+    catalogVersion: z.string().trim().min(1).max(191),
+    mode: z.literal("initial"),
+    page: z.literal(1),
+    admissionRevision: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type VisualSearchOperationInputV3 = z.infer<
+  typeof visualSearchOperationInputV3Schema
+>;
+
 /** V1 remains readable for immutable historical operations. */
 export const visualSearchOperationInputSchema = z.union([
+  visualSearchOperationInputV3Schema,
   visualSearchOperationInputV2Schema,
   visualSearchOperationInputV1Schema,
 ]);

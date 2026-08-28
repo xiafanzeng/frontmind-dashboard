@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { Readable } from "node:stream";
 
 import axios, { type AxiosInstance, type AxiosResponse } from "axios";
 
@@ -12,6 +13,12 @@ import {
 } from "./upstream-task-adapter";
 import { classifyManusV2StructuredResultEnvelope } from "./manus-v2-structured-result";
 import { stripFrontMindGeneralChatOperationContract } from "../shared/frontmind-general-chat-contract";
+import {
+  generalChatProviderEvidenceHasUniqueMatch,
+  resolveManusV2GeneralChatUserEventEvidence,
+  type GeneralChatLocalAttachmentManifestItem,
+  type GeneralChatProviderAttachmentReader,
+} from "./manus-v2-user-attachment-evidence";
 
 export {
   classifyManusV2StructuredResultEnvelope,
@@ -2141,6 +2148,8 @@ export class ManusV2Client {
     operationToken?: string;
     promptSha256?: string;
     attachmentFileIds?: readonly string[];
+    attachmentManifest?: readonly GeneralChatLocalAttachmentManifestItem[];
+    attachmentEvidenceReader?: GeneralChatProviderAttachmentReader;
     createdAfterSeconds?: number;
     createdBeforeSeconds?: number;
     apiKeyId?: string;
@@ -2162,6 +2171,7 @@ export class ManusV2Client {
       throw new Error("findCreatedTask requires reconciliation evidence");
     }
     const matches: ManusV2TaskSummary[] = [];
+    const unresolved: ManusV2TaskSummary[] = [];
     for (const candidate of candidates) {
       const events = await this.listAllMessages({
         taskId: candidate.id,
@@ -2171,23 +2181,46 @@ export class ManusV2Client {
           : {}),
       });
       if (
-        (input.operationToken &&
-          manusV2EventsContainOperationToken(events, input.operationToken)) ||
-        (input.promptSha256 &&
-          events.some((event) =>
-            manusV2EventMatchesGeneralChatRequest(event, {
-              promptSha256: input.promptSha256!,
-              attachmentFileIds: input.attachmentFileIds ?? [],
-            }),
-          ))
+        input.operationToken &&
+        manusV2EventsContainOperationToken(events, input.operationToken)
       ) {
         matches.push(candidate);
+        continue;
+      }
+      if (!input.promptSha256) continue;
+      let candidateMatched = false;
+      let candidateUnresolved = false;
+      for (const event of events) {
+        const disposition = await resolveManusV2GeneralChatUserEventEvidence({
+          event,
+          promptSha256: input.promptSha256,
+          expectedAttachmentFileIds: input.attachmentFileIds ?? [],
+          localAttachmentManifest: input.attachmentManifest,
+          readUrl: input.attachmentEvidenceReader,
+        });
+        if (disposition.kind === "match") {
+          candidateMatched = true;
+        }
+        if (disposition.kind === "unresolved") candidateUnresolved = true;
+      }
+      if (candidateMatched) {
+        matches.push(candidate);
+      }
+      if (candidateUnresolved) {
+        unresolved.push(candidate);
       }
     }
     return {
       candidates,
       matches,
-      unique: matches.length === 1 ? matches[0] : null,
+      unresolved,
+      unresolvedEvidenceCount: unresolved.length,
+      unique: generalChatProviderEvidenceHasUniqueMatch({
+        matchCount: matches.length,
+        unresolvedCount: unresolved.length,
+      })
+        ? matches[0]!
+        : null,
     };
   }
 
@@ -2440,29 +2473,42 @@ export class ManusV2Client {
     }
   }
 
-  async uploadFile(input: {
-    filename: string;
-    bytes: Buffer;
-    contentType: string;
-    confirmationPolicy?: ManusV2FileConfirmationPolicy;
-    minimumUsableSeconds?: number;
-    readinessDeadlineMs?: number;
-    detailAttemptTimeoutMs?: number;
-    sleep?: (ms: number) => Promise<void>;
-    now?: () => number;
-    /** Disabled by default; only response-logic file intent creation opts in. */
-    fileCreateRetryPolicy?: ManusV2FileCreateRetryPolicy;
-    observer?: ManusV2FileUploadObserver;
-    /** Resume a durable provider id after a crash/response-loss boundary. */
-    existingCandidate?: {
-      fileId: string;
+  async uploadFile(
+    input: {
       filename: string;
-      /** Resume a durably known no-PUT candidate (0) or rejected PUT (1..3). */
-      uploadUrl?: string;
-      uploadExpiresAt?: number;
-      resumePutRejectionCount?: number;
-    };
-  }) {
+      contentType: string;
+      confirmationPolicy?: ManusV2FileConfirmationPolicy;
+      minimumUsableSeconds?: number;
+      readinessDeadlineMs?: number;
+      detailAttemptTimeoutMs?: number;
+      sleep?: (ms: number) => Promise<void>;
+      now?: () => number;
+      /** Disabled by default; only response-logic file intent creation opts in. */
+      fileCreateRetryPolicy?: ManusV2FileCreateRetryPolicy;
+      observer?: ManusV2FileUploadObserver;
+      /** Resume a durable provider id after a crash/response-loss boundary. */
+      existingCandidate?: {
+        fileId: string;
+        filename: string;
+        /** Resume a durably known no-PUT candidate (0) or rejected PUT (1..3). */
+        uploadUrl?: string;
+        uploadExpiresAt?: number;
+        resumePutRejectionCount?: number;
+      };
+    } & (
+      | {
+          bytes: Buffer;
+          byteLength?: never;
+          createReadStream?: never;
+        }
+      | {
+          bytes?: never;
+          byteLength: number;
+          /** A PUT retry must receive a new, unread stream every time. */
+          createReadStream: () => Readable;
+        }
+    ),
+  ) {
     const expectedFilename = canonicalProviderFilename(input.filename);
     const expectedContentType = canonicalMediaType(input.contentType);
     if (!expectedContentType) {
@@ -2470,6 +2516,19 @@ export class ManusV2Client {
         "contentType",
         502,
         "INVALID_RESPONSE",
+        false,
+        false,
+      );
+    }
+    const expectedBytes =
+      input.bytes !== undefined
+        ? input.bytes.length
+        : requiredInteger(input.byteLength, "byteLength", 1);
+    if (expectedBytes < 1) {
+      throw new ManusV2ApiError(
+        "file.upload.content",
+        null,
+        "FILE_BYTES_INVALID",
         false,
         false,
       );
@@ -2482,7 +2541,7 @@ export class ManusV2Client {
       this.waitForExactProviderFile({
         fileId: candidate.fileId,
         filename: expectedFilename,
-        expectedBytes: input.bytes.length,
+        expectedBytes,
         expectedContentType,
         confirmationPolicy: input.confirmationPolicy,
         minimumUsableSeconds: input.minimumUsableSeconds,
@@ -2598,16 +2657,21 @@ export class ManusV2Client {
     let putOutcomeUnknown = false;
     for (let putAttempt = resumedRejectionCount; ; putAttempt += 1) {
       await input.observer?.onPutStarted?.(created);
+      // Axios consumes Node streams. Build the body outside the network
+      // try/catch so a local stream-open failure is not misclassified as an
+      // outcome-unknown PUT, and create a fresh stream for every retry.
+      const uploadBody =
+        input.bytes !== undefined ? input.bytes : input.createReadStream();
       let response: AxiosResponse;
       try {
-        response = await axios.put(created.uploadUrl, input.bytes, {
+        response = await axios.put(created.uploadUrl, uploadBody, {
           headers: {
             "Content-Type": expectedContentType,
-            "Content-Length": String(input.bytes.length),
+            "Content-Length": String(expectedBytes),
           },
           timeout: Math.max(1, uploadDeadlineMs - now()),
           maxRedirects: 0,
-          maxBodyLength: input.bytes.length,
+          maxBodyLength: expectedBytes,
           maxContentLength: 1024 * 1024,
           validateStatus: () => true,
         });

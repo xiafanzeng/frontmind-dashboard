@@ -4,7 +4,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   currentGeneralChatTurnProviderEvidence,
+  generalChatAssistantProjectionShouldBeVisible,
+  generalChatProjectionClaimMatches,
+  generalChatProjectionSnapshotClaimDecision,
+  generalChatTurnBindingFromDispositions,
   generalChatProviderEventEvidence,
+  selectGeneralChatProjectionCandidate,
   settleGeneralChatTurn,
 } from "./general-chat-terminal-arbitration";
 import type { ManusV2MessageEvent } from "./manus-v2-client";
@@ -128,6 +133,122 @@ describe("ordinary-chat current-turn Provider evidence", () => {
     expect(evidence.events).toEqual([]);
   });
 
+  it("uses the same disposition binding for projection and runtime settlement", () => {
+    const prompt = "url-only image";
+    const events = [
+      userEvent("proven", 0, prompt),
+      statusEvent("stopped", 1, "stopped"),
+      userEvent("descriptor-less", 2, prompt),
+    ];
+    const pending = generalChatTurnBindingFromDispositions([
+      { eventId: "proven", kind: "match" },
+      { eventId: "descriptor-less", kind: "unresolved" },
+    ]);
+    expect(pending).toMatchObject({
+      binding: "pending",
+      matchCount: 1,
+      unresolvedCount: 1,
+    });
+    expect(
+      currentGeneralChatTurnProviderEvidence({
+        events,
+        promptSha256: sha256(prompt),
+        providerAttachmentFileIds: [],
+        providerEventWatermark: [],
+        resolvedBinding: pending,
+      }),
+    ).toMatchObject({ binding: "pending", events: [] });
+
+    const recovered = generalChatTurnBindingFromDispositions([
+      { eventId: "proven", kind: "match" },
+      { eventId: "descriptor-less", kind: "mismatch" },
+    ]);
+    expect(recovered).toMatchObject({
+      binding: "bound",
+      matchedUserEventId: "proven",
+    });
+    expect(
+      currentGeneralChatTurnProviderEvidence({
+        events,
+        promptSha256: sha256(prompt),
+        providerAttachmentFileIds: [],
+        providerEventWatermark: [],
+        resolvedBinding: recovered,
+      }),
+    ).toMatchObject({
+      binding: "bound",
+      eventStatus: "stopped",
+    });
+  });
+
+  it("marks two proven Provider user events ambiguous", () => {
+    expect(
+      generalChatTurnBindingFromDispositions([
+        { eventId: "one", kind: "match" },
+        { eventId: "two", kind: "match" },
+      ]),
+    ).toMatchObject({
+      binding: "ambiguous",
+      matchedUserEventId: null,
+      matchCount: 2,
+    });
+  });
+
+  it("hides a prior projection while binding regresses and restores it when unique again", () => {
+    const assigned = new Set(["assistant-output"]);
+    const visibility = (binding: "bound" | "pending" | "ambiguous") =>
+      generalChatAssistantProjectionShouldBeVisible({
+        binding,
+        providerEventId: "assistant-output",
+        assignedProviderEventIds: assigned,
+      });
+    expect(visibility("bound")).toBe(true);
+    expect(visibility("pending")).toBe(false);
+    expect(visibility("ambiguous")).toBe(false);
+    expect(visibility("bound")).toBe(true);
+  });
+
+  it("selects only a unique set-superset watermark", () => {
+    const indexes = new Map([
+      ["old", 0],
+      ["middle", 1],
+      ["current", 2],
+    ]);
+    expect(
+      selectGeneralChatProjectionCandidate({
+        providerEventId: "current",
+        providerEventIndex: indexes,
+        candidates: [
+          { id: "old-turn", providerEventWatermark: ["old"] },
+          {
+            id: "current-turn",
+            providerEventWatermark: ["old", "middle"],
+          },
+        ],
+      })?.id,
+    ).toBe("current-turn");
+    expect(
+      selectGeneralChatProjectionCandidate({
+        providerEventId: "current",
+        providerEventIndex: indexes,
+        candidates: [
+          { id: "left", providerEventWatermark: ["old"] },
+          { id: "right", providerEventWatermark: ["middle"] },
+        ],
+      }),
+    ).toBeNull();
+    expect(
+      selectGeneralChatProjectionCandidate({
+        providerEventId: "current",
+        providerEventIndex: indexes,
+        candidates: [
+          { id: "left", providerEventWatermark: ["old"] },
+          { id: "right", providerEventWatermark: ["old"] },
+        ],
+      }),
+    ).toBeNull();
+  });
+
   it("extracts status, error and user-stop evidence without inventing fields", () => {
     expect(
       generalChatProviderEventEvidence(statusEvent("status", 0, "waiting")),
@@ -148,6 +269,117 @@ describe("ordinary-chat current-turn Provider evidence", () => {
     expect(
       generalChatProviderEventEvidence(event("stop", "user_stop", 2, {})),
     ).toMatchObject({ userStop: true });
+  });
+});
+
+describe("ordinary-chat projection snapshot generations", () => {
+  const older = {
+    eventIds: ["user-1", "assistant-1"],
+    snapshotHash: "a".repeat(64),
+    maxProviderTimestampMs: 100,
+  };
+  const newer = {
+    eventIds: ["user-1", "assistant-1", "user-2"],
+    snapshotHash: "b".repeat(64),
+    maxProviderTimestampMs: 200,
+  };
+
+  it("lets a newer snapshot supersede an active older generation", () => {
+    expect(
+      generalChatProjectionSnapshotClaimDecision({
+        candidate: newer,
+        state: {
+          generation: 4,
+          status: "claimed",
+          claimToken: "old-token",
+          claimStartedAtMs: 9_900,
+          claimedSnapshot: older,
+          appliedSnapshot: older,
+        },
+        nowMs: 10_000,
+        staleAfterMs: 1_000,
+      }),
+    ).toEqual({ kind: "claim", generation: 5 });
+  });
+
+  it("rejects an older or partial snapshot after a newer one applied", () => {
+    const state = {
+      generation: 5,
+      status: "applied" as const,
+      claimToken: "new-token",
+      claimStartedAtMs: 10_000,
+      claimedSnapshot: newer,
+      appliedSnapshot: newer,
+    };
+    for (const candidate of [
+      older,
+      {
+        eventIds: ["user-2", "assistant-2"],
+        snapshotHash: "d".repeat(64),
+        maxProviderTimestampMs: 300,
+      },
+    ]) {
+      expect(
+        generalChatProjectionSnapshotClaimDecision({
+          candidate,
+          state,
+          nowMs: 10_100,
+          staleAfterMs: 1_000,
+        }),
+      ).toEqual({ kind: "stale_candidate", generation: 5 });
+    }
+  });
+
+  it("reuses a fresh equivalent owner and permits stale takeover", () => {
+    const state = {
+      generation: 7,
+      status: "claimed" as const,
+      claimToken: "active",
+      claimStartedAtMs: 10_000,
+      claimedSnapshot: newer,
+      appliedSnapshot: older,
+    };
+    expect(
+      generalChatProjectionSnapshotClaimDecision({
+        candidate: { ...newer, snapshotHash: "c".repeat(64) },
+        state,
+        nowMs: 10_100,
+        staleAfterMs: 1_000,
+      }),
+    ).toEqual({ kind: "in_progress", generation: 7 });
+    expect(
+      generalChatProjectionSnapshotClaimDecision({
+        candidate: newer,
+        state,
+        nowMs: 11_000,
+        staleAfterMs: 1_000,
+      }),
+    ).toEqual({ kind: "claim", generation: 8 });
+  });
+
+  it("allows writes only for the exact current token and generation", () => {
+    const state = {
+      generation: 9,
+      status: "claimed" as const,
+      claimToken: "current",
+      claimStartedAtMs: 10_000,
+      claimedSnapshot: newer,
+      appliedSnapshot: older,
+    };
+    expect(
+      generalChatProjectionClaimMatches({
+        expectedGeneration: 9,
+        expectedClaimToken: "current",
+        state,
+      }),
+    ).toBe(true);
+    expect(
+      generalChatProjectionClaimMatches({
+        expectedGeneration: 8,
+        expectedClaimToken: "old",
+        state,
+      }),
+    ).toBe(false);
   });
 });
 

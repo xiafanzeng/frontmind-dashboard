@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 
 import axios from "axios";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -22,7 +22,6 @@ import { getDecryptedCredentialForAccountById } from "./auth-service";
 import { getDb } from "./db";
 import {
   latestManusV2WaitingDetail,
-  manusV2EventMatchesGeneralChatRequest,
   ManusV2ApiError,
   ManusV2Client,
   orderManusV2EventsByProviderRank,
@@ -30,9 +29,27 @@ import {
 } from "./manus-v2-client";
 import {
   currentGeneralChatTurnProviderEvidence,
+  generalChatAssistantProjectionShouldBeVisible,
+  generalChatProjectionClaimMatches,
+  generalChatProjectionSnapshotClaimDecision,
+  generalChatProjectionWatermarkScore,
+  generalChatTurnBindingFromDispositions,
   generalChatProviderEventEvidence,
+  selectGeneralChatProjectionCandidate,
   settleGeneralChatTurn,
+  type GeneralChatResolvedTurnBinding,
+  type GeneralChatResolvedUserEventDisposition,
+  type GeneralChatProjectionClaimState,
+  type GeneralChatProjectionSnapshot,
 } from "./general-chat-terminal-arbitration";
+import {
+  arbitrateFirstDurableGeneralChatProviderAttachmentEvidence,
+  generalChatProviderEvidenceHasUniqueMatch,
+  resolveManusV2GeneralChatUserEventEvidence,
+  type GeneralChatLocalAttachmentManifestItem,
+  type GeneralChatProviderAttachmentReader,
+  type GeneralChatUserEventEvidenceDisposition,
+} from "./manus-v2-user-attachment-evidence";
 import {
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
@@ -69,7 +86,6 @@ import {
   type GeneralAgentModelProfile,
 } from "../shared/manus-agent-profile";
 import { getUpstreamBaseUrl } from "./upstream-config";
-import { readGeneralChatIncidentProviderMessages } from "./general-chat-incident-repair-20260828-core";
 import {
   createGeneralChatPreparationClaim,
   generalChatPreparationClaimIsStale,
@@ -88,6 +104,7 @@ const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const LOCAL_CONTENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const RESULT_GRACE_MS = 120_000;
 const GENERAL_CHAT_TURN_TYPE = "general_chat_v2";
+const GENERAL_CHAT_PROJECTION_CLAIM_STALE_MS = 5 * 60_000;
 
 const taskCreateSchema = z
   .object({
@@ -611,6 +628,7 @@ function assistantText(event: ManusV2MessageEvent) {
 type GeneralChatProjectionTurn = {
   id: string;
   conversationId: string;
+  attachmentFileIds: string[];
   metadata: Record<string, unknown>;
 };
 
@@ -624,6 +642,7 @@ async function generalChatProjectionTurns(input: {
     .select({
       id: conversationTurns.id,
       conversationId: conversationTurns.conversationId,
+      attachmentFileIds: conversationTurns.attachmentFileIds,
       metadata: conversationTurns.metadata,
     })
     .from(conversationTurns)
@@ -640,38 +659,180 @@ async function generalChatProjectionTurns(input: {
     )) as GeneralChatProjectionTurn[];
 }
 
+function projectionTurnWatermark(turn: GeneralChatProjectionTurn) {
+  return Array.isArray(turn.metadata.providerEventWatermark)
+    ? sortedUnique(
+        turn.metadata.providerEventWatermark.filter(
+          (value): value is string => typeof value === "string",
+        ),
+      )
+    : [];
+}
+
+async function generalChatLocalAttachmentManifests(input: {
+  userId: number;
+  turns: readonly GeneralChatProjectionTurn[];
+}) {
+  const ids = sortedUnique(
+    input.turns.flatMap((turn) => turn.attachmentFileIds),
+  );
+  const rows = ids.length
+    ? await (
+        await requireDb()
+      )
+        .select({
+          id: localAssets.id,
+          filename: localAssets.filename,
+          mimeType: localAssets.mimeType,
+          sizeBytes: localAssets.sizeBytes,
+          contentSha256: localAssets.contentSha256,
+        })
+        .from(localAssets)
+        .where(
+          and(
+            inArray(localAssets.id, ids),
+            eq(localAssets.scope, "managed_user"),
+            eq(localAssets.accountUserId, input.userId),
+            isNull(localAssets.presalesProjectId),
+            or(
+              isNull(localAssets.retainUntil),
+              gt(localAssets.retainUntil, new Date()),
+            ),
+          ),
+        )
+    : [];
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return new Map(
+    input.turns.map((turn) => {
+      const turnIds = sortedUnique(turn.attachmentFileIds);
+      const manifest = turnIds.flatMap((fileId) => {
+        const row = byId.get(fileId);
+        return row
+          ? ([
+              {
+                fileId,
+                sha256: row.contentSha256,
+                sizeBytes: row.sizeBytes,
+                filename: row.filename,
+                mimeType: row.mimeType,
+              },
+            ] satisfies GeneralChatLocalAttachmentManifestItem[])
+          : [];
+      });
+      return [
+        turn.id,
+        manifest.length === turnIds.length ? manifest : null,
+      ] as const;
+    }),
+  );
+}
+
+async function generalChatLocalAttachmentManifest(input: {
+  userId: number;
+  localAssetIds: readonly string[];
+}): Promise<GeneralChatLocalAttachmentManifestItem[] | null> {
+  const turn: GeneralChatProjectionTurn = {
+    id: "manifest-only",
+    conversationId: "manifest-only",
+    attachmentFileIds: [...input.localAssetIds],
+    metadata: {},
+  };
+  return (
+    (
+      await generalChatLocalAttachmentManifests({
+        userId: input.userId,
+        turns: [turn],
+      })
+    ).get(turn.id) ?? null
+  );
+}
+
+function bindGeneralChatLocalManifestToProviderFiles(
+  manifest: readonly GeneralChatLocalAttachmentManifestItem[],
+  providerFileIds: readonly string[],
+) {
+  const ids = sortedUnique(providerFileIds);
+  if (manifest.length !== ids.length) return null;
+  return manifest.map((item, index) => ({
+    ...item,
+    fileId: ids[index]!,
+  }));
+}
+
+type GeneralChatDurableUserEventDisposition = {
+  eventId: string;
+  kind: "match" | "mismatch" | "unresolved";
+  code: string;
+};
+
+type GeneralChatProviderEventTurnAssignments = {
+  assignments: Map<string, GeneralChatProjectionTurn>;
+  bindings: Map<string, GeneralChatResolvedTurnBinding>;
+  invalidatedTurnIds: Set<string>;
+};
+
+function uniqueLatestProjectionTurn(
+  turns: readonly GeneralChatProjectionTurn[],
+) {
+  if (turns.length === 0) return null;
+  const candidates = turns.filter((candidate) => {
+    const candidateWatermark = new Set(projectionTurnWatermark(candidate));
+    return turns.every((other) =>
+      projectionTurnWatermark(other).every((eventId) =>
+        candidateWatermark.has(eventId),
+      ),
+    );
+  });
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
 function providerEventTurnAssignments(
   events: readonly ManusV2MessageEvent[],
   turns: readonly GeneralChatProjectionTurn[],
-) {
+  dispositions: ReadonlyMap<
+    string,
+    readonly GeneralChatDurableUserEventDisposition[]
+  >,
+  watermarkAmbiguousTurnIds: ReadonlySet<string> = new Set(),
+): GeneralChatProviderEventTurnAssignments {
   const assignments = new Map<string, GeneralChatProjectionTurn>();
-  const unmatched = [...turns];
+  const bindings = new Map<string, GeneralChatResolvedTurnBinding>();
+  const matchedUserTurns = new Map<string, GeneralChatProjectionTurn>();
+  const invalidatedTurnIds = new Set<string>();
+  for (const turn of turns) {
+    const binding = watermarkAmbiguousTurnIds.has(turn.id)
+      ? {
+          binding: "ambiguous" as const,
+          matchedUserEventId: null,
+          matchCount: 0,
+          unresolvedCount: 1,
+        }
+      : generalChatTurnBindingFromDispositions(
+          (dispositions.get(turn.id) ?? []).map(
+            ({ eventId, kind }): GeneralChatResolvedUserEventDisposition => ({
+              eventId,
+              kind,
+            }),
+          ),
+        );
+    bindings.set(turn.id, binding);
+    if (binding.binding === "bound" && binding.matchedUserEventId) {
+      matchedUserTurns.set(binding.matchedUserEventId, turn);
+    } else {
+      invalidatedTurnIds.add(turn.id);
+    }
+  }
   let current: GeneralChatProjectionTurn | null = null;
   for (const event of events) {
     if (event.type === "user_message") {
-      const index = unmatched.findIndex((turn) => {
-        const promptSha256 = turn.metadata.promptSha256;
-        const attachmentFileIds = turn.metadata.providerAttachmentFileIds;
-        return (
-          typeof promptSha256 === "string" &&
-          manusV2EventMatchesGeneralChatRequest(event, {
-            promptSha256,
-            attachmentFileIds: Array.isArray(attachmentFileIds)
-              ? attachmentFileIds.filter(
-                  (value): value is string => typeof value === "string",
-                )
-              : [],
-          })
-        );
-      });
-      current = index >= 0 ? unmatched.splice(index, 1)[0]! : null;
+      current = matchedUserTurns.get(event.id) ?? null;
       continue;
     }
     if (event.type === "assistant_message" && current) {
       assignments.set(event.id, current);
     }
   }
-  return assignments;
+  return { assignments, bindings, invalidatedTurnIds };
 }
 
 function persistedMessageIdForConversation(
@@ -685,6 +846,7 @@ function persistedMessageIdForConversation(
 }
 
 async function persistAssistantProjection(input: {
+  executor: any;
   operation: AgentOperation;
   task: AgentTask;
   event: ManusV2MessageEvent;
@@ -741,54 +903,622 @@ async function persistAssistantProjection(input: {
       ? input.event.timestamp * 1_000
       : input.event.timestamp,
   );
-  const db = await requireDb();
-  await db.transaction(async (tx) => {
-    await tx
-      .select({ id: conversations.id })
-      .from(conversations)
-      .where(eq(conversations.id, input.turn.conversationId))
+  await input.executor
+    .select({ id: conversations.id })
+    .from(conversations)
+    .where(eq(conversations.id, input.turn.conversationId))
+    .limit(1)
+    .for("update");
+  const existing = (
+    await input.executor
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.id, messageId))
       .limit(1)
-      .for("update");
-    const existing = (
-      await tx
-        .select({ id: messages.id })
-        .from(messages)
-        .where(eq(messages.id, messageId))
-        .limit(1)
-    )[0];
-    if (existing) {
-      await tx
-        .update(messages)
-        .set({
-          content: input.text,
-          metadata,
-          turnId: input.turn.id,
-          sentAt,
-          deletedAt: null,
-        })
-        .where(eq(messages.id, messageId));
-      return;
-    }
-    const latest = (
-      await tx
-        .select({ sequence: messages.sequence })
-        .from(messages)
-        .where(eq(messages.conversationId, input.turn.conversationId))
-        .orderBy(desc(messages.sequence))
-        .limit(1)
-    )[0];
-    await tx.insert(messages).values({
-      id: messageId,
-      conversationId: input.turn.conversationId,
-      turnId: input.turn.id,
-      userId,
-      role: "assistant",
-      content: input.text,
-      sequence: (latest?.sequence ?? -1) + 1,
-      metadata,
-      sentAt,
-      createdAt: sentAt,
+  )[0];
+  if (existing) {
+    await input.executor
+      .update(messages)
+      .set({
+        content: input.text,
+        metadata,
+        turnId: input.turn.id,
+        sentAt,
+        deletedAt: null,
+      })
+      .where(eq(messages.id, messageId));
+    return;
+  }
+  const latest = (
+    await input.executor
+      .select({ sequence: messages.sequence })
+      .from(messages)
+      .where(eq(messages.conversationId, input.turn.conversationId))
+      .orderBy(desc(messages.sequence))
+      .limit(1)
+  )[0];
+  await input.executor.insert(messages).values({
+    id: messageId,
+    conversationId: input.turn.conversationId,
+    turnId: input.turn.id,
+    userId,
+    role: "assistant",
+    content: input.text,
+    sequence: (latest?.sequence ?? -1) + 1,
+    metadata,
+    sentAt,
+    createdAt: sentAt,
+  });
+}
+
+const providerAttachmentEvidenceInFlight = new Map<
+  string,
+  Promise<GeneralChatUserEventEvidenceDisposition>
+>();
+
+const rejectGeneralChatProviderAttachmentRead: GeneralChatProviderAttachmentReader =
+  async () => {
+    throw Object.assign(new Error("Provider attachment network disabled"), {
+      code: "ATTACHMENT_NETWORK_DISABLED",
     });
+  };
+
+type GeneralChatProjectionClaim = {
+  acquired: boolean;
+  generation: number;
+  claimToken: string | null;
+  snapshot: GeneralChatProjectionSnapshot;
+  reason: "claimed" | "in_progress" | "stale_candidate";
+};
+
+function projectionSnapshotFromPayload(
+  payload: Record<string, unknown>,
+  prefix: "claim" | "applied",
+): GeneralChatProjectionSnapshot | null {
+  const rawIds = payload[`${prefix}EventIds`];
+  const snapshotHash = payload[`${prefix}SnapshotHash`];
+  const maxProviderTimestampMs = payload[`${prefix}MaxProviderTimestampMs`];
+  if (
+    !Array.isArray(rawIds) ||
+    !rawIds.every(
+      (eventId): eventId is string =>
+        typeof eventId === "string" &&
+        eventId.length > 0 &&
+        eventId.length <= 512,
+    ) ||
+    typeof snapshotHash !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(snapshotHash) ||
+    !Number.isSafeInteger(maxProviderTimestampMs) ||
+    Number(maxProviderTimestampMs) < 0
+  ) {
+    return null;
+  }
+  return {
+    eventIds: sortedUnique(rawIds),
+    snapshotHash,
+    maxProviderTimestampMs: Number(maxProviderTimestampMs),
+  };
+}
+
+function projectionClaimState(
+  payload: Record<string, unknown>,
+): GeneralChatProjectionClaimState | null {
+  const generation = payload.generation;
+  const status = payload.status;
+  if (
+    payload.kind !== "local_projection_snapshot" ||
+    !Number.isSafeInteger(generation) ||
+    Number(generation) < 0 ||
+    !["idle", "claimed", "applied"].includes(String(status))
+  ) {
+    return null;
+  }
+  const claimedSnapshot = projectionSnapshotFromPayload(payload, "claim");
+  const appliedSnapshot = projectionSnapshotFromPayload(payload, "applied");
+  const claimToken =
+    typeof payload.claimToken === "string" ? payload.claimToken : null;
+  const claimStartedAtMs = Number.isSafeInteger(payload.claimStartedAtMs)
+    ? Number(payload.claimStartedAtMs)
+    : null;
+  if (status === "claimed" && (!claimToken || !claimedSnapshot)) return null;
+  return {
+    generation: Number(generation),
+    status: status as GeneralChatProjectionClaimState["status"],
+    claimToken,
+    claimStartedAtMs,
+    claimedSnapshot,
+    appliedSnapshot,
+  };
+}
+
+function projectionSnapshotProviderEventId(taskId: string) {
+  return `local-projection-snapshot:${taskId}`;
+}
+
+async function claimProviderProjectionSnapshot(input: {
+  taskId: string;
+  events: readonly ManusV2MessageEvent[];
+}): Promise<GeneralChatProjectionClaim> {
+  const eventIds = sortedUnique(input.events.map((event) => event.id));
+  const snapshot: GeneralChatProjectionSnapshot = {
+    eventIds,
+    snapshotHash: requestHash(input.events),
+    maxProviderTimestampMs: input.events.reduce(
+      (maximum, event) => Math.max(maximum, event.timestamp),
+      0,
+    ),
+  };
+  const providerEventId = projectionSnapshotProviderEventId(input.taskId);
+  const db = await requireDb();
+  await db
+    .insert(agentEvents)
+    .values({
+      id: randomUUID(),
+      taskId: input.taskId,
+      providerEventId,
+      eventType: "local_projection_snapshot",
+      providerTimestampMs: Date.now(),
+      normalizedPayload: {
+        kind: "local_projection_snapshot",
+        generation: 0,
+        status: "idle",
+      },
+    })
+    .onDuplicateKeyUpdate({ set: { providerEventId } });
+  return db.transaction(async (tx) => {
+    const row = (
+      await tx
+        .select()
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.taskId),
+            eq(agentEvents.providerEventId, providerEventId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    const payload = row?.normalizedPayload ?? {};
+    const state = projectionClaimState(payload);
+    if (!row || !state) {
+      throw new ChatV2HttpError(
+        "GENERAL_CHAT_PROJECTION_CLAIM_INVALID",
+        409,
+        true,
+      );
+    }
+    const nowMs = Date.now();
+    const decision = generalChatProjectionSnapshotClaimDecision({
+      candidate: snapshot,
+      state,
+      nowMs,
+      staleAfterMs: GENERAL_CHAT_PROJECTION_CLAIM_STALE_MS,
+    });
+    if (decision.kind !== "claim") {
+      return {
+        acquired: false,
+        generation: decision.generation,
+        claimToken: null,
+        snapshot,
+        reason: decision.kind,
+      };
+    }
+    const claimToken = randomUUID();
+    await tx
+      .update(agentEvents)
+      .set({
+        normalizedPayload: {
+          ...payload,
+          kind: "local_projection_snapshot",
+          generation: decision.generation,
+          status: "claimed",
+          claimToken,
+          claimStartedAtMs: nowMs,
+          claimEventIds: snapshot.eventIds,
+          claimSnapshotHash: snapshot.snapshotHash,
+          claimMaxProviderTimestampMs: snapshot.maxProviderTimestampMs,
+        },
+      })
+      .where(eq(agentEvents.id, row.id));
+    return {
+      acquired: true,
+      generation: decision.generation,
+      claimToken,
+      snapshot,
+      reason: "claimed",
+    };
+  });
+}
+
+async function ensureProviderEventRows(input: {
+  taskId: string;
+  events: readonly ManusV2MessageEvent[];
+}) {
+  const db = await requireDb();
+  for (const event of input.events) {
+    await db
+      .insert(agentEvents)
+      .values({
+        id: randomUUID(),
+        taskId: input.taskId,
+        providerEventId: event.id,
+        eventType: event.type,
+        providerTimestampMs: event.timestamp,
+        normalizedPayload: { kind: "provider_event_pending" },
+      })
+      .onDuplicateKeyUpdate({
+        // Existing Provider rows are generation-owned. Their mutable wire
+        // payload, type and timestamp are updated only after the final claim
+        // token check inside applyProviderProjectionSnapshot.
+        set: { providerEventId: event.id },
+      });
+  }
+}
+
+async function providerEventRows(input: {
+  taskId: string;
+  eventIds: readonly string[];
+}) {
+  if (input.eventIds.length === 0)
+    return new Map<string, typeof agentEvents.$inferSelect>();
+  const rows = await (
+    await requireDb()
+  )
+    .select()
+    .from(agentEvents)
+    .where(
+      and(
+        eq(agentEvents.taskId, input.taskId),
+        inArray(agentEvents.providerEventId, [...input.eventIds]),
+      ),
+    );
+  return new Map(rows.map((row) => [row.providerEventId, row]));
+}
+
+async function resolveProviderUserEventEvidence(input: {
+  taskId: string;
+  event: ManusV2MessageEvent;
+  promptSha256: string;
+  expectedAttachmentFileIds: readonly string[];
+  localAttachmentManifest: readonly GeneralChatLocalAttachmentManifestItem[];
+  cachedEvidence: unknown;
+  allowNetwork: boolean;
+}) {
+  const resolverInput = {
+    event: input.event as unknown as Record<string, unknown>,
+    promptSha256: input.promptSha256,
+    expectedAttachmentFileIds: input.expectedAttachmentFileIds,
+    localAttachmentManifest: input.localAttachmentManifest,
+    cachedEvidence: input.cachedEvidence,
+  };
+  const withoutNetwork = await resolveManusV2GeneralChatUserEventEvidence({
+    ...resolverInput,
+    readUrl: rejectGeneralChatProviderAttachmentRead,
+  });
+  if (
+    !input.allowNetwork ||
+    withoutNetwork.code !== "ATTACHMENT_DOWNLOAD_FAILED"
+  ) {
+    return withoutNetwork;
+  }
+  const inFlightKey = hash(
+    `${input.taskId}\0${input.event.id}\0${requestHash(input.event)}`,
+  );
+  const existing = providerAttachmentEvidenceInFlight.get(inFlightKey);
+  if (existing) return existing;
+  const pending = resolveManusV2GeneralChatUserEventEvidence(
+    resolverInput,
+  ).finally(() => providerAttachmentEvidenceInFlight.delete(inFlightKey));
+  providerAttachmentEvidenceInFlight.set(inFlightKey, pending);
+  return pending;
+}
+
+async function persistProviderUserEventEvidence(input: {
+  taskId: string;
+  event: ManusV2MessageEvent;
+  promptSha256: string;
+  expectedAttachmentFileIds: readonly string[];
+  localAttachmentManifest: readonly GeneralChatLocalAttachmentManifestItem[];
+  incoming: GeneralChatUserEventEvidenceDisposition;
+}): Promise<GeneralChatDurableUserEventDisposition> {
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const row = (
+      await tx
+        .select()
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.taskId),
+            eq(agentEvents.providerEventId, input.event.id),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!row) {
+      throw new ChatV2HttpError("PROVIDER_EVENT_PERSISTENCE_FAILED", 500, true);
+    }
+    const payload = row.normalizedPayload ?? {};
+    const arbitration =
+      arbitrateFirstDurableGeneralChatProviderAttachmentEvidence({
+        existing: payload.providerAttachmentEvidence,
+        incoming: input.incoming.evidence,
+      });
+    let durable: GeneralChatUserEventEvidenceDisposition;
+    if (arbitration.kind === "conflict") {
+      durable = {
+        kind: "unresolved",
+        code: "ATTACHMENT_DESCRIPTOR_CONFLICT",
+        evidence: arbitration.evidence,
+      };
+    } else if (arbitration.kind === "accepted") {
+      durable = await resolveManusV2GeneralChatUserEventEvidence({
+        event: input.event as unknown as Record<string, unknown>,
+        promptSha256: input.promptSha256,
+        expectedAttachmentFileIds: input.expectedAttachmentFileIds,
+        localAttachmentManifest: input.localAttachmentManifest,
+        cachedEvidence: arbitration.evidence,
+        readUrl: rejectGeneralChatProviderAttachmentRead,
+      });
+    } else {
+      durable = input.incoming;
+    }
+    await tx
+      .update(agentEvents)
+      .set({
+        normalizedPayload: {
+          ...payload,
+          ...(arbitration.kind === "accepted" && arbitration.evidence
+            ? { providerAttachmentEvidence: arbitration.evidence }
+            : {}),
+          generalChatUserEventEvidence: {
+            kind: durable.kind,
+            code:
+              arbitration.kind === "conflict" ? arbitration.code : durable.code,
+          },
+        },
+      })
+      .where(eq(agentEvents.id, row.id));
+    return {
+      eventId: input.event.id,
+      kind: durable.kind,
+      code: arbitration.kind === "conflict" ? arbitration.code : durable.code,
+    };
+  });
+}
+
+async function reconcileAssistantProjectionVisibility(input: {
+  executor: any;
+  taskId: string;
+  turns: readonly GeneralChatProjectionTurn[];
+  assignments: ReadonlyMap<string, GeneralChatProjectionTurn>;
+  invalidatedTurnIds: ReadonlySet<string>;
+}) {
+  if (input.turns.length === 0) return;
+  const expectedByTurn = new Map<string, Set<string>>();
+  for (const [providerEventId, turn] of input.assignments) {
+    const expected = expectedByTurn.get(turn.id) ?? new Set<string>();
+    expected.add(providerEventId);
+    expectedByTurn.set(turn.id, expected);
+  }
+  const rows = await input.executor
+    .select({
+      id: messages.id,
+      turnId: messages.turnId,
+      metadata: messages.metadata,
+      deletedAt: messages.deletedAt,
+    })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.role, "assistant"),
+        inArray(
+          messages.turnId,
+          input.turns.map((turn) => turn.id),
+        ),
+      ),
+    );
+  for (const row of rows) {
+    const generalChat =
+      row.metadata?.generalChat &&
+      typeof row.metadata.generalChat === "object" &&
+      !Array.isArray(row.metadata.generalChat)
+        ? (row.metadata.generalChat as Record<string, unknown>)
+        : null;
+    if (
+      !row.turnId ||
+      generalChat?.serverOwned !== true ||
+      generalChat.kind !== "assistant_projection" ||
+      generalChat.agentTaskId !== input.taskId ||
+      generalChat.turnId !== row.turnId ||
+      typeof generalChat.providerEventId !== "string"
+    ) {
+      continue;
+    }
+    const remainsAssigned = generalChatAssistantProjectionShouldBeVisible({
+      binding: input.invalidatedTurnIds.has(row.turnId) ? "pending" : "bound",
+      providerEventId: generalChat.providerEventId,
+      assignedProviderEventIds:
+        expectedByTurn.get(row.turnId) ?? new Set<string>(),
+    });
+    if (!remainsAssigned && row.deletedAt === null) {
+      await input.executor
+        .update(messages)
+        .set({ deletedAt: new Date() })
+        .where(eq(messages.id, row.id));
+    }
+  }
+}
+
+type GeneralChatStagedProviderEvent = {
+  event: ManusV2MessageEvent;
+  normalizedPayload: Record<string, unknown>;
+  projectionTurn: GeneralChatProjectionTurn | null;
+  localized: Array<{
+    artifactId: string;
+    filename: string;
+    mimeType: string;
+    bytes: number;
+    sha256: string;
+  }>;
+};
+
+async function applyProviderProjectionSnapshot(input: {
+  operation: AgentOperation;
+  task: AgentTask;
+  claim: GeneralChatProjectionClaim;
+  turns: readonly GeneralChatProjectionTurn[];
+  eventTurnState: GeneralChatProviderEventTurnAssignments;
+  stagedEvents: readonly GeneralChatStagedProviderEvent[];
+}) {
+  const claimToken = input.claim.claimToken;
+  if (!input.claim.acquired || !claimToken) return false;
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const claimRow = (
+      await tx
+        .select()
+        .from(agentEvents)
+        .where(
+          and(
+            eq(agentEvents.taskId, input.task.id),
+            eq(
+              agentEvents.providerEventId,
+              projectionSnapshotProviderEventId(input.task.id),
+            ),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    const payload = claimRow?.normalizedPayload ?? {};
+    const state = projectionClaimState(payload);
+    if (
+      !claimRow ||
+      !state ||
+      !generalChatProjectionClaimMatches({
+        expectedGeneration: input.claim.generation,
+        expectedClaimToken: claimToken,
+        state,
+      }) ||
+      state.claimedSnapshot?.snapshotHash !== input.claim.snapshot.snapshotHash
+    ) {
+      return false;
+    }
+    const stagedEventIds = sortedUnique(
+      input.stagedEvents.map(({ event }) => event.id),
+    );
+    if (
+      stagedEventIds.length !== input.claim.snapshot.eventIds.length ||
+      !stagedEventIds.every(
+        (eventId, index) => eventId === input.claim.snapshot.eventIds[index],
+      )
+    ) {
+      throw new ChatV2HttpError(
+        "GENERAL_CHAT_PROJECTION_SNAPSHOT_INVALID",
+        409,
+        true,
+      );
+    }
+    const persistedEventIds = new Map<string, string>();
+    for (const staged of input.stagedEvents) {
+      const persistedEvent = (
+        await tx
+          .select()
+          .from(agentEvents)
+          .where(
+            and(
+              eq(agentEvents.taskId, input.task.id),
+              eq(agentEvents.providerEventId, staged.event.id),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0];
+      if (!persistedEvent) {
+        throw new ChatV2HttpError(
+          "PROVIDER_EVENT_PERSISTENCE_FAILED",
+          500,
+          true,
+        );
+      }
+      const previous = persistedEvent.normalizedPayload ?? {};
+      await tx
+        .update(agentEvents)
+        .set({
+          eventType: staged.event.type,
+          providerTimestampMs: staged.event.timestamp,
+          normalizedPayload: {
+            ...staged.normalizedPayload,
+            ...(Object.prototype.hasOwnProperty.call(
+              previous,
+              "providerAttachmentEvidence",
+            )
+              ? {
+                  providerAttachmentEvidence:
+                    previous.providerAttachmentEvidence,
+                }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(
+              previous,
+              "generalChatUserEventEvidence",
+            )
+              ? {
+                  generalChatUserEventEvidence:
+                    previous.generalChatUserEventEvidence,
+                }
+              : {}),
+          },
+        })
+        .where(eq(agentEvents.id, persistedEvent.id));
+      persistedEventIds.set(staged.event.id, persistedEvent.id);
+    }
+    await reconcileAssistantProjectionVisibility({
+      executor: tx,
+      taskId: input.task.id,
+      turns: input.turns,
+      assignments: input.eventTurnState.assignments,
+      invalidatedTurnIds: input.eventTurnState.invalidatedTurnIds,
+    });
+    for (const staged of input.stagedEvents) {
+      const persistedEventId = persistedEventIds.get(staged.event.id);
+      const text = assistantText(staged.event);
+      if (
+        !staged.projectionTurn ||
+        !persistedEventId ||
+        (!text && staged.localized.length === 0)
+      ) {
+        continue;
+      }
+      await persistAssistantProjection({
+        executor: tx,
+        operation: input.operation,
+        task: input.task,
+        event: staged.event,
+        turn: staged.projectionTurn,
+        upstreamOutputId: persistedEventId,
+        text,
+        localized: staged.localized,
+      });
+    }
+    await tx
+      .update(agentEvents)
+      .set({
+        normalizedPayload: {
+          ...payload,
+          status: "applied",
+          appliedGeneration: input.claim.generation,
+          appliedEventIds: input.claim.snapshot.eventIds,
+          appliedSnapshotHash: input.claim.snapshot.snapshotHash,
+          appliedMaxProviderTimestampMs:
+            input.claim.snapshot.maxProviderTimestampMs,
+          appliedAtMs: Date.now(),
+        },
+      })
+      .where(eq(agentEvents.id, claimRow.id));
+    return true;
   });
 }
 
@@ -796,12 +1526,7 @@ async function persistProviderEvents(input: {
   operation: AgentOperation;
   task: AgentTask;
   events: readonly ManusV2MessageEvent[];
-  forcedAssistantProjection?: {
-    turnId: string;
-    expectedProviderAssistantEventIds: readonly string[];
-  };
 }) {
-  const db = await requireDb();
   const waiting = latestManusV2WaitingDetail(input.events);
   const turns = await generalChatProjectionTurns({
     userId: input.operation.accountUserId!,
@@ -814,30 +1539,137 @@ async function persistProviderEvents(input: {
     input.events,
     "oldest_first",
   );
-  let eventTurns: Map<string, GeneralChatProjectionTurn>;
-  if (input.forcedAssistantProjection) {
-    const expectedIds = sortedUnique(
-      input.forcedAssistantProjection.expectedProviderAssistantEventIds,
-    );
-    const actualIds = sortedUnique(
-      orderedEvents
-        .filter((event) => event.type === "assistant_message")
-        .map((event) => event.id),
-    );
-    const turn = turns.filter(
-      (candidate) => candidate.id === input.forcedAssistantProjection!.turnId,
-    );
-    if (
-      expectedIds.length === 0 ||
-      turn.length !== 1 ||
-      JSON.stringify(actualIds) !== JSON.stringify(expectedIds)
-    ) {
-      throw new ChatV2HttpError("GENERAL_CHAT_REPAIR_PROJECTION_MISMATCH", 409);
-    }
-    eventTurns = new Map(expectedIds.map((eventId) => [eventId, turn[0]!]));
-  } else {
-    eventTurns = providerEventTurnAssignments(orderedEvents, turns);
+  const projectionClaim = await claimProviderProjectionSnapshot({
+    taskId: input.task.id,
+    events: orderedEvents,
+  });
+  if (!projectionClaim.acquired) {
+    return {
+      ...providerEventTurnAssignments(
+        orderedEvents,
+        turns,
+        new Map(turns.map((turn) => [turn.id, []])),
+      ),
+      applied: false,
+      claimReason: projectionClaim.reason,
+    };
   }
+  await ensureProviderEventRows({
+    taskId: input.task.id,
+    events: orderedEvents,
+  });
+  const persistedRows = await providerEventRows({
+    taskId: input.task.id,
+    eventIds: orderedEvents.map((event) => event.id),
+  });
+  const localManifests = await generalChatLocalAttachmentManifests({
+    userId: input.operation.accountUserId!,
+    turns,
+  });
+  const eventIndexes = new Map(
+    orderedEvents.map((event, index) => [event.id, index] as const),
+  );
+  const dispositionByTurn = new Map<
+    string,
+    GeneralChatDurableUserEventDisposition[]
+  >(turns.map((turn) => [turn.id, []]));
+  const watermarkAmbiguousTurnIds = new Set<string>();
+  const networkEligibleTurn = uniqueLatestProjectionTurn(turns);
+  let networkResolutionAttempted = false;
+  for (const event of orderedEvents) {
+    if (event.type !== "user_message") continue;
+    const candidates = turns.filter(
+      (turn) =>
+        generalChatProjectionWatermarkScore({
+          providerEventId: event.id,
+          providerEventIndex: eventIndexes,
+          providerEventWatermark: projectionTurnWatermark(turn),
+        }) !== null,
+    );
+    const selected = selectGeneralChatProjectionCandidate({
+      providerEventId: event.id,
+      providerEventIndex: eventIndexes,
+      candidates: candidates.map((turn) => ({
+        id: turn.id,
+        providerEventWatermark: projectionTurnWatermark(turn),
+      })),
+    });
+    if (!selected) {
+      if (candidates.length > 1) {
+        candidates.forEach((turn) => watermarkAmbiguousTurnIds.add(turn.id));
+      }
+      continue;
+    }
+    const turn = candidates.find((candidate) => candidate.id === selected.id)!;
+    const promptSha256 =
+      typeof turn.metadata.promptSha256 === "string"
+        ? turn.metadata.promptSha256
+        : null;
+    const expectedAttachmentFileIds = Array.isArray(
+      turn.metadata.providerAttachmentFileIds,
+    )
+      ? turn.metadata.providerAttachmentFileIds.filter(
+          (value): value is string => typeof value === "string",
+        )
+      : [];
+    const localManifestRows = localManifests.get(turn.id) ?? null;
+    const localManifest = localManifestRows
+      ? bindGeneralChatLocalManifestToProviderFiles(
+          localManifestRows,
+          expectedAttachmentFileIds,
+        )
+      : null;
+    let durable: GeneralChatDurableUserEventDisposition;
+    if (!promptSha256 || !localManifest) {
+      durable = {
+        eventId: event.id,
+        kind: "unresolved",
+        code: "ATTACHMENT_EVIDENCE_INVALID",
+      };
+    } else {
+      const cachedEvidence = persistedRows.get(event.id)?.normalizedPayload
+        ?.providerAttachmentEvidence;
+      const mayUseNetwork =
+        networkEligibleTurn?.id === turn.id && !networkResolutionAttempted;
+      let incoming = await resolveProviderUserEventEvidence({
+        taskId: input.task.id,
+        event,
+        promptSha256,
+        expectedAttachmentFileIds,
+        localAttachmentManifest: localManifest,
+        cachedEvidence,
+        allowNetwork: false,
+      });
+      if (mayUseNetwork && incoming.code === "ATTACHMENT_DOWNLOAD_FAILED") {
+        networkResolutionAttempted = true;
+        incoming = await resolveProviderUserEventEvidence({
+          taskId: input.task.id,
+          event,
+          promptSha256,
+          expectedAttachmentFileIds,
+          localAttachmentManifest: localManifest,
+          cachedEvidence,
+          allowNetwork: true,
+        });
+      }
+      durable = await persistProviderUserEventEvidence({
+        taskId: input.task.id,
+        event,
+        promptSha256,
+        expectedAttachmentFileIds,
+        localAttachmentManifest: localManifest,
+        incoming,
+      });
+    }
+    dispositionByTurn.get(turn.id)!.push(durable);
+  }
+  const eventTurnState = providerEventTurnAssignments(
+    orderedEvents,
+    turns,
+    dispositionByTurn,
+    watermarkAmbiguousTurnIds,
+  );
+  const stagedEvents: GeneralChatStagedProviderEvent[] = [];
   for (const event of orderedEvents) {
     const providerEvidence = generalChatProviderEventEvidence(event);
     const providerErrorContent = providerEvidence.errorContent
@@ -849,7 +1681,13 @@ async function persistProviderEvents(input: {
           .trim()
           .slice(0, 4_096)
       : null;
-    const localized = [];
+    const localized: Array<{
+      artifactId: string;
+      filename: string;
+      mimeType: string;
+      bytes: number;
+      sha256: string;
+    }> = [];
     for (const attachment of assistantAttachments(event)) {
       try {
         const artifact = await localizeArtifact({
@@ -908,64 +1746,77 @@ async function persistProviderEvents(input: {
           }
         : {}),
     };
-    const localEventId = randomUUID();
-    await db
-      .insert(agentEvents)
-      .values({
-        id: localEventId,
-        taskId: input.task.id,
-        providerEventId: event.id,
-        eventType: event.type,
-        providerTimestampMs: event.timestamp,
-        normalizedPayload,
-      })
-      .onDuplicateKeyUpdate({
-        set: {
-          eventType: event.type,
-          providerTimestampMs: event.timestamp,
-          normalizedPayload,
-        },
-      });
-    const persistedEvent = (
-      await db
-        .select({ id: agentEvents.id })
-        .from(agentEvents)
-        .where(
-          and(
-            eq(agentEvents.taskId, input.task.id),
-            eq(agentEvents.providerEventId, event.id),
-          ),
-        )
-        .limit(1)
-    )[0];
-    if (!persistedEvent) {
-      throw new ChatV2HttpError("PROVIDER_EVENT_PERSISTENCE_FAILED", 500, true);
-    }
-    const projectionTurn = eventTurns.get(event.id);
-    if (projectionTurn && (normalizedPayload.text || localized.length > 0)) {
-      await persistAssistantProjection({
-        operation: input.operation,
-        task: input.task,
-        event,
-        turn: projectionTurn,
-        upstreamOutputId: persistedEvent.id,
-        text: String(normalizedPayload.text ?? ""),
-        localized,
-      });
-    }
+    stagedEvents.push({
+      event,
+      normalizedPayload,
+      projectionTurn: eventTurnState.assignments.get(event.id) ?? null,
+      localized,
+    });
   }
+  const applied = await applyProviderProjectionSnapshot({
+    operation: input.operation,
+    task: input.task,
+    claim: projectionClaim,
+    turns,
+    eventTurnState,
+    stagedEvents,
+  });
+  return { ...eventTurnState, applied, claimReason: projectionClaim.reason };
 }
 
 async function cachedOutput(taskId: string) {
   const db = await requireDb();
-  const rows = await db
-    .select()
-    .from(agentEvents)
-    .where(eq(agentEvents.taskId, taskId))
-    .orderBy(agentEvents.providerTimestampMs, agentEvents.id);
+  const turnIds = (
+    await db
+      .select({ id: conversationTurns.id })
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+          eq(conversationTurns.upstreamTaskId, taskId),
+        ),
+      )
+  ).map(({ id }) => id);
+  const [rows, projectedMessages] = await Promise.all([
+    db
+      .select()
+      .from(agentEvents)
+      .where(eq(agentEvents.taskId, taskId))
+      .orderBy(agentEvents.providerTimestampMs, agentEvents.id),
+    turnIds.length
+      ? db
+          .select({ metadata: messages.metadata })
+          .from(messages)
+          .where(
+            and(
+              eq(messages.role, "assistant"),
+              inArray(messages.turnId, turnIds),
+              isNull(messages.deletedAt),
+            ),
+          )
+      : Promise.resolve([]),
+  ]);
+  const visibleEventIds = new Set(
+    projectedMessages.flatMap(({ metadata }) => {
+      const generalChat =
+        metadata?.generalChat &&
+        typeof metadata.generalChat === "object" &&
+        !Array.isArray(metadata.generalChat)
+          ? (metadata.generalChat as Record<string, unknown>)
+          : null;
+      return generalChat?.serverOwned === true &&
+        generalChat.kind === "assistant_projection" &&
+        generalChat.agentTaskId === taskId &&
+        typeof metadata?.upstreamOutputId === "string"
+        ? [metadata.upstreamOutputId]
+        : [];
+    }),
+  );
   return rows.flatMap((row) => {
     const payload = row.normalizedPayload ?? {};
-    if (payload.kind !== "provider_event") return [];
+    if (payload.kind !== "provider_event" || !visibleEventIds.has(row.id)) {
+      return [];
+    }
     const content = [];
     const text = typeof payload.text === "string" ? payload.text : "";
     if (text) {
@@ -1228,6 +2079,7 @@ async function updateTaskState(input: {
 type CreateReconcileEvidence = {
   promptSha256: string;
   attachmentFileIds: string[];
+  localAssetIds: string[];
 };
 
 type CreateReservationStatus =
@@ -1493,6 +2345,7 @@ async function freezeCreateReconcileEvidence(input: {
     return {
       promptSha256: payload.promptSha256,
       attachmentFileIds,
+      localAssetIds,
     } satisfies CreateReconcileEvidence;
   });
 }
@@ -1569,6 +2422,11 @@ async function readCreateReservation(taskId: string) {
         (value): value is string => typeof value === "string",
       )
     : [];
+  const localAssetIds = Array.isArray(payload.localAssetIds)
+    ? payload.localAssetIds.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
   return {
     status:
       typeof payload.status === "string"
@@ -1576,7 +2434,11 @@ async function readCreateReservation(taskId: string) {
         : null,
     rejectionProven: payload.rejectionProven === true,
     evidence: promptSha256
-      ? ({ promptSha256, attachmentFileIds } satisfies CreateReconcileEvidence)
+      ? ({
+          promptSha256,
+          attachmentFileIds,
+          localAssetIds,
+        } satisfies CreateReconcileEvidence)
       : null,
   };
 }
@@ -1650,6 +2512,17 @@ async function reconcileUnknownCreate(input: {
     return input;
   }
   const evidence = reservation.evidence;
+  const localAttachmentManifest = await generalChatLocalAttachmentManifest({
+    userId: input.operation.accountUserId!,
+    localAssetIds: evidence.localAssetIds,
+  });
+  const attachmentManifest = localAttachmentManifest
+    ? bindGeneralChatLocalManifestToProviderFiles(
+        localAttachmentManifest,
+        evidence.attachmentFileIds,
+      )
+    : null;
+  if (!attachmentManifest) return input;
   const result = await clientFor(
     input.credential.apiKey,
     input.operation.accountUserId!,
@@ -1657,6 +2530,7 @@ async function reconcileUnknownCreate(input: {
     title: input.task.title,
     promptSha256: evidence.promptSha256,
     attachmentFileIds: evidence.attachmentFileIds,
+    attachmentManifest,
     createdAfterSeconds:
       Math.floor(input.operation.createdAt.getTime() / 1_000) - 60,
     createdBeforeSeconds: Math.floor(Date.now() / 1_000) + 60,
@@ -1814,15 +2688,9 @@ async function latestGeneralChatTurnLifecycle(input: {
   )[0];
 }
 
-async function syncTask(
-  input: { userId: number; localTaskId: string },
-  options: { forceProjection?: boolean } = {},
-) {
+async function syncTask(input: { userId: number; localTaskId: string }) {
   let owned = await findOwnedTask(input);
-  if (
-    !options.forceProjection &&
-    ["succeeded", "cancelled"].includes(owned.operation.status)
-  ) {
+  if (["succeeded", "cancelled"].includes(owned.operation.status)) {
     const latestTurn = await latestGeneralChatTurnLifecycle(input);
     if (!latestTurn || ["completed", "cancelled"].includes(latestTurn.status)) {
       return owned;
@@ -1849,7 +2717,14 @@ async function syncTask(
       }),
       client.taskDetail(owned.task.providerTaskId),
     ]);
-    await persistProviderEvents({ ...owned, events });
+    const persisted = await persistProviderEvents({ ...owned, events });
+    if (!persisted.applied) {
+      console.info("[FrontMindV2] general-chat projection superseded", {
+        localTaskId: owned.task.id,
+        claimReason: persisted.claimReason,
+      });
+      return owned;
+    }
     const currentTurn = await latestGeneralChatTurnSettlementContext({
       ...input,
       operationId: owned.operation.id,
@@ -1860,6 +2735,7 @@ async function syncTask(
           promptSha256: currentTurn.promptSha256,
           providerAttachmentFileIds: currentTurn.providerAttachmentFileIds,
           providerEventWatermark: currentTurn.providerEventWatermark,
+          resolvedBinding: persisted.bindings.get(currentTurn.id),
         })
       : {
           binding: "pending" as const,
@@ -1931,51 +2807,6 @@ async function syncTask(
     });
   }
   return owned;
-}
-
-/**
- * Signed-image incident maintenance may only reuse the ordinary task's
- * read/reconcile path. This wrapper deliberately exposes no create/send
- * capability and therefore cannot issue a Provider write.
- */
-export async function syncGeneralChatTaskForRepair(input: {
-  userId: number;
-  localTaskId: string;
-  recoveryTurnId: string;
-  expectedProviderAssistantEventIds: readonly string[];
-}) {
-  const owned = await findOwnedTask(input);
-  if (
-    owned.operation.status !== "succeeded" ||
-    owned.task.providerState !== "stopped" ||
-    !owned.task.providerTaskId
-  ) {
-    throw new ChatV2HttpError("GENERAL_CHAT_REPAIR_TASK_MISMATCH", 409);
-  }
-  const credential = await getDecryptedCredentialForAccountById(
-    input.userId,
-    owned.operation.apiCredentialId,
-  );
-  if (
-    !credential ||
-    credential.id !== owned.operation.apiCredentialId ||
-    credential.version !== owned.operation.credentialVersion
-  ) {
-    throw new ChatV2HttpError("GENERAL_CHAT_REPAIR_CREDENTIAL_MISMATCH", 409);
-  }
-  const events = await readGeneralChatIncidentProviderMessages(
-    clientFor(credential.apiKey, input.userId),
-    { taskId: owned.task.providerTaskId, order: "desc" },
-  );
-  await persistProviderEvents({
-    ...owned,
-    events,
-    forcedAssistantProjection: {
-      turnId: input.recoveryTurnId,
-      expectedProviderAssistantEventIds:
-        input.expectedProviderAssistantEventIds,
-    },
-  });
 }
 
 function persistedConversationResourceId(
@@ -2557,38 +3388,34 @@ async function sendProviderMessage(input: {
       });
       return false;
     }
-    const expectedAttachmentFileIds = Array.isArray(evidence.attachmentFileIds)
-      ? evidence.attachmentFileIds.filter(
-          (value): value is string => typeof value === "string",
-        )
-      : [];
-    const watermark = new Set(
-      Array.isArray(evidence.providerEventWatermark)
-        ? evidence.providerEventWatermark.filter(
-            (value): value is string => typeof value === "string",
-          )
-        : [],
-    );
     const events = await client.listAllMessages({
       taskId: input.task.providerTaskId!,
       order: "desc",
     });
-    const matches = events.filter(
-      (event) =>
-        !watermark.has(event.id) &&
-        manusV2EventMatchesGeneralChatRequest(event, {
-          promptSha256,
-          attachmentFileIds: expectedAttachmentFileIds,
-        }),
-    );
-    if (matches.length === 1) {
+    const persisted = await persistProviderEvents({
+      operation: input.operation,
+      task: input.task,
+      events,
+    });
+    if (!persisted.applied) return false;
+    const binding = persisted.bindings.get(input.turnId) ?? {
+      binding: "pending" as const,
+      matchedUserEventId: null,
+      matchCount: 0,
+      unresolvedCount: 1,
+    };
+    const uniquelyMatched = generalChatProviderEvidenceHasUniqueMatch({
+      matchCount: binding.matchCount,
+      unresolvedCount: binding.unresolvedCount,
+    });
+    if (binding.binding === "bound" && uniquelyMatched) {
       await db
         .update(agentEvents)
         .set({ normalizedPayload: { ...evidence, status: "acknowledged" } })
         .where(eq(agentEvents.id, reservation.id));
       return true;
     }
-    if (matches.length > 1) {
+    if (binding.binding === "ambiguous" || binding.matchCount > 1) {
       await db
         .update(agentEvents)
         .set({ normalizedPayload: { ...evidence, status: "ambiguous" } })

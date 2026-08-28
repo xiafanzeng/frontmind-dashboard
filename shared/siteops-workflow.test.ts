@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   visualSelectionBundleSchema,
   visualSelectionBundleV6Schema,
+  visualSelectionBundleV7Schema,
 } from "./siteops";
 import {
   buildTwentyFirstVisualFunnel,
@@ -15,6 +16,7 @@ import {
   extractSafeVisualDirectives,
   normalizeTwentyFirstSearchResults,
   visualSearchOperationInputV1Schema,
+  visualSearchOperationInputV3Schema,
 } from "./siteops-workflow";
 
 function result(
@@ -44,6 +46,68 @@ function result(
 }
 
 describe("siteops workflow", () => {
+  it("binds workflow 2.8 to one credential-free four-page static catalog operation", () => {
+    expect(
+      visualSearchOperationInputV3Schema.parse({
+        schemaVersion: 3,
+        knowledgeSnapshotId: "11111111-1111-4111-8111-111111111111",
+        workflowVersion: "2.8.0",
+        catalogVersion: "21st-included-recommended-20260828-v1",
+        mode: "initial",
+        page: 1,
+        admissionRevision: 7,
+      }),
+    ).not.toHaveProperty("credentialId");
+
+    const candidates = Array.from({ length: 8 }, (_, index) => {
+      const order = index + 1;
+      const candidateId = `static-template-0${order}-fixture-${order}`;
+      const sampleId = `00000000-0000-4000-8000-${String(order).padStart(12, "0")}`;
+      return {
+        id: sampleId,
+        sampleId,
+        label: String.fromCharCode(65 + index),
+        title: `Template ${order}`,
+        description: null,
+        catalogVersion: "21st-included-recommended-20260828-v1",
+        catalogPosition: order,
+        catalogCandidateId: candidateId,
+        providerTemplateId: String(800 + order),
+        providerSlug: `fixture-${order}`,
+        providerVersion: order.toString(16).padStart(40, "0"),
+        sourceOwner: "frontmind",
+        sourceRepo: `fixture-${order}`,
+        sourceCommitSha: order.toString(16).padStart(40, "0"),
+        sourceSubdirectory: null,
+        sourceLicense: "MIT",
+        sourceAssetId: `catalog/source/${candidateId}`,
+        sourceArchiveSha256: order.toString(16).padStart(64, "0"),
+        sourceArchiveBytes: 1_024 + order,
+        previewAssetId: `catalog/preview/${candidateId}`,
+        previewSha256: (order + 100).toString(16).padStart(64, "0"),
+        previewMimeType: "image/png",
+        previewWidth: 1440,
+        previewHeight: 900,
+      };
+    });
+    expect(
+      visualSelectionBundleV7Schema.parse({
+        schemaVersion: 7,
+        renderer: "frontmind_static_template_catalog_v1",
+        workflowVersion: "2.8.0",
+        catalogVersion: "21st-included-recommended-20260828-v1",
+        pageNumber: 1,
+        pageSize: 8,
+        pageCount: 4,
+        displayTarget: 8,
+        candidates,
+        selectedCandidateId: null,
+        delegated: false,
+        degradedReasons: [],
+      }).candidates,
+    ).toHaveLength(8);
+  });
+
   it("composes four bounded Unicode catalog queries without leaking private facts", () => {
     const queries = composeTwentyFirstQueries({
       companyName: "前智科技 FrontMind",

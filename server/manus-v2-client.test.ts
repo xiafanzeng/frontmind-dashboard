@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 
 import axios from "axios";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -1097,6 +1098,234 @@ describe("ManusV2Client", () => {
     expect(result.candidates).toHaveLength(2);
   });
 
+  it("does not declare an unknown create unique when one candidate matches but another plausible candidate lacks attachment evidence", async () => {
+    const bytes = Buffer.from("input image");
+    const promptSha256 = createHash("sha256").update("analyze").digest("hex");
+    const get = vi.spyOn(axios.Axios.prototype, "get");
+    get
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          data: [
+            { id: "proven", title: "chat title", created_at: 100 },
+            { id: "plausible", title: "chat title", created_at: 101 },
+          ],
+          has_more: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "proven",
+          messages: [
+            {
+              id: "proven-user",
+              type: "user_message",
+              timestamp: 1,
+              user_message: {
+                content: [
+                  { type: "text", text: "analyze" },
+                  { type: "file", file_id: "provider-file-1" },
+                ],
+              },
+            },
+          ],
+          has_more: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "plausible",
+          messages: [
+            {
+              id: "plausible-user",
+              type: "user_message",
+              timestamp: 1,
+              user_message: {
+                content: [
+                  { type: "text", text: "analyze" },
+                  { type: "file", filename: "input.png" },
+                ],
+              },
+            },
+          ],
+          has_more: false,
+        },
+      });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+    const result = await client.findCreatedTask({
+      title: "chat title",
+      promptSha256,
+      attachmentFileIds: ["provider-file-1"],
+      attachmentManifest: [
+        {
+          fileId: "provider-file-1",
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          sizeBytes: bytes.byteLength,
+          filename: "input.png",
+          mimeType: "image/png",
+        },
+      ],
+      createdAfterSeconds: 90,
+      createdBeforeSeconds: 110,
+    });
+    expect(result.matches.map(({ id }) => id)).toEqual(["proven"]);
+    expect(result.unresolved.map(({ id }) => id)).toEqual(["plausible"]);
+    expect(result.unique).toBeNull();
+  });
+
+  it.each([
+    ["match then unresolved", ["match", "unresolved"]],
+    ["unresolved then match", ["unresolved", "match"]],
+  ] as const)(
+    "keeps one candidate ambiguous when its events contain %s",
+    async (_label, eventOrder) => {
+      const bytes = Buffer.from("input image");
+      const userEvents = {
+        match: {
+          id: "matching-user",
+          type: "user_message",
+          timestamp: 1,
+          user_message: {
+            content: [
+              { type: "text", text: "analyze" },
+              { type: "file", file_id: "provider-file-1" },
+            ],
+          },
+        },
+        unresolved: {
+          id: "unresolved-user",
+          type: "user_message",
+          timestamp: 2,
+          user_message: {
+            content: [
+              { type: "text", text: "analyze" },
+              { type: "file", filename: "input.png" },
+            ],
+          },
+        },
+      };
+      const get = vi.spyOn(axios.Axios.prototype, "get");
+      get
+        .mockResolvedValueOnce({
+          status: 200,
+          data: {
+            ok: true,
+            data: [
+              { id: "mixed-candidate", title: "chat title", created_at: 100 },
+            ],
+            has_more: false,
+          },
+        })
+        .mockResolvedValueOnce({
+          status: 200,
+          data: {
+            ok: true,
+            task_id: "mixed-candidate",
+            messages: eventOrder.map((kind) => userEvents[kind]),
+            has_more: false,
+          },
+        });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+      const result = await client.findCreatedTask({
+        title: "chat title",
+        promptSha256: createHash("sha256").update("analyze").digest("hex"),
+        attachmentFileIds: ["provider-file-1"],
+        attachmentManifest: [
+          {
+            fileId: "provider-file-1",
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+            sizeBytes: bytes.byteLength,
+            filename: "input.png",
+            mimeType: "image/png",
+          },
+        ],
+      });
+      expect(result.matches.map(({ id }) => id)).toEqual(["mixed-candidate"]);
+      expect(result.unresolved.map(({ id }) => id)).toEqual([
+        "mixed-candidate",
+      ]);
+      expect(result.unique).toBeNull();
+    },
+  );
+
+  it("reconciles a URL-only v2 user event by streamed content evidence", async () => {
+    const bytes = Buffer.from("input image");
+    const get = vi.spyOn(axios.Axios.prototype, "get");
+    get
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          data: [{ id: "url-only", title: "chat title", created_at: 100 }],
+          has_more: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "url-only",
+          messages: [
+            {
+              id: "url-user",
+              type: "user_message",
+              timestamp: 1,
+              user_message: {
+                content: [
+                  { type: "text", text: "analyze" },
+                  {
+                    type: "image",
+                    url: "https://files.manuscdn.com/input/image.png?Signature=signed",
+                  },
+                ],
+              },
+            },
+          ],
+          has_more: false,
+        },
+      });
+    const reader = vi.fn(async () => ({
+      body: (async function* () {
+        yield bytes;
+      })(),
+      contentLength: bytes.byteLength,
+      contentType: "image/png",
+    }));
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+    const result = await client.findCreatedTask({
+      title: "chat title",
+      promptSha256: createHash("sha256").update("analyze").digest("hex"),
+      attachmentFileIds: ["provider-file-1"],
+      attachmentManifest: [
+        {
+          fileId: "provider-file-1",
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          sizeBytes: bytes.byteLength,
+          filename: "local-name.png",
+          mimeType: "image/png",
+        },
+      ],
+      attachmentEvidenceReader: reader,
+    });
+    expect(result.unique?.id).toBe("url-only");
+    expect(result.unresolved).toEqual([]);
+    expect(reader).toHaveBeenCalledOnce();
+  });
+
   it("matches operation tokens as exact contract values, never substrings", () => {
     const event = {
       id: "u1",
@@ -1891,6 +2120,75 @@ describe("ManusV2Client", () => {
       }),
     );
     expect(sleep).toHaveBeenCalledWith(0);
+  });
+
+  it("streams large uploads with an exact length and opens a fresh stream for every PUT retry", async () => {
+    const now = Math.floor(Date.now() / 1_000);
+    const byteLength = 64 * 1024 * 1024;
+    vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: { id: "file-streamed", filename: "template.zip" },
+        upload_url: "https://uploads.example.test/streamed-signed",
+        upload_expires_at: now + 180,
+      },
+    });
+    const put = vi
+      .spyOn(axios, "put")
+      .mockResolvedValueOnce({
+        status: 503,
+        headers: { "retry-after": "0" },
+      })
+      .mockResolvedValueOnce({ status: 200 });
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-streamed",
+          filename: "template.zip",
+          status: "uploaded",
+          bytes: byteLength,
+          content_type: "application/zip",
+          expires_at: now + 48 * 3600,
+        },
+      },
+    });
+    const openedStreams: Readable[] = [];
+    const createReadStream = vi.fn(() => {
+      const stream = Readable.from(["fresh-stream"]);
+      openedStreams.push(stream);
+      return stream;
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "template.zip",
+        byteLength,
+        createReadStream,
+        contentType: "application/zip",
+        sleep: async () => undefined,
+      }),
+    ).resolves.toMatchObject({
+      fileId: "file-streamed",
+      detail: { status: "uploaded", bytes: byteLength },
+    });
+
+    expect(createReadStream).toHaveBeenCalledTimes(2);
+    expect(openedStreams).toHaveLength(2);
+    expect(openedStreams[0]).not.toBe(openedStreams[1]);
+    expect(put.mock.calls[0]?.[1]).toBe(openedStreams[0]);
+    expect(put.mock.calls[1]?.[1]).toBe(openedStreams[1]);
+    expect(put.mock.calls[0]?.[2]?.headers).toMatchObject({
+      "Content-Length": String(byteLength),
+      "Content-Type": "application/zip",
+    });
+    expect(put.mock.calls[0]?.[2]?.maxBodyLength).toBe(byteLength);
   });
 
   it("does not retry a PUT response loss while reconciling by GET", async () => {
