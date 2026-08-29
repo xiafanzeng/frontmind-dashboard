@@ -319,6 +319,39 @@ async function replaceAsync(
   return result + value.slice(cursor);
 }
 
+function addPreviewExecutableNonces(html: string, nonce: string) {
+  const openingTag = /<(script|style)\b[^>]*>/giu;
+  let cursor = 0;
+  let result = "";
+  while (cursor < html.length) {
+    openingTag.lastIndex = cursor;
+    const match = openingTag.exec(html);
+    if (!match || match.index === undefined) {
+      result += html.slice(cursor);
+      break;
+    }
+    const tagName = match[1]!.toLowerCase();
+    const opening = match[0];
+    result += html.slice(cursor, match.index);
+    result += /\bnonce\s*=/iu.test(opening)
+      ? opening
+      : opening.replace(/>$/u, ` nonce="${nonce}">`);
+
+    const contentStart = match.index + opening.length;
+    const closingTag = new RegExp(`</${tagName}\\s*>`, "iu");
+    const closing = closingTag.exec(html.slice(contentStart));
+    if (!closing || closing.index === undefined) {
+      result += html.slice(contentStart);
+      break;
+    }
+    const contentEnd = contentStart + closing.index;
+    const closingEnd = contentEnd + closing[0].length;
+    result += html.slice(contentStart, closingEnd);
+    cursor = closingEnd;
+  }
+  return result;
+}
+
 export async function createSandboxedPreviewDocument(input: {
   zip: JSZip;
   entryName: string;
@@ -404,6 +437,16 @@ export async function createSandboxedPreviewDocument(input: {
 
   const nonce = randomBytes(18).toString("base64url");
   let html = (await fileBytes(input.entryName)).toString("utf8");
+  // The immutable dist carries its production document policy and a root base
+  // URL. The private preview is a self-contained, nonce-authorized sandbox at
+  // a build-scoped path, so neither directive may be allowed to compose with
+  // the response policy or change how relative navigation resolves.
+  html = html
+    .replace(
+      /<meta\b(?=[^>]*\bhttp-equiv\s*=\s*["']Content-Security-Policy["'])[^>]*>/giu,
+      "",
+    )
+    .replace(/<base\b[^>]*>/giu, "");
   html = await replaceAsync(
     html,
     /<link\b(?=[^>]*\brel=["']stylesheet["'])[^>]*\bhref=["']([^"']+)["'][^>]*>/giu,
@@ -480,20 +523,11 @@ export async function createSandboxedPreviewDocument(input: {
     async (_match, attributes, css) =>
       `<style${attributes}>${await embedCssUrls(css, input.entryName)}</style>`,
   );
-  html = html
-    .replace(
-      /<style\b(?![^>]*\bnonce=)([^>]*)>/giu,
-      `<style nonce="${nonce}"$1>`,
-    )
-    .replace(
-      /<script\b(?![^>]*\bnonce=)([^>]*)>/giu,
-      `<script nonce="${nonce}"$1>`,
-    )
-    .replace(
-      /\bhref(\s*=\s*)(["'])(\/(?!\/)[^"']*)\2/giu,
-      (_match, equals: string, quote: string, url: string) =>
-        `href${equals}${quote}${prefixPreviewRootUrl(url, input.previewPrefix)}${quote}`,
-    );
+  html = addPreviewExecutableNonces(html, nonce).replace(
+    /\bhref(\s*=\s*)(["'])(\/(?!\/)[^"']*)\2/giu,
+    (_match, equals: string, quote: string, url: string) =>
+      `href${equals}${quote}${prefixPreviewRootUrl(url, input.previewPrefix)}${quote}`,
+  );
   return { bytes: Buffer.from(html, "utf8"), nonce };
 }
 

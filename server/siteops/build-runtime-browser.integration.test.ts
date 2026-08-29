@@ -182,21 +182,27 @@ browserIntegration("SiteOps React static real-browser integration", () => {
     const zip = new JSZip();
     zip.file(
       "index.html",
-      '<!doctype html><html><body><div id="root"></div><script type="module" src="/assets/app.js"></script></body></html>',
+      '<!doctype html><html><head><base href="/"><meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\'; base-uri \'self\'"></head><body><div id="root"></div><script type="module" src="/assets/app.js"></script></body></html>',
     );
     zip.file(
       "assets/app.js",
-      `const probe=(name,read)=>{try{read();document.body.dataset[name]="available"}catch{document.body.dataset[name]="blocked"}};
+      `const scriptMarkup="<script><\\/script>";
+const probe=(name,read)=>{try{read();document.body.dataset[name]="available"}catch{document.body.dataset[name]="blocked"}};
 probe("cookie",()=>document.cookie);
 probe("local",()=>localStorage.getItem("frontmind"));
 probe("session",()=>sessionStorage.getItem("frontmind"));
-fetch("/api/private-sentinel",{credentials:"include"}).then(()=>{document.body.dataset.api="available"}).catch(()=>{document.body.dataset.api="blocked"}).finally(()=>{document.getElementById("root").textContent="原生预览已渲染";document.body.dataset.ready="yes"});`,
+fetch("/api/private-sentinel",{credentials:"include"}).then(()=>{document.body.dataset.api="available"}).catch(()=>{document.body.dataset.api="blocked"}).finally(()=>{document.getElementById("root").textContent="原生预览已渲染";document.body.dataset.markup=scriptMarkup;document.body.dataset.ready="yes"});`,
     );
     const previewDocument = await createSandboxedPreviewDocument({
       zip,
       entryName: "index.html",
       previewPrefix: "/preview/",
     });
+    const previewHtml = previewDocument.bytes.toString("utf8");
+    expect(previewHtml).not.toMatch(/<base\b/iu);
+    expect(previewHtml).not.toMatch(
+      /<meta\b[^>]*http-equiv=["']Content-Security-Policy["']/iu,
+    );
     let privateApiHits = 0;
     const server = createServer((request, response) => {
       if (request.url === "/preview/") {
@@ -238,6 +244,7 @@ fetch("/api/private-sentinel",{credentials:"include"}).then(()=>{document.body.d
           local: document.body.dataset.local,
           session: document.body.dataset.session,
           api: document.body.dataset.api,
+          markup: document.body.dataset.markup,
         })),
       ).toEqual({
         text: "原生预览已渲染",
@@ -245,6 +252,7 @@ fetch("/api/private-sentinel",{credentials:"include"}).then(()=>{document.body.d
         local: "blocked",
         session: "blocked",
         api: "blocked",
+        markup: "<script></script>",
       });
       expect(privateApiHits).toBe(0);
     } finally {

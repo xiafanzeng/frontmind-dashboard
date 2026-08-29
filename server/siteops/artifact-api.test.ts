@@ -53,6 +53,8 @@ beforeEach(async () => {
   archive.file(
     "index.html",
     `<!doctype html><html><head>
+      <base href="/">
+      <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; base-uri 'self'">
       <link rel="icon" href="/favicon.svg">
       <link rel="stylesheet" href="/styles.css">
       <script type="module" src="/assets/app.js"></script>
@@ -74,7 +76,7 @@ beforeEach(async () => {
   archive.file("images/hero@2x.png", Buffer.from("preview-image-2x"));
   archive.file(
     "assets/app.js",
-    'const routes={"/":"home","/about/":"about"};const logo="/images/hero.png";const product=(slug)=>`/products/${slug}/`;document.body.dataset.route=routes[location.pathname]??"missing";document.body.dataset.logo=logo;document.body.dataset.product=product("demo");',
+    'const marker="<script><\\/script>";const routes={"/":"home","/about/":"about"};const logo="/images/hero.png";const product=(slug)=>`/products/${slug}/`;document.body.dataset.route=routes[location.pathname]??"missing";document.body.dataset.logo=logo;document.body.dataset.product=product("demo");document.body.dataset.marker=marker;',
   );
   distZip = await archive.generateAsync({ type: "nodebuffer" });
 
@@ -411,12 +413,17 @@ describe("SiteOps private preview proxy", () => {
     expect(html).toContain('<script nonce="');
     expect(html).toContain('type="module"');
     expect(html).toContain("document.body.dataset.route");
+    expect(html).toContain('const marker="<script><\\/script>"');
     expect(html).toContain(`href="${prefix}"`);
     expect(html).toContain(`href="${prefix}about/"`);
     expect(html).toContain('src="data:image/png;base64,');
     expect(html).toContain("url('data:image/png;base64,");
     expect(html).toContain("body{font-family:system-ui}");
     expect(html).toContain('href="https://example.com/"');
+    expect(html).not.toMatch(/<base\b/iu);
+    expect(html).not.toMatch(
+      /<meta\b[^>]*http-equiv=["']Content-Security-Policy["']/iu,
+    );
 
     const [cssResponse, faviconResponse, aboutResponse, jsResponse] =
       await Promise.all([
