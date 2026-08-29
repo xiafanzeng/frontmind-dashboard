@@ -734,6 +734,25 @@ export const TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT = `你是负责交�
 只返回一个 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME} 和一个 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。
 上传完成后立即结束，不继续解释、复盘、浏览或更新计划。`;
 
+const STATIC_TEMPLATE_REDUNDANT_TARGET_PREAMBLE = `目标：
+基于附件中的原始 21st Template 源码和企业知识 dossier，
+生成一份完整、可独立安装、可执行 production build、
+可由 FrontMind Dashboard 展示的网站源码 ZIP。
+`;
+
+/** Workflow 2.8 keeps the complete 2.7 Template adaptation semantics and adds
+ * one explicit static-site capability boundary. The redundant target preamble
+ * is already enforced by the input/build/delivery sections and is omitted to
+ * keep the outbound Manus prompt within its fixed budget. Historical 2.7
+ * operations continue to replay with their original prompt bytes. */
+export const TWENTY_FIRST_STATIC_TEMPLATE_V2_8_SYSTEM_PROMPT = `${TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT.replace(
+  STATIC_TEMPLATE_REDUNDANT_TARGET_PREAMBLE,
+  "",
+)}
+
+应用能力边界：
+不得保留或新增认证、支付、订阅、数据库、管理后台、聊天机器人、外部统计、第三方 webhook、服务端 API 或知识库未要求的其他运行时能力；模板原有此类能力时，必须移除对应入口、表单和误导性 CTA。`;
+
 export type NativeSourceLimits = {
   maxArchiveBytes: number;
   maxFiles: number;
@@ -2008,12 +2027,19 @@ export async function validateNativeReactSourceArchive(input: {
   }
   const entries = Object.values(archive.files) as UnsafeZipObject[];
   const filesOnly = entries.filter((entry) => !entry.dir);
-  if (
-    filesOnly.length < 1 ||
-    filesOnly.length > limits.maxFiles ||
-    filesOnly.length !== receipt.fileCount
-  ) {
+  if (filesOnly.length < 1 || filesOnly.length > limits.maxFiles) {
     throw new NativeReactSourceError("NATIVE_SOURCE_LIMIT_EXCEEDED");
+  }
+  // V1 receipts have always counted regular files only. V2 keeps that as the
+  // canonical form, while accepting the other common ZIP-tool convention:
+  // counting explicit directory records in the central directory. The exact
+  // archive hash still binds every record and all real safety limits continue
+  // to use the authoritative non-directory file set below.
+  const receiptFileCountMatches =
+    receipt.fileCount === filesOnly.length ||
+    (v2Receipt !== null && receipt.fileCount === entries.length);
+  if (!receiptFileCountMatches) {
+    throw new NativeReactSourceError("NATIVE_SOURCE_RECEIPT_INVALID");
   }
   const rawFilePaths: string[] = [];
   const entryByRawPath = new Map<string, UnsafeZipObject>();

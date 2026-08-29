@@ -54,6 +54,22 @@ export type PresalesV2RepairRecord = {
   updatedAt: string;
 };
 
+export type PresalesV2PreparationRecord = {
+  /**
+   * Kept only until the Provider create boundary is durably claimed. This is
+   * private dispatch input and is never included in the public task view.
+   */
+  prompt: string | null;
+  assets: Array<{
+    localAssetId: string;
+    filename: string;
+    /** A fresh Provider file candidate is reserved at most twice. */
+    candidateAttempts: number;
+  }>;
+  /** Once set, createTask is reconcile-only and must never be called again. */
+  providerCreateAttemptedAt: string | null;
+};
+
 export type PresalesV2TaskRecord = {
   schemaVersion: 2;
   localTaskId: string;
@@ -116,6 +132,8 @@ export type PresalesV2TaskRecord = {
     | null;
   providerCleanupErrorCode?: string | null;
   projectCleanupAt?: string | null;
+  /** Optional so pre-existing revision-3 records keep their frozen behavior. */
+  preparation?: PresalesV2PreparationRecord;
   createdAt: string;
   updatedAt: string;
 };
@@ -432,6 +450,10 @@ export async function acquirePresalesV2Task(input: {
   upstreamModel: string;
   credentialId: string;
   credentialVersion: number;
+  preparation?: {
+    prompt: string;
+    assets: Array<{ localAssetId: string; filename: string }>;
+  };
 }): Promise<
   | { state: "acquired"; record: PresalesV2TaskRecord }
   | { state: "existing"; record: PresalesV2TaskRecord }
@@ -484,6 +506,18 @@ export async function acquirePresalesV2Task(input: {
       providerRunDeadlineExceededAt: null,
       terminalAt: null,
       createSearchUntil: new Date(Date.now() + 5 * 60_000).toISOString(),
+      ...(input.preparation
+        ? {
+            preparation: {
+              prompt: input.preparation.prompt,
+              assets: input.preparation.assets.map((asset) => ({
+                ...asset,
+                candidateAttempts: 0,
+              })),
+              providerCreateAttemptedAt: null,
+            },
+          }
+        : {}),
       createdAt: now,
       updatedAt: now,
     };
@@ -513,6 +547,45 @@ export async function updatePresalesV2Task(
     const current = await readPresalesV2Task(localTaskId);
     if (!current) return null;
     const next = update(current);
+    const currentPreparation = current.preparation;
+    const nextPreparation = next.preparation;
+    const preparationIdentityChanged = (() => {
+      if (!currentPreparation || !nextPreparation) {
+        return currentPreparation !== nextPreparation;
+      }
+      if (
+        currentPreparation.assets.length !== nextPreparation.assets.length ||
+        currentPreparation.assets.some((asset, index) => {
+          const candidate = nextPreparation.assets[index];
+          return (
+            !candidate ||
+            candidate.localAssetId !== asset.localAssetId ||
+            candidate.filename !== asset.filename ||
+            !Number.isSafeInteger(candidate.candidateAttempts) ||
+            candidate.candidateAttempts < asset.candidateAttempts ||
+            candidate.candidateAttempts > 2
+          );
+        })
+      ) {
+        return true;
+      }
+      if (
+        currentPreparation.prompt === null
+          ? nextPreparation.prompt !== null
+          : nextPreparation.prompt !== currentPreparation.prompt &&
+            nextPreparation.prompt !== null
+      ) {
+        return true;
+      }
+      return currentPreparation.providerCreateAttemptedAt
+        ? nextPreparation.providerCreateAttemptedAt !==
+            currentPreparation.providerCreateAttemptedAt
+        : nextPreparation.providerCreateAttemptedAt !== null &&
+            (typeof nextPreparation.providerCreateAttemptedAt !== "string" ||
+              !Number.isFinite(
+                Date.parse(nextPreparation.providerCreateAttemptedAt),
+              ));
+    })();
     const deadlineResultFinalization =
       current.status === "attention_required" &&
       current.errorCode === "PROVIDER_RUN_DEADLINE_EXCEEDED" &&
@@ -538,6 +611,7 @@ export async function updatePresalesV2Task(
       next.operationToken !== current.operationToken ||
       next.operationMarker !== current.operationMarker ||
       next.providerTitle !== current.providerTitle ||
+      preparationIdentityChanged ||
       (current.repair !== undefined &&
         current.repair !== null &&
         (!next.repair ||

@@ -162,6 +162,7 @@ import {
   NativeReactSourceError,
   TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
   TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT,
+  TWENTY_FIRST_STATIC_TEMPLATE_V2_8_SYSTEM_PROMPT,
   auditNativeRuntimeContractV1,
   readNativeSourceAttachment,
   siteSourceReceiptV1Schema,
@@ -3972,8 +3973,10 @@ function nativeBrandAttachment(
 }
 
 export function nativeSourceSystemPromptForWorkflow(workflowVersion: string) {
-  return workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION ||
-    workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION
+  if (workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION) {
+    return TWENTY_FIRST_STATIC_TEMPLATE_V2_8_SYSTEM_PROMPT;
+  }
+  return workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
     ? TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT
     : TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT;
 }
@@ -4019,7 +4022,7 @@ function nativeSourcePrompt(input: {
     : "";
   const deliveryContract =
     input.contractVersion === 2
-      ? `Receipt 必须符合 Structured Output schema，并严格使用：operationToken=${input.operationToken}；baseSourceSha256=${input.baseSourceSha256}；executionBaselineSha256=${input.baseSourceSha256}；preflightVersion=${input.runtimeCoordinates!.preflightVersion}；preflightStatus=passed；preflightSha256=${input.runtimeCoordinates!.preflightSha256}；runtimeContractVersion=${input.runtimeCoordinates!.contractVersion}；runtimeContractSha256=${input.runtimeCoordinates!.contractSha256}；executionShellSha256=${input.runtimeCoordinates!.executionShellSha256}；archiveSha256/fileCount 必须对应最终 ZIP。`
+      ? `Receipt 必须符合 Structured Output schema，并严格使用：operationToken=${input.operationToken}；baseSourceSha256=${input.baseSourceSha256}；executionBaselineSha256=${input.baseSourceSha256}；preflightVersion=${input.runtimeCoordinates!.preflightVersion}；preflightStatus=passed；preflightSha256=${input.runtimeCoordinates!.preflightSha256}；runtimeContractVersion=${input.runtimeCoordinates!.contractVersion}；runtimeContractSha256=${input.runtimeCoordinates!.contractSha256}；executionShellSha256=${input.runtimeCoordinates!.executionShellSha256}；archiveSha256 必须对应最终 ZIP；fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）。`
       : `交付前必须运行 ${NATIVE_SOURCE_PREFLIGHT_FILENAME} 并通过 package、文件类型、依赖、源码语法和 production build 自检。Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256、实际 fileCount、preflightVersion=${NATIVE_SOURCE_PREFLIGHT_VERSION}、preflightStatus=passed、preflightSha256=${NATIVE_SOURCE_PREFLIGHT_SHA256}。`;
   return promptWithMarker(
     `${systemPrompt}

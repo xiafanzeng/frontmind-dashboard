@@ -4169,10 +4169,11 @@ async function handleVisualSearch(
       );
     }
   }
-  const currentPublishedBatches = await tx
+  const currentVisualBatches = await tx
     .select({
       id: websiteStyleSampleBatches.id,
       engineerNote: websiteStyleSampleBatches.engineerNote,
+      status: websiteStyleSampleBatches.status,
     })
     .from(websiteStyleSampleBatches)
     .where(
@@ -4180,7 +4181,7 @@ async function handleVisualSearch(
         eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
         eq(websiteStyleSampleBatches.userId, input.actor.id),
         eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-        eq(websiteStyleSampleBatches.status, "published"),
+        ne(websiteStyleSampleBatches.status, "superseded"),
         gte(
           websiteStyleSampleBatches.createdAt,
           input.project.currentTaskStartedAt,
@@ -4189,8 +4190,20 @@ async function handleVisualSearch(
     )
     .limit(STATIC_TEMPLATE_CATALOG_PAGE_COUNT)
     .for("update");
-  const activeVisualRows = await tx
-    .select({ id: siteOperations.id })
+  const currentPublishedBatches = currentVisualBatches.filter(
+    (batch: { status: string }) => batch.status === "published",
+  );
+  const visualOperationRows = await tx
+    .select({
+      id: siteOperations.id,
+      input: siteOperations.input,
+      status: siteOperations.status,
+      provider: siteOperations.provider,
+      createdAt: siteOperations.createdAt,
+      updatedAt: siteOperations.updatedAt,
+      startedAt: siteOperations.startedAt,
+      completedAt: siteOperations.completedAt,
+    })
     .from(siteOperations)
     .where(
       and(
@@ -4198,20 +4211,135 @@ async function handleVisualSearch(
         eq(siteOperations.userId, input.actor.id),
         eq(siteOperations.kind, "visual_search"),
         gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
-        inArray(siteOperations.status, [
-          "queued",
-          "running",
-          "outcome_unknown",
-        ]),
       ),
     )
-    .limit(1);
+    .for("update");
+  const parsedVisualInputs = visualOperationRows.map(
+    (row: { input: unknown }) =>
+      visualSearchOperationInputSchema.safeParse(row.input),
+  );
+  if (
+    parsedVisualInputs.some(
+      (result: { success: boolean }) => !result.success,
+    ) ||
+    visualOperationRows.some(
+      (row: { provider: string | null }) => row.provider !== "21st",
+    )
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮视觉候选的冻结工作流无法核验，请重置后重新检索。",
+      409,
+    );
+  }
+  if (visualOperationRows.length === 0 && currentVisualBatches.length > 0) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "现有视觉候选缺少可核验的冻结工作流坐标，请重置后重新检索。",
+      409,
+    );
+  }
+  const frozenVisualInputs: VisualSearchOperationInput[] =
+    parsedVisualInputs.map(
+      (result: { data?: VisualSearchOperationInput }) => result.data!,
+    );
+  if (
+    frozenVisualInputs.some(
+      (frozen) =>
+        frozen.knowledgeSnapshotId !== input.project.currentKnowledgeSnapshotId,
+    )
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮视觉候选与当前知识库不一致，请重置后重新检索。",
+      409,
+    );
+  }
+  const frozenWorkflowVersion =
+    frozenVisualInputs.length > 0
+      ? siteOpsVisualCycleWorkflowVersion(frozenVisualInputs)
+      : SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+  const staticCatalogVisualCycle =
+    frozenVisualInputs.length === 0 ||
+    frozenVisualInputs.some(
+      (frozen) =>
+        "schemaVersion" in frozen &&
+        frozen.schemaVersion === 3 &&
+        frozen.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
+    );
+  const historicalCredentialCoordinates = new Set(
+    staticCatalogVisualCycle
+      ? []
+      : frozenVisualInputs.map((frozen) =>
+          "credentialId" in frozen
+            ? `${frozen.credentialId}:${frozen.credentialVersion}`
+            : "",
+        ),
+  );
+  if (!staticCatalogVisualCycle && historicalCredentialCoordinates.size !== 1) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮视觉候选的冻结检索凭据不一致，请重置后重新检索。",
+      409,
+    );
+  }
+  const activeVisualRows = visualOperationRows.filter(
+    (row: { status: string }) =>
+      ACTIVE_VISUAL_OPERATION_STATUSES.has(row.status),
+  );
   if (activeVisualRows[0]) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "当前视觉候选仍在生成，请等待本次生成完成后再试。",
       409,
     );
+  }
+  if (input.reselect && staticCatalogVisualCycle) {
+    if (currentVisualBatches.length > 0) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "内置模板已载入，请直接选择；状态异常时请重置后重新开始。",
+        409,
+      );
+    }
+    const latestVisualOperation = [...visualOperationRows].sort(
+      compareSiteOpsVisualOperationsNewestFirst,
+    )[0];
+    if (
+      latestVisualOperation &&
+      !["failed", "attention_required"].includes(latestVisualOperation.status)
+    ) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "内置模板载入状态无法安全重试，请重置后重新开始。",
+        409,
+      );
+    }
+  }
+  if (input.reselect && !staticCatalogVisualCycle) {
+    const cycleOperationsById = new Map(
+      visualOperationRows.map((row: { id: string }) => [row.id, row]),
+    );
+    for (const batch of currentPublishedBatches) {
+      const operationId = batch.engineerNote?.startsWith(
+        TWENTY_FIRST_OPERATION_MARKER_PREFIX,
+      )
+        ? batch.engineerNote.slice(TWENTY_FIRST_OPERATION_MARKER_PREFIX.length)
+        : "";
+      const frozenOperation = cycleOperationsById.get(operationId) as
+        | { status: string }
+        | undefined;
+      if (
+        !uuidSchema.safeParse(operationId).success ||
+        frozenOperation?.status !== "succeeded"
+      ) {
+        throw new SiteOpsServiceError(
+          "STATE_CONFLICT",
+          "现有视觉候选的冻结工作流无法核验，请重置后重新检索。",
+          409,
+        );
+      }
+    }
   }
   if (
     input.reselect &&
@@ -4253,19 +4381,19 @@ async function handleVisualSearch(
     );
   }
   const mode =
-    currentPublishedBatches.length > 0
+    !staticCatalogVisualCycle && currentPublishedBatches.length > 0
       ? ("supplemental" as const)
       : ("initial" as const);
   const page = (mode === "initial" ? 1 : currentPublishedBatches.length + 1) as
     | 1
     | 2
     | 3;
-  const staticCatalog =
-    mode === "initial" ? await requireActiveStaticTemplateCatalog() : null;
-  const credential =
-    mode === "supplemental"
-      ? await ensureActiveProviderCredential(tx, "site_builder_21st")
-      : null;
+  const staticCatalog = staticCatalogVisualCycle
+    ? await requireActiveStaticTemplateCatalog()
+    : null;
+  const credential = staticCatalogVisualCycle
+    ? null
+    : await ensureActiveProviderCredential(tx, "site_builder_21st");
   if (
     credential &&
     input.expectedCredential &&
@@ -4278,20 +4406,35 @@ async function handleVisualSearch(
       409,
     );
   }
-  const workflowVersion =
-    mode === "initial"
-      ? SITEOPS_DEFAULT_WORKFLOW.frontMindVersion
-      : await frozenSupplementalVisualWorkflowVersion(tx, {
+  const workflowVersion = staticCatalogVisualCycle
+    ? SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+    : mode === "supplemental"
+      ? await frozenSupplementalVisualWorkflowVersion(tx, {
           batches: currentPublishedBatches,
           projectId: input.project.id,
           userId: input.actor.id,
           knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
           credentialId: credential!.id,
           credentialVersion: credential!.version,
-        });
+        })
+      : frozenWorkflowVersion;
+  if (!staticCatalogVisualCycle && mode === "initial") {
+    const expectedHistoricalCredential =
+      [...historicalCredentialCoordinates][0] ?? "";
+    if (
+      expectedHistoricalCredential !==
+      `${credential!.id}:${credential!.version}`
+    ) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "本轮视觉候选与当前检索凭据不一致，请重置后重新检索。",
+        409,
+      );
+    }
+  }
   const admissionRevision = input.project.revision + 1;
   const operationPayload = createVisualSearchOperationInput(
-    mode === "initial"
+    staticCatalogVisualCycle
       ? {
           schemaVersion: 3,
           knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
@@ -4327,10 +4470,9 @@ async function handleVisualSearch(
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content:
-      mode === "supplemental"
-        ? `正在生成第 ${page} 组全新视觉候选；前面展示过的参考不会重复。`
-        : "正在载入 32 个固定完整 Template，完成后将按四页展示。",
+    content: staticCatalogVisualCycle
+      ? "正在载入 32 个固定完整 Template，完成后将按四页展示。"
+      : `正在生成第 ${page} 组全新视觉候选；前面展示过的参考不会重复。`,
     siteOps: {
       kind: "build_progress",
       subjectId: operationId,
@@ -4338,13 +4480,12 @@ async function handleVisualSearch(
       status: "active",
       payload: {
         stage: "visual_searching",
-        targets:
-          mode === "initial"
-            ? [
-                STATIC_TEMPLATE_CATALOG_PAGE_COUNT *
-                  STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
-              ]
-            : [18, 12, 9],
+        targets: staticCatalogVisualCycle
+          ? [
+              STATIC_TEMPLATE_CATALOG_PAGE_COUNT *
+                STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
+            ]
+          : [18, 12, 9],
         page,
         mode,
       },

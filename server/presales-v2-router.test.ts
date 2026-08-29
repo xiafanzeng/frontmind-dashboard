@@ -153,6 +153,7 @@ function reconcileHarness(input: {
       return current;
     }),
     isDispatchActive: vi.fn(() => false),
+    resumePreparation: vi.fn(() => false),
     clientForTask: vi.fn(async () => providerCalls as never),
     localizeArtifact,
   };
@@ -395,6 +396,20 @@ describe("Presales v2 public contract", () => {
       presalesV2PreparationFailureState(
         new ManusV2ApiError(
           "file.upload.content",
+          503,
+          "HTTP_503",
+          true,
+          false,
+        ),
+      ),
+    ).toEqual({
+      status: "attention_required",
+      errorCode: "FILE_UPLOAD_OUTCOME_UNKNOWN",
+    });
+    expect(
+      presalesV2PreparationFailureState(
+        new ManusV2ApiError(
+          "file.upload.content",
           null,
           "TRANSPORT_UNKNOWN",
           false,
@@ -525,6 +540,384 @@ describe("Presales v2 public contract", () => {
     expect(uploadFile).toHaveBeenCalledTimes(3);
     expect(createTask).toHaveBeenCalledOnce();
     expect(events).toEqual(["uploaded", "uploaded", "uploaded", "create"]);
+  });
+
+  it("confirms outcome-unknown and reuses uploaded candidates without retransmission", async () => {
+    const now = new Date("2026-08-29T08:00:00.000Z");
+    const asset = uploadedAssetRecord(11);
+    const confirmedAsset = uploadedAssetRecord(15);
+    const candidateExpiresAt = Math.floor(now.getTime() / 1_000) + 3_600;
+    let current = taskRecord({
+      status: "queued",
+      providerTaskId: null,
+      providerRequestId: null,
+      providerFileLeases: [
+        {
+          localAssetId: asset.localAssetId,
+          providerFileId: "provider-file-outcome-unknown-secret",
+          filename: asset.filename,
+          expiresAt: candidateExpiresAt,
+          providerRequestId: null,
+          uploadState: "outcome_unknown",
+        },
+        {
+          localAssetId: confirmedAsset.localAssetId,
+          providerFileId: "provider-file-already-confirmed-secret",
+          filename: confirmedAsset.filename,
+          expiresAt: candidateExpiresAt,
+          providerRequestId: null,
+          uploadState: "uploaded",
+        },
+      ],
+      preparation: {
+        prompt: "sensitive customer prompt",
+        assets: [
+          {
+            localAssetId: asset.localAssetId,
+            filename: asset.filename,
+            candidateAttempts: 1,
+          },
+          {
+            localAssetId: confirmedAsset.localAssetId,
+            filename: confirmedAsset.filename,
+            candidateAttempts: 1,
+          },
+        ],
+        providerCreateAttemptedAt: null,
+      },
+      terminalAt: null,
+    });
+    const uploadFile = vi.fn(async (input: any) => {
+      expect(input.existingCandidate).toEqual({
+        fileId: "provider-file-outcome-unknown-secret",
+        filename: asset.filename,
+      });
+      return {
+        ...input.existingCandidate,
+        uploadUrl: "",
+        uploadExpiresAt: 0,
+        requestId: null,
+        detail: {
+          ...input.existingCandidate,
+          status: "uploaded",
+          bytes: 3,
+          expiresAt: candidateExpiresAt,
+          contentType: "application/pdf",
+          requestId: null,
+        },
+      };
+    });
+    const createTask = vi.fn(async () => ({
+      taskId: "provider-created-after-confirmation",
+      taskUrl: null,
+      taskTitle: null,
+      requestId: null,
+      raw: {},
+    }));
+
+    await presalesV2ReconcileTestHooks.dispatchTask(
+      {
+        record: current,
+        assets: [asset, confirmedAsset],
+        prompt: "sensitive customer prompt",
+        contract: resolvePresalesV2Contract(current.contract),
+        apiKey: "provider-key-not-logged",
+      },
+      {
+        now: () => now,
+        sleep: vi.fn(async () => undefined),
+        readStoredBytes: vi.fn(async () => ({
+          stored: {} as never,
+          bytes: Buffer.from("pdf"),
+        })),
+        createClient: () => ({ uploadFile, createTask }) as never,
+        updateTask: vi.fn(async (_localTaskId, update) => {
+          current = update(current);
+          return current;
+        }),
+        persistProviderFileLease: vi.fn(),
+      },
+    );
+
+    expect(uploadFile).toHaveBeenCalledOnce();
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(current.providerFileLeases).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          providerFileId: "provider-file-outcome-unknown-secret",
+          uploadState: "uploaded",
+        }),
+        expect.objectContaining({
+          providerFileId: "provider-file-already-confirmed-secret",
+          uploadState: "uploaded",
+        }),
+      ]),
+    );
+    expect(current.preparation).toMatchObject({
+      prompt: null,
+      providerCreateAttemptedAt: now.toISOString(),
+      assets: [{ candidateAttempts: 1 }, { candidateAttempts: 1 }],
+    });
+  });
+
+  it("uses a second candidate only after transient confirmation failure and keeps logs redacted", async () => {
+    const now = new Date("2026-08-29T08:00:00.000Z");
+    const asset = uploadedAssetRecord(12);
+    const firstProviderFileId = "provider-first-file-secret";
+    const secondProviderFileId = "provider-second-file-secret";
+    const prompt = "sensitive customer prompt that must not be logged";
+    const candidateExpiresAt = Math.floor(now.getTime() / 1_000) + 3_600;
+    let current = taskRecord({
+      status: "queued",
+      providerTaskId: null,
+      providerRequestId: null,
+      providerFileLeases: [
+        {
+          localAssetId: asset.localAssetId,
+          providerFileId: firstProviderFileId,
+          filename: asset.filename,
+          expiresAt: candidateExpiresAt,
+          providerRequestId: null,
+          uploadState: "outcome_unknown",
+        },
+      ],
+      preparation: {
+        prompt,
+        assets: [
+          {
+            localAssetId: asset.localAssetId,
+            filename: asset.filename,
+            candidateAttempts: 1,
+          },
+        ],
+        providerCreateAttemptedAt: null,
+      },
+      terminalAt: null,
+    });
+    const uploadFile = vi.fn(async (input: any) => {
+      if (uploadFile.mock.calls.length === 1) {
+        expect(input.existingCandidate?.fileId).toBe(firstProviderFileId);
+        await input.observer.onConfirmationUnknown({
+          ...input.existingCandidate,
+          uploadUrl: "",
+          uploadExpiresAt: 0,
+          requestId: null,
+        });
+        throw new ManusV2ApiError(
+          "file.detail",
+          null,
+          "FILE_UPLOAD_CONFIRMATION_UNKNOWN",
+          false,
+          true,
+        );
+      }
+      expect(input.existingCandidate).toBeUndefined();
+      const candidate = {
+        fileId: secondProviderFileId,
+        filename: asset.filename,
+        uploadUrl: "",
+        uploadExpiresAt: candidateExpiresAt,
+        requestId: null,
+      };
+      await input.observer.onCandidateCreated(candidate);
+      return {
+        ...candidate,
+        detail: {
+          ...candidate,
+          status: "uploaded",
+          bytes: 3,
+          expiresAt: candidateExpiresAt,
+          contentType: "application/pdf",
+        },
+      };
+    });
+    const createTask = vi.fn(async (input: any) => {
+      expect(input.attachments).toEqual([
+        { file_id: secondProviderFileId, filename: asset.filename },
+      ]);
+      return {
+        taskId: "provider-created-after-replacement",
+        taskUrl: null,
+        taskTitle: null,
+        requestId: null,
+        raw: {},
+      };
+    });
+    const infoLog = vi
+      .spyOn(console, "info")
+      .mockImplementation(() => undefined);
+    try {
+      await presalesV2ReconcileTestHooks.dispatchTask(
+        {
+          record: current,
+          assets: [asset],
+          prompt,
+          contract: resolvePresalesV2Contract(current.contract),
+          apiKey: "provider-key-not-logged",
+        },
+        {
+          now: () => now,
+          sleep: vi.fn(async () => undefined),
+          readStoredBytes: vi.fn(async () => ({
+            stored: {} as never,
+            bytes: Buffer.from("pdf"),
+          })),
+          createClient: () => ({ uploadFile, createTask }) as never,
+          updateTask: vi.fn(async (_localTaskId, update) => {
+            current = update(current);
+            return current;
+          }),
+          persistProviderFileLease: vi.fn(),
+        },
+      );
+      const serializedLogs = JSON.stringify(infoLog.mock.calls);
+      expect(serializedLogs).toContain(
+        "PRESALES_V2_TRANSIENT_FILE_CANDIDATE_REPLACEMENT",
+      );
+      for (const secret of [
+        prompt,
+        asset.localAssetId,
+        asset.filename,
+        firstProviderFileId,
+        secondProviderFileId,
+      ]) {
+        expect(serializedLogs).not.toContain(secret);
+      }
+    } finally {
+      infoLog.mockRestore();
+    }
+
+    expect(uploadFile).toHaveBeenCalledTimes(2);
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(current.providerFileLeases).toHaveLength(2);
+    expect(current.preparation?.assets[0]?.candidateAttempts).toBe(2);
+  });
+
+  it("does not reserve a replacement after a deterministic Provider 4xx", async () => {
+    const now = new Date("2026-08-29T08:00:00.000Z");
+    const asset = uploadedAssetRecord(13);
+    let current = taskRecord({
+      status: "queued",
+      providerTaskId: null,
+      providerRequestId: null,
+      providerFileLeases: [],
+      preparation: {
+        prompt: "sensitive customer prompt",
+        assets: [
+          {
+            localAssetId: asset.localAssetId,
+            filename: asset.filename,
+            candidateAttempts: 0,
+          },
+        ],
+        providerCreateAttemptedAt: null,
+      },
+      terminalAt: null,
+    });
+    const uploadFile = vi.fn(async () => {
+      throw new ManusV2ApiError(
+        "file.upload.content",
+        400,
+        "HTTP_400",
+        false,
+        false,
+      );
+    });
+    const createTask = vi.fn();
+
+    await presalesV2ReconcileTestHooks.dispatchTask(
+      {
+        record: current,
+        assets: [asset],
+        prompt: "sensitive customer prompt",
+        contract: resolvePresalesV2Contract(current.contract),
+        apiKey: "provider-key-not-logged",
+      },
+      {
+        now: () => now,
+        readStoredBytes: vi.fn(async () => ({
+          stored: {} as never,
+          bytes: Buffer.from("pdf"),
+        })),
+        createClient: () => ({ uploadFile, createTask }) as never,
+        updateTask: vi.fn(async (_localTaskId, update) => {
+          current = update(current);
+          return current;
+        }),
+        persistProviderFileLease: vi.fn(),
+      },
+    );
+
+    expect(uploadFile).toHaveBeenCalledOnce();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(current).toMatchObject({
+      status: "failed",
+      errorCode: "FILE_UPLOAD_REJECTED",
+      preparation: {
+        prompt: null,
+        assets: [{ candidateAttempts: 1 }],
+      },
+    });
+  });
+
+  it("crosses the durable Provider create boundary at most once", async () => {
+    const now = new Date("2026-08-29T08:00:00.000Z");
+    let current = taskRecord({
+      status: "queued",
+      providerTaskId: null,
+      providerRequestId: null,
+      providerFileLeases: [],
+      preparation: {
+        prompt: "sensitive customer prompt",
+        assets: [],
+        providerCreateAttemptedAt: null,
+      },
+      terminalAt: null,
+    });
+    const createTask = vi.fn(async () => {
+      throw new ManusV2ApiError(
+        "task.create",
+        null,
+        "TRANSPORT_UNKNOWN",
+        false,
+        true,
+      );
+    });
+    const dependencies: Partial<PresalesV2DispatchDependencies> = {
+      now: () => now,
+      createClient: () => ({ uploadFile: vi.fn(), createTask }) as never,
+      updateTask: vi.fn(async (_localTaskId, update) => {
+        current = update(current);
+        return current;
+      }),
+      persistProviderFileLease: vi.fn(),
+    };
+    const dispatchInput = () => ({
+      record: current,
+      assets: [],
+      prompt: "sensitive customer prompt",
+      contract: resolvePresalesV2Contract(current.contract),
+      apiKey: "provider-key-not-logged",
+    });
+
+    await presalesV2ReconcileTestHooks.dispatchTask(
+      dispatchInput(),
+      dependencies,
+    );
+    await presalesV2ReconcileTestHooks.dispatchTask(
+      dispatchInput(),
+      dependencies,
+    );
+
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(current).toMatchObject({
+      status: "queued",
+      providerTaskId: null,
+      preparation: {
+        prompt: null,
+        providerCreateAttemptedAt: now.toISOString(),
+      },
+    });
   });
 
   it("continues after the same uploaded lease succeeds on its bounded retry", async () => {
@@ -2207,6 +2600,11 @@ describe("Presales v2 public contract", () => {
         providerRunDeadlineAt: "2026-08-15T12:30:00.000Z",
         providerRunDeadlineExceededAt: "2026-08-15T12:31:00.000Z",
         terminalAt: "2026-08-15T12:32:00.000Z",
+        preparation: {
+          prompt: "private durable preparation prompt",
+          assets: [],
+          providerCreateAttemptedAt: null,
+        },
       }),
     );
     expect(publicTask).toMatchObject({
@@ -2223,6 +2621,7 @@ describe("Presales v2 public contract", () => {
       "provider-file-secret",
       "credential-secret-id",
       "secret-operation-marker",
+      "private durable preparation prompt",
       "manus-1.6-max",
     ]) {
       expect(serialized).not.toContain(secret);
@@ -2468,6 +2867,47 @@ describe("Presales v2 public contract", () => {
     });
   });
 
+  it("reschedules durable pre-create preparation after a process restart without Provider I/O", async () => {
+    const now = new Date("2026-08-29T08:00:00.000Z");
+    const asset = uploadedAssetRecord(14);
+    const harness = reconcileHarness({
+      now,
+      events: [],
+      record: taskRecord({
+        status: "queued",
+        providerTaskId: null,
+        providerRequestId: null,
+        providerFileLeases: [],
+        preparation: {
+          prompt: "durable private prompt",
+          assets: [
+            {
+              localAssetId: asset.localAssetId,
+              filename: asset.filename,
+              candidateAttempts: 1,
+            },
+          ],
+          providerCreateAttemptedAt: null,
+        },
+        terminalAt: null,
+      }),
+    });
+    vi.mocked(harness.dependencies.resumePreparation).mockReturnValue(true);
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "queued",
+      providerTaskId: null,
+    });
+    expect(harness.dependencies.resumePreparation).toHaveBeenCalledOnce();
+    expect(harness.dependencies.clientForTask).not.toHaveBeenCalled();
+    expect(harness.providerCalls.findCreatedTask).not.toHaveBeenCalled();
+  });
+
   it("does not expire unknown-create while dispatch is active and uses only marker reconciliation after restart", async () => {
     const now = new Date("2026-08-16T08:00:00.000Z");
     const harness = reconcileHarness({
@@ -2485,6 +2925,13 @@ describe("Presales v2 public contract", () => {
         providerTaskId: null,
         providerRequestId: null,
         createSearchUntil: new Date(now.getTime() - 1).toISOString(),
+        preparation: {
+          prompt: null,
+          assets: [],
+          providerCreateAttemptedAt: new Date(
+            now.getTime() - 30_000,
+          ).toISOString(),
+        },
         terminalAt: null,
       }),
     });

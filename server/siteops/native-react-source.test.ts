@@ -570,6 +570,90 @@ describe("native React source archive boundary", () => {
     }
   });
 
+  it("accepts V2 ZIP entry counts that include explicit directory records", async () => {
+    const archive = await runtimeV2Archive({
+      mutate: (zip) => {
+        zip.folder("native-site");
+        zip.folder("native-site/src");
+        for (let index = 0; index < 8; index += 1) {
+          zip.file(
+            `native-site/src/fixture-${index}.ts`,
+            `export const fixture${index} = ${index};\n`,
+          );
+        }
+      },
+    });
+    const parsed = await JSZip.loadAsync(archive, { createFolders: false });
+    const entries = Object.values(parsed.files);
+    const regularFileCount = entries.filter((entry) => !entry.dir).length;
+
+    expect(regularFileCount).toBe(13);
+    expect(entries.length).toBe(15);
+    await expect(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receiptV2(archive, { fileCount: entries.length }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        expectedExecutionBaselineSha256: executionBaselineSha256,
+        requiredReceiptVersion: 2,
+      }),
+    ).resolves.toMatchObject({ fileCount: regularFileCount });
+  });
+
+  it("keeps V1 file counts strict and classifies true V2 count mismatches as invalid receipts", async () => {
+    const archive = await runtimeV2Archive({
+      mutate: (zip) => {
+        zip.folder("native-site");
+        zip.folder("native-site/src");
+      },
+    });
+    const parsed = await JSZip.loadAsync(archive, { createFolders: false });
+    const entries = Object.values(parsed.files);
+    const regularFileCount = entries.filter((entry) => !entry.dir).length;
+    expect(entries.length).toBeGreaterThan(regularFileCount + 1);
+
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receipt(archive, { fileCount: entries.length }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        requiredReceiptVersion: 1,
+      }),
+      "NATIVE_SOURCE_RECEIPT_INVALID",
+    );
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receiptV2(archive, { fileCount: regularFileCount + 1 }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        expectedExecutionBaselineSha256: executionBaselineSha256,
+        requiredReceiptVersion: 2,
+      }),
+      "NATIVE_SOURCE_RECEIPT_INVALID",
+    );
+  });
+
+  it("does not relax the authoritative non-directory file limit for V2 archives", async () => {
+    const archive = await runtimeV2Archive({
+      mutate: (zip) => zip.file("native-site/src/extra.ts", "export {};\n"),
+    });
+    await expectCode(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receiptV2(archive, { fileCount: 6 }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        expectedExecutionBaselineSha256: executionBaselineSha256,
+        requiredReceiptVersion: 2,
+        limits: { maxFiles: 5 },
+      }),
+      "NATIVE_SOURCE_LIMIT_EXCEEDED",
+    );
+  });
+
   it("aggregates framework, shell, dependency, route and execution violations", async () => {
     const badFiles = new Map<string, Buffer>([
       [

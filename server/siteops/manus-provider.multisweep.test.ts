@@ -1296,6 +1296,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     expect(createInput.prompt).toContain(selectedBaseSha256);
     expect(createInput.prompt).toContain("preflightStatus=passed");
     expect(createInput.prompt).toContain(
+      "fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）",
+    );
+    expect(createInput.prompt).toContain(
       "只返回 frontmind-site-source-v1.zip 与 frontmind-site-source-receipt-v1.json 各一份后结束",
     );
     const preflightAttachment = createInput.attachments.find(

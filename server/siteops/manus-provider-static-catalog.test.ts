@@ -656,13 +656,18 @@ afterEach(async () => {
 });
 
 describe("V7 static Template Manus source", () => {
-  it("uses the complete Template adaptation prompt without inventing an entrypoint coordinate", () => {
-    expect(nativeSourceSystemPromptForWorkflow("2.8.0")).toBe(
-      nativeSourceSystemPromptForWorkflow("2.7.0"),
+  it("adds the static application-capability boundary without changing the Template adaptation contract", () => {
+    const prompt = nativeSourceSystemPromptForWorkflow("2.8.0");
+    expect(prompt).not.toBe(nativeSourceSystemPromptForWorkflow("2.7.0"));
+    expect(prompt).toContain("不得把模板改造成通用卡片站");
+    expect(prompt).toContain(
+      "不得保留或新增认证、支付、订阅、数据库、管理后台、聊天机器人、外部统计、第三方 webhook、服务端 API 或知识库未要求的其他运行时能力；模板原有此类能力时，必须移除对应入口、表单和误导性 CTA。",
     );
-    expect(nativeSourceSystemPromptForWorkflow("2.8.0")).toContain(
-      "不得把模板改造成通用卡片站",
+    expect(prompt).toContain("FrontMind 宿主管理的 Vite SPA");
+    expect(prompt).toContain(
+      "企业 dossier、SiteBrief 和已验证媒体是唯一企业事实来源",
     );
+    expect(prompt).toContain("frontmind-native-preflight-v2.mjs");
     const selected = candidate(0);
     const directive = nativeTemplateCoordinateDirective({
       bundle: { schemaVersion: 7 },
@@ -1414,6 +1419,9 @@ describe("V7 static Template Manus source", () => {
     });
     expect(harness.client.sendMessage).toHaveBeenCalledTimes(1);
     const repairInput = harness.client.sendMessage.mock.calls[0]![0] as any;
+    expect(repairInput.prompt).toContain(
+      "fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）",
+    );
     const diagnosticsAttachment = repairInput.attachments.find(
       (attachment: any) =>
         attachment.filename === "frontmind-native-runtime-diagnostics-v1.json",

@@ -12,6 +12,9 @@ const dependencies = vi.hoisted(() => ({
     capabilities: { search: true },
     nativeTemplateReadiness: "ready" as const,
   })),
+  requireActiveStaticTemplateCatalog: vi.fn(async () => ({
+    catalogVersion: "21st-included-recommended-20260828-v2",
+  })),
 }));
 
 vi.mock("../db", () => ({ getDb: dependencies.getDb }));
@@ -38,6 +41,15 @@ vi.mock("./providers", async (importOriginal) => {
 vi.mock("../twenty-first-service", () => ({
   getTwentyFirstCredentialStatus: dependencies.getTwentyFirstCredentialStatus,
 }));
+vi.mock("./static-template-catalog", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./static-template-catalog")>();
+  return {
+    ...actual,
+    requireActiveStaticTemplateCatalog:
+      dependencies.requireActiveStaticTemplateCatalog,
+  };
+});
 
 import {
   apiCredentials,
@@ -170,7 +182,11 @@ function serviceDatabaseFixture() {
     },
   };
   const visualRows = [{ sample, batch }];
-  const publishedBatches: Array<{ id: string }> = [];
+  const publishedBatches: Array<{
+    id: string;
+    engineerNote?: string | null;
+    status?: string;
+  }> = [];
   const activeVisualOperations: Array<{ id: string }> = [];
   const visualOperationInput = {
     knowledgeSnapshotId: snapshot.id,
@@ -178,6 +194,13 @@ function serviceDatabaseFixture() {
     credentialVersion: 3,
     workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
   };
+  const visualCycleOperations: Array<{
+    id: string;
+    input: unknown;
+    status: string;
+    createdAt?: Date;
+    updatedAt?: Date;
+  }> = [];
   const customerCredential = {
     id: customerCredentialId,
     userId: 7,
@@ -190,6 +213,7 @@ function serviceDatabaseFixture() {
   };
 
   const inserts: Insert[] = [];
+  const credentialReads = { count: 0 };
   const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
   const insertFailures = new Map<unknown, unknown>();
@@ -208,6 +232,12 @@ function serviceDatabaseFixture() {
     if (table === knowledgeBaseSnapshots) return snapshots;
     if (table === users) return userRows;
     if (table === siteOperations) {
+      if (inTransaction && keys.includes("input") && keys.includes("status")) {
+        return visualCycleOperations.map((row) => ({
+          provider: "21st",
+          ...row,
+        }));
+      }
       if (inTransaction && keys.includes("input")) {
         return [{ input: visualOperationInput }];
       }
@@ -218,6 +248,7 @@ function serviceDatabaseFixture() {
     }
     if (table === presalesApiCredentials) {
       if (inTransaction && keys.includes("version")) {
+        credentialReads.count += 1;
         return [
           { id: platformCredentialId, version: 3, fingerprint: "fingerprint" },
         ];
@@ -234,7 +265,13 @@ function serviceDatabaseFixture() {
         ? [{ sequence: 0 }]
         : [];
     }
-    if (table === websiteStyleSampleBatches) return publishedBatches;
+    if (table === websiteStyleSampleBatches) {
+      return publishedBatches.map((row) => ({
+        engineerNote: `siteops-21st-operation:${visualOperationId}`,
+        status: "published",
+        ...row,
+      }));
+    }
     return [];
   };
   const select = (selection?: unknown) => {
@@ -310,6 +347,8 @@ function serviceDatabaseFixture() {
     visualRows,
     publishedBatches,
     activeVisualOperations,
+    visualCycleOperations,
+    credentialReads,
     snapshots,
     userRows,
     inspirationTaxonomy,
@@ -352,6 +391,43 @@ function connectKnowledgeInput(revision: number, knowledgeSnapshotId?: string) {
     expectedRevision: revision,
     input: knowledgeSnapshotId ? { knowledgeSnapshotId } : {},
   } as const;
+}
+
+function prepareVisualAction(
+  fixture: ReturnType<typeof serviceDatabaseFixture>,
+  status = "awaiting_visual_selection",
+) {
+  fixture.project.currentBuildId = null;
+  Object.assign(fixture.project, {
+    status,
+    brief: siteBriefFromSnapshot({
+      sourceFileName: "knowledge.zip",
+      documents: [
+        {
+          id: "overview-source",
+          path: "企业概览.md",
+          title: "企业概览",
+          content: "星河智造提供经过来源核验的设备巡检服务。",
+          kind: "overview",
+          evidenceStatus: "verified_first_party",
+          customerVisible: true,
+        },
+      ],
+      assets: [],
+    } as never),
+  });
+}
+
+function staticVisualInput(fixture: ReturnType<typeof serviceDatabaseFixture>) {
+  return {
+    schemaVersion: 3 as const,
+    knowledgeSnapshotId: fixture.project.currentKnowledgeSnapshotId,
+    workflowVersion: "2.8.0" as const,
+    catalogVersion: "21st-included-recommended-20260828-v2",
+    mode: "initial" as const,
+    page: 1 as const,
+    admissionRevision: fixture.project.revision,
+  };
 }
 
 beforeEach(() => {
@@ -531,8 +607,10 @@ describe("SiteOps visual selection and current-task revisions", () => {
       } as never),
     });
     fixture.publishedBatches.push({ id: fixture.batch.id });
-    fixture.activeVisualOperations.push({
-      id: "47000000-0000-4000-8000-000000000004",
+    fixture.visualCycleOperations.push({
+      id: "42000000-0000-4000-8000-000000000004",
+      input: fixture.visualOperationInput,
+      status: "running",
     });
     dependencies.getDb.mockResolvedValue(fixture.db);
 
@@ -579,6 +657,11 @@ describe("SiteOps visual selection and current-task revisions", () => {
       { id: "45000000-0000-4000-8000-000000000002" },
       { id: "45000000-0000-4000-8000-000000000003" },
     );
+    fixture.visualCycleOperations.push({
+      id: "42000000-0000-4000-8000-000000000004",
+      input: fixture.visualOperationInput,
+      status: "succeeded",
+    });
     dependencies.getDb.mockResolvedValue(fixture.db);
 
     await expect(
@@ -593,6 +676,160 @@ describe("SiteOps visual selection and current-task revisions", () => {
     expect(
       fixture.inserts.some((entry) => entry.table === siteOperations),
     ).toBe(false);
+  });
+
+  it("starts a pristine 2.8 catalog cycle without reading the 21st credential", async () => {
+    const fixture = serviceDatabaseFixture();
+    prepareVisualAction(fixture, "collecting_brief");
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(actor as never, {
+      conversationId: "siteops:7",
+      action: "start_visual_search",
+      clientRequestId: "start-static-catalog",
+      expectedRevision: fixture.project.revision,
+      input: {},
+    });
+
+    expect(
+      fixture.inserts.find(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "visual_search",
+      )?.values.input,
+    ).toMatchObject({
+      schemaVersion: 3,
+      workflowVersion: "2.8.0",
+      mode: "initial",
+      page: 1,
+    });
+    expect(fixture.credentialReads.count).toBe(0);
+  });
+
+  it("reloads a failed zero-page 2.8 cycle locally with a new schema v3 operation", async () => {
+    const fixture = serviceDatabaseFixture();
+    prepareVisualAction(fixture, "attention_required");
+    fixture.visualCycleOperations.push({
+      id: "42000000-0000-4000-8000-000000000004",
+      input: staticVisualInput(fixture),
+      status: "attention_required",
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(actor as never, {
+      conversationId: "siteops:7",
+      action: "reselect_visual",
+      clientRequestId: "reload-static-catalog",
+      expectedRevision: fixture.project.revision,
+      input: {},
+    });
+
+    expect(
+      fixture.inserts.find(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "visual_search",
+      )?.values.input,
+    ).toMatchObject({ schemaVersion: 3, workflowVersion: "2.8.0" });
+    expect(fixture.credentialReads.count).toBe(0);
+  });
+
+  it.each([1, 3, 4])(
+    "rejects 2.8 reselect with %i existing catalog batch(es) before credential access",
+    async (batchCount) => {
+      const fixture = serviceDatabaseFixture();
+      prepareVisualAction(fixture);
+      fixture.visualCycleOperations.push({
+        id: "42000000-0000-4000-8000-000000000004",
+        input: staticVisualInput(fixture),
+        status: "succeeded",
+      });
+      fixture.publishedBatches.push(
+        ...Array.from({ length: batchCount }, (_, index) => ({
+          id: `45000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+          status: index === 0 ? "selected" : "published",
+        })),
+      );
+      dependencies.getDb.mockResolvedValue(fixture.db);
+
+      await expect(
+        actOnSiteOps(actor as never, {
+          conversationId: "siteops:7",
+          action: "reselect_visual",
+          clientRequestId: `reject-static-catalog-${batchCount}`,
+          expectedRevision: fixture.project.revision,
+          input: {},
+        }),
+      ).rejects.toMatchObject({
+        code: "STATE_CONFLICT",
+        statusCode: 409,
+        message: "内置模板已载入，请直接选择；状态异常时请重置后重新开始。",
+      });
+      expect(fixture.credentialReads.count).toBe(0);
+      expect(
+        fixture.inserts.some(
+          (entry) =>
+            entry.table === siteOperations &&
+            entry.values.kind === "visual_search",
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("fails closed on an unverifiable frozen operation without reading the credential", async () => {
+    const fixture = serviceDatabaseFixture();
+    prepareVisualAction(fixture, "attention_required");
+    fixture.visualCycleOperations.push({
+      id: "42000000-0000-4000-8000-000000000004",
+      input: { workflowVersion: "2.8.0" },
+      status: "failed",
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(actor as never, {
+        conversationId: "siteops:7",
+        action: "reselect_visual",
+        clientRequestId: "reject-corrupt-frozen-operation",
+        expectedRevision: fixture.project.revision,
+        input: {},
+      }),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+    expect(fixture.credentialReads.count).toBe(0);
+  });
+
+  it("keeps a verifiable historical V1/V2 cycle on the schema v2 supplemental path", async () => {
+    const fixture = serviceDatabaseFixture();
+    prepareVisualAction(fixture);
+    fixture.visualCycleOperations.push({
+      id: "42000000-0000-4000-8000-000000000004",
+      input: fixture.visualOperationInput,
+      status: "succeeded",
+    });
+    fixture.publishedBatches.push({ id: fixture.batch.id });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(actor as never, {
+      conversationId: "siteops:7",
+      action: "reselect_visual",
+      clientRequestId: "continue-historical-visual-cycle",
+      expectedRevision: fixture.project.revision,
+      input: {},
+    });
+
+    expect(
+      fixture.inserts.find(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "visual_search",
+      )?.values.input,
+    ).toMatchObject({
+      schemaVersion: 2,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
+      mode: "supplemental",
+      page: 2,
+    });
+    expect(fixture.credentialReads.count).toBeGreaterThan(0);
   });
 
   it("recommends the highest score across all 27 published candidates", async () => {

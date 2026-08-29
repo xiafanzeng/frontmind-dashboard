@@ -114,9 +114,59 @@ const historicalOptimizationForecastSchema = (() => {
 const CREATE_RECONCILE_WINDOW_MS = 5 * 60_000;
 const PROVIDER_RUN_DEADLINE_MS = 60 * 60_000;
 const PROVIDER_TASK_VISIBILITY_GRACE_MS = 180_000;
+const PROVIDER_FILE_MINIMUM_USABLE_SECONDS = 15 * 60;
+const MAX_PROVIDER_FILE_CANDIDATES = 2;
 const MAX_STRUCTURED_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_STRUCTURED_RESULT_DEPTH = 64;
 const MAX_STRUCTURED_RESULT_NODES = 100_000;
+
+const TERMINAL_PRESALES_FILE_ERROR_CODES = new Set([
+  "FILE_ID_CONFLICT",
+  "FILE_IDENTITY_CONFLICT",
+  "FILE_BYTES_CONFLICT",
+  "FILE_MIME_CONFLICT",
+  "FILE_UNUSABLE",
+  "FILE_EXPIRING",
+  "FILE_BYTES_INVALID",
+  "UNSAFE_UPLOAD_URL",
+]);
+
+function presalesV2TaskHash(localTaskId: string) {
+  return createHash("sha256")
+    .update(localTaskId, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function transientPresalesV2FileFailure(error: unknown) {
+  if (
+    !(error instanceof ManusV2ApiError) ||
+    !error.operation.startsWith("file.") ||
+    TERMINAL_PRESALES_FILE_ERROR_CODES.has(error.code)
+  ) {
+    return false;
+  }
+  if (
+    error.code === "FILE_UPLOAD_CONFIRMATION_UNKNOWN" ||
+    error.outcomeUnknown
+  ) {
+    return true;
+  }
+  return (
+    error.retryable &&
+    (error.status === null ||
+      error.status === 408 ||
+      error.status === 425 ||
+      error.status === 429 ||
+      (typeof error.status === "number" && error.status >= 500))
+  );
+}
+
+function safePresalesV2FileFailureClass(error: unknown) {
+  if (!(error instanceof ManusV2ApiError)) return "local";
+  if (TERMINAL_PRESALES_FILE_ERROR_CODES.has(error.code)) return "terminal";
+  return transientPresalesV2FileFailure(error) ? "transient" : "rejected";
+}
 
 export function presalesV2PreparationFailureState(error: unknown): {
   status: "failed" | "attention_required";
@@ -133,18 +183,11 @@ export function presalesV2PreparationFailureState(error: unknown): {
   }
   if (
     error instanceof ManusV2ApiError &&
-    [
-      "FILE_ID_CONFLICT",
-      "FILE_IDENTITY_CONFLICT",
-      "FILE_BYTES_CONFLICT",
-      "FILE_MIME_CONFLICT",
-      "FILE_UNUSABLE",
-      "FILE_EXPIRING",
-    ].includes(error.code)
+    TERMINAL_PRESALES_FILE_ERROR_CODES.has(error.code)
   ) {
     return { status: "failed", errorCode: "FILE_UPLOAD_REJECTED" };
   }
-  if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+  if (transientPresalesV2FileFailure(error)) {
     return {
       status: "attention_required",
       errorCode: "FILE_UPLOAD_OUTCOME_UNKNOWN",
@@ -482,7 +525,7 @@ function startPresalesV2Dispatch(
           "[Presales v2] asynchronous dispatch compensation failed",
           {
             diagnosticCode: "PRESALES_V2_ASYNC_DISPATCH_COMPENSATION_FAILED",
-            localTaskId,
+            taskHash: presalesV2TaskHash(localTaskId),
             errorType:
               compensationError instanceof Error
                 ? compensationError.name
@@ -495,7 +538,7 @@ function startPresalesV2Dispatch(
       // customer prompt, filename, Provider response, or credential detail.
       console.error("[Presales v2] asynchronous task dispatch failed", {
         diagnosticCode: "PRESALES_V2_ASYNC_DISPATCH_FAILED",
-        localTaskId,
+        taskHash: presalesV2TaskHash(localTaskId),
         errorType: error instanceof Error ? error.name : "UnknownError",
       });
     })
@@ -576,6 +619,14 @@ async function settlePresalesV2PreparationFailure(
             ...current,
             ...failure,
             terminalAt: dependencies.now().toISOString(),
+            ...(current.preparation
+              ? {
+                  preparation: {
+                    ...current.preparation,
+                    prompt: null,
+                  },
+                }
+              : {}),
           }
         : current,
     );
@@ -687,21 +738,33 @@ async function dispatchPresalesV2Task(
     return;
   }
   const attachments: Array<{ file_id: string; filename: string }> = [];
-  const taskHash = createHash("sha256")
-    .update(record.localTaskId, "utf8")
-    .digest("hex")
-    .slice(0, 16);
+  const taskHash = presalesV2TaskHash(record.localTaskId);
 
   try {
     for (const [assetIndex, asset] of input.assets.entries()) {
       const local = await dependencies.readStoredBytes(asset.localAssetId);
-      const safeLog = (phaseName: string) => {
+      const safeLog = (
+        phaseName: string,
+        detail: {
+          candidateCount?: number;
+          failureClass?: ReturnType<typeof safePresalesV2FileFailureClass>;
+          diagnosticCode?: string;
+        } = {},
+      ) => {
         console.info("[Presales v2] provider file preparation", {
           taskHash,
+          contractName: record.contract.name,
           assetRole: presalesV2SafeAssetRole(asset.filename),
           ordinal: assetIndex + 1,
           declaredBytes: local.bytes.length,
           phase: phaseName,
+          ...(detail.candidateCount !== undefined
+            ? { candidateCount: detail.candidateCount }
+            : {}),
+          ...(detail.failureClass ? { failureClass: detail.failureClass } : {}),
+          ...(detail.diagnosticCode
+            ? { diagnosticCode: detail.diagnosticCode }
+            : {}),
         });
       };
       const rememberLease = async (
@@ -712,22 +775,43 @@ async function dispatchPresalesV2Task(
         try {
           const updated = await dependencies.updateTask(
             record.localTaskId,
-            (current) => ({
-              ...current,
-              providerFileLeases: [
-                ...current.providerFileLeases.filter(
-                  (lease) => lease.localAssetId !== asset.localAssetId,
-                ),
-                {
-                  localAssetId: asset.localAssetId,
-                  providerFileId: candidate.fileId,
-                  filename: candidate.filename,
-                  expiresAt,
-                  providerRequestId: candidate.requestId,
-                  uploadState,
-                },
-              ],
-            }),
+            (current) => {
+              if (
+                current.status !== "queued" ||
+                current.providerTaskId ||
+                current.preparation?.providerCreateAttemptedAt
+              ) {
+                return current;
+              }
+              const existing = current.providerFileLeases.find(
+                (lease) =>
+                  lease.localAssetId === asset.localAssetId &&
+                  lease.providerFileId === candidate.fileId,
+              );
+              const lease = {
+                localAssetId: asset.localAssetId,
+                providerFileId: candidate.fileId,
+                filename: candidate.filename,
+                expiresAt:
+                  Number.isSafeInteger(expiresAt) && expiresAt > 0
+                    ? expiresAt
+                    : (existing?.expiresAt ?? candidate.uploadExpiresAt),
+                providerRequestId:
+                  candidate.requestId ?? existing?.providerRequestId ?? null,
+                uploadState,
+              };
+              return {
+                ...current,
+                providerFileLeases: existing
+                  ? current.providerFileLeases.map((item) =>
+                      item.localAssetId === asset.localAssetId &&
+                      item.providerFileId === candidate.fileId
+                        ? lease
+                        : item,
+                    )
+                  : [...current.providerFileLeases, lease],
+              };
+            },
           );
           if (!updated) {
             throw new PresalesV2HttpError("FILE_LEASE_PERSIST_FAILED", 500);
@@ -738,7 +822,6 @@ async function dispatchPresalesV2Task(
               item.localAssetId === asset.localAssetId &&
               item.providerFileId === candidate.fileId &&
               item.filename === candidate.filename &&
-              item.expiresAt === expiresAt &&
               item.uploadState === uploadState,
           );
           if (!lease) {
@@ -773,40 +856,231 @@ async function dispatchPresalesV2Task(
         }
         throw new PresalesV2HttpError("FILE_LEASE_PERSIST_FAILED", 500);
       };
-      const uploaded = await client.uploadFile({
-        filename: asset.filename,
-        bytes: local.bytes,
-        contentType: asset.mimeType,
-        observer: {
-          onCandidateCreated: async (candidate) => {
-            await rememberLease(candidate, "reserved");
-            safeLog("candidate_reserved");
+      const assetLeases = () =>
+        record.providerFileLeases.filter(
+          (lease) => lease.localAssetId === asset.localAssetId,
+        );
+      const candidateCount = () =>
+        new Set(assetLeases().map((lease) => lease.providerFileId)).size;
+      const mismatchedLease = assetLeases().find(
+        (lease) => lease.filename !== asset.filename,
+      );
+      if (mismatchedLease) {
+        throw new ManusV2ApiError(
+          "file.detail",
+          502,
+          "FILE_IDENTITY_CONFLICT",
+          false,
+          false,
+        );
+      }
+      const reusableUploadedLease = [...assetLeases()]
+        .reverse()
+        .find(
+          (lease) =>
+            lease.uploadState === "uploaded" &&
+            lease.expiresAt -
+              Math.floor(dependencies.now().getTime() / 1_000) >=
+              PROVIDER_FILE_MINIMUM_USABLE_SECONDS,
+        );
+      if (reusableUploadedLease) {
+        safeLog("lease_reused_uploaded", {
+          candidateCount: candidateCount(),
+        });
+        attachments.push({
+          file_id: reusableUploadedLease.providerFileId,
+          filename: reusableUploadedLease.filename,
+        });
+        continue;
+      }
+
+      let resumeLease = [...assetLeases()]
+        .reverse()
+        .find((lease) =>
+          ["reserved", "uploading", "uploaded", "outcome_unknown"].includes(
+            lease.uploadState,
+          ),
+        );
+      let inMemoryCandidateAttempts = candidateCount();
+      let lastTransientFailure: unknown = null;
+      let uploaded:
+        | Awaited<ReturnType<PresalesV2DispatchClient["uploadFile"]>>
+        | undefined;
+
+      const reserveFreshCandidateAttempt = async () => {
+        if (!record.preparation) {
+          if (inMemoryCandidateAttempts >= MAX_PROVIDER_FILE_CANDIDATES) {
+            return null;
+          }
+          inMemoryCandidateAttempts += 1;
+          return inMemoryCandidateAttempts;
+        }
+        let reservedAttempt: number | null = null;
+        const updated = await dependencies.updateTask(
+          record.localTaskId,
+          (current) => {
+            if (
+              current.status !== "queued" ||
+              current.providerTaskId ||
+              current.preparation?.providerCreateAttemptedAt
+            ) {
+              return current;
+            }
+            const preparation = current.preparation;
+            if (!preparation) return current;
+            const preparationAsset = preparation.assets.find(
+              (item) => item.localAssetId === asset.localAssetId,
+            );
+            if (
+              !preparationAsset ||
+              preparationAsset.filename !== asset.filename ||
+              preparationAsset.candidateAttempts >= MAX_PROVIDER_FILE_CANDIDATES
+            ) {
+              return current;
+            }
+            reservedAttempt = preparationAsset.candidateAttempts + 1;
+            return {
+              ...current,
+              preparation: {
+                ...preparation,
+                assets: preparation.assets.map((item) =>
+                  item.localAssetId === asset.localAssetId
+                    ? { ...item, candidateAttempts: reservedAttempt! }
+                    : item,
+                ),
+              },
+            };
           },
-          onPutStarted: async (candidate) => {
-            await rememberLease(candidate, "uploading");
-            safeLog("put_started");
-          },
-          onPutAccepted: async (candidate) => {
-            await rememberLease(candidate, "uploading");
-            safeLog("put_accepted");
-          },
-          onPutRejected: async (candidate) => {
-            await rememberLease(candidate, "failed");
-            safeLog("put_rejected");
-          },
-          onPutOutcomeUnknown: async (candidate) => {
-            await rememberLease(candidate, "outcome_unknown");
-            safeLog("put_outcome_unknown");
-          },
-          onConfirmationUnknown: async (candidate) => {
-            await rememberLease(candidate, "outcome_unknown");
-            safeLog("confirmation_unknown");
-          },
-        },
+        );
+        if (!updated) {
+          throw new PresalesV2HttpError("FILE_LEASE_PERSIST_FAILED", 500);
+        }
+        record = updated;
+        return reservedAttempt;
+      };
+
+      while (!uploaded) {
+        const existingCandidate = resumeLease
+          ? {
+              fileId: resumeLease.providerFileId,
+              filename: resumeLease.filename,
+            }
+          : undefined;
+        if (resumeLease) {
+          safeLog("lease_confirmation_resumed", {
+            candidateCount: candidateCount(),
+          });
+        } else {
+          const freshAttempt = await reserveFreshCandidateAttempt();
+          if (freshAttempt === null) {
+            throw (
+              lastTransientFailure ??
+              new ManusV2ApiError(
+                "file.detail",
+                null,
+                "FILE_UPLOAD_CONFIRMATION_UNKNOWN",
+                false,
+                true,
+              )
+            );
+          }
+          safeLog(
+            freshAttempt === 1
+              ? "candidate_attempt_reserved"
+              : "candidate_replacement_reserved",
+            {
+              candidateCount: Math.max(candidateCount(), freshAttempt),
+              ...(freshAttempt === 2
+                ? {
+                    diagnosticCode:
+                      "PRESALES_V2_TRANSIENT_FILE_CANDIDATE_REPLACEMENT",
+                  }
+                : {}),
+            },
+          );
+        }
+
+        try {
+          uploaded = await client.uploadFile({
+            filename: asset.filename,
+            bytes: local.bytes,
+            contentType: asset.mimeType,
+            minimumUsableSeconds: PROVIDER_FILE_MINIMUM_USABLE_SECONDS,
+            sleep: dependencies.sleep,
+            now: () => dependencies.now().getTime(),
+            ...(existingCandidate ? { existingCandidate } : {}),
+            observer: {
+              onCandidateCreated: async (candidate) => {
+                await rememberLease(candidate, "reserved");
+                safeLog("candidate_reserved", {
+                  candidateCount: candidateCount(),
+                });
+              },
+              onPutStarted: async (candidate) => {
+                await rememberLease(candidate, "uploading");
+                safeLog("put_started", {
+                  candidateCount: candidateCount(),
+                });
+              },
+              onPutAccepted: async (candidate) => {
+                await rememberLease(candidate, "uploading");
+                safeLog("put_accepted", {
+                  candidateCount: candidateCount(),
+                });
+              },
+              onPutRejected: async (candidate) => {
+                await rememberLease(candidate, "failed");
+                safeLog("put_rejected", {
+                  candidateCount: candidateCount(),
+                });
+              },
+              onPutOutcomeUnknown: async (candidate) => {
+                await rememberLease(candidate, "outcome_unknown");
+                safeLog("put_outcome_unknown", {
+                  candidateCount: candidateCount(),
+                });
+              },
+              onConfirmationUnknown: async (candidate) => {
+                await rememberLease(candidate, "outcome_unknown");
+                safeLog("confirmation_unknown", {
+                  candidateCount: candidateCount(),
+                  failureClass: "transient",
+                  diagnosticCode: "PRESALES_V2_FILE_CONFIRMATION_TIMEOUT",
+                });
+              },
+            },
+          });
+        } catch (error) {
+          const failureClass = safePresalesV2FileFailureClass(error);
+          safeLog("candidate_failed", {
+            candidateCount: candidateCount(),
+            failureClass,
+            ...(failureClass === "transient"
+              ? {
+                  diagnosticCode: "PRESALES_V2_PROVIDER_FILE_UNAVAILABLE",
+                }
+              : {}),
+          });
+          if (!transientPresalesV2FileFailure(error)) throw error;
+          lastTransientFailure = error;
+          resumeLease = undefined;
+          if (
+            candidateCount() >= MAX_PROVIDER_FILE_CANDIDATES ||
+            (record.preparation?.assets.find(
+              (item) => item.localAssetId === asset.localAssetId,
+            )?.candidateAttempts ?? inMemoryCandidateAttempts) >=
+              MAX_PROVIDER_FILE_CANDIDATES
+          ) {
+            throw error;
+          }
+        }
+      }
+
+      safeLog("confirmation_uploaded", {
+        candidateCount: candidateCount(),
       });
-      safeLog("confirmation_uploaded");
       await rememberUploadedLease(uploaded, uploaded.detail.expiresAt);
-      safeLog("lease_uploaded");
+      safeLog("lease_uploaded", { candidateCount: candidateCount() });
       attachments.push({
         file_id: uploaded.fileId,
         filename: uploaded.filename,
@@ -836,23 +1110,50 @@ async function dispatchPresalesV2Task(
   // before createTask so an active upload can never age out prematurely.
   try {
     const createAttemptedAt = dependencies.now();
+    let ownsProviderCreateBoundary = false;
     const refreshed = await dependencies.updateTask(
       record.localTaskId,
-      (current) =>
-        current.status === "queued" && !current.providerTaskId
-          ? {
-              ...current,
-              createSearchUntil: new Date(
-                createAttemptedAt.getTime() + CREATE_RECONCILE_WINDOW_MS,
-              ).toISOString(),
-            }
-          : current,
+      (current) => {
+        if (current.status !== "queued" || current.providerTaskId) {
+          return current;
+        }
+        if (current.preparation?.providerCreateAttemptedAt) {
+          return current;
+        }
+        ownsProviderCreateBoundary = true;
+        // Set the phase inside the durable CAS. If the filesystem write lands
+        // but its SQL projection fails, outer compensation must still treat the
+        // Provider create boundary as crossed and must never reopen dispatch.
+        phase.providerCreateAttempted = true;
+        return {
+          ...current,
+          createSearchUntil: new Date(
+            createAttemptedAt.getTime() + CREATE_RECONCILE_WINDOW_MS,
+          ).toISOString(),
+          ...(current.preparation
+            ? {
+                preparation: {
+                  ...current.preparation,
+                  prompt: null,
+                  providerCreateAttemptedAt: createAttemptedAt.toISOString(),
+                },
+              }
+            : {}),
+        };
+      },
     );
     if (!refreshed) {
       throw new PresalesV2HttpError("TASK_RESERVATION_MISSING", 500);
     }
     record = refreshed;
+    if (!ownsProviderCreateBoundary) return;
   } catch (error) {
+    if (phase.providerCreateAttempted) {
+      // The durable claim callback ran. The filesystem claim may have landed
+      // even when its SQL projection failed, so marker reconciliation is the
+      // only safe next action; never write a contradictory pre-create failure.
+      return;
+    }
     await settlePresalesV2PreparationFailure(
       record.localTaskId,
       error,
@@ -869,7 +1170,6 @@ async function dispatchPresalesV2Task(
       phase: "sending",
       attachmentCount: attachments.length,
     });
-    phase.providerCreateAttempted = true;
     created = await client.createTask({
       prompt: providerPrompt,
       attachments,
@@ -937,7 +1237,7 @@ async function dispatchPresalesV2Task(
     // the existing GET reconciliation path to bind the unique Provider task.
     console.error("[Presales v2] Provider task binding persistence failed", {
       diagnosticCode: "PRESALES_V2_PROVIDER_BIND_PERSIST_FAILED",
-      localTaskId: record.localTaskId,
+      taskHash,
       errorType: error instanceof Error ? error.name : "UnknownError",
     });
     throw error;
@@ -2047,11 +2347,89 @@ type PresalesV2ReconcileClient = Pick<
   "findCreatedTask" | "listAllMessages"
 >;
 
+function resumePresalesV2Preparation(record: PresalesV2TaskRecord) {
+  const preparation = record.preparation;
+  if (
+    record.status !== "queued" ||
+    record.providerTaskId ||
+    !preparation ||
+    preparation.providerCreateAttemptedAt
+  ) {
+    return false;
+  }
+
+  const phase: PresalesV2DispatchPhase = { providerCreateAttempted: false };
+  startPresalesV2Dispatch(
+    record.localTaskId,
+    async () => {
+      const latest = await readPresalesV2Task(record.localTaskId);
+      const latestPreparation = latest?.preparation;
+      if (
+        !latest ||
+        latest.status !== "queued" ||
+        latest.providerTaskId ||
+        !latestPreparation ||
+        latestPreparation.providerCreateAttemptedAt
+      ) {
+        return;
+      }
+      if (typeof latestPreparation.prompt !== "string") {
+        throw new PresalesV2HttpError(
+          "TASK_PREPARATION_INPUT_UNAVAILABLE",
+          409,
+        );
+      }
+      const credential = await getPresalesCredentialById(latest.credentialId);
+      if (!credential || credential.version !== latest.credentialVersion) {
+        throw new PresalesV2HttpError(
+          "TASK_CREDENTIAL_UNAVAILABLE",
+          410,
+          false,
+          latest.operationId,
+        );
+      }
+      const assets = await Promise.all(
+        latestPreparation.assets.map(async (coordinate) => {
+          const asset = await readPresalesV2Asset(coordinate.localAssetId);
+          if (
+            !asset ||
+            asset.status !== "uploaded" ||
+            asset.filename !== coordinate.filename ||
+            asset.projectId !== latest.projectId
+          ) {
+            throw new PresalesV2HttpError("ASSET_NOT_AVAILABLE", 409);
+          }
+          return asset;
+        }),
+      );
+      await dispatchPresalesV2Task(
+        {
+          record: latest,
+          assets,
+          prompt: latestPreparation.prompt,
+          contract: resolvePresalesV2Contract(latest.contract),
+          apiKey: credential.apiKey,
+        },
+        {},
+        phase,
+      );
+    },
+    (error) =>
+      compensatePresalesV2DispatchFailure({
+        localTaskId: record.localTaskId,
+        error,
+        phase,
+      }),
+  );
+  return true;
+}
+
 export type PresalesV2ReconcileDependencies = {
   now: () => Date;
   readTask: typeof readPresalesV2Task;
   updateTask: typeof updatePresalesV2Task;
   isDispatchActive: (localTaskId: string) => boolean;
+  resumePreparation: (record: PresalesV2TaskRecord) => boolean;
   clientForTask: (
     record: PresalesV2TaskRecord,
   ) => Promise<PresalesV2ReconcileClient>;
@@ -2066,6 +2444,7 @@ function reconcileDependencies(
     readTask: readPresalesV2Task,
     updateTask: updatePresalesV2Task,
     isDispatchActive: isPresalesV2DispatchActive,
+    resumePreparation: resumePresalesV2Preparation,
     clientForTask,
     localizeArtifact,
     ...overrides,
@@ -2258,12 +2637,24 @@ async function reconcileUnknownCreate(
   // create-search deadline does not begin until immediately before createTask,
   // so GET must not race the active uploader or classify it as unknown.
   if (dependencies.isDispatchActive(record.localTaskId)) return record;
+  if (
+    record.preparation &&
+    record.preparation.providerCreateAttemptedAt === null
+  ) {
+    dependencies.resumePreparation(record);
+    return record;
+  }
   const client = await dependencies.clientForTask(record);
   const now = dependencies.now();
+  const createdAtMs = Date.parse(record.createdAt);
+  const createAttemptedAtMs = validTimestamp(
+    record.preparation?.providerCreateAttemptedAt,
+    Number.isFinite(createdAtMs) ? createdAtMs : now.getTime(),
+  );
   const match = await client.findCreatedTask({
     title: record.providerTitle,
     operationToken: record.operationToken,
-    createdAfterSeconds: Math.floor(Date.parse(record.createdAt) / 1_000) - 60,
+    createdAfterSeconds: Math.floor(createAttemptedAtMs / 1_000) - 60,
     createdBeforeSeconds: Math.floor(now.getTime() / 1_000) + 60,
   });
   if (match.matches.length > 1) {
@@ -3028,6 +3419,13 @@ router.post("/tasks", jsonParser, async (req, res) => {
       upstreamModel: managedAgentProfileModel(contract.profile),
       credentialId: credential.id,
       credentialVersion: credential.version,
+      preparation: {
+        prompt: input.prompt,
+        assets: input.localAssetIds.map(({ localAssetId, filename }) => ({
+          localAssetId,
+          filename,
+        })),
+      },
     });
     if (acquired.state === "conflict") {
       throw new PresalesV2HttpError("IDEMPOTENCY_CONFLICT", 409);
