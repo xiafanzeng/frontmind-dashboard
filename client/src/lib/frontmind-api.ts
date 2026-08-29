@@ -346,6 +346,21 @@ export class ResponseLogicTaskStartError
  */
 export interface OutputMessage {
   id?: string;
+  /** Canonical Dashboard message identity for a persisted assistant projection. */
+  message_id?: string;
+  /** Stable server-authored send time for the canonical message. */
+  sent_at_ms?: number;
+  /** Stable ordering coordinate from the persisted conversation message. */
+  server_sequence?: number;
+  /** Server-owned ordinary-chat projection metadata. */
+  general_chat?: {
+    schemaVersion: 1;
+    kind: "assistant_projection";
+    turnId: string;
+    agentTaskId: string;
+    providerEventId: string;
+    serverOwned: true;
+  };
   type?: string;
   role?: "user" | "assistant";
   status?: string;

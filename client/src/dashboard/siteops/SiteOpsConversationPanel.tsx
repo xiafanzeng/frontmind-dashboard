@@ -425,13 +425,19 @@ function visualGenerationFailureCopy(
   usesStaticTemplateCatalog = false,
 ) {
   if (usesStaticTemplateCatalog) {
-    const message =
-      category === "catalog_unavailable"
-        ? "固定 Template 目录的本地资产尚未就绪或未通过完整性校验。"
-        : "固定 Template 目录的本地源码或预览资产暂时无法读取。";
+    if (category === "catalog_unavailable") {
+      return hasExistingCandidates
+        ? "建站模板目录的本地资产尚未就绪或未通过完整性校验。当前已加载的候选仍可选择；服务恢复后也可重新载入建站模板。"
+        : "建站模板目录的本地资产尚未就绪或未通过完整性校验。服务恢复后可直接重新载入建站模板；刷新页面只会更新当前状态。";
+    }
+    if (category === "persistence_failed") {
+      return hasExistingCandidates
+        ? "建站模板资产已经就绪，但候选列表未能完整保存。当前已加载的候选仍可选择，也可重新载入建站模板。"
+        : "建站模板资产已经就绪，但候选列表未能安全保存。可以直接重新载入建站模板，无需重置知识库。";
+    }
     return hasExistingCandidates
-      ? `${message}当前已加载的候选仍可选择；也可刷新页面重新读取固定目录。`
-      : `${message}请先刷新页面；若仍失败，可提交官网重置申请后重新进入固定目录。此操作不会在线生成补充候选。`;
+      ? "建站模板未能完整载入。当前已加载的候选仍可选择，也可重新载入建站模板。"
+      : "建站模板未能完整载入。可以直接重新载入建站模板，无需重置知识库。";
   }
   const suffix = hasExistingCandidates
     ? "当前候选仍可选择，也可稍后重试。"
@@ -1133,7 +1139,9 @@ export default function SiteOpsConversationPanel({
     );
   }
 
-  const upstreamMessage = providerMessage(observation);
+  const upstreamMessage = usesStaticTemplateCatalog
+    ? null
+    : providerMessage(observation);
   const builderMessage = aiBuilderMessage(observation);
   const aiBuilderConfigured =
     observation.serviceReadiness.website.status === "configured";
@@ -1517,9 +1525,7 @@ export default function SiteOpsConversationPanel({
                   aria-hidden="true"
                 />
               )}
-              {usesStaticTemplateCatalog
-                ? "查看 32 个 Template"
-                : "生成 9 个视觉候选"}
+              {usesStaticTemplateCatalog ? "查看建站模板" : "生成 9 个视觉候选"}
             </button>
           </section>
         )}
@@ -1552,7 +1558,12 @@ export default function SiteOpsConversationPanel({
               <div>
                 <h3 id="siteops-visual-retry-title">
                   {usesStaticTemplateCatalog
-                    ? "固定 Template 目录暂时不可用"
+                    ? visualGeneration.failureCategory === "catalog_unavailable"
+                      ? "建站模板目录暂时不可用"
+                      : visualGeneration.failureCategory ===
+                          "persistence_failed"
+                        ? "建站模板列表保存失败"
+                        : "建站模板载入未完成"
                     : "视觉候选生成未完成"}
                 </h3>
                 <p>
@@ -1565,36 +1576,30 @@ export default function SiteOpsConversationPanel({
               </div>
             </div>
             {usesStaticTemplateCatalog ? (
-              <div className="siteops-inline-actions">
-                {onRefresh && (
-                  <button
-                    type="button"
-                    className="siteops-primary-button"
-                    disabled={refreshing}
-                    onClick={() => onRefresh()}
-                  >
-                    <RefreshCw
-                      className={refreshing ? "siteops-spin" : undefined}
-                      size={15}
-                      aria-hidden="true"
-                    />
-                    刷新固定 Template 目录
-                  </button>
+              <button
+                type="button"
+                className="siteops-primary-button"
+                disabled={
+                  interactionLocked ||
+                  visualGenerationPending ||
+                  Boolean(upstreamMessage)
+                }
+                onClick={() =>
+                  runAction("reselect_visual", {
+                    action: "reselect_visual",
+                    input: {},
+                  })
+                }
+              >
+                {visualGenerationPending && (
+                  <Loader2
+                    className="siteops-spin"
+                    size={15}
+                    aria-hidden="true"
+                  />
                 )}
-                {observation.rebuildRequest.allowed && (
-                  <button
-                    type="button"
-                    disabled={Boolean(busyAction)}
-                    onClick={() => {
-                      setRebuildError(null);
-                      setRebuildDialogOpen(true);
-                    }}
-                  >
-                    <Wrench size={15} aria-hidden="true" />
-                    提交官网重置申请
-                  </button>
-                )}
-              </div>
+                重新载入建站模板
+              </button>
             ) : (
               <button
                 type="button"

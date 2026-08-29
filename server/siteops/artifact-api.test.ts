@@ -471,6 +471,7 @@ describe("SiteOps visual sample preview", () => {
       sourceArchiveSha256: "d".repeat(64),
       previewAssetId:
         "21st-included-recommended-20260828-v1/preview/static-template-01-arfazrll-portfolio",
+      previewLocalAssetId: previewAssetId,
       previewSha256: "c".repeat(64),
       previewMimeType: "image/png",
       previewWidth: 1440,
@@ -545,31 +546,22 @@ describe("SiteOps visual sample preview", () => {
     });
   });
 
-  it("serves an authorized V7 preview from the active static catalog without a tenant asset copy", async () => {
-    const candidateId = "static-template-01-arfazrll-portfolio";
-    const staticBytes = Buffer.from("static-template-preview");
+  it("serves an authorized V7 preview from its frozen managed-user asset", async () => {
+    const managedBytes = Buffer.from("managed-template-preview");
     const staticHash = "c".repeat(64);
-    const sourceHash = "d".repeat(64);
     const metadata = v7StaticPreviewMetadata();
     mocks.getDb.mockResolvedValueOnce(
-      stylePreviewDatabase(null, metadata, true),
+      stylePreviewDatabase(previewAssetId, metadata),
     );
-    mocks.openStaticTemplateCatalogVersionPreview.mockResolvedValueOnce({
-      entry: {
-        order: 1,
-        providerTemplateId: "827",
-        providerSlug: "arfazrll-portfolio",
-        sourceAssetId: metadata.sourceAssetId,
-        previewAssetId: metadata.previewAssetId,
-        previewSha256: staticHash,
-        previewMimeType: "image/png",
-        previewWidth: 1440,
-        previewHeight: 900,
-        previewBytes: staticBytes.length,
-        sourceSha256: sourceHash,
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "image/png",
+        sizeBytes: managedBytes.length,
+        contentSha256: staticHash,
+        filename: "static-template-01.png",
       },
-      path: "/static/preview.png",
-      stream: Readable.from([staticBytes]),
+      stored: { createReadStream: () => Readable.from([managedBytes]) },
     });
     const origin = await startApp();
 
@@ -582,44 +574,47 @@ describe("SiteOps visual sample preview", () => {
     expect(response.headers.get("cache-control")).toBe(
       "private, no-store, max-age=0",
     );
-    expect(Buffer.from(await response.arrayBuffer())).toEqual(staticBytes);
-    expect(mocks.openStaticTemplateCatalogVersionPreview).toHaveBeenCalledWith(
-      metadata.catalogVersion,
-      candidateId,
-    );
-    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(managedBytes);
+    expect(
+      mocks.openStaticTemplateCatalogVersionPreview,
+    ).not.toHaveBeenCalled();
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: staticHash,
+      expectedMimeTypes: ["image/png"],
+    });
   });
 
-  it("serves a frozen V7 preview after the active catalog switches to a future version", async () => {
+  it("serves a frozen V7 preview independently of later catalog mount changes", async () => {
     const candidateId = "static-template-01-arfazrll-portfolio";
     const catalogVersion = "21st-included-recommended-20260828-v2";
-    const previewAssetId = `${catalogVersion}/preview/${candidateId}`;
+    const catalogPreviewAssetId = `${catalogVersion}/preview/${candidateId}`;
     const sourceAssetId = `${catalogVersion}/source/${candidateId}`;
     const metadata = v7StaticPreviewMetadata({
       catalogVersion,
-      previewAssetId,
+      previewAssetId: catalogPreviewAssetId,
       sourceAssetId,
     });
     const staticBytes = Buffer.from("frozen-version-preview");
     mocks.getDb.mockResolvedValueOnce(
-      stylePreviewDatabase(null, metadata, true),
+      stylePreviewDatabase(previewAssetId, metadata),
     );
-    mocks.openStaticTemplateCatalogVersionPreview.mockResolvedValueOnce({
-      entry: {
-        order: 1,
-        providerTemplateId: "827",
-        providerSlug: "arfazrll-portfolio",
-        sourceAssetId,
-        previewAssetId,
-        previewSha256: "c".repeat(64),
-        previewMimeType: "image/png",
-        previewWidth: 1440,
-        previewHeight: 900,
-        previewBytes: staticBytes.length,
-        sourceSha256: "d".repeat(64),
+    mocks.openStaticTemplateCatalogVersionPreview.mockRejectedValueOnce(
+      new mocks.StaticTemplateCatalogError(
+        "STATIC_TEMPLATE_CATALOG_VERSION_NOT_FOUND",
+      ),
+    );
+    mocks.readSiteOpsArtifact.mockResolvedValueOnce({
+      row: {
+        id: previewAssetId,
+        mimeType: "image/png",
+        sizeBytes: staticBytes.length,
+        contentSha256: "c".repeat(64),
+        filename: "frozen-preview.png",
       },
-      path: "/static/catalog-v2/preview.png",
-      stream: Readable.from([staticBytes]),
+      stored: { createReadStream: () => Readable.from([staticBytes]) },
     });
     const origin = await startApp();
 
@@ -629,79 +624,78 @@ describe("SiteOps visual sample preview", () => {
 
     expect(response.status).toBe(200);
     expect(Buffer.from(await response.arrayBuffer())).toEqual(staticBytes);
-    expect(mocks.openStaticTemplateCatalogVersionPreview).toHaveBeenCalledWith(
-      catalogVersion,
-      candidateId,
-    );
+    expect(
+      mocks.openStaticTemplateCatalogVersionPreview,
+    ).not.toHaveBeenCalled();
   });
 
-  it.each([
-    [
-      "preview asset coordinate",
-      { previewAssetId: "catalog/preview/wrong-candidate" },
-    ],
-    ["source asset coordinate", { sourceAssetId: "catalog/source/wrong" }],
-    ["provider slug", { providerSlug: "wrong-provider-slug" }],
-    ["preview hash", { previewSha256: "e".repeat(64) }],
-    ["source hash", { sourceArchiveSha256: "f".repeat(64) }],
-  ])(
-    "returns 404 when a V7 %s disagrees with the active catalog",
-    async (_label, override) => {
-      const metadata = v7StaticPreviewMetadata(override);
-      const stream = Readable.from([Buffer.from("must-not-leak")]);
-      const destroy = vi.spyOn(stream, "destroy");
-      mocks.getDb.mockResolvedValueOnce(
-        stylePreviewDatabase(null, metadata, true),
-      );
-      mocks.openStaticTemplateCatalogVersionPreview.mockResolvedValueOnce({
-        entry: {
-          order: 1,
-          providerTemplateId: "827",
-          providerSlug: "arfazrll-portfolio",
-          sourceAssetId:
-            "21st-included-recommended-20260828-v1/source/static-template-01-arfazrll-portfolio",
-          previewAssetId:
-            "21st-included-recommended-20260828-v1/preview/static-template-01-arfazrll-portfolio",
-          previewSha256: "c".repeat(64),
-          previewMimeType: "image/png",
-          previewWidth: 1440,
-          previewHeight: 900,
-          previewBytes: 13,
-          sourceSha256: "d".repeat(64),
-        },
-        path: "/static/preview.png",
-        stream,
-      });
-      const origin = await startApp();
-
-      const response = await fetch(
-        `${origin}/api/site-ops/style-previews/v7-coordinate-mismatch`,
-      );
-
-      expect(response.status).toBe(404);
-      expect(destroy).toHaveBeenCalled();
-      expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
-    },
-  );
-
-  it("projects static catalog path and hash verification failures as 404", async () => {
+  it("rejects a V7 row without its required frozen managed-user asset", async () => {
+    const metadata = v7StaticPreviewMetadata({
+      previewLocalAssetId: null,
+    });
     mocks.getDb.mockResolvedValueOnce(
-      stylePreviewDatabase(null, v7StaticPreviewMetadata(), true),
+      stylePreviewDatabase(null, metadata, true),
     );
-    mocks.openStaticTemplateCatalogVersionPreview.mockRejectedValueOnce(
-      new mocks.StaticTemplateCatalogError(
-        "STATIC_TEMPLATE_CATALOG_ASSET_HASH_MISMATCH",
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v7-historical-static-sample`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "NOT_FOUND" });
+    expect(
+      mocks.openStaticTemplateCatalogVersionPreview,
+    ).not.toHaveBeenCalled();
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when a V7 row and its frozen managed-user asset coordinate disagree", async () => {
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(
+        previewAssetId,
+        v7StaticPreviewMetadata({
+          previewLocalAssetId: realizationAssetId,
+        }),
       ),
     );
     const origin = await startApp();
 
     const response = await fetch(
-      `${origin}/api/site-ops/style-previews/v7-static-hash-mismatch`,
+      `${origin}/api/site-ops/style-previews/v7-local-asset-mismatch`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(
+      mocks.openStaticTemplateCatalogVersionPreview,
+    ).not.toHaveBeenCalled();
+    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "SITEOPS_ARTIFACT_HASH_MISMATCH",
+    "SITEOPS_ARTIFACT_MIME_MISMATCH",
+    "SITEOPS_ARTIFACT_BODY_MISMATCH",
+  ])("projects V7 managed preview %s failures as 404", async (errorCode) => {
+    const metadata = v7StaticPreviewMetadata();
+    mocks.getDb.mockResolvedValueOnce(
+      stylePreviewDatabase(previewAssetId, metadata),
+    );
+    mocks.readSiteOpsArtifact.mockRejectedValueOnce(new Error(errorCode));
+    const origin = await startApp();
+
+    const response = await fetch(
+      `${origin}/api/site-ops/style-previews/v7-managed-integrity-failure`,
     );
 
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: "NOT_FOUND" });
-    expect(mocks.readSiteOpsArtifact).not.toHaveBeenCalled();
+    expect(mocks.readSiteOpsArtifact).toHaveBeenCalledWith({
+      userId: 42,
+      localAssetId: previewAssetId,
+      expectedSha256: "c".repeat(64),
+      expectedMimeTypes: ["image/png"],
+    });
   });
 
   it("serves a V4 reference with its reference hash instead of the distinct realization hash", async () => {

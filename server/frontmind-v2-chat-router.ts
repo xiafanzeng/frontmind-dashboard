@@ -79,6 +79,10 @@ import {
 } from "./_core/safe-external-url";
 import { sanitizeFrontMindPublicText } from "../shared/frontmind-public-brand";
 import { stripFrontMindGeneralChatOperationContract } from "../shared/frontmind-general-chat-contract";
+import {
+  canonicalizeGeneralChatAssistantMarkdown,
+  type GeneralChatAssistantArtifactBinding,
+} from "../shared/frontmind-general-chat-markdown";
 import { GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE } from "../shared/frontmind-general-chat-terminal";
 import {
   generalAgentModelProfileModel,
@@ -850,6 +854,46 @@ function persistedMessageIdForConversation(
     : publicMessageId;
 }
 
+function generalChatAssistantPublicMessageId(input: {
+  taskId: string;
+  providerEventId: string;
+}) {
+  return `msg-general-chat-${hash(
+    `${input.taskId}\0${input.providerEventId}`,
+  )}`;
+}
+
+function generalChatProjectionArtifactCount(metadata: unknown) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return 0;
+  }
+  const record = metadata as Record<string, unknown>;
+  return (
+    (Array.isArray(record.outputFiles) ? record.outputFiles.length : 0) +
+    (Array.isArray(record.inlineImages) ? record.inlineImages.length : 0)
+  );
+}
+
+function logGeneralChatAssistantProjection(input: {
+  taskId: string;
+  turnId: string;
+  providerEventId: string;
+  messageId: string;
+  action: "insert" | "update" | "delete";
+  artifactCount: number;
+  content: string;
+}) {
+  console.info("[FrontMindV2] general-chat assistant projection", {
+    localTaskId: input.taskId,
+    turnId: input.turnId,
+    providerEventId: input.providerEventId,
+    messageId: input.messageId,
+    action: input.action,
+    artifactCount: input.artifactCount,
+    contentHash: hash(input.content),
+  });
+}
+
 async function persistAssistantProjection(input: {
   executor: any;
   operation: AgentOperation;
@@ -867,9 +911,10 @@ async function persistAssistantProjection(input: {
   }>;
 }) {
   const userId = input.operation.accountUserId!;
-  const publicMessageId = `msg-general-chat-${hash(
-    `${input.task.id}\0${input.event.id}`,
-  )}`;
+  const publicMessageId = generalChatAssistantPublicMessageId({
+    taskId: input.task.id,
+    providerEventId: input.event.id,
+  });
   const messageId = persistedMessageIdForConversation(
     input.turn.conversationId,
     publicMessageId,
@@ -916,12 +961,24 @@ async function persistAssistantProjection(input: {
     .for("update");
   const existing = (
     await input.executor
-      .select({ id: messages.id })
+      .select({
+        id: messages.id,
+        content: messages.content,
+        metadata: messages.metadata,
+        turnId: messages.turnId,
+        deletedAt: messages.deletedAt,
+      })
       .from(messages)
       .where(eq(messages.id, messageId))
       .limit(1)
   )[0];
   if (existing) {
+    const unchanged =
+      existing.content === input.text &&
+      existing.turnId === input.turn.id &&
+      existing.deletedAt === null &&
+      requestHash(existing.metadata ?? null) === requestHash(metadata);
+    if (unchanged) return;
     await input.executor
       .update(messages)
       .set({
@@ -932,6 +989,15 @@ async function persistAssistantProjection(input: {
         deletedAt: null,
       })
       .where(eq(messages.id, messageId));
+    logGeneralChatAssistantProjection({
+      taskId: input.task.id,
+      turnId: input.turn.id,
+      providerEventId: input.event.id,
+      messageId: publicMessageId,
+      action: "update",
+      artifactCount: input.localized.length,
+      content: input.text,
+    });
     return;
   }
   const latest = (
@@ -953,6 +1019,15 @@ async function persistAssistantProjection(input: {
     metadata,
     sentAt,
     createdAt: sentAt,
+  });
+  logGeneralChatAssistantProjection({
+    taskId: input.task.id,
+    turnId: input.turn.id,
+    providerEventId: input.event.id,
+    messageId: publicMessageId,
+    action: "insert",
+    artifactCount: input.localized.length,
+    content: input.text,
   });
 }
 
@@ -1312,6 +1387,7 @@ async function reconcileAssistantProjectionVisibility(input: {
     .select({
       id: messages.id,
       turnId: messages.turnId,
+      content: messages.content,
       metadata: messages.metadata,
       deletedAt: messages.deletedAt,
     })
@@ -1353,6 +1429,18 @@ async function reconcileAssistantProjectionVisibility(input: {
         .update(messages)
         .set({ deletedAt: new Date() })
         .where(eq(messages.id, row.id));
+      logGeneralChatAssistantProjection({
+        taskId: input.taskId,
+        turnId: row.turnId,
+        providerEventId: generalChat.providerEventId,
+        messageId: generalChatAssistantPublicMessageId({
+          taskId: input.taskId,
+          providerEventId: generalChat.providerEventId,
+        }),
+        action: "delete",
+        artifactCount: generalChatProjectionArtifactCount(row.metadata),
+        content: row.content,
+      });
     }
   }
 }
@@ -1361,6 +1449,7 @@ type GeneralChatStagedProviderEvent = {
   event: ManusV2MessageEvent;
   normalizedPayload: Record<string, unknown>;
   projectionTurn: GeneralChatProjectionTurn | null;
+  canonicalText: string;
   localized: Array<{
     artifactId: string;
     filename: string;
@@ -1489,11 +1578,10 @@ async function applyProviderProjectionSnapshot(input: {
     });
     for (const staged of input.stagedEvents) {
       const persistedEventId = persistedEventIds.get(staged.event.id);
-      const text = assistantText(staged.event);
       if (
         !staged.projectionTurn ||
         !persistedEventId ||
-        (!text && staged.localized.length === 0)
+        (!staged.canonicalText && staged.localized.length === 0)
       ) {
         continue;
       }
@@ -1504,7 +1592,7 @@ async function applyProviderProjectionSnapshot(input: {
         event: staged.event,
         turn: staged.projectionTurn,
         upstreamOutputId: persistedEventId,
-        text,
+        text: staged.canonicalText,
         localized: staged.localized,
       });
     }
@@ -1693,6 +1781,7 @@ async function persistProviderEvents(input: {
       bytes: number;
       sha256: string;
     }> = [];
+    const markdownBindings: GeneralChatAssistantArtifactBinding[] = [];
     for (const attachment of assistantAttachments(event)) {
       try {
         const artifact = await localizeArtifact({
@@ -1708,6 +1797,12 @@ async function persistProviderEvents(input: {
             bytes: artifact.sizeBytes,
             sha256: artifact.contentSha256,
           });
+          markdownBindings.push({
+            artifactId: artifact.id,
+            originalUrl: attachment.url,
+            filename: artifact.filename,
+            mimeType: artifact.mimeType,
+          });
         }
       } catch (error) {
         console.warn("[FrontMindV2] artifact localization deferred", {
@@ -1719,10 +1814,54 @@ async function persistProviderEvents(input: {
         });
       }
     }
+    const canonicalMarkdown = canonicalizeGeneralChatAssistantMarkdown(
+      assistantText(event),
+      markdownBindings,
+    );
+    const previousProviderEvent =
+      persistedRows.get(event.id)?.normalizedPayload ?? {};
+    const linkEvidenceChanged =
+      previousProviderEvent.text !== canonicalMarkdown.text ||
+      requestHash(previousProviderEvent.artifacts ?? []) !==
+        requestHash(localized);
+    if (
+      linkEvidenceChanged &&
+      (canonicalMarkdown.rewrittenCount > 0 ||
+        canonicalMarkdown.unresolvedCount > 0 ||
+        canonicalMarkdown.deduplicatedImageCount > 0)
+    ) {
+      console.info("[FrontMindV2] general-chat assistant links", {
+        localTaskId: input.task.id,
+        turnId: eventTurnState.assignments.get(event.id)?.id ?? null,
+        providerEventId: event.id,
+        rewrittenCount: canonicalMarkdown.rewrittenCount,
+        unresolvedCount: canonicalMarkdown.unresolvedCount,
+        deduplicatedImageCount: canonicalMarkdown.deduplicatedImageCount,
+        matchKinds: sortedUnique(canonicalMarkdown.matchKinds),
+        unresolvedKinds: sortedUnique(canonicalMarkdown.unresolvedKinds),
+        unresolvedReasons: sortedUnique(canonicalMarkdown.unresolvedReasons),
+        pathEvidence: [
+          ...canonicalMarkdown.matchedDestinations.map(
+            (destination, index) => ({
+              kind: canonicalMarkdown.matchKinds[index] ?? "unknown",
+              outcome: "matched",
+              hash: hash(destination),
+            }),
+          ),
+          ...canonicalMarkdown.unresolvedDestinations.map(
+            (destination, index) => ({
+              kind: canonicalMarkdown.unresolvedKinds[index] ?? "unknown",
+              outcome: canonicalMarkdown.unresolvedReasons[index] ?? "missing",
+              hash: hash(destination),
+            }),
+          ),
+        ],
+      });
+    }
     const normalizedPayload: Record<string, unknown> = {
       kind: "provider_event",
       type: event.type,
-      text: assistantText(event),
+      text: canonicalMarkdown.text,
       artifacts: localized,
       ...(providerEvidence.agentStatus
         ? {
@@ -1755,6 +1894,7 @@ async function persistProviderEvents(input: {
       event,
       normalizedPayload,
       projectionTurn: eventTurnState.assignments.get(event.id) ?? null,
+      canonicalText: canonicalMarkdown.text,
       localized,
     });
   }
@@ -1791,8 +1931,10 @@ async function cachedOutput(taskId: string) {
     turnIds.length
       ? db
           .select({
+            content: messages.content,
             metadata: messages.metadata,
             sequence: messages.sequence,
+            sentAt: messages.sentAt,
           })
           .from(messages)
           .where(
@@ -1805,8 +1947,17 @@ async function cachedOutput(taskId: string) {
           .orderBy(messages.sequence)
       : Promise.resolve([]),
   ]);
-  const visibleEventSequences = new Map<string, number>();
-  for (const { metadata, sequence } of projectedMessages) {
+  const visibleEventProjections = new Map<
+    string,
+    {
+      content: string;
+      messageId: string;
+      sentAtMs: number;
+      sequence: number;
+      generalChat: Record<string, unknown>;
+    }
+  >();
+  for (const { content, metadata, sequence, sentAt } of projectedMessages) {
     const generalChat =
       metadata?.generalChat &&
       typeof metadata.generalChat === "object" &&
@@ -1817,20 +1968,30 @@ async function cachedOutput(taskId: string) {
       generalChat?.serverOwned === true &&
       generalChat.kind === "assistant_projection" &&
       generalChat.agentTaskId === taskId &&
+      typeof generalChat.providerEventId === "string" &&
       typeof metadata?.upstreamOutputId === "string"
     ) {
-      visibleEventSequences.set(metadata.upstreamOutputId, sequence);
+      visibleEventProjections.set(metadata.upstreamOutputId, {
+        content,
+        messageId: generalChatAssistantPublicMessageId({
+          taskId,
+          providerEventId: generalChat.providerEventId,
+        }),
+        sentAtMs: sentAt.getTime(),
+        sequence,
+        generalChat,
+      });
     }
   }
   // Provider timestamps can collide. Durable conversation sequence is
   // assigned while walking Provider rank, so it is the authoritative DTO
   // order and remains stable when the same projection ID is restored.
   const visibleRows = rows
-    .filter((row) => visibleEventSequences.has(row.id))
+    .filter((row) => visibleEventProjections.has(row.id))
     .sort(
       (left, right) =>
-        visibleEventSequences.get(left.id)! -
-          visibleEventSequences.get(right.id)! ||
+        visibleEventProjections.get(left.id)!.sequence -
+          visibleEventProjections.get(right.id)!.sequence ||
         left.id.localeCompare(right.id),
     );
   return visibleRows.flatMap((row) => {
@@ -1838,8 +1999,9 @@ async function cachedOutput(taskId: string) {
     if (payload.kind !== "provider_event") {
       return [];
     }
+    const projection = visibleEventProjections.get(row.id)!;
     const content = [];
-    const text = typeof payload.text === "string" ? payload.text : "";
+    const text = projection.content;
     if (text) {
       content.push({ type: "output_text", text });
     }
@@ -1861,6 +2023,10 @@ async function cachedOutput(taskId: string) {
       ? [
           {
             id: row.id,
+            message_id: projection.messageId,
+            sent_at_ms: projection.sentAtMs,
+            server_sequence: projection.sequence,
+            general_chat: projection.generalChat,
             type: "message",
             role: "assistant",
             content,
@@ -4735,29 +4901,72 @@ router.post(
 );
 
 router.get("/artifacts/:artifactId/content", async (req, res) => {
+  let localTaskId: string | null = null;
+  let projectOwnership: "matched" | "denied_or_missing" = "denied_or_missing";
+  let contentPresent = false;
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
-    const row = (
+    const projectAssignmentId =
+      req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null;
+    const owned = (
       await (
         await requireDb()
       )
-        .select({ artifact: artifacts })
+        .select({
+          artifact: artifacts,
+          turnId: conversationTurns.id,
+          conversationId: conversations.id,
+        })
         .from(artifacts)
         .innerJoin(
           agentOperations,
-          eq(artifacts.operationId, agentOperations.id),
-        )
-        .where(
           and(
-            eq(artifacts.id, req.params.artifactId),
+            eq(artifacts.operationId, agentOperations.id),
             eq(agentOperations.scope, "managed_user"),
             eq(agentOperations.accountUserId, req.frontmindUser.id),
           ),
         )
+        .innerJoin(
+          agentTasks,
+          and(
+            eq(artifacts.taskId, agentTasks.id),
+            eq(agentTasks.operationId, agentOperations.id),
+          ),
+        )
+        .innerJoin(
+          conversationTurns,
+          and(
+            eq(conversationTurns.upstreamTaskId, agentTasks.id),
+            eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE),
+            eq(conversationTurns.userId, req.frontmindUser.id),
+          ),
+        )
+        .innerJoin(
+          conversations,
+          and(
+            eq(conversations.id, conversationTurns.conversationId),
+            eq(conversations.userId, req.frontmindUser.id),
+            projectAssignmentId
+              ? eq(conversations.projectAssignmentId, projectAssignmentId)
+              : isNull(conversations.projectAssignmentId),
+            isNull(conversations.deletedAt),
+          ),
+        )
+        .where(
+          and(
+            eq(artifacts.id, req.params.artifactId),
+            eq(artifacts.validationState, "valid"),
+          ),
+        )
         .limit(1)
-    )[0]?.artifact;
+    )[0];
+    const row = owned?.artifact;
+    localTaskId = row?.taskId ?? null;
+    projectOwnership = row ? "matched" : "denied_or_missing";
     const stored = row ? await readStoredPresalesFile(row.id) : null;
+    contentPresent = Boolean(stored);
     if (!row || !stored) throw new ChatV2HttpError("ARTIFACT_NOT_FOUND", 404);
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.setHeader("Content-Type", row.mimeType);
     res.setHeader("Content-Length", String(row.sizeBytes));
     res.setHeader("ETag", `\"sha256:${row.contentSha256}\"`);
@@ -4765,8 +4974,29 @@ router.get("/artifacts/:artifactId/content", async (req, res) => {
       "Content-Disposition",
       `attachment; filename*=UTF-8''${encodeURIComponent(row.filename)}`,
     );
+    console.info("[FrontMindV2] general-chat artifact download", {
+      artifactId: req.params.artifactId,
+      localTaskId,
+      projectOwnership,
+      contentPresent,
+      status: 200,
+      bytes: row.sizeBytes,
+    });
     stored.createReadStream().pipe(res);
   } catch (error) {
+    console.info("[FrontMindV2] general-chat artifact download", {
+      artifactId: req.params.artifactId,
+      localTaskId,
+      projectOwnership,
+      contentPresent,
+      status:
+        error instanceof ChatV2HttpError
+          ? error.statusCode
+          : error instanceof OwnedFileContentError
+            ? error.statusCode
+            : 500,
+      bytes: 0,
+    });
     sendError(res, error);
   }
 });

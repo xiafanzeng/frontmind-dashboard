@@ -481,6 +481,48 @@ type Action =
     }
   | { type: "LOAD_STATE"; payload: ConversationState };
 
+function generalChatProjectionIdentity(message: LocalMessage) {
+  if (message.generalChat?.serverOwned) {
+    return `${message.generalChat.turnId}\0${message.generalChat.providerEventId}`;
+  }
+  return message.upstreamOutputId || message.id || "";
+}
+
+function generalChatProjectionSemanticallyEqual(
+  left: LocalMessage,
+  right: LocalMessage,
+) {
+  const semanticProjection = (message: LocalMessage) => ({
+    role: message.role,
+    content: message.content,
+    outputFiles: message.outputFiles,
+    inlineImages: message.inlineImages,
+    intermediateSteps: message.intermediateSteps,
+    stepGroups: message.stepGroups,
+    isStepsPlaceholder: message.isStepsPlaceholder,
+    elapsedTime: message.elapsedTime,
+    responseStartedAt: message.responseStartedAt,
+    modelName: message.modelName,
+    upstreamOutputId: message.upstreamOutputId,
+    serverSequence: message.serverSequence,
+    generalChat: message.generalChat,
+  });
+  return (
+    JSON.stringify(semanticProjection(left)) ===
+    JSON.stringify(semanticProjection(right))
+  );
+}
+
+function sameMessageReferences(
+  left: readonly LocalMessage[],
+  right: readonly LocalMessage[],
+) {
+  return (
+    left.length === right.length &&
+    left.every((message, index) => message === right[index])
+  );
+}
+
 function conversationReducer(
   state: ConversationState,
   action: Action,
@@ -524,104 +566,145 @@ function conversationReducer(
       };
     }
     case "UPDATE_STATUS": {
-      return {
-        ...state,
-        conversations: state.conversations.map((c) =>
-          c.id === action.payload.conversationId
-            ? {
-                ...c,
-                status: action.payload.status,
-                taskId: action.payload.clearTaskPointer
-                  ? undefined
-                  : (action.payload.taskId ?? c.taskId),
-                // Provider task/share navigation URLs are never conversation
-                // state. Older hydrated values are removed on the next write.
-                taskUrl: undefined,
-                previousResponseId: action.payload.clearTaskPointer
-                  ? undefined
-                  : (action.payload.previousResponseId ?? c.previousResponseId),
-                executionKind: action.payload.executionKind ?? c.executionKind,
-                startedAt: action.payload.startedAt ?? c.startedAt,
-                completedAt:
-                  action.payload.completedAt !== undefined
-                    ? action.payload.completedAt
-                    : (action.payload.status === "running" ||
-                          action.payload.status === "pending") &&
-                        action.payload.startedAt !== undefined
-                      ? undefined
-                      : c.completedAt,
-                lastKnownOutputLength:
-                  action.payload.lastKnownOutputLength ??
-                  c.lastKnownOutputLength,
-                updatedAt: Date.now(),
-              }
-            : c,
-        ),
-      };
+      let changed = false;
+      const conversations = state.conversations.map((c) => {
+        if (c.id !== action.payload.conversationId) return c;
+        const next = {
+          ...c,
+          status: action.payload.status,
+          taskId: action.payload.clearTaskPointer
+            ? undefined
+            : (action.payload.taskId ?? c.taskId),
+          // Provider task/share navigation URLs are never conversation
+          // state. Older hydrated values are removed on the next write.
+          taskUrl: undefined,
+          previousResponseId: action.payload.clearTaskPointer
+            ? undefined
+            : (action.payload.previousResponseId ?? c.previousResponseId),
+          executionKind: action.payload.executionKind ?? c.executionKind,
+          startedAt: action.payload.startedAt ?? c.startedAt,
+          completedAt:
+            action.payload.completedAt !== undefined
+              ? action.payload.completedAt
+              : (action.payload.status === "running" ||
+                    action.payload.status === "pending") &&
+                  action.payload.startedAt !== undefined
+                ? undefined
+                : c.completedAt,
+          lastKnownOutputLength:
+            action.payload.lastKnownOutputLength ?? c.lastKnownOutputLength,
+        };
+        if (
+          next.status === c.status &&
+          next.taskId === c.taskId &&
+          next.previousResponseId === c.previousResponseId &&
+          next.executionKind === c.executionKind &&
+          next.startedAt === c.startedAt &&
+          next.completedAt === c.completedAt &&
+          next.lastKnownOutputLength === c.lastKnownOutputLength &&
+          c.taskUrl === undefined
+        ) {
+          return c;
+        }
+        changed = true;
+        return { ...next, updatedAt: Date.now() };
+      });
+      return changed ? { ...state, conversations } : state;
     }
     case "UPDATE_ASSISTANT_MESSAGES": {
-      return {
-        ...state,
-        conversations: state.conversations.map((c) => {
-          if (c.id !== action.payload.conversationId) return c;
-          if (
-            c.knowledgeBase?.initialized ||
-            hasServerOwnedKnowledgeBaseMessages(c)
-          ) {
-            return c;
+      let changed = false;
+      const conversations = state.conversations.map((c) => {
+        if (c.id !== action.payload.conversationId) return c;
+        if (
+          c.knowledgeBase?.initialized ||
+          hasServerOwnedKnowledgeBaseMessages(c)
+        ) {
+          return c;
+        }
+
+        // Find the index of the last user message.
+        // All assistant messages after it belong to the current turn and will be
+        // REPLACED by the incoming (authoritative) set from parseOutputMessages.
+        const messages = [...c.messages];
+        let lastUserIdx = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === "user") {
+            lastUserIdx = i;
+            break;
           }
+        }
 
-          // Find the index of the last user message.
-          // All assistant messages after it belong to the current turn and will be
-          // REPLACED by the incoming (authoritative) set from parseOutputMessages.
-          const messages = [...c.messages];
-          let lastUserIdx = -1;
-          for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i].role === "user") {
-              lastUserIdx = i;
-              break;
-            }
-          }
-
-          // Keep everything up to and including the last user message.
-          const kept = messages.slice(0, lastUserIdx + 1);
-          // Terminal notices are local state about settlement, not Provider
-          // projection rows. Empty/ambiguous output must clear the latter
-          // without deleting the former.
-          const terminalNotices = messages
-            .slice(lastUserIdx + 1)
-            .filter((message) =>
-              message.id.startsWith(GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX),
-            );
-
-          // Only filter out messages that were manually deleted by the user
-          const deletedIds = new Set(c.deletedMessageIds || []);
-
-          const newMessages = action.payload.messages.filter((m) => {
-            // Skip messages that were manually deleted
-            if (m.id && deletedIds.has(m.id)) return false;
-            // Steps placeholders always pass through (they get replaced each poll)
-            if (m.isStepsPlaceholder) return true;
-            return true;
-          });
-          const incomingIds = new Set(newMessages.map((message) => message.id));
-          const preservedTerminalNotices = terminalNotices.filter(
-            (message) => !incomingIds.has(message.id),
+        // Keep everything up to and including the last user message.
+        const kept = messages.slice(0, lastUserIdx + 1);
+        // Terminal notices are local state about settlement, not Provider
+        // projection rows. Empty/ambiguous output must clear the latter
+        // without deleting the former.
+        const terminalNotices = messages
+          .slice(lastUserIdx + 1)
+          .filter((message) =>
+            message.id.startsWith(GENERAL_CHAT_TERMINAL_MESSAGE_ID_PREFIX),
           );
 
-          // Provider output IDs can be reused across two user turns. Preserve
-          // both turns and deterministically disambiguate the local/database ID.
-          return {
-            ...c,
-            messages: repairConversationMessageIds([
-              ...kept,
-              ...newMessages,
-              ...preservedTerminalNotices,
-            ]),
-            updatedAt: Date.now(),
-          };
-        }),
-      };
+        // Only filter out messages that were manually deleted by the user
+        const deletedIds = new Set(c.deletedMessageIds || []);
+
+        let newMessages = action.payload.messages.filter((m) => {
+          // Skip messages that were manually deleted
+          if (m.id && deletedIds.has(m.id)) return false;
+          // Steps placeholders always pass through (they get replaced each poll)
+          if (m.isStepsPlaceholder) return true;
+          return true;
+        });
+
+        if (c.executionKind === "general_chat_v2") {
+          const currentTurnMessages = messages.slice(lastUserIdx + 1);
+          const currentByIdentity = new Map(
+            currentTurnMessages
+              .map(
+                (message) =>
+                  [generalChatProjectionIdentity(message), message] as const,
+              )
+              .filter((entry): entry is readonly [string, LocalMessage] =>
+                Boolean(entry[0]),
+              ),
+          );
+          newMessages = newMessages.map((incoming) => {
+            const identity = generalChatProjectionIdentity(incoming);
+            const existing = identity
+              ? currentByIdentity.get(identity)
+              : undefined;
+            if (!existing) return incoming;
+            const stabilized = {
+              ...incoming,
+              id: existing.id,
+              timestamp: existing.timestamp,
+            };
+            return generalChatProjectionSemanticallyEqual(existing, stabilized)
+              ? existing
+              : stabilized;
+          });
+        }
+        const incomingIds = new Set(newMessages.map((message) => message.id));
+        const preservedTerminalNotices = terminalNotices.filter(
+          (message) => !incomingIds.has(message.id),
+        );
+
+        // Provider output IDs can be reused across two user turns. Preserve
+        // both turns and deterministically disambiguate the local/database ID.
+        const nextMessages = repairConversationMessageIds([
+          ...kept,
+          ...newMessages,
+          ...preservedTerminalNotices,
+        ]);
+        if (sameMessageReferences(messages, nextMessages)) return c;
+        changed = true;
+        return {
+          ...c,
+          messages: nextMessages,
+          updatedAt: Date.now(),
+        };
+      });
+      return changed ? { ...state, conversations } : state;
     }
     case "SETTLE_GENERAL_CHAT_DISPATCH": {
       return {
@@ -2265,7 +2348,9 @@ export function ConversationProvider({
 
   const commit = useCallback(
     (action: Action, conversationIdsToSync: string[] = []) => {
-      const nextState = conversationReducer(stateRef.current, action);
+      const currentState = stateRef.current;
+      const nextState = conversationReducer(currentState, action);
+      if (nextState === currentState) return;
       replaceState(nextState);
 
       if (!canSyncRef.current) return;
@@ -2748,12 +2833,18 @@ export function ConversationProvider({
 
   const updateAssistantMessages = useCallback(
     (conversationId: string, messages: LocalMessage[]) => {
+      const conversation = stateRef.current.conversations.find(
+        (candidate) => candidate.id === conversationId,
+      );
+      const serverOwnedGeneralChatProjection =
+        conversation?.executionKind === "general_chat_v2" &&
+        messages.every(isServerOwnedGeneralChatMessage);
       commit(
         {
           type: "UPDATE_ASSISTANT_MESSAGES",
           payload: { conversationId, messages },
         },
-        [conversationId],
+        serverOwnedGeneralChatProjection ? [] : [conversationId],
       );
     },
     [commit],
@@ -3307,6 +3398,27 @@ function isImageOutputResource(input: {
   );
 }
 
+function outputMessageIdentity(message: OutputMessage) {
+  const canonical =
+    typeof message.message_id === "string" ? message.message_id.trim() : "";
+  return canonical || message.id || undefined;
+}
+
+function outputMessageTimestamp(message: OutputMessage) {
+  const sentAt = Number(message.sent_at_ms);
+  return Number.isFinite(sentAt) && sentAt > 0 ? sentAt : Date.now();
+}
+
+function outputMessageProjectionMetadata(message: OutputMessage) {
+  const generalChat = message.general_chat;
+  return {
+    ...(generalChat?.serverOwned === true ? { generalChat } : {}),
+    ...(Number.isSafeInteger(message.server_sequence)
+      ? { serverSequence: message.server_sequence }
+      : {}),
+  };
+}
+
 /**
  * Parse FrontMind API output messages into local messages
  * Handles both OpenAI Responses API format and native FrontMind API format.
@@ -3442,12 +3554,13 @@ function _parseOutputMessagesInner(
         });
         messages.push({
           id:
-            msg.id ||
+            outputMessageIdentity(msg) ||
             `msg-file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           ...(msg.id ? { upstreamOutputId: msg.id } : {}),
           role: "assistant",
           content: "",
-          timestamp: Date.now(),
+          timestamp: outputMessageTimestamp(msg),
+          ...outputMessageProjectionMetadata(msg),
           ...(image
             ? {
                 inlineImages: [
@@ -3628,7 +3741,7 @@ function _parseOutputMessagesInner(
       ) {
         messages.push({
           id:
-            msg.id ||
+            outputMessageIdentity(msg) ||
             `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           ...(msg.id ? { upstreamOutputId: msg.id } : {}),
           role: "assistant",
@@ -3636,7 +3749,8 @@ function _parseOutputMessagesInner(
             textParts.length > 0
               ? sanitizeBrandText(textParts.join("\n\n"))
               : "",
-          timestamp: Date.now(),
+          timestamp: outputMessageTimestamp(msg),
+          ...outputMessageProjectionMetadata(msg),
           outputFiles:
             files.length > 0
               ? files.map((f) => ({

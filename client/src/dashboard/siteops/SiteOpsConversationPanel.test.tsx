@@ -210,7 +210,52 @@ describe("SiteOpsConversationPanel", () => {
     });
   });
 
-  it("accepts the public retry action and both V5 and V6 failure categories", () => {
+  it("uses the concise static catalog entry label", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          serviceReadiness: {
+            visuals: { status: "not_configured" },
+            website: { status: "configured" },
+            publishing: { status: "configured" },
+            domain: { status: "not_configured" },
+          },
+          project: {
+            ...observation().project,
+            status: "collecting_brief",
+          },
+          interactionState: "collecting_brief",
+          visualCandidates: [],
+          visualCandidatePages: [],
+          visualGeneration: {
+            status: "idle",
+            targetPage: null,
+            generatedPages: 0,
+            availablePages: 4,
+            reservedPages: 0,
+            maxPages: 4,
+            canGenerateMore: false,
+            canSelectExisting: false,
+            retryAction: null,
+            failureCategory: null,
+            workflowVersion: "2.8.0",
+            catalogVersion: "twenty-first-static-32-v1",
+            pageSize: 8,
+            pageCount: 4,
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "查看建站模板" })).toBeEnabled();
+    expect(screen.queryByText(/视觉参考服务尚未配置/u)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /查看 32 个 Template/u }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("accepts the public retry action and compatible visual failure categories", () => {
     expect(
       siteOpsVisualGenerationProjectionSchema.parse({
         status: "retryable_error",
@@ -255,6 +300,19 @@ describe("SiteOpsConversationPanel", () => {
         failureCategory: "source_incomplete",
       }),
     ).toMatchObject({ failureCategory: "source_incomplete" });
+
+    expect(
+      siteOpsVisualGenerationProjectionSchema.parse({
+        status: "retryable_error",
+        targetPage: null,
+        generatedPages: 0,
+        maxPages: 4,
+        canGenerateMore: false,
+        canSelectExisting: false,
+        retryAction: "start",
+        failureCategory: "persistence_failed",
+      }),
+    ).toMatchObject({ failureCategory: "persistence_failed" });
   });
 
   it("binds visual page cardinality to the projected workflow version", () => {
@@ -1000,9 +1058,8 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
-  it("surfaces a 2.8 local catalog failure with refresh and reset but never supplemental generation", async () => {
+  it("surfaces a 2.8 local catalog failure with a local-only retry", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
-    const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -1038,19 +1095,18 @@ describe("SiteOpsConversationPanel", () => {
           },
         })}
         onAction={onAction}
-        onRefresh={onRefresh}
       />,
     );
 
     expect(
       screen.getByRole("heading", {
-        name: "固定 Template 目录暂时不可用",
+        name: "建站模板目录暂时不可用",
       }),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/本地资产尚未就绪或未通过完整性校验/u),
     ).toBeInTheDocument();
-    expect(screen.getByText(/不会在线生成补充候选/u)).toBeInTheDocument();
+    expect(screen.getByText(/刷新页面只会更新当前状态/u)).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /重新生成 9 个/u }),
     ).not.toBeInTheDocument();
@@ -1058,17 +1114,60 @@ describe("SiteOpsConversationPanel", () => {
       screen.queryByRole("button", { name: /下一组 9 个/u }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "刷新固定 Template 目录" }),
+    fireEvent.click(screen.getByRole("button", { name: "重新载入建站模板" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "reselect_visual",
+        input: {},
+      }),
     );
-    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
-    expect(onAction).not.toHaveBeenCalled();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "提交官网重置申请" }));
+  it("labels a 2.8 persistence failure without blaming local catalog assets", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "attention_required",
+          },
+          interactionState: "attention_required",
+          visualCandidates: [],
+          visualCandidatePages: [],
+          visualGeneration: {
+            status: "retryable_error",
+            targetPage: null,
+            generatedPages: 0,
+            availablePages: 0,
+            reservedPages: 0,
+            maxPages: 4,
+            canGenerateMore: false,
+            canSelectExisting: false,
+            retryAction: "start",
+            failureCategory: "persistence_failed",
+            workflowVersion: "2.8.0",
+            catalogVersion: "twenty-first-static-32-v1",
+            pageSize: 8,
+            pageCount: 4,
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
     expect(
-      screen.getByRole("heading", { name: "申请重置并全新开始" }),
+      screen.getByRole("heading", { name: "建站模板列表保存失败" }),
     ).toBeInTheDocument();
-    expect(onAction).not.toHaveBeenCalled();
+    expect(screen.getByText(/建站模板资产已经就绪/u)).toBeInTheDocument();
+    expect(screen.getByText(/无需重置知识库/u)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重新载入建站模板" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "reselect_visual",
+        input: {},
+      }),
+    );
   });
 
   it("switches to a newly completed visual page and unlocks its candidates", () => {

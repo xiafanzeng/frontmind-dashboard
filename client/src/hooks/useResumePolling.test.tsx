@@ -149,6 +149,31 @@ describe("useResumePolling ordinary-task boundary", () => {
     );
   });
 
+  it("never probes knowledge-base progress for a known general-chat v2 conversation", async () => {
+    mocks.hydrated = true;
+    mocks.conversations[0] = {
+      ...mocks.conversations[0],
+      executionKind: "general_chat_v2",
+    };
+
+    renderHook(() => useResumePolling());
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+
+    expect(mocks.fetchKnowledgeBaseProgress).not.toHaveBeenCalled();
+    expect(mocks.retrieveTask).toHaveBeenCalledWith("task-1");
+  });
+
+  it("performs the legacy identity compatibility probe only once after a negative result", async () => {
+    mocks.hydrated = true;
+
+    renderHook(() => useResumePolling());
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+
+    expect(mocks.retrieveTask).toHaveBeenCalledTimes(2);
+    expect(mocks.fetchKnowledgeBaseProgress).toHaveBeenCalledTimes(1);
+  });
+
   it("applies an empty authoritative projection so an ambiguous current turn is hidden", async () => {
     mocks.hydrated = true;
     mocks.conversations[0] = {

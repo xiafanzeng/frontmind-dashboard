@@ -541,10 +541,58 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
       serverSource.indexOf("async function taskDto"),
       serverSource.indexOf("async function updateTaskState"),
     );
-    expect(outputSource).toContain("visibleEventSequences");
+    expect(outputSource).toContain("visibleEventProjections");
     expect(outputSource).toContain(".orderBy(messages.sequence)");
+    expect(outputSource).toContain("message_id: projection.messageId");
+    expect(outputSource).toContain("sent_at_ms: projection.sentAtMs");
+    expect(outputSource).toContain("server_sequence: projection.sequence");
+    expect(outputSource).toContain("general_chat: projection.generalChat");
     expect(dtoSource).toContain('status === "error" && operation.errorCode');
     expect(dtoSource).toContain("GENERAL_CHAT_PARTIAL_RESULT_ERROR_CODE");
     expect(dtoSource).toContain("partialResult: true");
+  });
+
+  it("canonicalizes assistant links before persisting either Provider events or server-owned messages", () => {
+    const persistSource = serverSource.slice(
+      serverSource.indexOf("async function persistProviderEvents"),
+      serverSource.indexOf("async function cachedOutput"),
+    );
+    const projectionSource = serverSource.slice(
+      serverSource.indexOf("async function persistAssistantProjection"),
+      serverSource.indexOf("const providerAttachmentEvidenceInFlight"),
+    );
+    expect(persistSource).toContain(
+      "canonicalizeGeneralChatAssistantMarkdown(",
+    );
+    expect(persistSource).toContain("text: canonicalMarkdown.text");
+    expect(persistSource).toContain("canonicalText: canonicalMarkdown.text");
+    expect(projectionSource).toContain("content: input.text");
+    expect(projectionSource).toContain("logGeneralChatAssistantProjection({");
+    expect(serverSource).toContain(
+      "[FrontMindV2] general-chat assistant projection",
+    );
+  });
+
+  it("authorizes artifact downloads through the ordinary-chat task, turn, conversation and selected project", () => {
+    const routeSource = serverSource.slice(
+      serverSource.indexOf(
+        'router.get("/artifacts/:artifactId/content", async (req, res) =>',
+      ),
+      serverSource.indexOf("export default router"),
+    );
+    expect(routeSource).toContain(".innerJoin(\n          agentTasks");
+    expect(routeSource).toContain(".innerJoin(\n          conversationTurns");
+    expect(routeSource).toContain(".innerJoin(\n          conversations");
+    expect(routeSource).toContain(
+      "eq(conversationTurns.operationType, GENERAL_CHAT_TURN_TYPE)",
+    );
+    expect(routeSource).toContain(
+      "eq(conversations.projectAssignmentId, projectAssignmentId)",
+    );
+    expect(routeSource).toContain("isNull(conversations.projectAssignmentId)");
+    expect(routeSource).toContain('"ARTIFACT_NOT_FOUND", 404');
+    expect(routeSource).toContain(
+      "[FrontMindV2] general-chat artifact download",
+    );
   });
 });

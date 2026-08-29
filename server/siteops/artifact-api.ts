@@ -16,10 +16,6 @@ import { getDb } from "../db";
 import { readSiteOpsArtifact } from "./artifact-store";
 import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
 import { completeSiteOpsAliyunOAuth } from "./service";
-import {
-  StaticTemplateCatalogError,
-  openStaticTemplateCatalogVersionPreview,
-} from "./static-template-catalog";
 import { customerVisibleStyleBatchStatusCondition } from "./visual-batch-visibility";
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
@@ -618,6 +614,35 @@ async function sendOwnedAsset(input: {
   asset.stored.createReadStream().pipe(input.res);
 }
 
+const FAIL_CLOSED_ARTIFACT_ERRORS = new Set([
+  "SITEOPS_ARTIFACT_BODY_MISMATCH",
+  "SITEOPS_ARTIFACT_HASH_MISMATCH",
+  "SITEOPS_ARTIFACT_MIME_MISMATCH",
+]);
+
+async function sendOwnedStylePreview(input: {
+  res: express.Response;
+  userId: number;
+  localAssetId: string;
+  expectedSha256?: string | null;
+  expectedMimeTypes: string[];
+}) {
+  try {
+    await sendOwnedAsset({
+      ...input,
+      disposition: "inline",
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      FAIL_CLOSED_ARTIFACT_ERRORS.has(error.message)
+    ) {
+      return notFound(input.res);
+    }
+    throw error;
+  }
+}
+
 export const siteOpsArtifactApi = express.Router();
 
 const STYLE_PREVIEW_MIME_TYPES = [
@@ -866,6 +891,7 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       const catalogVersion = nonEmptyString(metadata.catalogVersion);
       const candidateId = nonEmptyString(metadata.catalogCandidateId);
       const previewAssetId = nonEmptyString(metadata.previewAssetId);
+      const previewLocalAssetId = nonEmptyString(metadata.previewLocalAssetId);
       const previewSha256 = normalizedSha256(metadata.previewSha256);
       const previewMimeType = nonEmptyString(metadata.previewMimeType);
       const providerTemplateId = nonEmptyString(metadata.providerTemplateId);
@@ -877,12 +903,15 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       const catalogPosition = Number(metadata.catalogPosition);
       const previewWidth = Number(metadata.previewWidth);
       const previewHeight = Number(metadata.previewHeight);
+      const rowLocalAssetId = nonEmptyString(row?.localAssetId);
       if (
-        row?.localAssetId !== null ||
         metadata.workflowVersion !== "2.8.0" ||
         !catalogVersion ||
         !candidateId ||
         !previewAssetId ||
+        !previewLocalAssetId ||
+        !rowLocalAssetId ||
+        rowLocalAssetId !== previewLocalAssetId ||
         !previewSha256 ||
         !previewMimeType ||
         !STYLE_PREVIEW_MIME_TYPES.includes(
@@ -898,51 +927,17 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       ) {
         return notFound(res);
       }
-      let opened: Awaited<
-        ReturnType<typeof openStaticTemplateCatalogVersionPreview>
-      >;
-      try {
-        opened = await openStaticTemplateCatalogVersionPreview(
-          catalogVersion,
-          candidateId,
-        );
-      } catch (error) {
-        if (error instanceof StaticTemplateCatalogError) {
-          return notFound(res);
-        }
-        throw error;
-      }
-      if (
-        opened.entry.order !== catalogPosition ||
-        opened.entry.providerTemplateId !== providerTemplateId ||
-        opened.entry.providerSlug !== providerSlug ||
-        opened.entry.sourceAssetId !== sourceAssetId ||
-        opened.entry.previewAssetId !== previewAssetId ||
-        opened.entry.previewSha256 !== previewSha256 ||
-        opened.entry.previewMimeType !== previewMimeType ||
-        opened.entry.previewWidth !== previewWidth ||
-        opened.entry.previewHeight !== previewHeight ||
-        opened.entry.sourceSha256 !== sourceArchiveSha256
-      ) {
-        opened.stream.destroy();
-        return notFound(res);
-      }
-      res.setHeader("Cache-Control", "private, no-store, max-age=0");
-      res.setHeader("Content-Type", opened.entry.previewMimeType);
-      res.setHeader("Content-Length", String(opened.entry.previewBytes));
-      res.setHeader("ETag", `"sha256:${opened.entry.previewSha256}"`);
-      res.setHeader(
-        "Content-Disposition",
-        `inline; filename*=UTF-8''${encodeURIComponent(`${candidateId}.${opened.entry.previewMimeType.split("/")[1]}`)}`,
-      );
-      opened.stream.once("error", () => {
-        if (!res.headersSent) {
-          notFound(res);
-          return;
-        }
-        res.destroy();
+      // The immutable catalog coordinates were independently verified before
+      // this managed-user mirror was bound. Serving must now depend only on
+      // the frozen row/metadata coordinate and the mirrored bytes, otherwise
+      // a later catalog mount change would break an already published board.
+      await sendOwnedStylePreview({
+        res,
+        userId,
+        localAssetId: rowLocalAssetId,
+        expectedSha256: previewSha256,
+        expectedMimeTypes: [previewMimeType],
       });
-      opened.stream.pipe(res);
       return;
     }
     const localAssetId = row?.localAssetId;
@@ -950,13 +945,12 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       ? frozenStylePreviewSha256(localAssetId, row?.sourceMetadata)
       : { valid: false as const, value: undefined };
     if (!localAssetId || !expectedHash.valid) return notFound(res);
-    await sendOwnedAsset({
+    await sendOwnedStylePreview({
       res,
       userId,
       localAssetId,
       expectedSha256: expectedHash.value,
       expectedMimeTypes: [...STYLE_PREVIEW_MIME_TYPES],
-      disposition: "inline",
     });
   } catch (error) {
     sendError(res, error);

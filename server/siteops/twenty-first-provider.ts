@@ -97,7 +97,9 @@ import {
   STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
   STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
   STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
-  requireActiveStaticTemplateCatalog,
+  StaticTemplateCatalogError,
+  readStaticTemplateCatalogVersionPreview,
+  requireStaticTemplateCatalogVersion,
   type StaticTemplateCatalog,
 } from "./static-template-catalog";
 import { registerSiteOpsProviderHandler } from "./providers";
@@ -247,6 +249,7 @@ type StaticTemplateBoardCandidate = {
   sourceArchiveSha256: string;
   sourceArchiveBytes: number;
   previewAssetId: string;
+  previewLocalAssetId: string;
   previewSha256: string;
   previewMimeType: "image/avif" | "image/jpeg" | "image/png" | "image/webp";
   previewWidth: number;
@@ -475,7 +478,10 @@ export type TwentyFirstProviderDependencies = {
     db: any,
     input: TwentyFirstBoardPersistenceInput,
   ) => Promise<ExistingBoard>;
-  loadStaticTemplateCatalog?: () => Promise<StaticTemplateCatalog>;
+  loadStaticTemplateCatalog?: (
+    catalogVersion: string,
+  ) => Promise<StaticTemplateCatalog>;
+  readStaticTemplateCatalogPreview?: typeof readStaticTemplateCatalogVersionPreview;
   persistStaticTemplateCatalogBoards?: (
     db: any,
     input: StaticTemplateCatalogBoardsPersistenceInput,
@@ -501,6 +507,7 @@ class TwentyFirstProviderFailure extends Error {
     public readonly code: string,
     message: string,
     public readonly status: "failed" | "attention_required" = "failed",
+    public readonly diagnosticCause?: unknown,
   ) {
     super(message);
     this.name = "TwentyFirstProviderFailure";
@@ -2241,6 +2248,36 @@ function sha256Buffer(buffer: Buffer) {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
+function deterministicSiteOpsUuid(value: string) {
+  const bytes = createHash("sha256")
+    .update(value, "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function staticTemplateSampleId(input: {
+  operationId: string;
+  pageNumber: number;
+  candidateId: string;
+}) {
+  return deterministicSiteOpsUuid(
+    `frontmind.siteops.static-template-sample.v1\0${input.operationId}\0${input.pageNumber}\0${input.candidateId}`,
+  );
+}
+
+function staticTemplateBatchId(input: {
+  operationId: string;
+  pageNumber: number;
+}) {
+  return deterministicSiteOpsUuid(
+    `frontmind.siteops.static-template-batch.v1\0${input.operationId}\0${input.pageNumber}`,
+  );
+}
+
 async function perceptualHash64(buffer: Buffer) {
   const { data, info } = await sharp(buffer)
     .removeAlpha()
@@ -3045,7 +3082,7 @@ async function persistDefaultBoard(
   });
 }
 
-async function persistDefaultStaticTemplateCatalogBoards(
+export async function persistDefaultStaticTemplateCatalogBoards(
   db: any,
   input: StaticTemplateCatalogBoardsPersistenceInput,
 ) {
@@ -3168,7 +3205,10 @@ async function persistDefaultStaticTemplateCatalogBoards(
       for (const page of [...input.pages].sort(
         (left, right) => left.pageNumber - right.pageNumber,
       )) {
-        const batchId = randomUUID();
+        const batchId = staticTemplateBatchId({
+          operationId: input.operation.id,
+          pageNumber: page.pageNumber,
+        });
         batchIds.push(batchId);
         await tx.insert(websiteStyleSampleBatches).values({
           id: batchId,
@@ -3189,7 +3229,7 @@ async function persistDefaultStaticTemplateCatalogBoards(
             id: candidate.sampleId,
             batchId,
             attachmentId: null,
-            previewLocalAssetId: null,
+            previewLocalAssetId: candidate.previewLocalAssetId,
             sourceMetadata: {
               schemaVersion: 7,
               renderer: "frontmind_static_template_catalog_v1" as const,
@@ -3210,6 +3250,7 @@ async function persistDefaultStaticTemplateCatalogBoards(
               sourceArchiveSha256: candidate.sourceArchiveSha256,
               sourceArchiveBytes: candidate.sourceArchiveBytes,
               previewAssetId: candidate.previewAssetId,
+              previewLocalAssetId: candidate.previewLocalAssetId,
               previewSha256: candidate.previewSha256,
               previewMimeType: candidate.previewMimeType,
               previewWidth: candidate.previewWidth,
@@ -3330,6 +3371,14 @@ function safeProviderFailure(
       result: diagnostics,
     };
   }
+  if (error instanceof StaticTemplateCatalogError) {
+    return {
+      status: "attention_required",
+      code: error.code,
+      message: "冻结的建站模板目录版本无法读取或完整性校验失败。",
+      result: diagnostics,
+    };
+  }
   if (error instanceof z.ZodError) {
     if (stage !== "validate_operation" && stage !== "load_context") {
       return {
@@ -3392,6 +3441,58 @@ function safeProviderFailure(
   };
 }
 
+function safePersistenceErrorDetails(error: unknown, stage: VisualSearchStage) {
+  if (
+    stage !== "mirror_previews" &&
+    stage !== "persist_selection_bundle" &&
+    stage !== "persist_board"
+  ) {
+    return {};
+  }
+  if (
+    (error instanceof TwentyFirstProviderFailure && !error.diagnosticCause) ||
+    error instanceof StaticTemplateCatalogError
+  ) {
+    return {};
+  }
+  const candidate =
+    error instanceof TwentyFirstProviderFailure && error.diagnosticCause
+      ? error.diagnosticCause
+      : error;
+  if (!candidate || typeof candidate !== "object") return {};
+  const record = candidate as Record<string, unknown>;
+  const driverCode =
+    typeof record.code === "string" &&
+    /^[A-Z][A-Z0-9_]{1,63}$/u.test(record.code)
+      ? record.code
+      : null;
+  const sqlState =
+    typeof record.sqlState === "string" &&
+    /^[0-9A-Z]{5}$/u.test(record.sqlState)
+      ? record.sqlState
+      : null;
+  const explicitConstraint =
+    typeof record.constraint === "string" &&
+    /^[A-Za-z0-9_]{1,128}$/u.test(record.constraint)
+      ? record.constraint
+      : null;
+  const safeMessage = typeof record.message === "string" ? record.message : "";
+  const extractedConstraint =
+    explicitConstraint ??
+    /\bconstraint\s+['`"]([A-Za-z0-9_]{1,128})['`"](?:\s|$)/iu.exec(
+      safeMessage,
+    )?.[1] ??
+    null;
+  return {
+    ...(driverCode ? { driverCode } : {}),
+    ...(sqlState ? { sqlState } : {}),
+    ...(extractedConstraint ? { constraint: extractedConstraint } : {}),
+    ...(stage === "persist_board"
+      ? { transactionOutcome: "rolled_back_or_not_started" as const }
+      : {}),
+  };
+}
+
 async function assertCommitLeaseActive(
   assertLeaseActive: (() => Promise<void>) | undefined,
 ) {
@@ -3410,11 +3511,18 @@ async function mapWithBoundedConcurrency<T, R>(input: {
 }) {
   const results = new Array<R>(input.values.length);
   let cursor = 0;
+  let failed = false;
+  let firstFailure: unknown;
   const worker = async () => {
-    while (cursor < input.values.length) {
+    while (!failed && cursor < input.values.length) {
       const index = cursor;
       cursor += 1;
-      results[index] = await input.map(input.values[index]!, index);
+      try {
+        results[index] = await input.map(input.values[index]!, index);
+      } catch (error) {
+        if (!failed) firstFailure = error;
+        failed = true;
+      }
     }
   };
   await Promise.all(
@@ -3428,6 +3536,7 @@ async function mapWithBoundedConcurrency<T, R>(input: {
       worker,
     ),
   );
+  if (failed) throw firstFailure;
   return results;
 }
 
@@ -4923,6 +5032,8 @@ async function runStaticTemplateCatalogVisualSearch(input: {
   searchPlan: ResolvedVisualSearchPlan;
   catalog: StaticTemplateCatalog;
   persistArtifact: typeof persistSiteOpsArtifact;
+  readCatalogPreview: typeof readStaticTemplateCatalogVersionPreview;
+  updateStage?: (stage: VisualSearchStage) => void;
   persistBoards: (
     db: any,
     input: StaticTemplateCatalogBoardsPersistenceInput,
@@ -4958,6 +5069,141 @@ async function runStaticTemplateCatalogVisualSearch(input: {
       "attention_required",
     );
   }
+
+  input.updateStage?.("mirror_previews");
+  const stagedRetainUntil = new Date(Date.now() + 24 * 60 * 60 * 1_000);
+  const mirroredPreviews = await mapWithBoundedConcurrency({
+    values: sortedEntries,
+    concurrency: 4,
+    map: async (entry) => {
+      let loaded: Awaited<
+        ReturnType<typeof readStaticTemplateCatalogVersionPreview>
+      >;
+      try {
+        loaded = await input.readCatalogPreview(
+          input.catalog.catalogVersion,
+          entry.candidateId,
+        );
+      } catch (error) {
+        if (error instanceof StaticTemplateCatalogError) {
+          throw new TwentyFirstProviderFailure(
+            error.code,
+            "冻结的建站模板预览资产无法读取或完整性校验失败。",
+            "attention_required",
+            error,
+          );
+        }
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_CATALOG_PREVIEW_READ_FAILED",
+          "冻结的建站模板预览资产无法读取。",
+          "attention_required",
+          error,
+        );
+      }
+      if (canonicalSha256(loaded.entry) !== canonicalSha256(entry)) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_CATALOG_CANDIDATE_COORDINATE_MISMATCH",
+          "冻结的建站模板候选坐标不一致。",
+          "attention_required",
+        );
+      }
+      if (
+        loaded.bytes.length !== entry.previewBytes ||
+        sha256Buffer(loaded.bytes) !== entry.previewSha256
+      ) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_CATALOG_PREVIEW_HASH_MISMATCH",
+          "冻结的建站模板预览完整性校验失败。",
+          "attention_required",
+        );
+      }
+      let metadata: Awaited<ReturnType<ReturnType<typeof sharp>["metadata"]>>;
+      try {
+        metadata = await sharp(loaded.bytes, {
+          failOn: "error",
+          limitInputPixels: 40_000_000,
+        }).metadata();
+      } catch (error) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_CATALOG_PREVIEW_DECODE_FAILED",
+          "冻结的建站模板预览无法解码。",
+          "attention_required",
+          error,
+        );
+      }
+      const detectedMimeType =
+        metadata.format === "png"
+          ? "image/png"
+          : metadata.format === "jpeg"
+            ? "image/jpeg"
+            : metadata.format === "webp"
+              ? "image/webp"
+              : metadata.format === "heif"
+                ? "image/avif"
+                : null;
+      if (detectedMimeType !== entry.previewMimeType) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_CATALOG_PREVIEW_MIME_MISMATCH",
+          "冻结的建站模板预览格式不一致。",
+          "attention_required",
+        );
+      }
+      if (
+        metadata.width !== entry.previewWidth ||
+        metadata.height !== entry.previewHeight
+      ) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_CATALOG_PREVIEW_DIMENSIONS_MISMATCH",
+          "冻结的建站模板预览尺寸不一致。",
+          "attention_required",
+        );
+      }
+      const extension =
+        entry.previewMimeType === "image/jpeg"
+          ? "jpg"
+          : entry.previewMimeType.slice("image/".length);
+      await assertCommitLeaseActive(input.assertLeaseActive);
+      let artifact: Awaited<ReturnType<typeof persistSiteOpsArtifact>>;
+      try {
+        artifact = await input.persistArtifact({
+          userId: input.operation.userId,
+          projectId: input.context.project.id,
+          kind: "static-template-preview",
+          filename: `${entry.candidateId}.${extension}`,
+          mimeType: entry.previewMimeType,
+          buffer: loaded.bytes,
+          maxBytes: entry.previewBytes,
+          idempotencyKey: `v1:${input.catalog.catalogVersion}:${entry.candidateId}:${entry.previewSha256}`,
+          retainUntil: stagedRetainUntil,
+        });
+      } catch (error) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_PREVIEW_PERSISTENCE_FAILED",
+          "建站模板预览暂时无法安全保存。",
+          "attention_required",
+          error,
+        );
+      }
+      if (artifact.contentSha256 !== entry.previewSha256) {
+        throw new TwentyFirstProviderFailure(
+          "STATIC_TEMPLATE_PREVIEW_PERSISTENCE_HASH_MISMATCH",
+          "建站模板预览写入校验失败。",
+          "attention_required",
+        );
+      }
+      return [entry.candidateId, artifact] as const;
+    },
+  });
+  const previewsByCandidateId = new Map(mirroredPreviews);
+  if (previewsByCandidateId.size !== STATIC_TEMPLATE_CATALOG_ENTRY_COUNT) {
+    throw new TwentyFirstProviderFailure(
+      "STATIC_TEMPLATE_CATALOG_PREVIEW_SET_INCOMPLETE",
+      "冻结的建站模板预览集合不完整。",
+      "attention_required",
+    );
+  }
+
+  input.updateStage?.("persist_selection_bundle");
   const pages: StaticTemplateCatalogPagePersistenceInput[] = [];
   for (
     let pageNumber = 1;
@@ -4970,7 +5216,11 @@ async function runStaticTemplateCatalogVisualSearch(input: {
     );
     const candidates = entries.map(
       (entry, index): StaticTemplateBoardCandidate => ({
-        sampleId: randomUUID(),
+        sampleId: staticTemplateSampleId({
+          operationId: input.operation.id,
+          pageNumber,
+          candidateId: entry.candidateId,
+        }),
         optionLabel: String.fromCharCode(65 + index),
         catalogVersion: input.catalog.catalogVersion,
         catalogPosition: entry.order,
@@ -4992,6 +5242,7 @@ async function runStaticTemplateCatalogVisualSearch(input: {
         sourceArchiveSha256: entry.sourceSha256,
         sourceArchiveBytes: entry.sourceBytes,
         previewAssetId: entry.previewAssetId,
+        previewLocalAssetId: previewsByCandidateId.get(entry.candidateId)!.id,
         previewSha256: entry.previewSha256,
         previewMimeType: entry.previewMimeType,
         previewWidth: entry.previewWidth,
@@ -5039,15 +5290,27 @@ async function runStaticTemplateCatalogVisualSearch(input: {
     });
     const bytes = createVisualSelectionBundleV7Artifact(selectionBundle);
     await assertCommitLeaseActive(input.assertLeaseActive);
-    const artifact = await input.persistArtifact({
-      userId: input.operation.userId,
-      projectId: input.context.project.id,
-      kind: "static-template-selection-bundle",
-      filename: `static-template-selection-${input.operation.id}-p${pageNumber}.json`,
-      mimeType: VISUAL_SELECTION_BUNDLE_V7_MIME_TYPE,
-      buffer: bytes,
-      maxBytes: VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES,
-    });
+    let artifact: Awaited<ReturnType<typeof persistSiteOpsArtifact>>;
+    try {
+      artifact = await input.persistArtifact({
+        userId: input.operation.userId,
+        projectId: input.context.project.id,
+        kind: "static-template-selection-bundle",
+        filename: `static-template-selection-${input.operation.id}-p${pageNumber}.json`,
+        mimeType: VISUAL_SELECTION_BUNDLE_V7_MIME_TYPE,
+        buffer: bytes,
+        maxBytes: VISUAL_SELECTION_BUNDLE_V7_MAX_BYTES,
+        idempotencyKey: `v1:${input.operation.id}:page:${pageNumber}`,
+        retainUntil: stagedRetainUntil,
+      });
+    } catch (error) {
+      throw new TwentyFirstProviderFailure(
+        "STATIC_TEMPLATE_SELECTION_PERSISTENCE_FAILED",
+        "建站模板选择清单暂时无法安全保存。",
+        "attention_required",
+        error,
+      );
+    }
     if (artifact.contentSha256 !== sha256Buffer(bytes)) {
       throw new TwentyFirstProviderFailure(
         "STATIC_TEMPLATE_SELECTION_HASH_MISMATCH",
@@ -5063,6 +5326,7 @@ async function runStaticTemplateCatalogVisualSearch(input: {
     });
   }
   await assertCommitLeaseActive(input.assertLeaseActive);
+  input.updateStage?.("persist_board");
   const board = await input.persistBoards(input.db, {
     operation: input.operation,
     searchPlan: input.searchPlan,
@@ -5115,7 +5379,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
   const loadStaticTemplateCatalog =
     dependencies.loadStaticTemplateCatalog ??
-    requireActiveStaticTemplateCatalog;
+    requireStaticTemplateCatalogVersion;
+  const readStaticTemplateCatalogPreview =
+    dependencies.readStaticTemplateCatalogPreview ??
+    readStaticTemplateCatalogVersionPreview;
   const persistStaticTemplateCatalogBoards =
     dependencies.persistStaticTemplateCatalogBoards ??
     persistDefaultStaticTemplateCatalogBoards;
@@ -5303,7 +5570,9 @@ export function createTwentyFirstSiteOpsProviderHandler(
           );
         }
         stage = "retrieve_native_sources";
-        const catalog = await loadStaticTemplateCatalog();
+        const catalog = await loadStaticTemplateCatalog(
+          parsedInput.catalogVersion,
+        );
         if (catalog.catalogVersion !== parsedInput.catalogVersion) {
           throw new TwentyFirstProviderFailure(
             "STATIC_TEMPLATE_CATALOG_VERSION_MISMATCH",
@@ -5318,6 +5587,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
           searchPlan,
           catalog,
           persistArtifact,
+          readCatalogPreview: readStaticTemplateCatalogPreview,
+          updateStage: (nextStage) => {
+            stage = nextStage;
+          },
           persistBoards: persistStaticTemplateCatalogBoards,
           db,
         });
@@ -6098,6 +6371,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
         stage,
         operationStatus: failure.status,
         errorCode: "code" in failure ? failure.code : "PROVIDER_ERROR",
+        ...safePersistenceErrorDetails(error, stage),
       });
       return failure;
     }

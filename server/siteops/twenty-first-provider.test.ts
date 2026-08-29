@@ -23,6 +23,7 @@ import {
   createTwentyFirstSiteOpsProviderHandler,
   nativeTemplateProviderErrorCode,
   nativeSourceProviderErrorCode,
+  persistDefaultStaticTemplateCatalogBoards,
   planNativeTemplateCapacityPages,
   resolveVisualSearchPlan,
   type NativeTemplatePoolPersistenceInput,
@@ -36,6 +37,7 @@ import {
   prepareNativeTemplateCandidate,
   readVisualSelectionBundleArtifact,
 } from "./native-visual-source";
+import { StaticTemplateCatalogError } from "./static-template-catalog";
 import {
   fetchPinnedPublicHttps,
   fetchSafeVisualPreview,
@@ -543,6 +545,26 @@ describe("21st SiteOps provider", () => {
     const context = providerContext();
     context.project.revision = 4;
     context.publishedPageCount = 0;
+    const previewFixtures = await Promise.all(
+      Array.from({ length: 32 }, async (_, index) => {
+        const bytes = await sharp({
+          create: {
+            width: 16,
+            height: 10,
+            channels: 4,
+            background: {
+              r: 28 + index,
+              g: 44 + index,
+              b: 72 + index,
+              alpha: 1,
+            },
+          },
+        })
+          .png()
+          .toBuffer();
+        return { bytes, sha256: sha256(bytes) };
+      }),
+    );
     const catalog = {
       schemaVersion: "frontmind-static-template-catalog-v1" as const,
       workflowVersion: "2.8.0" as const,
@@ -552,6 +574,7 @@ describe("21st SiteOps provider", () => {
       entryCount: 32 as const,
       entries: Array.from({ length: 32 }, (_, index) => {
         const order = index + 1;
+        const preview = previewFixtures[index]!;
         const candidateId = `static-template-${String(order).padStart(2, "0")}-fixture-${order}`;
         return {
           order,
@@ -576,11 +599,11 @@ describe("21st SiteOps provider", () => {
           sourceExpandedBytes: 2_048 + order,
           previewAssetId: `catalog/preview/${candidateId}`,
           previewPath: `catalog/previews/${candidateId}.png`,
-          previewSha256: (order + 100).toString(16).padStart(64, "0"),
-          previewBytes: 512 + order,
+          previewSha256: preview.sha256,
+          previewBytes: preview.bytes.length,
           previewMimeType: "image/png" as const,
-          previewWidth: 1440,
-          previewHeight: 900,
+          previewWidth: 16,
+          previewHeight: 10,
           tags: ["fixture"],
         };
       }),
@@ -589,7 +612,14 @@ describe("21st SiteOps provider", () => {
     const withReadOnlySession = vi.fn();
     const listNativeTemplates = vi.fn();
     const downloadNativeTemplate = vi.fn();
-    const persistedArtifacts: Array<{ mimeType: string; buffer: Buffer }> = [];
+    const persistedArtifacts: Array<{
+      kind: string;
+      mimeType: string;
+      buffer: Buffer;
+      idempotencyKey?: string;
+      retainUntil?: Date;
+    }> = [];
+    const persistedSampleRuns: string[][] = [];
     const persistStaticTemplateCatalogBoards = vi.fn(async (_db, input) => {
       expect(input.catalogVersion).toBe(catalog.catalogVersion);
       expect(input.pages).toHaveLength(4);
@@ -598,16 +628,104 @@ describe("21st SiteOps provider", () => {
         expect(page.candidates).toHaveLength(8);
         expect(page.selectionBundle.candidates).toHaveLength(8);
         expect(
+          page.candidates.every(
+            (candidate) =>
+              candidate.previewLocalAssetId ===
+              `local:${candidate.catalogCandidateId}`,
+          ),
+        ).toBe(true);
+        expect(
           page.selectionBundle.candidates.every(
             (candidate) => !("sourceArchivePath" in candidate),
           ),
         ).toBe(true);
       }
-      return {
-        batchIds: Array.from({ length: 4 }, () => randomUUID()),
-        candidateCount: 32,
+      persistedSampleRuns.push(
+        input.pages.flatMap((page) =>
+          page.candidates.map((candidate) => candidate.sampleId),
+        ),
+      );
+      const selectResults: unknown[][] = [
+        [input.context.project],
+        [],
+        [input.operation],
+        [],
+        [{ ordinal: 0 }],
+        [{ sequence: 0 }],
+      ];
+      const insertedSampleRows: Array<Record<string, unknown>> = [];
+      const query = (result: unknown[]) => {
+        const chain: Record<string, unknown> & PromiseLike<unknown[]> = {
+          then: (resolve, reject) =>
+            Promise.resolve(result).then(resolve, reject),
+        };
+        chain.from = () => chain;
+        chain.where = () => chain;
+        chain.limit = () => chain;
+        chain.for = async () => result;
+        return chain;
       };
+      const tx = {
+        select: () => query(selectResults.shift() ?? []),
+        insert: () => ({
+          values: async (values: unknown) => {
+            if (Array.isArray(values)) {
+              insertedSampleRows.push(
+                ...(values as Array<Record<string, unknown>>),
+              );
+            }
+          },
+        }),
+        update: () => ({
+          set: () => ({
+            where: async () => ({ affectedRows: 1 }),
+          }),
+        }),
+      };
+      const result = await persistDefaultStaticTemplateCatalogBoards(
+        {
+          transaction: async (callback: (value: typeof tx) => unknown) =>
+            callback(tx),
+        },
+        input,
+      );
+      expect(insertedSampleRows).toHaveLength(32);
+      expect(
+        insertedSampleRows.every((sample) => {
+          const metadata = sample.sourceMetadata as Record<string, unknown>;
+          return (
+            typeof sample.previewLocalAssetId === "string" &&
+            sample.previewLocalAssetId === metadata.previewLocalAssetId &&
+            sample.attachmentId === null
+          );
+        }),
+      ).toBe(true);
+      return result;
     });
+    let activePreviewReads = 0;
+    let maximumPreviewReads = 0;
+    const readStaticTemplateCatalogPreview = vi.fn(
+      async (catalogVersion: string, candidateId: string) => {
+        expect(catalogVersion).toBe(catalog.catalogVersion);
+        activePreviewReads += 1;
+        maximumPreviewReads = Math.max(maximumPreviewReads, activePreviewReads);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        activePreviewReads -= 1;
+        return {
+          entry: catalog.entries.find(
+            (candidate) => candidate.candidateId === candidateId,
+          )!,
+          bytes: Buffer.from(
+            previewFixtures[
+              catalog.entries.findIndex(
+                (candidate) => candidate.candidateId === candidateId,
+              )
+            ]!.bytes,
+          ),
+        };
+      },
+    );
+    const loadStaticTemplateCatalog = vi.fn(async () => catalog);
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
       loadContext: async () => context,
@@ -617,13 +735,23 @@ describe("21st SiteOps provider", () => {
         listNativeTemplates,
         downloadNativeTemplate,
       },
-      loadStaticTemplateCatalog: async () => catalog,
+      loadStaticTemplateCatalog,
+      readStaticTemplateCatalogPreview,
       persistArtifact: vi.fn(async (input) => {
         persistedArtifacts.push({
+          kind: input.kind,
           mimeType: input.mimeType,
           buffer: Buffer.from(input.buffer),
+          idempotencyKey: input.idempotencyKey,
+          retainUntil: input.retainUntil,
         });
-        return { id: randomUUID(), contentSha256: sha256(input.buffer) };
+        return {
+          id:
+            input.kind === "static-template-preview"
+              ? `local:${input.filename.replace(/\.png$/u, "")}`
+              : `bundle:${input.idempotencyKey}`,
+          contentSha256: sha256(input.buffer),
+        };
       }) as never,
       persistStaticTemplateCatalogBoards,
     });
@@ -643,8 +771,43 @@ describe("21st SiteOps provider", () => {
         canGenerateMore: false,
       },
     });
-    expect(persistedArtifacts).toHaveLength(4);
-    for (const artifact of persistedArtifacts) {
+    await expect(
+      handler({ operation: row, signal: new AbortController().signal }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(loadStaticTemplateCatalog).toHaveBeenNthCalledWith(
+      1,
+      catalog.catalogVersion,
+    );
+    expect(loadStaticTemplateCatalog).toHaveBeenNthCalledWith(
+      2,
+      catalog.catalogVersion,
+    );
+    expect(readStaticTemplateCatalogPreview).toHaveBeenCalledTimes(64);
+    expect(maximumPreviewReads).toBe(4);
+    expect(persistedSampleRuns).toHaveLength(2);
+    expect(persistedSampleRuns[1]).toEqual(persistedSampleRuns[0]);
+    expect(new Set(persistedSampleRuns[0]).size).toBe(32);
+    const previewArtifacts = persistedArtifacts.filter(
+      (artifact) => artifact.kind === "static-template-preview",
+    );
+    expect(previewArtifacts).toHaveLength(64);
+    for (const artifact of previewArtifacts) {
+      expect(artifact.mimeType).toBe("image/png");
+      expect(artifact.idempotencyKey).toMatch(
+        new RegExp(`^v1:${catalog.catalogVersion}:.+:[a-f0-9]{64}$`, "u"),
+      );
+      expect(artifact.retainUntil!.getTime()).toBeGreaterThan(
+        Date.now() + 23 * 60 * 60 * 1_000,
+      );
+    }
+    const selectionArtifacts = persistedArtifacts.filter(
+      (artifact) => artifact.kind === "static-template-selection-bundle",
+    );
+    expect(selectionArtifacts).toHaveLength(8);
+    expect(
+      selectionArtifacts.slice(0, 4).map((item) => item.idempotencyKey),
+    ).toEqual(selectionArtifacts.slice(4).map((item) => item.idempotencyKey));
+    for (const artifact of selectionArtifacts) {
       expect(artifact.mimeType).toBe("application/json");
       expect(
         visualSelectionBundleV7Schema.parse(
@@ -713,6 +876,42 @@ describe("21st SiteOps provider", () => {
     expect(getCredential).not.toHaveBeenCalled();
     expect(loadStaticTemplateCatalog).not.toHaveBeenCalled();
     expect(persistStaticTemplateCatalogBoards).not.toHaveBeenCalled();
+  });
+
+  it("preserves an exact frozen static catalog error instead of reporting board persistence", async () => {
+    const row = operation();
+    row.input = {
+      schemaVersion: 3,
+      knowledgeSnapshotId: snapshotId,
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      mode: "initial",
+      page: 1,
+      admissionRevision: 4,
+    };
+    const context = providerContext();
+    context.project.revision = 4;
+    const loadStaticTemplateCatalog = vi.fn(async () => {
+      throw new StaticTemplateCatalogError(
+        "STATIC_TEMPLATE_CATALOG_VERSION_NOT_FOUND",
+      );
+    });
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      client: { withReadOnlySession: vi.fn() },
+      loadStaticTemplateCatalog,
+    });
+
+    await expect(
+      handler({ operation: row, signal: new AbortController().signal }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "STATIC_TEMPLATE_CATALOG_VERSION_NOT_FOUND",
+    });
+    expect(loadStaticTemplateCatalog).toHaveBeenCalledWith(
+      "21st-included-recommended-20260828-v1",
+    );
   });
 
   it("binds nine directed families 1:1 to distinct real search-only 21st references", async () => {

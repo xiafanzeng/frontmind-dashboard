@@ -1134,6 +1134,7 @@ describe("ConversationProvider cloud hydration", () => {
     });
     const { result } = renderHook(() => useConversation(), { wrapper });
     await waitFor(() => expect(result.current.hydrated).toBe(true));
+    mocks.syncSnapshot.mockClear();
 
     act(() => {
       result.current.updateAssistantMessages("projection-recovery", []);
@@ -1157,6 +1158,71 @@ describe("ConversationProvider cloud hydration", () => {
         .find((item) => item.id === "projection-recovery")
         ?.messages.map((message) => message.id),
     ).toEqual(["user-1", "projection-1", terminalId]);
+    expect(mocks.syncSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("keeps twenty identical general-chat projections referentially stable and never re-syncs them", async () => {
+    const projection = {
+      id: "canonical-message-1",
+      upstreamOutputId: "event-row-1",
+      role: "assistant" as const,
+      content: "稳定的处理中消息",
+      timestamp: 2,
+      serverSequence: 7,
+      generalChat: {
+        schemaVersion: 1 as const,
+        kind: "assistant_projection" as const,
+        turnId: "turn-1",
+        agentTaskId: "task-1",
+        providerEventId: "provider-event-1",
+        serverOwned: true as const,
+      },
+    };
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [
+        {
+          ...conversation("stable-general-chat"),
+          executionKind: "general_chat_v2",
+          status: "running",
+          taskId: "task-1",
+          startedAt: 1,
+          messages: [
+            { id: "user-1", role: "user", content: "开始", timestamp: 1 },
+            projection,
+          ],
+        },
+      ],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+    const initialConversation = result.current.state.conversations[0];
+    const initialProjection = initialConversation.messages[1];
+    mocks.syncSnapshot.mockClear();
+
+    act(() => {
+      for (let index = 0; index < 20; index += 1) {
+        result.current.updateAssistantMessages("stable-general-chat", [
+          {
+            ...projection,
+            id: `transient-${index}`,
+            timestamp: 10_000 + index,
+          },
+        ]);
+        result.current.updateStatus("stable-general-chat", "running", {
+          taskId: "task-1",
+          startedAt: 1,
+        });
+      }
+    });
+
+    const current = result.current.state.conversations[0];
+    expect(current).toBe(initialConversation);
+    expect(current.messages[1]).toBe(initialProjection);
+    expect(current.messages[1]).toMatchObject({
+      id: "canonical-message-1",
+      timestamp: 2,
+    });
+    expect(mocks.syncSnapshot).not.toHaveBeenCalled();
   });
 
   it("removes and revives a deterministic terminal notice without a tombstone", async () => {
@@ -1645,6 +1711,39 @@ describe("prepareConversationForCloud", () => {
 });
 
 describe("parseOutputMessages file IDs", () => {
+  it("uses the canonical durable message identity, time, sequence, and projection metadata", () => {
+    const generalChat = {
+      schemaVersion: 1 as const,
+      kind: "assistant_projection" as const,
+      turnId: "turn-1",
+      agentTaskId: "task-1",
+      providerEventId: "provider-event-1",
+      serverOwned: true as const,
+    };
+    const messages = parseOutputMessages([
+      {
+        id: "event-row-1",
+        message_id: "canonical-message-1",
+        sent_at_ms: 1_725_000_000_123,
+        server_sequence: 9,
+        general_chat: generalChat,
+        role: "assistant",
+        type: "message",
+        content: [{ type: "output_text", text: "稳定正文" }],
+      },
+    ]);
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        id: "canonical-message-1",
+        upstreamOutputId: "event-row-1",
+        timestamp: 1_725_000_000_123,
+        serverSequence: 9,
+        generalChat,
+      }),
+    ]);
+  });
+
   it.each([
     {
       type: "output_message",

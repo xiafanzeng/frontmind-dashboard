@@ -853,6 +853,7 @@ export const staticTemplateSelectionMetadataSchema = z
       .positive()
       .max(192 * 1024 * 1024),
     previewAssetId: z.string().trim().min(1).max(512),
+    previewLocalAssetId: z.string().uuid().optional(),
     previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     previewMimeType: z.enum([
       "image/avif",
@@ -1361,6 +1362,7 @@ const VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE: Readonly<
   NATIVE_TEMPLATE_BROWSER_UNAVAILABLE: "browser_unavailable",
   NATIVE_TEMPLATE_RENDER_UNAVAILABLE: "render_failed",
   NATIVE_TEMPLATE_BUILD_POOL_INSUFFICIENT: "insufficient_live_templates",
+  VISUAL_BOARD_PERSISTENCE_FAILED: "persistence_failed",
   VISUAL_SEARCH_DEADLINE_EXHAUSTED: "deadline_exhausted",
   VISUAL_SEARCH_TIMEOUT: "deadline_exhausted",
 };
@@ -1378,9 +1380,17 @@ function projectNativeVisualFailureCategory(
     result?.templateFailureCategory,
   );
   if (recorded.success) return recorded.data;
-  return operation?.errorCode
-    ? (VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE[operation.errorCode] ?? null)
-    : null;
+  if (!operation?.errorCode) return null;
+  if (operation.errorCode === "STATIC_TEMPLATE_CATALOG_OPERATION_INVALID") {
+    return null;
+  }
+  if (operation.errorCode.startsWith("STATIC_TEMPLATE_CATALOG_")) {
+    return "catalog_unavailable";
+  }
+  if (operation.errorCode.startsWith("STATIC_TEMPLATE_")) {
+    return "persistence_failed";
+  }
+  return VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE[operation.errorCode] ?? null;
 }
 
 function projectedVisualTargetPage(
@@ -4460,9 +4470,17 @@ async function selectVisualSample(
     staticTemplateSelectionMetadataSchema.safeParse(
       selected?.sample.sourceMetadata,
     );
+  const selectedStaticPreviewCoordinateMatches = selectedStaticTemplate.success
+    ? Boolean(
+        selected?.sample.previewLocalAssetId &&
+          selectedStaticTemplate.data.previewLocalAssetId ===
+            selected.sample.previewLocalAssetId,
+      )
+    : true;
   if (
     !selected?.sample.sourceMetadata ||
-    (!selected.sample.previewLocalAssetId && !selectedStaticTemplate.success)
+    (!selected.sample.previewLocalAssetId && !selectedStaticTemplate.success) ||
+    !selectedStaticPreviewCoordinateMatches
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",

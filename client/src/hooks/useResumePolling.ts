@@ -74,11 +74,19 @@ interface KnowledgeBaseRecoveryBoundary {
 async function handOffKnowledgeBaseIfNeeded(
   conversation: Conversation,
   boundary: KnowledgeBaseRecoveryBoundary,
+  probedConversationIds: Set<string>,
 ) {
+  // The execution domain is authoritative for v2 ordinary chat. Never issue
+  // a knowledge-base compatibility request for a known general-chat task.
+  if (conversation.executionKind === "general_chat_v2") return false;
   if (boundary.isKnowledgeBaseConversation?.(conversation.id)) {
     boundary.wakeKnowledgeBaseConversation?.(conversation.id);
     return true;
   }
+  // Only identity-unknown legacy snapshots need the compatibility probe, and
+  // one negative probe per hydrated browser session is sufficient.
+  if (probedConversationIds.has(conversation.id)) return false;
+  probedConversationIds.add(conversation.id);
   try {
     const progress = await fetchKnowledgeBaseProgress(conversation.id);
     if (!progress) return false;
@@ -88,6 +96,7 @@ async function handOffKnowledgeBaseIfNeeded(
   } catch (error) {
     // A failed KB identity probe must not allow raw output to bypass the
     // authoritative projection. Retry the probe on the next pass.
+    probedConversationIds.delete(conversation.id);
     console.warn("[ResumePolling] knowledge-base probe deferred", error);
     return true;
   }
@@ -104,11 +113,19 @@ async function checkAndUpdateOrdinaryTask(
   boundary: KnowledgeBaseRecoveryBoundary,
   observedTerminalMessageIds: Set<string>,
   terminalObservedAt: Map<string, number>,
+  knowledgeBaseProbeIds: Set<string>,
 ): Promise<boolean> {
   if (!conversation.taskId || conversation.executionKind === "response_logic") {
     return false;
   }
-  if (await handOffKnowledgeBaseIfNeeded(conversation, boundary)) return false;
+  if (
+    await handOffKnowledgeBaseIfNeeded(
+      conversation,
+      boundary,
+      knowledgeBaseProbeIds,
+    )
+  )
+    return false;
 
   try {
     const taskData = await retrieveTask(conversation.taskId);
@@ -258,6 +275,7 @@ export function useResumePolling() {
   const terminalProbeKeysRef = useRef(new Set<string>());
   const terminalMessageIdsRef = useRef(new Set<string>());
   const terminalObservedAtRef = useRef(new Map<string, number>());
+  const knowledgeBaseProbeIdsRef = useRef(new Set<string>());
   const hydratedRef = useRef(hydrated);
   const stateRef = useRef(state);
   const functionsRef = useRef({
@@ -330,6 +348,7 @@ export function useResumePolling() {
           functions,
           terminalMessageIdsRef.current,
           terminalObservedAtRef.current,
+          knowledgeBaseProbeIdsRef.current,
         );
         if (!keepPolling) stillRunning.delete(conversationId);
       }
@@ -385,6 +404,7 @@ export function useResumePolling() {
       terminalProbeKeysRef.current.clear();
       terminalMessageIdsRef.current.clear();
       terminalObservedAtRef.current.clear();
+      knowledgeBaseProbeIdsRef.current.clear();
       return;
     }
     for (const conversation of state.conversations) {
@@ -399,7 +419,11 @@ export function useResumePolling() {
       const key = `${conversation.id}:${conversation.taskId}:${conversation.knowledgeBase?.generation ?? "ordinary"}:${conversation.knowledgeBase?.stateEpoch ?? 0}`;
       if (terminalProbeKeysRef.current.has(key)) continue;
       terminalProbeKeysRef.current.add(key);
-      void handOffKnowledgeBaseIfNeeded(conversation, functionsRef.current);
+      void handOffKnowledgeBaseIfNeeded(
+        conversation,
+        functionsRef.current,
+        knowledgeBaseProbeIdsRef.current,
+      );
     }
   }, [hydrated, state.conversations]);
 

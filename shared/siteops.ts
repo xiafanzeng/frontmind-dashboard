@@ -425,6 +425,7 @@ export type SiteOpsNativeTemplateFailureCategory = z.infer<
 export const siteOpsVisualFailureCategorySchema = z.union([
   siteOpsNativeTemplateFailureCategorySchema,
   siteOpsNativeVisualFailureCategorySchema,
+  z.literal("persistence_failed"),
 ]);
 
 export type SiteOpsVisualFailureCategory = z.infer<

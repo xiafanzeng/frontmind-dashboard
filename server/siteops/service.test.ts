@@ -35,6 +35,7 @@ import {
   siteOpsResetPendingBlocksAction,
   siteOpsVisualCycleWorkflowVersion,
   siteOpsWorkflowForVisualSelectionMetadata,
+  staticTemplateSelectionMetadataSchema,
   siteOpsVisualSelectionRecovery,
   SiteOpsServiceError,
   visualSearchAllowedForProjectStatus,
@@ -139,6 +140,50 @@ describe("SiteOps core contracts", () => {
         renderer: "twenty_first_native_template_v1",
         providerTemplateId: "template-42",
       }),
+    ).toBe(false);
+  });
+
+  it("keeps historical V7 metadata readable while accepting its managed preview coordinate", () => {
+    const metadata = {
+      schemaVersion: 7,
+      renderer: "frontmind_static_template_catalog_v1",
+      workflowVersion: "2.8.0",
+      catalogVersion: "21st-included-recommended-20260828-v1",
+      catalogPosition: 1,
+      catalogCandidateId: "template-1",
+      providerTemplateId: "provider-template-1",
+      providerSlug: "provider-template-1",
+      providerVersion: null,
+      sourceOwner: "frontmind",
+      sourceRepo: "templates",
+      sourceCommitSha: "a".repeat(40),
+      sourceSubdirectory: null,
+      sourceLicense: "MIT",
+      sourceAssetId: "catalog/source/template-1",
+      sourceArchiveSha256: "b".repeat(64),
+      sourceArchiveBytes: 1024,
+      previewAssetId: "catalog/preview/template-1",
+      previewLocalAssetId: "10000000-0000-4000-8000-000000000001",
+      previewSha256: "c".repeat(64),
+      previewMimeType: "image/png",
+      previewWidth: 1440,
+      previewHeight: 900,
+    } as const;
+
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse(metadata).success,
+    ).toBe(true);
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse({
+        ...metadata,
+        previewLocalAssetId: undefined,
+      }).success,
+    ).toBe(true);
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse({
+        ...metadata,
+        previewLocalAssetId: "not-a-uuid",
+      }).success,
     ).toBe(false);
   });
 
@@ -1347,6 +1392,62 @@ describe("SiteOps core contracts", () => {
       failureCategory: "insufficient_live_templates",
       canGenerateMore: true,
     });
+  });
+
+  it("distinguishes static catalog persistence from local catalog failures", () => {
+    const projectionFor = (errorCode: string) =>
+      projectSiteOpsVisualGeneration({
+        projectStatus: "attention_required",
+        generatedPages: 0,
+        latestVisualOperation: {
+          status: "attention_required",
+          errorCode,
+          input: {
+            schemaVersion: 3,
+            knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+            workflowVersion: "2.8.0",
+            catalogVersion: "21st-included-recommended-20260828-v1",
+            mode: "initial",
+            page: 1,
+            admissionRevision: 9,
+          },
+        },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+        workflowVersion: "2.8.0",
+        catalogVersion: "21st-included-recommended-20260828-v1",
+        pageSize: 8,
+        pageCount: 4,
+      });
+
+    expect(projectionFor("VISUAL_BOARD_PERSISTENCE_FAILED")).toMatchObject({
+      status: "retryable_error",
+      failureCategory: "persistence_failed",
+    });
+    expect(
+      projectionFor("STATIC_TEMPLATE_CATALOG_PREVIEW_HASH_MISMATCH"),
+    ).toMatchObject({
+      status: "retryable_error",
+      failureCategory: "catalog_unavailable",
+    });
+    expect(
+      projectionFor("STATIC_TEMPLATE_CATALOG_OPERATION_INVALID"),
+    ).toMatchObject({
+      status: "retryable_error",
+      failureCategory: null,
+    });
+    for (const errorCode of [
+      "STATIC_TEMPLATE_PREVIEW_PERSISTENCE_FAILED",
+      "STATIC_TEMPLATE_PREVIEW_PERSISTENCE_HASH_MISMATCH",
+      "STATIC_TEMPLATE_SELECTION_PERSISTENCE_FAILED",
+      "STATIC_TEMPLATE_SELECTION_HASH_MISMATCH",
+    ]) {
+      expect(projectionFor(errorCode)).toMatchObject({
+        status: "retryable_error",
+        failureCategory: "persistence_failed",
+      });
+    }
   });
 
   it("prefers the recorded complete-template failure cause over the aggregate pool code", () => {

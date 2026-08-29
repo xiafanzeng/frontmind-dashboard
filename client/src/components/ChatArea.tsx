@@ -1250,7 +1250,6 @@ export default function ChatArea({
     clientRequestId: string;
   } | null>(null);
 
-  const [, setTick] = useState(0);
   const [retryingKnowledgeBase, setRetryingKnowledgeBase] = useState(false);
 
   const startFreshKnowledgeBaseBuild = useCallback(() => {
@@ -1335,14 +1334,6 @@ export default function ChatArea({
     }, 100);
     return () => clearTimeout(timer);
   }, [activeConversation?.messages?.length, status]);
-
-  // Force re-render every second when running to update elapsed time
-  useEffect(() => {
-    if (displayActiveTask && startedAt) {
-      const timer = setInterval(() => setTick((t) => t + 1), 1000);
-      return () => clearInterval(timer);
-    }
-  }, [displayActiveTask, startedAt]);
 
   const startKnowledgeBase = useCallback(
     async (
@@ -1709,6 +1700,12 @@ export default function ChatArea({
         : [],
     [activeConversation, messageProjection],
   );
+  const finalAssistantMessageId = useMemo(
+    () =>
+      [...messages].reverse().find((message) => message.role === "assistant")
+        ?.id,
+    [messages],
+  );
 
   if (!activeConversation) {
     return <EmptyState />;
@@ -1719,13 +1716,6 @@ export default function ChatArea({
     : activeConversation.title;
   const activeTask = displayActiveTask;
   const displayStatus = knowledgeBaseDisplayFailed ? "error" : status;
-  const executionDuration =
-    startedAt && (activeTask || completedAt)
-      ? Math.max(
-          0,
-          ((activeTask ? Date.now() : completedAt!) - startedAt) / 1000,
-        )
-      : null;
   const executionModel =
     fixedAgentProfile ||
     [...messages]
@@ -1797,11 +1787,12 @@ export default function ChatArea({
                   })}
                 </span>
               )}
-              {executionDuration !== null && (
-                <span className="inline-flex items-center gap-1 font-mono">
-                  <Clock className="h-3 w-3" />
-                  {formatExecutionDuration(executionDuration)}
-                </span>
+              {startedAt && (activeTask || completedAt) && (
+                <HeaderExecutionDuration
+                  startedAt={startedAt}
+                  completedAt={completedAt}
+                  active={Boolean(activeTask)}
+                />
               )}
             </div>
           )}
@@ -1857,6 +1848,17 @@ export default function ChatArea({
                 key={msg.id}
                 message={msg}
                 isRunning={displayActiveTask}
+                generalChatLinks={
+                  activeConversation.executionKind === "general_chat_v2"
+                }
+                fixedElapsedTime={
+                  status === "completed" &&
+                  msg.id === finalAssistantMessageId &&
+                  startedAt !== undefined &&
+                  completedAt !== undefined
+                    ? Math.max(0, (completedAt - startedAt) / 1_000)
+                    : undefined
+                }
                 suppressKnowledgeArtifacts={syncKnowledgeBaseSnapshot}
                 onDelete={
                   syncKnowledgeBaseSnapshot
@@ -3917,14 +3919,18 @@ function UserAttachmentImage({ attachment }: { attachment: Attachment }) {
   );
 }
 
-function MessageBubble({
+export function MessageBubble({
   message,
   isRunning,
+  generalChatLinks,
+  fixedElapsedTime,
   suppressKnowledgeArtifacts,
   onDelete,
 }: {
   message: LocalMessage;
   isRunning?: boolean;
+  generalChatLinks?: boolean;
+  fixedElapsedTime?: number;
   suppressKnowledgeArtifacts?: boolean;
   onDelete?: () => void;
 }) {
@@ -3968,28 +3974,11 @@ function MessageBubble({
     [],
   );
 
-  // Calculate running elapsed time for this specific response
-  const getRunningElapsed = () => {
-    if (
-      !isUser &&
-      isRunning &&
-      message.responseStartedAt &&
-      !message.elapsedTime
-    ) {
-      const elapsed = (Date.now() - message.responseStartedAt) / 1000;
-      if (elapsed >= 0) {
-        if (elapsed < 60) return `${elapsed.toFixed(1)}s`;
-        const mins = Math.floor(elapsed / 60);
-        const secs = (elapsed % 60).toFixed(0);
-        return `${mins}m ${secs}s`;
-      }
-    }
-    return null;
-  };
-
   const getCompletedElapsed = () => {
-    if (message.elapsedTime != null && message.elapsedTime >= 0) {
-      const elapsed = message.elapsedTime;
+    // Conversation settlement timestamps survive hydrate; prefer that fixed
+    // duration so refresh never changes the completed footer.
+    const elapsed = fixedElapsedTime ?? message.elapsedTime;
+    if (elapsed != null && elapsed >= 0) {
       if (elapsed < 60) return `${elapsed.toFixed(1)}s`;
       const mins = Math.floor(elapsed / 60);
       const secs = (elapsed % 60).toFixed(0);
@@ -3998,9 +3987,8 @@ function MessageBubble({
     return null;
   };
 
-  const runningElapsed = getRunningElapsed();
   const completedElapsed = getCompletedElapsed();
-  const elapsedDisplay = completedElapsed || runningElapsed;
+  const elapsedDisplay = completedElapsed;
 
   // Check file types
   const isMdFile = (fileName: string) => {
@@ -4063,6 +4051,34 @@ function MessageBubble({
       }
     });
   };
+
+  const handleArtifactDownload = useCallback(
+    async (href: string) => {
+      const matchingImage = message.inlineImages?.find(
+        (image) => image.src === href,
+      );
+      const matchingFile = visibleOutputFiles?.find(
+        (file) => file.fileUrl === href,
+      );
+      const downloadName = sanitizeBrandText(
+        matchingFile?.fileName ||
+          matchingImage?.alt ||
+          href.split("/").filter(Boolean).at(-2) ||
+          "frontmind-artifact",
+      );
+      try {
+        const blobUrl = await fetchWithAuth(href, downloadName);
+        nativeDownload(blobUrl, downloadName);
+        URL.revokeObjectURL(blobUrl);
+      } catch (error) {
+        console.error("Artifact download failed:", error);
+        toast.error("文件下载失败", {
+          description: error instanceof Error ? error.message : "请稍后重试",
+        });
+      }
+    },
+    [message.inlineImages, visibleOutputFiles],
+  );
 
   return (
     <>
@@ -4154,6 +4170,8 @@ function MessageBubble({
                 ) : (
                   <MarkdownRenderer
                     content={sanitizedContent}
+                    generalChatLinks={generalChatLinks}
+                    onArtifactDownload={handleArtifactDownload}
                     className="prose prose-sm max-w-none prose-p:my-1.5 prose-headings:my-2 prose-pre:my-2 prose-ul:my-1 prose-ol:my-1"
                   />
                 )}
@@ -4428,7 +4446,39 @@ function StatusBadge({
   );
 }
 
-function formatExecutionDuration(seconds: number) {
+export function HeaderExecutionDuration({
+  startedAt,
+  completedAt,
+  active,
+}: {
+  startedAt: number;
+  completedAt?: number;
+  active: boolean;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active, startedAt]);
+
+  const endedAt = active ? now : completedAt;
+  if (endedAt === undefined) return null;
+  const seconds = Math.max(0, (endedAt - startedAt) / 1_000);
+  return (
+    <span
+      className="inline-flex items-center gap-1 font-mono"
+      data-testid="header-execution-duration"
+    >
+      <Clock className="h-3 w-3" />
+      {formatExecutionDuration(seconds)}
+    </span>
+  );
+}
+
+export function formatExecutionDuration(seconds: number) {
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = Math.floor(seconds % 60);
