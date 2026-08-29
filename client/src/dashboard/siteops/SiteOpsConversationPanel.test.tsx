@@ -779,7 +779,7 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
-  it("renders the 2.8 fixed catalog as four local pages of eight without requesting another group", async () => {
+  it("routes the exact page-one and page-four F samples from the fixed 32-template catalog", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     const pages = [
       staticCatalogPage(1),
@@ -831,20 +831,123 @@ describe("SiteOpsConversationPanel", () => {
       ),
     ).not.toBeNull();
 
+    fireEvent.click(screen.getByRole("button", { name: "选择 F" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "select_visual",
+        input: { sampleId: "static-candidate-1-F" },
+        messageId: "message-1",
+        cardKind: "visual_board",
+      }),
+    );
+    onAction.mockClear();
+
     fireEvent.click(screen.getByRole("button", { name: "第 4 页" }));
     expect(screen.getByAltText("A：固定目录第 4 页 A")).toBeInTheDocument();
     expect(screen.getByText("第 4 / 4 页 · 共 32 个")).toBeInTheDocument();
     expect(onAction).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "选择 A" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择 F" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "select_visual",
-        input: { sampleId: "static-candidate-4-A" },
+        input: { sampleId: "static-candidate-4-F" },
         messageId: "message-1",
         cardKind: "visual_board",
       }),
     );
+  });
+
+  it("locks every template choice around the selected item and renders an adjacent explicit retry", async () => {
+    const pages = [
+      staticCatalogPage(1),
+      staticCatalogPage(2),
+      staticCatalogPage(3),
+      staticCatalogPage(4),
+    ];
+    const currentObservation = observation({
+      visualCandidates: pages[0].candidates.slice(),
+      visualCandidatePages: pages.map((page) => ({
+        ...page,
+        candidates: page.candidates.slice(),
+      })),
+      visualGeneration: {
+        status: "idle",
+        targetPage: null,
+        generatedPages: 4,
+        availablePages: 4,
+        reservedPages: 0,
+        maxPages: 4,
+        canGenerateMore: false,
+        canSelectExisting: true,
+        workflowVersion: "2.8.0",
+        catalogVersion: "twenty-first-static-32-v1",
+        pageSize: 8,
+        pageCount: 4,
+      },
+    });
+    const onRetrySelectVisual = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <SiteOpsConversationPanel
+        observation={currentObservation}
+        onAction={vi.fn()}
+        onRetrySelectVisual={onRetrySelectVisual}
+        selectVisual={{
+          sampleId: "static-candidate-1-F",
+          label: "F",
+          clientRequestId: "11111111-1111-4111-8111-111111111111",
+          phase: "observing",
+          ack: {
+            schemaVersion: 1,
+            accepted: true,
+            clientRequestId: "11111111-1111-4111-8111-111111111111",
+            operationId: "22222222-2222-4222-8222-222222222222",
+            projectRevision: 4,
+            latestSequence: 3,
+            interactionState: "building",
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "正在选择 F" })).toBeDisabled();
+    expect(
+      screen
+        .getAllByRole("button", { name: /^选择 [A-H]$/u })
+        .every((button) => button.hasAttribute("disabled")),
+    ).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "第 4 页" }));
+    const fourthPageButtons = screen.getAllByRole("button", {
+      name: /^选择 [A-H]$/u,
+    });
+    expect(fourthPageButtons).toHaveLength(8);
+    expect(
+      fourthPageButtons.every((button) => button.hasAttribute("disabled")),
+    ).toBe(true);
+
+    rerender(
+      <SiteOpsConversationPanel
+        observation={currentObservation}
+        onAction={vi.fn()}
+        onRetrySelectVisual={onRetrySelectVisual}
+        selectVisual={{
+          sampleId: "static-candidate-1-F",
+          label: "F",
+          clientRequestId: "11111111-1111-4111-8111-111111111111",
+          phase: "failed",
+          ack: null,
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "建站任务未能创建，所选模板尚未生效。无需重新载入模板，请重试选择 F。",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "第 1 页" }));
+    expect(screen.getByRole("button", { name: "选择 F" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "选择 G" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "重试选择 F" }));
+    await waitFor(() => expect(onRetrySelectVisual).toHaveBeenCalledOnce());
   });
 
   it.each([

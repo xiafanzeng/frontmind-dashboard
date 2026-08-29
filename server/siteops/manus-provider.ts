@@ -166,6 +166,7 @@ import {
 import {
   openStaticTemplateCatalogVersionSource,
   requireStaticTemplateCatalogVersion,
+  STATIC_TEMPLATE_SOURCE_MAX_BYTES,
   type StaticTemplateCatalogEntry,
 } from "./static-template-catalog";
 import {
@@ -500,7 +501,10 @@ const providerStateV2Schema = providerStateV1Schema
           .number()
           .int()
           .positive()
-          .max(VISUAL_SELECTION_BUNDLE_V6_SOURCE_ARCHIVE_MAX_BYTES),
+          // V7 catalog archives can be larger than the historical V6 source
+          // ceiling. V6 bytes are still rejected by the explicit assertion in
+          // providerSourceAttachment before this durable receipt is written.
+          .max(STATIC_TEMPLATE_SOURCE_MAX_BYTES),
         filename: z.literal("frontmind-selected-21st-source-v1.zip"),
         fileId: z.string().min(1).max(512),
         expiresAt: z.number().int().positive(),

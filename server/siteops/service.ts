@@ -46,6 +46,7 @@ import {
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+  parseSiteOpsPersistedWorkflowCoordinates,
   siteBriefSchema,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
@@ -125,6 +126,11 @@ import {
 } from "./rebuild-ticket";
 import { customerVisibleStyleBatchStatusCondition } from "./visual-batch-visibility";
 import { siteOpsTrustedFallbackPreviewFromResult } from "./trusted-fallback";
+import {
+  isSiteOpsPersistenceDatabaseError,
+  safeSiteOpsPersistenceDiagnostics,
+  siteOpsPersistenceTransactionOutcome,
+} from "./persistence-diagnostics";
 
 export type SiteOpsServiceErrorCode =
   | "CREDENTIAL_ROTATED"
@@ -136,7 +142,8 @@ export type SiteOpsServiceErrorCode =
   | "NOT_FOUND"
   | "PROVIDER_NOT_CONFIGURED"
   | "REVISION_CONFLICT"
-  | "STATE_CONFLICT";
+  | "STATE_CONFLICT"
+  | "VISUAL_SELECTION_PERSISTENCE_FAILED";
 
 export class SiteOpsServiceError extends Error {
   constructor(
@@ -185,19 +192,25 @@ export function requireAcceptedSiteOpsRebuild(input: {
   }
 }
 
-function siteOpsBuildWorkflowCoordinates(
+export function siteOpsBuildWorkflowCoordinates(
   workflow:
     | typeof SITEOPS_MATERIALIZER_V2_5
     | typeof SITEOPS_MATERIALIZER_V2_6
     | typeof SITEOPS_MATERIALIZER_V2_7
     | typeof SITEOPS_MATERIALIZER_V2_8,
 ) {
-  return {
-    workflowUpstreamVersion: workflow.upstreamVersion,
-    workflowUpstreamHash: workflow.upstreamSha256,
-    workflowVersion: workflow.frontMindVersion,
-    workflowPackageHash: workflow.runtimeManifestSha256,
+  const persisted = parseSiteOpsPersistedWorkflowCoordinates({
+    upstreamVersion: workflow.upstreamVersion,
+    frontMindVersion: workflow.frontMindVersion,
     starterVersion: workflow.starterVersion,
+    componentLibraryVersion: workflow.componentLibraryVersion,
+  });
+  return {
+    workflowUpstreamVersion: persisted.upstreamVersion,
+    workflowUpstreamHash: workflow.upstreamSha256,
+    workflowVersion: persisted.frontMindVersion,
+    workflowPackageHash: workflow.runtimeManifestSha256,
+    starterVersion: persisted.starterVersion,
   } as const;
 }
 
@@ -4497,6 +4510,8 @@ async function selectVisualSample(
   const selectedWorkflow = siteOpsWorkflowForVisualSelectionMetadata(
     selectedMetadataRecord,
   );
+  const buildWorkflowCoordinates =
+    siteOpsBuildWorkflowCoordinates(selectedWorkflow);
   if (!nativeVisual) {
     const selectedEvidence = visualEvidenceV1Schema.safeParse(
       selectedMetadata.visualEvidence,
@@ -4685,7 +4700,7 @@ async function selectVisualSample(
     knowledgeSnapshotId: snapshot.id,
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
-    ...siteOpsBuildWorkflowCoordinates(selectedWorkflow),
+    ...buildWorkflowCoordinates,
     twentyFirstCredentialId: credential?.id ?? null,
     twentyFirstCredentialVersion: credential?.version ?? null,
     styleSampleId: selected.sample.id,
@@ -4913,6 +4928,8 @@ async function handleRevision(
   const nativeVisual = isNativeVisualSelectionMetadata(styleMetadata);
   const selectedWorkflow =
     siteOpsWorkflowForVisualSelectionMetadata(styleMetadata);
+  const buildWorkflowCoordinates =
+    siteOpsBuildWorkflowCoordinates(selectedWorkflow);
   const derivedReferenceBlueprint = nativeVisual
     ? null
     : freezeSiteOpsReferenceBlueprint({
@@ -4974,7 +4991,7 @@ async function handleRevision(
     // A revision is a new immutable build. Freeze the current workflow,
     // starter and materializer as one coordinate set instead of pairing the
     // current host runtime with a historical parent's contract.
-    ...siteOpsBuildWorkflowCoordinates(selectedWorkflow),
+    ...buildWorkflowCoordinates,
     twentyFirstCredentialId: parent.twentyFirstCredentialId,
     twentyFirstCredentialVersion: parent.twentyFirstCredentialVersion,
     styleSampleId: parent.styleSampleId,
@@ -5601,7 +5618,8 @@ export async function actOnSiteOpsFast(
   ) as Record<string, unknown>;
   const requestHash = hashSiteOpsRequest({ action: input.action, payload });
   const db = await requireDb();
-  return db.transaction(async (tx: any) => {
+  let visualSelectionProjectId: string | null = null;
+  const transaction = db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
       tx,
       actor.id,
@@ -5611,6 +5629,7 @@ export async function actOnSiteOpsFast(
     if (!project) {
       throw new SiteOpsServiceError("NOT_FOUND", "AI 建站会话不存在。", 404);
     }
+    visualSelectionProjectId = project.id;
     const resetGate = await loadSiteOpsRebuildRequest(tx, {
       userId: actor.id,
       projectId: project.id,
@@ -5840,6 +5859,32 @@ export async function actOnSiteOpsFast(
       })
       .where(eq(conversationTurns.id, turnId));
     return ack;
+  });
+  return transaction.catch((error: unknown) => {
+    if (
+      (input.action !== "select_visual" &&
+        input.action !== "delegate_visual") ||
+      error instanceof SiteOpsServiceError ||
+      !isSiteOpsPersistenceDatabaseError(error)
+    ) {
+      throw error;
+    }
+    const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
+    console.error("[SiteOps] visual_selection_persistence_failed", {
+      event: "siteops_visual_selection_persistence_failed",
+      action: input.action,
+      stage: "transaction",
+      projectId: visualSelectionProjectId,
+      expectedRevision: input.expectedRevision,
+      releaseSha: /^[a-f0-9]{40}$/u.test(release) ? release : null,
+      ...safeSiteOpsPersistenceDiagnostics(error),
+      transactionOutcome: siteOpsPersistenceTransactionOutcome(error),
+    });
+    throw new SiteOpsServiceError(
+      "VISUAL_SELECTION_PERSISTENCE_FAILED",
+      "建站任务未能创建，所选模板尚未生效。无需重新载入模板，请重试选择。",
+      503,
+    );
   });
 }
 

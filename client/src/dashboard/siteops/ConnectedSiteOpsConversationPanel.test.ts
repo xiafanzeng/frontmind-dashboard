@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isAcceptedSelectVisualAck,
+  matchesSelectVisualCommittedObservation,
   newestSiteOpsObservation,
+  SITEOPS_SELECT_VISUAL_OBSERVE_SCHEDULE_MS,
   shouldPollSiteOpsObservation,
   siteOpsClientRequestId,
   siteOpsPollIntervalMs,
@@ -16,6 +19,105 @@ describe("connected SiteOps request identity", () => {
       /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
     );
     expect(requestId).not.toContain("siteops-");
+  });
+
+  it("accepts select_visual only with an operation, building state and an advanced revision", () => {
+    const ack = {
+      schemaVersion: 1,
+      accepted: true,
+      clientRequestId: "11111111-1111-4111-8111-111111111111",
+      operationId: "22222222-2222-4222-8222-222222222222",
+      projectRevision: 4,
+      latestSequence: 3,
+      interactionState: "building",
+    } as const;
+    const input = {
+      clientRequestId: ack.clientRequestId,
+      expectedRevision: 3,
+    };
+
+    expect(isAcceptedSelectVisualAck(ack, input)).toBe(true);
+    expect(
+      isAcceptedSelectVisualAck({ ...ack, operationId: null }, input),
+    ).toBe(false);
+    expect(
+      isAcceptedSelectVisualAck(
+        { ...ack, interactionState: "awaiting_visual_selection" },
+        input,
+      ),
+    ).toBe(false);
+    expect(
+      isAcceptedSelectVisualAck({ ...ack, projectRevision: 3 }, input),
+    ).toBe(false);
+    expect(SITEOPS_SELECT_VISUAL_OBSERVE_SCHEDULE_MS).toEqual([
+      1_000, 2_000, 5_000,
+    ]);
+  });
+
+  it("matches the ACK operation's building projection and rejects old or late projections", () => {
+    const ack = {
+      schemaVersion: 1,
+      accepted: true,
+      clientRequestId: "11111111-1111-4111-8111-111111111111",
+      operationId: "22222222-2222-4222-8222-222222222222",
+      projectRevision: 4,
+      latestSequence: 3,
+      interactionState: "building",
+    } as const;
+    const old = {
+      project: { revision: 3 },
+      latestSequence: 1,
+      interactionState: "awaiting_visual_selection",
+      messages: [],
+    } as never;
+    const building = {
+      project: { revision: 4 },
+      latestSequence: 3,
+      interactionState: "building",
+      messages: [
+        {
+          metadata: {
+            siteOps: {
+              kind: "build_progress",
+              subjectId: ack.operationId,
+              revision: 4,
+            },
+          },
+        },
+      ],
+    } as never;
+    const wrongOperation = {
+      ...building,
+      messages: [
+        {
+          metadata: {
+            siteOps: {
+              kind: "build_progress",
+              subjectId: "33333333-3333-4333-8333-333333333333",
+              revision: 4,
+            },
+          },
+        },
+      ],
+    } as never;
+
+    expect(matchesSelectVisualCommittedObservation(old, ack)).toBe(false);
+    expect(matchesSelectVisualCommittedObservation(wrongOperation, ack)).toBe(
+      false,
+    );
+    expect(matchesSelectVisualCommittedObservation(building, ack)).toBe(true);
+    expect(
+      matchesSelectVisualCommittedObservation(
+        {
+          ...building,
+          project: { revision: 4 },
+          interactionState: "preview_ready",
+        } as never,
+        ack,
+      ),
+    ).toBe(true);
+    expect(newestSiteOpsObservation(old, building)).toBe(building);
+    expect(newestSiteOpsObservation(building, old)).toBe(building);
   });
 
   it("keeps polling while an approved reset is unpublishing the old site", () => {

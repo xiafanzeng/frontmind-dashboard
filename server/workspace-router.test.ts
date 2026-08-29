@@ -40,4 +40,34 @@ describe("workspace SiteOps error boundary", () => {
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
+
+  it("projects visual selection persistence as the public 503 response", () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const serviceError = new SiteOpsServiceError(
+      "VISUAL_SELECTION_PERSISTENCE_FAILED",
+      "建站任务未能创建，所选模板尚未生效。无需重新载入模板，请重试选择。",
+      503,
+    );
+
+    let projected: unknown;
+    try {
+      toSiteOpsServiceError(serviceError);
+    } catch (error) {
+      projected = error;
+    }
+
+    expect(projected).toMatchObject({
+      code: "SERVICE_UNAVAILABLE",
+      message:
+        "建站任务未能创建，所选模板尚未生效。无需重新载入模板，请重试选择。",
+      cause: {
+        code: "VISUAL_SELECTION_PERSISTENCE_FAILED",
+        statusCode: 503,
+      },
+    });
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
 });

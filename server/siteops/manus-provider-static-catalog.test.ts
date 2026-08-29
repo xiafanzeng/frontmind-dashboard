@@ -3,6 +3,7 @@ import { createReadStream } from "node:fs";
 import { mkdtemp, open, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -32,6 +33,7 @@ vi.mock("./native-visual-source", () => ({
 }));
 
 vi.mock("./static-template-catalog", () => ({
+  STATIC_TEMPLATE_SOURCE_MAX_BYTES: 192 * 1024 * 1024,
   requireActiveStaticTemplateCatalog:
     catalogMocks.requireActiveStaticTemplateCatalog,
   requireStaticTemplateCatalogVersion:
@@ -41,6 +43,7 @@ vi.mock("./static-template-catalog", () => ({
 }));
 
 import {
+  createManusSiteOpsProviderHandler,
   nativeSourceSystemPromptForWorkflow,
   nativeTemplateCoordinateDirective,
   selectedStaticNativeSourceArchive,
@@ -98,7 +101,23 @@ function bundle(): VisualSelectionBundleV7 {
     pageSize: 8,
     pageCount: 4,
     displayTarget: 8,
-    candidates: Array.from({ length: 8 }, (_, index) => candidate(index)),
+    candidates: Array.from({ length: 8 }, (_, index) => ({
+      ...candidate(index, {
+        bytes: 64 * 1024 * 1024,
+        sha256:
+          index === 0
+            ? HASH
+            : createHash("sha256")
+                .update(`static-source-${index}`, "utf8")
+                .digest("hex"),
+      }),
+      previewSha256:
+        index === 0
+          ? PREVIEW_HASH
+          : createHash("sha256")
+              .update(`static-preview-${index}`, "utf8")
+              .digest("hex"),
+    })),
     selectedCandidateId: null,
     delegated: false,
     degradedReasons: [],
@@ -139,6 +158,247 @@ function entryFor(selected: ReturnType<typeof candidate>) {
 }
 
 const temporaryRoots: string[] = [];
+
+async function sha256File(sourcePath: string) {
+  const digest = createHash("sha256");
+  for await (const chunk of createReadStream(sourcePath)) {
+    digest.update(chunk as Buffer);
+  }
+  return digest.digest("hex");
+}
+
+async function createProviderHarness(input: {
+  sourcePath: string;
+  sourceBytes: number;
+  sourceSha256: string;
+  failCreateUnknownOnce?: boolean;
+}) {
+  const selected = candidate(0, {
+    bytes: input.sourceBytes,
+    sha256: input.sourceSha256,
+  });
+  const staticBundle = bundle();
+  staticBundle.candidates[0] = selected;
+  const entry = entryFor(selected);
+  catalogMocks.requireStaticTemplateCatalogVersion.mockResolvedValue({
+    catalogVersion: CATALOG_VERSION,
+    entries: [entry],
+  });
+  catalogMocks.openStaticTemplateCatalogVersionSource.mockImplementation(
+    async () => ({
+      entry,
+      path: input.sourcePath,
+      stream: createReadStream(input.sourcePath),
+    }),
+  );
+
+  const selectionBytes = Buffer.from(JSON.stringify(staticBundle), "utf8");
+  const selectionSha256 = createHash("sha256")
+    .update(selectionBytes)
+    .digest("hex");
+  const snapshotBytes = Buffer.from("x", "utf8");
+  const snapshotSha256 = createHash("sha256")
+    .update(snapshotBytes)
+    .digest("hex");
+  const operation = {
+    id: "10000000-0000-4000-8000-000000000001",
+    projectId: "20000000-0000-4000-8000-000000000002",
+    userId: 7,
+    conversationTurnId: null,
+    buildId: "30000000-0000-4000-8000-000000000003",
+    kind: "site_build",
+    status: "running",
+    clientRequestId: "request-static-template",
+    inputHash: "d".repeat(64),
+    input: {
+      credentialScope: "customer",
+      buildId: "30000000-0000-4000-8000-000000000003",
+      manusCredentialId: "40000000-0000-4000-8000-000000000004",
+      manusCredentialVersion: 9,
+      agentProfile: "frontmind-base",
+    },
+    provider: "manus",
+    providerOperationId: null,
+    providerTaskId: null,
+    leaseOwner: "lease-static-template",
+    leaseExpiresAt: new Date(Date.now() + 12 * 60_000),
+    attempt: 1,
+    result: null,
+    errorCode: null,
+    errorMessage: null,
+    startedAt: new Date(),
+    completedAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  } as const;
+  const brief = {
+    companyName: "星河智造",
+    primaryLanguage: "zh-CN",
+    contacts: [],
+    offerings: ["设备服务"],
+    audience: ["制造企业"],
+    conversionGoal: "联系咨询",
+    routes: [
+      {
+        id: "home",
+        slug: "/",
+        title: "首页",
+        sourceDocumentIds: ["overview"],
+      },
+    ],
+    verifiedFacts: [
+      {
+        statement: "星河智造提供设备服务。",
+        sourceDocumentIds: ["overview"],
+      },
+    ],
+    publicAssetIds: [],
+    unknowns: [],
+  };
+  const context = {
+    build: {
+      id: operation.buildId,
+      projectId: operation.projectId,
+      userId: operation.userId,
+      knowledgeSnapshotId: "50000000-0000-4000-8000-000000000005",
+      knowledgeArchiveHash: snapshotSha256,
+      workflowVersion: "2.8.0",
+      brief,
+      selectionHash: createHash("sha256")
+        .update("static-selection", "utf8")
+        .digest("hex"),
+      repairAttempts: 0,
+      parentBuildId: null,
+      upstreamManusTaskId: null as string | null,
+      contractLocalAssetId: null,
+      sourceLocalAssetId: null,
+      distLocalAssetId: null,
+      qaLocalAssetId: null,
+      provenanceLocalAssetId: null,
+      status: "queued",
+    },
+    project: { id: operation.projectId },
+    snapshot: {
+      id: "50000000-0000-4000-8000-000000000005",
+      userId: operation.userId,
+      archiveHash: snapshotSha256,
+      totalBytes: snapshotBytes.length,
+      sourceBuildId: null,
+      sourceBuildRevision: null,
+      assets: [],
+      documents: [
+        {
+          id: "overview",
+          path: "overview.md",
+          title: "企业简介",
+          content: "星河智造提供设备服务。",
+          kind: "leaf" as const,
+          evidenceStatus: "verified_first_party" as const,
+          customerVisible: true,
+        },
+      ],
+    },
+    sample: {
+      id: selected.id,
+      batchId: "70000000-0000-4000-8000-000000000007",
+      previewLocalAssetId: null,
+      sourceMetadata: {
+        schemaVersion: 7,
+        renderer: staticBundle.renderer,
+        workflowVersion: staticBundle.workflowVersion,
+        ...selected,
+      },
+    },
+    batch: {
+      selectionBundleLocalAssetId: "90000000-0000-4000-8000-000000000009",
+      selectionBundleHash: selectionSha256,
+    },
+  };
+  const query: any = {};
+  query.from = () => query;
+  query.innerJoin = () => query;
+  query.where = () => query;
+  query.limit = async () => [context];
+  let persistedOperationResult: unknown = null;
+  let failCreateUnknownOnce = input.failCreateUnknownOnce ?? false;
+  const db = {
+    select: () => query,
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
+      callback(db),
+    update: () => ({
+      set: (values: Record<string, unknown>) => ({
+        where: async () => {
+          if ("result" in values) {
+            const state = values.result as { stage?: string };
+            if (failCreateUnknownOnce && state.stage === "create_unknown") {
+              failCreateUnknownOnce = false;
+              throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+            }
+            persistedOperationResult = values.result;
+          } else {
+            Object.assign(context.build, values);
+          }
+          return [{ affectedRows: 1 }];
+        },
+      }),
+    }),
+  };
+  const uploadFile = vi.fn(async () => ({
+    fileId: "provider-static-source",
+    detail: { expiresAt: Math.floor(Date.now() / 1_000) + 60 * 60 },
+  }));
+  const createTask = vi.fn(async () => ({ taskId: "static-manus-task" }));
+  const client = {
+    uploadFile,
+    createTask,
+    sendMessage: vi.fn(),
+    findCreatedTask: vi.fn(async () => ({ matches: [], unique: null })),
+    taskDetail: vi.fn(async () => ({ status: "running" })),
+    listAllMessages: vi.fn(async () => []),
+  };
+  const handler = createManusSiteOpsProviderHandler({
+    getDb: async () => db as never,
+    getCredential: async () => ({
+      id: operation.input.manusCredentialId,
+      userId: operation.userId,
+      version: operation.input.manusCredentialVersion,
+      apiKey: "customer-personal-key",
+    }),
+    createClient: () => client as never,
+    readSnapshotArchive: async () => snapshotBytes,
+    readArtifact: async () =>
+      ({
+        row: {
+          id: context.batch.selectionBundleLocalAssetId,
+          scope: "managed_user",
+          accountUserId: operation.userId,
+          storageKey: `siteops:${operation.projectId}:static-selection`,
+          mimeType: "application/json",
+          contentSha256: selectionSha256,
+          sizeBytes: selectionBytes.length,
+        },
+        stored: {
+          sizeBytes: selectionBytes.length,
+          createReadStream: () => Readable.from([selectionBytes]),
+        },
+      }) as never,
+    materializeSite: vi.fn() as never,
+    materializeNativeSite: vi.fn() as never,
+    materializeNativeTrustedFallbackSite: vi.fn() as never,
+    persistArtifact: vi.fn() as never,
+    generateSocial: vi.fn() as never,
+  });
+  return {
+    client,
+    context,
+    createTask,
+    getPersistedOperationResult: () => persistedOperationResult,
+    handler,
+    operation,
+    selected,
+    uploadFile,
+  };
+}
 
 afterEach(async () => {
   vi.clearAllMocks();
@@ -260,6 +520,154 @@ describe("V7 static Template Manus source", () => {
     expect(first).not.toBe(second);
     first.destroy();
     second.destroy();
+  });
+
+  it("keeps a small V7 source inline when the provider task is created", async () => {
+    const sourceBytes = Buffer.from("verified-inline-static-template", "utf8");
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "frontmind-v7-task-inline-"),
+    );
+    temporaryRoots.push(root);
+    const sourcePath = path.join(root, "template.zip");
+    const handle = await open(sourcePath, "w");
+    await handle.writeFile(sourceBytes);
+    await handle.close();
+    const harness = await createProviderHarness({
+      sourcePath,
+      sourceBytes: sourceBytes.length,
+      sourceSha256: createHash("sha256").update(sourceBytes).digest("hex"),
+    });
+
+    const result = await harness.handler({
+      operation: harness.operation as never,
+      signal: new AbortController().signal,
+      assertLeaseActive: async () => undefined,
+    });
+
+    expect(result).toMatchObject({
+      status: "pending",
+      providerTaskId: "static-manus-task",
+      result: { stage: "native_source_pending" },
+    });
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.createTask).toHaveBeenCalledTimes(1);
+    const createInput = harness.createTask.mock.calls[0]![0] as any;
+    const sourceAttachment = createInput.attachments.find(
+      (attachment: any) =>
+        attachment.filename === "frontmind-selected-21st-source-v1.zip",
+    );
+    expect(sourceAttachment).not.toHaveProperty("file_id");
+    expect(
+      Buffer.from(sourceAttachment.file_data.split(",", 2)[1], "base64"),
+    ).toEqual(sourceBytes);
+    expect(result.result).not.toHaveProperty("nativeInputProviderFile");
+  });
+
+  it("persists and reuses a streamed V7 upload above 52 MiB across worker reclaim", async () => {
+    const sourceBytes = 64 * 1024 * 1024;
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "frontmind-v7-task-stream-"),
+    );
+    temporaryRoots.push(root);
+    const sourcePath = path.join(root, "template.zip");
+    const handle = await open(sourcePath, "w");
+    await handle.truncate(sourceBytes);
+    await handle.close();
+    const sourceSha256 = await sha256File(sourcePath);
+    const harness = await createProviderHarness({
+      sourcePath,
+      sourceBytes,
+      sourceSha256,
+      failCreateUnknownOnce: true,
+    });
+
+    await expect(
+      harness.handler({
+        operation: harness.operation as never,
+        signal: new AbortController().signal,
+        assertLeaseActive: async () => undefined,
+      }),
+    ).rejects.toThrow("SITEOPS_OPERATION_LEASE_LOST");
+
+    expect(harness.uploadFile).toHaveBeenCalledTimes(1);
+    expect(harness.createTask).not.toHaveBeenCalled();
+    const uploadInput = harness.uploadFile.mock.calls[0]![0] as any;
+    expect(uploadInput).toMatchObject({
+      filename: "frontmind-selected-21st-source-v1.zip",
+      byteLength: sourceBytes,
+      contentType: "application/zip",
+    });
+    expect(uploadInput).not.toHaveProperty("bytes");
+    const firstUploadStream = uploadInput.createReadStream();
+    const secondUploadStream = uploadInput.createReadStream();
+    expect(firstUploadStream).not.toBe(secondUploadStream);
+    expect(path.resolve(String(firstUploadStream.path))).toBe(
+      path.resolve(sourcePath),
+    );
+    firstUploadStream.destroy();
+    secondUploadStream.destroy();
+
+    const uploadedState = harness.getPersistedOperationResult() as any;
+    expect(uploadedState).toMatchObject({
+      schemaVersion: 2,
+      stage: "native_input_ready",
+      nativeInputProviderFile: {
+        sourceArchiveSha256: sourceSha256,
+        bytes: sourceBytes,
+        filename: "frontmind-selected-21st-source-v1.zip",
+        fileId: "provider-static-source",
+        status: "uploaded",
+      },
+    });
+    expect(sourceBytes).toBeGreaterThan(52 * 1024 * 1024);
+
+    const reclaimed = await harness.handler({
+      operation: {
+        ...harness.operation,
+        result: uploadedState,
+      } as never,
+      signal: new AbortController().signal,
+      assertLeaseActive: async () => undefined,
+    });
+    expect(reclaimed).toMatchObject({
+      status: "pending",
+      providerTaskId: "static-manus-task",
+      result: {
+        stage: "native_source_pending",
+        nativeInputProviderFile: {
+          bytes: sourceBytes,
+          fileId: "provider-static-source",
+        },
+      },
+    });
+    expect(harness.uploadFile).toHaveBeenCalledTimes(1);
+    expect(harness.createTask).toHaveBeenCalledTimes(1);
+    const createInput = harness.createTask.mock.calls[0]![0] as any;
+    const sourceAttachment = createInput.attachments.find(
+      (attachment: any) =>
+        attachment.filename === "frontmind-selected-21st-source-v1.zip",
+    );
+    expect(sourceAttachment).toEqual({
+      file_id: "provider-static-source",
+      filename: "frontmind-selected-21st-source-v1.zip",
+    });
+
+    await expect(
+      harness.handler({
+        operation: {
+          ...harness.operation,
+          providerTaskId: "static-manus-task",
+          result: reclaimed.result,
+        } as never,
+        signal: new AbortController().signal,
+        assertLeaseActive: async () => undefined,
+      }),
+    ).resolves.toMatchObject({
+      status: "pending",
+      providerTaskId: "static-manus-task",
+    });
+    expect(harness.uploadFile).toHaveBeenCalledTimes(1);
+    expect(harness.createTask).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a V7 source asset coordinate before opening catalog bytes", async () => {

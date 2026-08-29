@@ -187,6 +187,7 @@ function serviceDatabaseFixture() {
   const inserts: Insert[] = [];
   const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
+  const insertFailures = new Map<unknown, unknown>();
   let inTransaction = false;
   const rowsFor = (table: unknown, selection: unknown) => {
     const keys = Object.keys((selection as Record<string, unknown>) ?? {});
@@ -266,6 +267,7 @@ function serviceDatabaseFixture() {
     select,
     insert: (table: unknown) => ({
       values: async (values: Record<string, unknown>) => {
+        if (insertFailures.has(table)) throw insertFailures.get(table);
         inserts.push({ table, values });
       },
     }),
@@ -297,6 +299,7 @@ function serviceDatabaseFixture() {
     sample,
     batch,
     inserts,
+    insertFailures,
     updates,
     customerCredential,
     visualRows,
@@ -691,6 +694,153 @@ describe("SiteOps visual selection and current-task revisions", () => {
       },
     });
     expect(fixture.project.currentBuildId).toBe(buildInsert?.values.id);
+  });
+
+  it("returns one safe 503 when select_visual build persistence rolls back", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    const secret = "customer-private-template-choice";
+    const driverError = Object.assign(
+      new Error(
+        `Data too long for column 'workflow_upstream_version': ${secret}`,
+      ),
+      {
+        code: "ER_DATA_TOO_LONG",
+        errno: 1406,
+        sqlState: "22001",
+      },
+    );
+    fixture.insertFailures.set(
+      siteBuilds,
+      Object.assign(new Error(`Failed query with ${secret}`), {
+        query: "insert into site_builds values (?)",
+        params: [secret],
+        cause: driverError,
+      }),
+    );
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const previousRelease = process.env.FRONTMIND_BUILD_SHA;
+    process.env.FRONTMIND_BUILD_SHA = "f".repeat(40);
+
+    try {
+      await expect(
+        actOnSiteOps(
+          actor as never,
+          selectVisualInput(fixture.project.revision, fixture.sample.id),
+        ),
+      ).rejects.toMatchObject({
+        code: "VISUAL_SELECTION_PERSISTENCE_FAILED",
+        statusCode: 503,
+        message:
+          "建站任务未能创建，所选模板尚未生效。无需重新载入模板，请重试选择。",
+      });
+      expect(consoleError).toHaveBeenCalledOnce();
+      expect(consoleError).toHaveBeenCalledWith(
+        "[SiteOps] visual_selection_persistence_failed",
+        {
+          event: "siteops_visual_selection_persistence_failed",
+          action: "select_visual",
+          stage: "transaction",
+          projectId: fixture.project.id,
+          expectedRevision: fixture.project.revision,
+          releaseSha: "f".repeat(40),
+          driverCode: "ER_DATA_TOO_LONG",
+          errno: 1406,
+          sqlState: "22001",
+          column: "workflow_upstream_version",
+          transactionOutcome: "rolled_back",
+        },
+      );
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(secret);
+    } finally {
+      if (previousRelease === undefined) {
+        delete process.env.FRONTMIND_BUILD_SHA;
+      } else {
+        process.env.FRONTMIND_BUILD_SHA = previousRelease;
+      }
+      consoleError.mockRestore();
+    }
+  });
+
+  it("uses the same safe persistence boundary for delegate_visual", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    fixture.insertFailures.set(
+      siteBuilds,
+      Object.assign(new Error("deadlock"), {
+        code: "ER_LOCK_DEADLOCK",
+        errno: 1213,
+        sqlState: "40001",
+      }),
+    );
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const previousRelease = process.env.FRONTMIND_BUILD_SHA;
+    const unsafeRelease = "release-secret-customer";
+    process.env.FRONTMIND_BUILD_SHA = unsafeRelease;
+
+    try {
+      await expect(
+        actOnSiteOps(
+          actor as never,
+          delegateVisualInput(fixture.project.revision),
+        ),
+      ).rejects.toMatchObject({
+        code: "VISUAL_SELECTION_PERSISTENCE_FAILED",
+        statusCode: 503,
+      });
+      expect(consoleError).toHaveBeenCalledOnce();
+      expect(consoleError).toHaveBeenCalledWith(
+        "[SiteOps] visual_selection_persistence_failed",
+        expect.objectContaining({
+          event: "siteops_visual_selection_persistence_failed",
+          action: "delegate_visual",
+          driverCode: "ER_LOCK_DEADLOCK",
+          errno: 1213,
+          sqlState: "40001",
+          releaseSha: null,
+          transactionOutcome: "rolled_back",
+        }),
+      );
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+        unsafeRelease,
+      );
+    } finally {
+      if (previousRelease === undefined) {
+        delete process.env.FRONTMIND_BUILD_SHA;
+      } else {
+        process.env.FRONTMIND_BUILD_SHA = previousRelease;
+      }
+      consoleError.mockRestore();
+    }
+  });
+
+  it("does not classify an unknown select_visual failure as persistence", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    const unknownError = new Error("unexpected selection bug");
+    fixture.insertFailures.set(siteBuilds, unknownError);
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    try {
+      await expect(
+        actOnSiteOps(
+          actor as never,
+          selectVisualInput(fixture.project.revision, fixture.sample.id),
+        ),
+      ).rejects.toBe(unknownError);
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("creates a fresh root build from a snapshot at the post-reset floor", async () => {

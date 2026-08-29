@@ -1,8 +1,13 @@
 import type { SiteOpsObservationV1 } from "@shared/siteops-contract";
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
+import type { SiteOpsActInput } from "@shared/siteops";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { trpc } from "@/lib/trpc";
-import SiteOpsConversationPanel from "./SiteOpsConversationPanel";
+import SiteOpsConversationPanel, {
+  siteOpsSelectVisualFailureMessage,
+  type SiteOpsSelectVisualAck,
+  type SiteOpsSelectVisualState,
+} from "./SiteOpsConversationPanel";
 
 const POLLING_STATES = new Set<SiteOpsObservationV1["interactionState"]>([
   "collecting_brief",
@@ -60,6 +65,85 @@ const SITEOPS_PROGRESSIVE_POLL_INTERVALS = [
   { untilMs: 30 * 60_000, intervalMs: 20_000 },
   { untilMs: Number.POSITIVE_INFINITY, intervalMs: 30_000 },
 ] as const;
+
+export const SITEOPS_SELECT_VISUAL_OBSERVE_SCHEDULE_MS = [
+  1_000, 2_000, 5_000,
+] as const;
+
+type SiteOpsActionInput = Pick<
+  SiteOpsActInput,
+  "action" | "input" | "messageId" | "cardKind"
+>;
+
+type SelectVisualRequestScope = {
+  projectId: string;
+  conversationId: string;
+  expectedRevision: number;
+  action: SiteOpsActionInput;
+};
+
+export function isAcceptedSelectVisualAck(
+  value: unknown,
+  input: { clientRequestId: string; expectedRevision: number },
+): value is SiteOpsSelectVisualAck {
+  if (!value || typeof value !== "object") return false;
+  const ack = value as Record<string, unknown>;
+  return Boolean(
+    ack.schemaVersion === 1 &&
+      ack.accepted === true &&
+      ack.clientRequestId === input.clientRequestId &&
+      typeof ack.operationId === "string" &&
+      ack.operationId.trim().length > 0 &&
+      typeof ack.projectRevision === "number" &&
+      Number.isInteger(ack.projectRevision) &&
+      ack.projectRevision > input.expectedRevision &&
+      typeof ack.latestSequence === "number" &&
+      Number.isInteger(ack.latestSequence) &&
+      ack.latestSequence >= 0 &&
+      ack.interactionState === "building",
+  );
+}
+
+const SELECT_VISUAL_COMMITTED_INTERACTION_STATES = new Set<
+  SiteOpsObservationV1["interactionState"]
+>([
+  "building",
+  "preview_ready",
+  "approved",
+  "live",
+  "attention_required",
+  "failed",
+  "cancelled",
+]);
+
+export function matchesSelectVisualCommittedObservation(
+  observation: SiteOpsObservationV1,
+  ack: SiteOpsSelectVisualAck,
+) {
+  if (
+    !SELECT_VISUAL_COMMITTED_INTERACTION_STATES.has(
+      observation.interactionState,
+    ) ||
+    observation.project.revision < ack.projectRevision ||
+    observation.latestSequence < ack.latestSequence
+  ) {
+    return false;
+  }
+  return observation.messages.some((message) => {
+    const card = message.metadata?.siteOps;
+    return Boolean(
+      card?.kind === "build_progress" &&
+        card.subjectId === ack.operationId &&
+        card.revision >= ack.projectRevision,
+    );
+  });
+}
+
+function selectVisualInFlight(state: SiteOpsSelectVisualState | null) {
+  return Boolean(
+    state && ["submitting", "observing", "polling"].includes(state.phase),
+  );
+}
 
 function hasTrustedFallbackReconciliation(
   observation: SiteOpsObservationV1 | null,
@@ -301,17 +385,23 @@ export default function ConnectedSiteOpsConversationPanel({
   }) => Promise<void> | void;
 }) {
   const opened = useRef(false);
+  const observationRef = useRef<SiteOpsObservationV1 | null>(null);
   const pendingActionAck = useRef<{
     clientRequestId: string;
     projectRevision: number;
     latestSequence: number;
   } | null>(null);
+  const selectVisualRef = useRef<SiteOpsSelectVisualState | null>(null);
+  const selectVisualScope = useRef<SelectVisualRequestScope | null>(null);
+  const selectVisualObserveRun = useRef(0);
   const observeRequestGeneration = useRef(0);
   const acceptedObserveGeneration = useRef(0);
   const pollEpoch = useRef({ coordinate: "idle", startedAt: Date.now() });
   const [observation, setObservation] = useState<SiteOpsObservationV1 | null>(
     null,
   );
+  const [selectVisual, setSelectVisual] =
+    useState<SiteOpsSelectVisualState | null>(null);
   const [submissionNotice, setSubmissionNotice] = useState<string | null>(null);
   const [pageActive, setPageActive] = useState(() =>
     Boolean(
@@ -319,19 +409,54 @@ export default function ConnectedSiteOpsConversationPanel({
         (typeof navigator === "undefined" || navigator.onLine),
     ),
   );
-  const acceptObservation = useCallback((incoming: SiteOpsObservationV1) => {
-    setObservation((current) => newestSiteOpsObservation(current, incoming));
-    const pending = pendingActionAck.current;
-    if (
-      pending &&
-      (incoming.project.revision > pending.projectRevision ||
-        (incoming.project.revision === pending.projectRevision &&
-          incoming.latestSequence >= pending.latestSequence))
-    ) {
-      pendingActionAck.current = null;
-      setSubmissionNotice(null);
-    }
-  }, []);
+  const updateSelectVisual = useCallback(
+    (next: SiteOpsSelectVisualState | null) => {
+      selectVisualRef.current = next;
+      setSelectVisual(next);
+    },
+    [],
+  );
+  const acceptObservation = useCallback(
+    (incoming: SiteOpsObservationV1) => {
+      const accepted = newestSiteOpsObservation(
+        observationRef.current,
+        incoming,
+      );
+      observationRef.current = accepted;
+      setObservation(accepted);
+      const pending = pendingActionAck.current;
+      if (
+        pending &&
+        (accepted.project.revision > pending.projectRevision ||
+          (accepted.project.revision === pending.projectRevision &&
+            accepted.latestSequence >= pending.latestSequence))
+      ) {
+        pendingActionAck.current = null;
+        setSubmissionNotice(null);
+      }
+      const selection = selectVisualRef.current;
+      const selectionScope = selectVisualScope.current;
+      if (
+        selection?.phase === "failed" &&
+        selectionScope &&
+        (accepted.project.id !== selectionScope.projectId ||
+          accepted.project.revision !== selectionScope.expectedRevision)
+      ) {
+        selectVisualScope.current = null;
+        updateSelectVisual(null);
+        setSubmissionNotice(null);
+      } else if (
+        selection?.ack &&
+        selection.phase !== "confirmed" &&
+        matchesSelectVisualCommittedObservation(accepted, selection.ack)
+      ) {
+        selectVisualObserveRun.current += 1;
+        updateSelectVisual({ ...selection, phase: "confirmed" });
+        setSubmissionNotice(null);
+      }
+    },
+    [updateSelectVisual],
+  );
   const openMutation = trpc.workspace.siteOps.open.useMutation({
     onSuccess: acceptObservation,
   });
@@ -349,10 +474,13 @@ export default function ConnectedSiteOpsConversationPanel({
   if (pollEpoch.current.coordinate !== pollCoordinate) {
     pollEpoch.current = { coordinate: pollCoordinate, startedAt: Date.now() };
   }
-  const pollInterval = siteOpsPollIntervalMs(
-    observation,
-    Date.now() - pollEpoch.current.startedAt,
-  );
+  const pollInterval =
+    selectVisual?.phase === "polling"
+      ? SITEOPS_PROGRESSIVE_POLL_INTERVALS[0].intervalMs
+      : siteOpsPollIntervalMs(
+          observation,
+          Date.now() - pollEpoch.current.startedAt,
+        );
   const observeQuery = trpc.workspace.siteOps.observe.useQuery(
     { conversationId },
     {
@@ -407,10 +535,218 @@ export default function ConnectedSiteOpsConversationPanel({
     acceptObservation(observeQuery.data);
   }, [acceptObservation, observeQuery.data]);
 
+  useEffect(
+    () => () => {
+      selectVisualObserveRun.current += 1;
+    },
+    [],
+  );
+
+  async function observeSelectedVisual(
+    clientRequestId: string,
+    ack: SiteOpsSelectVisualAck,
+  ) {
+    const run = ++selectVisualObserveRun.current;
+    const startedAt = Date.now();
+    for (const scheduledAtMs of SITEOPS_SELECT_VISUAL_OBSERVE_SCHEDULE_MS) {
+      const remainingMs = Math.max(0, scheduledAtMs - (Date.now() - startedAt));
+      await new Promise<void>((resolve) => setTimeout(resolve, remainingMs));
+      if (run !== selectVisualObserveRun.current) return;
+
+      const generation = ++observeRequestGeneration.current;
+      try {
+        const refreshed = await observeQuery.refetch({ cancelRefetch: false });
+        if (run !== selectVisualObserveRun.current) return;
+        if (!refreshed.data || generation < acceptedObserveGeneration.current) {
+          continue;
+        }
+        acceptedObserveGeneration.current = generation;
+        acceptObservation(refreshed.data);
+      } catch {
+        // A transient observation failure does not invalidate an already
+        // accepted build request. Continue the bounded serial schedule.
+      }
+
+      const current = selectVisualRef.current;
+      if (
+        !current ||
+        current.clientRequestId !== clientRequestId ||
+        current.phase === "confirmed"
+      ) {
+        return;
+      }
+    }
+
+    const current = selectVisualRef.current;
+    if (
+      run === selectVisualObserveRun.current &&
+      current?.clientRequestId === clientRequestId &&
+      current.ack === ack &&
+      current.phase === "observing"
+    ) {
+      updateSelectVisual({ ...current, phase: "polling" });
+      setSubmissionNotice("已提交，状态同步延迟");
+    }
+  }
+
+  async function submitSelectVisual(
+    scope: SelectVisualRequestScope,
+    attempt: SiteOpsSelectVisualState,
+  ) {
+    selectVisualObserveRun.current += 1;
+    const submitting: SiteOpsSelectVisualState = {
+      ...attempt,
+      phase: "submitting",
+      ack: null,
+    };
+    updateSelectVisual(submitting);
+    setSubmissionNotice(null);
+    actMutation.reset();
+
+    let rawAck: unknown;
+    try {
+      rawAck = await actMutation.mutateAsync({
+        conversationId: scope.conversationId,
+        clientRequestId: submitting.clientRequestId,
+        expectedRevision: scope.expectedRevision,
+        action: scope.action.action,
+        input: scope.action.input,
+        ...(scope.action.messageId
+          ? { messageId: scope.action.messageId }
+          : {}),
+        ...(scope.action.cardKind ? { cardKind: scope.action.cardKind } : {}),
+      });
+    } catch {
+      const current = selectVisualRef.current;
+      if (current?.clientRequestId === submitting.clientRequestId) {
+        updateSelectVisual({ ...submitting, phase: "failed", ack: null });
+      }
+      throw new Error(siteOpsSelectVisualFailureMessage(submitting.label));
+    }
+
+    if (
+      !isAcceptedSelectVisualAck(rawAck, {
+        clientRequestId: submitting.clientRequestId,
+        expectedRevision: scope.expectedRevision,
+      })
+    ) {
+      const current = selectVisualRef.current;
+      if (current?.clientRequestId === submitting.clientRequestId) {
+        updateSelectVisual({ ...submitting, phase: "failed", ack: null });
+      }
+      throw new Error(siteOpsSelectVisualFailureMessage(submitting.label));
+    }
+
+    if (
+      selectVisualRef.current?.clientRequestId !== submitting.clientRequestId
+    ) {
+      return;
+    }
+    const acknowledged: SiteOpsSelectVisualState = {
+      ...submitting,
+      phase: "observing",
+      ack: rawAck,
+    };
+    updateSelectVisual(acknowledged);
+    setSubmissionNotice(null);
+
+    const currentObservation = observationRef.current;
+    if (
+      currentObservation &&
+      matchesSelectVisualCommittedObservation(currentObservation, rawAck)
+    ) {
+      updateSelectVisual({ ...acknowledged, phase: "confirmed" });
+      return;
+    }
+    void observeSelectedVisual(submitting.clientRequestId, rawAck);
+  }
+
+  async function runSiteOpsAction(input: SiteOpsActionInput) {
+    const currentObservation = observationRef.current;
+    if (!currentObservation || selectVisualInFlight(selectVisualRef.current)) {
+      return;
+    }
+
+    if (input.action === "select_visual") {
+      const sampleId =
+        typeof input.input.sampleId === "string"
+          ? input.input.sampleId.trim()
+          : "";
+      const candidate = [
+        ...currentObservation.visualCandidatePages.flatMap(
+          (page) => page.candidates,
+        ),
+        ...currentObservation.visualCandidates,
+      ].find((item) => item.id === sampleId);
+      if (!sampleId || !candidate) {
+        throw new Error("所选模板已不可用，请重新选择。");
+      }
+      const scope: SelectVisualRequestScope = {
+        projectId: currentObservation.project.id,
+        conversationId: currentObservation.project.conversationId,
+        expectedRevision: currentObservation.project.revision,
+        action: input,
+      };
+      const attempt: SiteOpsSelectVisualState = {
+        sampleId,
+        label: candidate.label,
+        clientRequestId: siteOpsClientRequestId(),
+        phase: "submitting",
+        ack: null,
+      };
+      selectVisualScope.current = scope;
+      await submitSelectVisual(scope, attempt);
+      return;
+    }
+
+    const clientRequestId = siteOpsClientRequestId();
+    actMutation.reset();
+    const ack = await actMutation.mutateAsync({
+      conversationId: currentObservation.project.conversationId,
+      clientRequestId,
+      expectedRevision: currentObservation.project.revision,
+      action: input.action,
+      input: input.input,
+      ...(input.messageId ? { messageId: input.messageId } : {}),
+      ...(input.cardKind ? { cardKind: input.cardKind } : {}),
+    });
+    pendingActionAck.current = {
+      clientRequestId: ack.clientRequestId,
+      projectRevision: ack.projectRevision,
+      latestSequence: ack.latestSequence,
+    };
+    setSubmissionNotice("已提交，后台处理中。页面会自动更新，无需刷新。");
+    const generation = ++observeRequestGeneration.current;
+    void observeQuery.refetch({ cancelRefetch: true }).then((refreshed) => {
+      if (!refreshed.data || generation < acceptedObserveGeneration.current) {
+        return;
+      }
+      acceptedObserveGeneration.current = generation;
+      acceptObservation(refreshed.data);
+    });
+  }
+
+  async function retrySelectVisual() {
+    const current = selectVisualRef.current;
+    const scope = selectVisualScope.current;
+    const currentObservation = observationRef.current;
+    if (
+      !current ||
+      current.phase !== "failed" ||
+      !scope ||
+      !currentObservation ||
+      currentObservation.project.id !== scope.projectId ||
+      currentObservation.project.revision !== scope.expectedRevision ||
+      scope.action.input.sampleId !== current.sampleId
+    ) {
+      return;
+    }
+    await submitSelectVisual(scope, current);
+  }
+
   const requestError =
     openMutation.error?.message ||
     observeQuery.error?.message ||
-    actMutation.error?.message ||
     aliyunBeginMutation.error?.message ||
     aliyunDisconnectMutation.error?.message ||
     null;
@@ -422,7 +758,10 @@ export default function ConnectedSiteOpsConversationPanel({
       refreshing={observeQuery.isFetching}
       error={requestError}
       notice={submissionNotice}
-      interactionPending={Boolean(pendingActionAck.current)}
+      interactionPending={
+        Boolean(pendingActionAck.current) || selectVisualInFlight(selectVisual)
+      }
+      selectVisual={selectVisual}
       onRefresh={async () => {
         if (observation) {
           const refreshed = await observeQuery.refetch();
@@ -431,36 +770,8 @@ export default function ConnectedSiteOpsConversationPanel({
         }
         acceptObservation(await openMutation.mutateAsync(undefined));
       }}
-      onAction={async (input) => {
-        if (!observation) return;
-        const clientRequestId = siteOpsClientRequestId();
-        const ack = await actMutation.mutateAsync({
-          conversationId: observation.project.conversationId,
-          clientRequestId,
-          expectedRevision: observation.project.revision,
-          action: input.action,
-          input: input.input,
-          ...(input.messageId ? { messageId: input.messageId } : {}),
-          ...(input.cardKind ? { cardKind: input.cardKind } : {}),
-        });
-        pendingActionAck.current = {
-          clientRequestId: ack.clientRequestId,
-          projectRevision: ack.projectRevision,
-          latestSequence: ack.latestSequence,
-        };
-        setSubmissionNotice("已提交，后台处理中。页面会自动更新，无需刷新。");
-        const generation = ++observeRequestGeneration.current;
-        void observeQuery.refetch({ cancelRefetch: true }).then((refreshed) => {
-          if (
-            !refreshed.data ||
-            generation < acceptedObserveGeneration.current
-          ) {
-            return;
-          }
-          acceptedObserveGeneration.current = generation;
-          acceptObservation(refreshed.data);
-        });
-      }}
+      onAction={runSiteOpsAction}
+      onRetrySelectVisual={retrySelectVisual}
       onBeginAliyun={async () => {
         if (!observation) {
           throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);

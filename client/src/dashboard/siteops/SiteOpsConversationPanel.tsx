@@ -47,6 +47,28 @@ type SiteOpsActionContext = Pick<
   "action" | "input" | "messageId" | "cardKind"
 >;
 
+export type SiteOpsSelectVisualAck = {
+  schemaVersion: 1;
+  accepted: true;
+  clientRequestId: string;
+  operationId: string;
+  projectRevision: number;
+  latestSequence: number;
+  interactionState: "building";
+};
+
+export type SiteOpsSelectVisualState = {
+  sampleId: string;
+  label: string;
+  clientRequestId: string;
+  phase: "submitting" | "observing" | "polling" | "failed" | "confirmed";
+  ack: SiteOpsSelectVisualAck | null;
+};
+
+export function siteOpsSelectVisualFailureMessage(label: string) {
+  return `建站任务未能创建，所选模板尚未生效。无需重新载入模板，请重试选择 ${label}。`;
+}
+
 export type SiteOpsConversationPanelProps = {
   observation: SiteOpsObservationV1 | null;
   loading?: boolean;
@@ -54,8 +76,10 @@ export type SiteOpsConversationPanelProps = {
   error?: string | null;
   notice?: string | null;
   interactionPending?: boolean;
+  selectVisual?: SiteOpsSelectVisualState | null;
   onRefresh?: () => Promise<void> | void;
   onAction?: (input: SiteOpsActionContext) => Promise<void> | void;
+  onRetrySelectVisual?: () => Promise<void> | void;
   onBeginAliyun?: () => Promise<{
     authorizationUrl: string;
     expiresAt: string;
@@ -565,10 +589,12 @@ function customerDomainStateLabel(value: string | null | undefined) {
 function VisualCandidateCard({
   candidate,
   disabled,
+  selecting,
   onSelect,
 }: {
   candidate: SiteOpsPublicVisualCandidate;
   disabled: boolean;
+  selecting: boolean;
   onSelect: () => void;
 }) {
   const presentation = visualCandidatePresentation(candidate);
@@ -596,8 +622,16 @@ function VisualCandidateCard({
           disabled={disabled || candidate.selected}
           onClick={onSelect}
         >
-          {candidate.selected && <Check size={15} aria-hidden="true" />}
-          {candidate.selected ? "已选择" : `选择 ${candidate.label}`}
+          {selecting ? (
+            <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
+          ) : (
+            candidate.selected && <Check size={15} aria-hidden="true" />
+          )}
+          {selecting
+            ? `正在选择 ${candidate.label}`
+            : candidate.selected
+              ? "已选择"
+              : `选择 ${candidate.label}`}
         </button>
       </div>
     </article>
@@ -611,8 +645,10 @@ export default function SiteOpsConversationPanel({
   error = null,
   notice = null,
   interactionPending = false,
+  selectVisual = null,
   onRefresh,
   onAction,
+  onRetrySelectVisual,
   onBeginAliyun,
   aliyunDomains = [],
   aliyunDomainsLoading = false,
@@ -761,24 +797,51 @@ export default function SiteOpsConversationPanel({
   }
 
   async function runAction(key: string, input: SiteOpsActionContext) {
-    if (!onAction || busyAction) return;
+    if (!onAction || busyAction || interactionPending) return;
     setBusyAction(key);
     setLocalError(null);
     try {
       await onAction(input);
     } catch (actionError) {
-      setLocalError(
-        actionError instanceof Error
-          ? customerFacingMessage(actionError.message)
-          : "操作没有完成，请刷新后重试。",
-      );
+      if (input.action !== "select_visual" || !onRetrySelectVisual) {
+        setLocalError(
+          actionError instanceof Error
+            ? customerFacingMessage(actionError.message)
+            : "操作没有完成，请刷新后重试。",
+        );
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function retrySelectVisual() {
+    if (
+      !onRetrySelectVisual ||
+      busyAction ||
+      selectVisual?.phase !== "failed"
+    ) {
+      return;
+    }
+    setBusyAction(`visual-retry:${selectVisual.sampleId}`);
+    setLocalError(null);
+    try {
+      await onRetrySelectVisual();
+    } catch {
+      // The connected selection state owns the exact, card-adjacent failure
+      // copy and preserves the original idempotency key for another retry.
     } finally {
       setBusyAction(null);
     }
   }
 
   async function requestRebuild() {
-    if (!onAction || busyAction || !observation?.rebuildRequest.allowed) {
+    if (
+      !onAction ||
+      busyAction ||
+      interactionPending ||
+      !observation?.rebuildRequest.allowed
+    ) {
       return;
     }
     setBusyAction("request_rebuild");
@@ -880,7 +943,12 @@ export default function SiteOpsConversationPanel({
   }
 
   async function beginAliyunConnection() {
-    if (!onBeginAliyun || busyAction || aliyunFlowPhaseRef.current !== "idle") {
+    if (
+      !onBeginAliyun ||
+      busyAction ||
+      interactionPending ||
+      aliyunFlowPhaseRef.current !== "idle"
+    ) {
       return;
     }
     const authorizationWindow = window.open(
@@ -943,7 +1011,7 @@ export default function SiteOpsConversationPanel({
     key: string,
     action: (() => Promise<void> | void) | undefined,
   ) {
-    if (!action || busyAction) return;
+    if (!action || busyAction || interactionPending) return;
     setBusyAction(key);
     setLocalError(null);
     try {
@@ -969,7 +1037,15 @@ export default function SiteOpsConversationPanel({
     event.preventDefault();
     const domain = observation?.domainState?.domain;
     const number = icpNumber.trim();
-    if (!domain || !number || !onSubmitIcpFiling || busyAction) return;
+    if (
+      !domain ||
+      !number ||
+      !onSubmitIcpFiling ||
+      busyAction ||
+      interactionPending
+    ) {
+      return;
+    }
     setBusyAction("icp_filing");
     setLocalError(null);
     try {
@@ -1001,6 +1077,7 @@ export default function SiteOpsConversationPanel({
       !observation ||
       observation.rebuildRequest.resetPending ||
       !onAction ||
+      interactionPending ||
       busyAction
     ) {
       return;
@@ -1086,6 +1163,7 @@ export default function SiteOpsConversationPanel({
       aliyunDomains.length !== 1 ||
       observation.rebuildRequest.resetPending ||
       !onAction ||
+      interactionPending ||
       busyAction
     ) {
       return;
@@ -1103,6 +1181,7 @@ export default function SiteOpsConversationPanel({
     aliyunDomains,
     busyAction,
     failedAutomaticDomainKey,
+    interactionPending,
     observation,
     onAction,
   ]);
@@ -1148,6 +1227,10 @@ export default function SiteOpsConversationPanel({
   const interactionLocked = Boolean(
     busyAction || interactionPending || !onAction,
   );
+  const selectVisualInFlight = Boolean(
+    selectVisual &&
+      ["submitting", "observing", "polling"].includes(selectVisual.phase),
+  );
   const externalResetPending = observation.rebuildRequest.resetPending;
   const visualGeneration = observation.visualGeneration ?? {
     status: "idle" as const,
@@ -1190,6 +1273,7 @@ export default function SiteOpsConversationPanel({
     : visualPages.length * 9;
   const visualSelectionDisabled =
     interactionLocked ||
+    selectVisualInFlight ||
     visualGenerationPending ||
     !visualGeneration.canSelectExisting ||
     !visualSelectionOpen ||
@@ -1292,7 +1376,9 @@ export default function SiteOpsConversationPanel({
                 className="siteops-icon-button"
                 aria-label={rebuildRequestLabel}
                 disabled={Boolean(
-                  busyAction || !observation.rebuildRequest.allowed,
+                  busyAction ||
+                    interactionPending ||
+                    !observation.rebuildRequest.allowed,
                 )}
                 title={rebuildRequestLabel}
                 onClick={() => {
@@ -1350,7 +1436,7 @@ export default function SiteOpsConversationPanel({
               取消
             </AlertDialogCancel>
             <AlertDialogAction
-              disabled={busyAction === "request_rebuild"}
+              disabled={interactionPending || busyAction === "request_rebuild"}
               onClick={(event) => {
                 event.preventDefault();
                 void requestRebuild();
@@ -1693,6 +1779,34 @@ export default function SiteOpsConversationPanel({
               </div>
             )}
           </div>
+          {selectVisual?.phase === "failed" && (
+            <div
+              className="siteops-notice error siteops-visual-selection-error"
+              role="alert"
+            >
+              <AlertCircle size={17} aria-hidden="true" />
+              <span>
+                {siteOpsSelectVisualFailureMessage(selectVisual.label)}
+              </span>
+              <button
+                type="button"
+                className="siteops-primary-button"
+                disabled={
+                  busyAction === `visual-retry:${selectVisual.sampleId}`
+                }
+                onClick={() => void retrySelectVisual()}
+              >
+                {busyAction === `visual-retry:${selectVisual.sampleId}` && (
+                  <Loader2
+                    className="siteops-spin"
+                    size={15}
+                    aria-hidden="true"
+                  />
+                )}
+                重试选择 {selectVisual.label}
+              </button>
+            </div>
+          )}
           {visualGeneration.status === "retryable_error" && (
             <div className="siteops-notice error" role="alert">
               <AlertCircle size={17} aria-hidden="true" />
@@ -1782,7 +1896,17 @@ export default function SiteOpsConversationPanel({
               <VisualCandidateCard
                 key={candidate.id}
                 candidate={candidate}
-                disabled={visualSelectionDisabled}
+                disabled={
+                  visualSelectionDisabled ||
+                  Boolean(
+                    selectVisual?.phase === "failed" &&
+                      selectVisual.sampleId === candidate.id,
+                  )
+                }
+                selecting={Boolean(
+                  selectVisualInFlight &&
+                    selectVisual?.sampleId === candidate.id,
+                )}
                 onSelect={() =>
                   runAction(
                     `visual:${candidate.id}`,
@@ -1888,7 +2012,9 @@ export default function SiteOpsConversationPanel({
                 type="button"
                 className="siteops-secondary-button"
                 disabled={Boolean(
-                  busyAction || !observation.rebuildRequest.allowed,
+                  busyAction ||
+                    interactionPending ||
+                    !observation.rebuildRequest.allowed,
                 )}
                 onClick={() => {
                   setRebuildError(null);
@@ -1906,7 +2032,9 @@ export default function SiteOpsConversationPanel({
                   type="button"
                   className="siteops-primary-button"
                   disabled={Boolean(
-                    busyAction || !observation.rebuildRequest.allowed,
+                    busyAction ||
+                      interactionPending ||
+                      !observation.rebuildRequest.allowed,
                   )}
                   onClick={() => {
                     setRebuildError(null);
@@ -2138,6 +2266,7 @@ export default function SiteOpsConversationPanel({
               disabled={
                 !onBeginAliyun ||
                 Boolean(busyAction) ||
+                interactionPending ||
                 aliyunFlowPhase !== "idle"
               }
               onClick={() => void beginAliyunConnection()}
@@ -2161,6 +2290,7 @@ export default function SiteOpsConversationPanel({
               disabled={
                 !onDisconnectAliyun ||
                 !observation.aliyunConnection.canDisconnect ||
+                interactionPending ||
                 Boolean(busyAction)
               }
               onClick={() =>

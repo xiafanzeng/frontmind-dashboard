@@ -171,6 +171,18 @@
   color: #991b1b;
 }
 
+.siteops-visual-selection-error {
+  align-items: center;
+}
+
+.siteops-visual-selection-error span {
+  flex: 1 1 280px;
+}
+
+.siteops-visual-selection-error .siteops-primary-button {
+  flex: 0 0 auto;
+}
+
 .siteops-snapshot-card,
 .siteops-build-card,
 .siteops-domain-card {

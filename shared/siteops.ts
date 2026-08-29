@@ -1,5 +1,30 @@
 import { z } from "zod";
 
+/** Every persisted/runtime workflow coordinate must satisfy this shared
+ * boundary before quota reservation or build persistence begins. */
+export const siteOpsPersistedWorkflowCoordinateSchema = z
+  .string()
+  .min(1)
+  .max(32);
+
+const siteOpsPersistedWorkflowCoordinatesSchema = z
+  .object({
+    upstreamVersion: siteOpsPersistedWorkflowCoordinateSchema,
+    frontMindVersion: siteOpsPersistedWorkflowCoordinateSchema,
+    starterVersion: siteOpsPersistedWorkflowCoordinateSchema,
+    componentLibraryVersion: siteOpsPersistedWorkflowCoordinateSchema,
+  })
+  .strict();
+
+export function parseSiteOpsPersistedWorkflowCoordinates(input: {
+  readonly upstreamVersion: string;
+  readonly frontMindVersion: string;
+  readonly starterVersion: string;
+  readonly componentLibraryVersion: string;
+}) {
+  return siteOpsPersistedWorkflowCoordinatesSchema.parse(input);
+}
+
 /** Immutable coordinates for the FrontMind 1.2 host materializer. Keep this
  * record when a later workflow registers a new handler. */
 export const SITEOPS_MATERIALIZER_V1_2 = {
@@ -265,16 +290,16 @@ export const SITEOPS_MATERIALIZER_V2_7 = {
  * the immutable catalog coordinates; no provider lookup, download, candidate
  * compilation or source archive is embedded in the customer selection page. */
 export const SITEOPS_MATERIALIZER_V2_8 = {
-  upstreamVersion: "frontmind-static-template-catalog-v1",
+  upstreamVersion: "frontmind-static-catalog-v1",
   upstreamSha256:
     "772d8938e73213f505dbd7b078a61f2bed9351262d3a429d31a8621b3cc0ce4f",
   frontMindVersion: "2.8.0",
   runtimeManifestSha256:
     "c846027250d6519860a9458696e3e185a2bb14b7863be58b88afb367293983f9",
-  starterVersion: "frontmind-static-template-catalog-v1",
+  starterVersion: "frontmind-static-catalog-v1",
   starterSha256:
     "d7a87a67ecb83fc89320c59c97070c18c23af49fa5dde7bbe14f177e2f4e898e",
-  componentLibraryVersion: "frontmind-static-template-catalog-v1",
+  componentLibraryVersion: "frontmind-static-catalog-v1",
   materializerVersion: "2.8.0",
   materializerSha256:
     "806e2e87226f454ad6344f2e14d687f997d9716783536a336757113641ec26ce",
@@ -288,7 +313,7 @@ export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_6;
 /** Workflow frozen for every newly admitted/reset SiteOps root. */
 export const SITEOPS_DEFAULT_WORKFLOW = SITEOPS_MATERIALIZER_V2_8;
 
-const SITEOPS_WORKFLOWS_BY_VERSION = {
+export const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
   [SITEOPS_MATERIALIZER_V1_3.frontMindVersion]: SITEOPS_MATERIALIZER_V1_3,
   [SITEOPS_MATERIALIZER_V1_4.frontMindVersion]: SITEOPS_MATERIALIZER_V1_4,
@@ -304,6 +329,17 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_7.frontMindVersion]: SITEOPS_MATERIALIZER_V2_7,
   [SITEOPS_MATERIALIZER_V2_8.frontMindVersion]: SITEOPS_MATERIALIZER_V2_8,
 } as const;
+
+// Fail at module load if any current or historical registry entry crosses the
+// shared persisted/runtime coordinate boundary.
+for (const workflow of Object.values(SITEOPS_WORKFLOWS_BY_VERSION)) {
+  parseSiteOpsPersistedWorkflowCoordinates({
+    upstreamVersion: workflow.upstreamVersion,
+    frontMindVersion: workflow.frontMindVersion,
+    starterVersion: workflow.starterVersion,
+    componentLibraryVersion: workflow.componentLibraryVersion,
+  });
+}
 
 export function siteOpsWorkflowForVersion(version: string) {
   const workflow =
