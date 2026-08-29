@@ -144,13 +144,29 @@ import {
   NATIVE_SOURCE_PREFLIGHT_SCRIPT,
   NATIVE_SOURCE_PREFLIGHT_SHA256,
   NATIVE_SOURCE_PREFLIGHT_VERSION,
+  NATIVE_SOURCE_PREFLIGHT_V2_FILENAME,
+  NATIVE_SOURCE_PREFLIGHT_V2_SCRIPT,
+  NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+  NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+  NATIVE_RUNTIME_CONTRACT_FILENAME,
+  NATIVE_RUNTIME_CONTRACT_V1,
+  NATIVE_RUNTIME_CONTRACT_V1_BYTES,
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_CONTRACT_VERSION,
+  NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_BYTES,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_VERSION,
   FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
+  NativeRuntimeContractAuditError,
   NativeReactSourceError,
   TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
   TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT,
+  auditNativeRuntimeContractV1,
   readNativeSourceAttachment,
   siteSourceReceiptV1Schema,
   validateNativeReactSourceArchive,
+  type NativeRuntimeAudit,
 } from "./native-react-source";
 import {
   SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
@@ -166,6 +182,7 @@ import {
 import {
   openStaticTemplateCatalogVersionSource,
   requireStaticTemplateCatalogVersion,
+  staticTemplateAdmissionEvidenceSha256,
   STATIC_TEMPLATE_SOURCE_MAX_BYTES,
   type StaticTemplateCatalogEntry,
 } from "./static-template-catalog";
@@ -253,6 +270,7 @@ const providerStageSchema = z.enum([
   "native_input_ready",
   "create_unknown",
   "native_source_pending",
+  "native_repair_send_ready",
   "native_repair_send_unknown",
   "native_repair_pending",
   "design_pending",
@@ -291,7 +309,58 @@ const providerBuildCheckpointSchema = z.enum([
  * releases must not make a known-bad provider attachment hot-loop again.
  */
 export const NATIVE_SOURCE_VALIDATOR_VERSION =
-  "native-react-source-and-build-v2.2026-08-28" as const;
+  "native-react-source-and-build-v3.2026-08-29" as const;
+
+const nativeSourceAttachmentScopeSchema = z
+  .object({
+    taskId: z.string().min(1).max(255),
+    repairAttempt: z.number().int().min(0).max(2),
+    operationToken: z.string().min(1).max(512),
+  })
+  .strict();
+
+type NativeSourceAttachmentScope = z.infer<
+  typeof nativeSourceAttachmentScopeSchema
+>;
+
+const nativeSourceRuntimeCoordinatesSchema = z
+  .object({
+    contractVersion: z.string().min(1).max(128),
+    contractSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    executionShellVersion: z.string().min(1).max(128),
+    executionShellSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    preflightVersion: z.string().min(1).max(128),
+    preflightSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
+export type NativeSourceRuntimeCoordinates = z.infer<
+  typeof nativeSourceRuntimeCoordinatesSchema
+>;
+
+const replayableSiteSourceReceiptV2Schema = z
+  .object({
+    operationToken: z.string().min(1).max(256),
+    baseSourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    archiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    fileCount: z.number().int().min(1).max(512),
+    preflightVersion: z.string().min(1).max(128),
+    preflightStatus: z.literal("passed"),
+    preflightSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    runtimeContractVersion: z.string().min(1).max(128),
+    runtimeContractSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    executionShellSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    executionBaselineSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
+const persistedSiteSourceReceiptSchema = z.union([
+  siteSourceReceiptV1Schema,
+  replayableSiteSourceReceiptV2Schema,
+]);
+type PersistedSiteSourceReceipt = z.infer<
+  typeof persistedSiteSourceReceiptSchema
+>;
 
 const nativeRejectedCandidateV1Schema = z
   .object({
@@ -460,6 +529,27 @@ const providerAttemptsSchema = z
   })
   .strict();
 
+const nativeSourceRepairInputSchema = z
+  .object({
+    attempt: z.number().int().min(1).max(2),
+    kind: z.enum(["compile", "hard_safety"]),
+    diagnostics: z
+      .array(
+        z
+          .object({
+            code: z.string().min(1).max(128),
+            file: z.string().min(1).max(500).nullable(),
+            line: z.number().int().positive().nullable(),
+            column: z.number().int().positive().nullable(),
+          })
+          .strict(),
+      )
+      .max(32),
+  })
+  .strict();
+
+type NativeSourceRepairInput = z.infer<typeof nativeSourceRepairInputSchema>;
+
 const providerValidationSchema = z
   .object({
     phase: z.enum(["design", "content"]),
@@ -491,9 +581,17 @@ const providerStateV2Schema = providerStateV1Schema
     resultPendingOperationToken: z.string().min(1).max(512).optional(),
     providerSyncStartedAt: z.string().datetime().optional(),
     providerLastReadFailure: providerReadFailureSchema.optional(),
+    // V2 is written before a new task-side effect. A historical bound task
+    // without this field remains a V1 receipt conversation and is never
+    // silently upgraded in place.
+    nativeSourceContractVersion: z.literal(2).optional(),
+    nativeSourceRuntimeCoordinates:
+      nativeSourceRuntimeCoordinatesSchema.optional(),
+    nativeRepairInput: nativeSourceRepairInputSchema.optional(),
     nativeSourceFileId: z.string().min(1).max(512).optional(),
     nativeSourceAttachmentEventId: z.string().min(1).max(512).optional(),
     nativeSourceAttachmentIdentity: z.string().min(1).max(768).optional(),
+    nativeSourceAttachmentScope: nativeSourceAttachmentScopeSchema.optional(),
     nativeInputProviderFile: z
       .object({
         sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -534,7 +632,7 @@ const providerStateV2Schema = providerStateV1Schema
         repairAttempt: z.number().int().min(0).max(2).optional(),
         // Optional for operations staged before provider-offline resume was
         // introduced. New archive_validated checkpoints always freeze it.
-        receipt: siteSourceReceiptV1Schema.optional(),
+        receipt: persistedSiteSourceReceiptSchema.optional(),
       })
       .strict()
       .optional(),
@@ -562,6 +660,169 @@ const providerStateSchema = z.union([
 
 type ProviderState = z.infer<typeof providerStateSchema>;
 type ProviderStateV2 = z.infer<typeof providerStateV2Schema>;
+
+type NativeSourceRuntimeValidationInput = {
+  archive: Buffer;
+  receipt: unknown;
+  expectedOperationToken: string;
+  expectedBaseSourceSha256: string;
+  expectedExecutionBaselineSha256: string;
+};
+
+export type NativeSourceRuntimeRegistryEntry = Readonly<{
+  coordinates: NativeSourceRuntimeCoordinates;
+  attachments: readonly ManusV2Attachment[];
+  receiptSchema: z.ZodType<PersistedSiteSourceReceipt>;
+  validate: (
+    input: NativeSourceRuntimeValidationInput,
+  ) => ReturnType<typeof validateNativeReactSourceArchive>;
+  audit: (input: {
+    files: ReadonlyMap<string, Buffer>;
+    expectedRoutePaths: readonly string[];
+  }) => NativeRuntimeAudit;
+}>;
+
+export type NativeSourceRuntimeRegistry = Readonly<{
+  current: NativeSourceRuntimeRegistryEntry;
+  resolve: (
+    coordinates: NativeSourceRuntimeCoordinates,
+  ) => NativeSourceRuntimeRegistryEntry | null;
+}>;
+
+function nativeSourceRuntimeRegistryKey(
+  coordinates: NativeSourceRuntimeCoordinates,
+) {
+  return [
+    coordinates.contractSha256,
+    coordinates.executionShellSha256,
+    coordinates.preflightSha256,
+  ].join(":");
+}
+
+function nativeSourceRuntimeCoordinatesMatch(
+  left: NativeSourceRuntimeCoordinates,
+  right: NativeSourceRuntimeCoordinates,
+) {
+  return (
+    left.contractVersion === right.contractVersion &&
+    left.contractSha256 === right.contractSha256 &&
+    left.executionShellVersion === right.executionShellVersion &&
+    left.executionShellSha256 === right.executionShellSha256 &&
+    left.preflightVersion === right.preflightVersion &&
+    left.preflightSha256 === right.preflightSha256
+  );
+}
+
+export function createNativeSourceRuntimeRegistry(input: {
+  current: NativeSourceRuntimeRegistryEntry;
+  entries?: readonly NativeSourceRuntimeRegistryEntry[];
+}): NativeSourceRuntimeRegistry {
+  const currentCoordinates = nativeSourceRuntimeCoordinatesSchema.parse(
+    input.current.coordinates,
+  );
+  const entries = input.entries ?? [input.current];
+  const byHashes = new Map<string, NativeSourceRuntimeRegistryEntry>();
+  for (const entry of entries) {
+    const coordinates = nativeSourceRuntimeCoordinatesSchema.parse(
+      entry.coordinates,
+    );
+    const key = nativeSourceRuntimeRegistryKey(coordinates);
+    const prior = byHashes.get(key);
+    if (
+      prior &&
+      !nativeSourceRuntimeCoordinatesMatch(prior.coordinates, coordinates)
+    ) {
+      throw new Error("NATIVE_SOURCE_RUNTIME_REGISTRY_HASH_COLLISION");
+    }
+    byHashes.set(key, { ...entry, coordinates });
+  }
+  const current = byHashes.get(
+    nativeSourceRuntimeRegistryKey(currentCoordinates),
+  );
+  if (
+    !current ||
+    !nativeSourceRuntimeCoordinatesMatch(
+      current.coordinates,
+      currentCoordinates,
+    )
+  ) {
+    throw new Error("NATIVE_SOURCE_RUNTIME_REGISTRY_CURRENT_MISSING");
+  }
+  return Object.freeze({
+    current,
+    resolve(coordinates: NativeSourceRuntimeCoordinates) {
+      const parsed = nativeSourceRuntimeCoordinatesSchema.parse(coordinates);
+      const entry = byHashes.get(nativeSourceRuntimeRegistryKey(parsed));
+      return entry &&
+        nativeSourceRuntimeCoordinatesMatch(entry.coordinates, parsed)
+        ? entry
+        : null;
+    },
+  });
+}
+
+function nativeSourceReceiptV2SchemaForRuntime(
+  coordinates: NativeSourceRuntimeCoordinates,
+) {
+  return replayableSiteSourceReceiptV2Schema.extend({
+    preflightVersion: z.literal(coordinates.preflightVersion),
+    preflightSha256: z.literal(coordinates.preflightSha256),
+    runtimeContractVersion: z.literal(coordinates.contractVersion),
+    runtimeContractSha256: z.literal(coordinates.contractSha256),
+    executionShellSha256: z.literal(coordinates.executionShellSha256),
+  });
+}
+
+const CURRENT_NATIVE_SOURCE_RUNTIME_COORDINATES =
+  nativeSourceRuntimeCoordinatesSchema.parse({
+    contractVersion: NATIVE_RUNTIME_CONTRACT_VERSION,
+    contractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+    executionShellVersion: NATIVE_RUNTIME_EXECUTION_SHELL_VERSION,
+    executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+    preflightVersion: NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+    preflightSha256: NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+  });
+
+const CURRENT_NATIVE_SOURCE_RUNTIME_ENTRY: NativeSourceRuntimeRegistryEntry =
+  Object.freeze({
+    coordinates: CURRENT_NATIVE_SOURCE_RUNTIME_COORDINATES,
+    attachments: Object.freeze([
+      {
+        filename: NATIVE_RUNTIME_CONTRACT_FILENAME,
+        mime_type: "application/json",
+        file_data: `data:application/json;base64,${NATIVE_RUNTIME_CONTRACT_V1_BYTES.toString("base64")}`,
+      },
+      {
+        filename: NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+        mime_type: "application/json",
+        file_data: `data:application/json;base64,${NATIVE_RUNTIME_EXECUTION_SHELL_V1_BYTES.toString("base64")}`,
+      },
+      {
+        filename: NATIVE_SOURCE_PREFLIGHT_V2_FILENAME,
+        mime_type: "text/javascript",
+        file_data: `data:text/javascript;base64,${NATIVE_SOURCE_PREFLIGHT_V2_SCRIPT.toString("base64")}`,
+      },
+    ] satisfies ManusV2Attachment[]),
+    receiptSchema: nativeSourceReceiptV2SchemaForRuntime(
+      CURRENT_NATIVE_SOURCE_RUNTIME_COORDINATES,
+    ),
+    validate: (input) =>
+      validateNativeReactSourceArchive({
+        ...input,
+        requiredReceiptVersion: 2,
+        runtimeContract: NATIVE_RUNTIME_CONTRACT_V1,
+      }),
+    audit: (input) =>
+      auditNativeRuntimeContractV1({
+        ...input,
+        contract: NATIVE_RUNTIME_CONTRACT_V1,
+      }),
+  });
+
+const DEFAULT_NATIVE_SOURCE_RUNTIME_REGISTRY =
+  createNativeSourceRuntimeRegistry({
+    current: CURRENT_NATIVE_SOURCE_RUNTIME_ENTRY,
+  });
 
 type ManusBuildLogStage =
   | "wire_intake"
@@ -720,6 +981,7 @@ type ManusProviderDependencies = {
   materializeNativeTrustedFallbackSite?: typeof materializeNativeTrustedFallbackSite;
   materializeNativeSite?: typeof materializeNativeReactSource;
   generateSocial?: typeof generateSocialPackage;
+  nativeSourceRuntimeRegistry?: NativeSourceRuntimeRegistry;
 };
 
 class SiteOpsManusFailure extends Error {
@@ -1825,6 +2087,99 @@ export function startProviderResultSyncWindow(
   });
 }
 
+const NATIVE_REPAIR_CLEARED_STATE_KEYS = [
+  "nativeSourceFileId",
+  "nativeSourceAttachmentEventId",
+  "nativeSourceAttachmentIdentity",
+  "nativeSourceAttachmentScope",
+  "nativeSourceStaging",
+  "buildCheckpoint",
+  "nativeSourceReadFailureCount",
+  "nativeSourceReadFailureSince",
+  "nativeSourceNextPollAt",
+  "providerReadFailureCount",
+  "providerReadFailureSince",
+  "providerNextPollAt",
+  "providerTaskNotFoundCount",
+  "providerLastReadFailure",
+  "providerSyncStartedAt",
+  "lastContractProgressAt",
+  "resultPendingSince",
+  "resultPendingOperationToken",
+  "providerStoppedAt",
+  "providerStoppedOperationToken",
+] as const;
+
+function clearedNativeRepairIntakeState(state: ProviderStateV2) {
+  const cleared = { ...state };
+  for (const key of NATIVE_REPAIR_CLEARED_STATE_KEYS) delete cleared[key];
+  return providerStateV2Schema.parse(cleared);
+}
+
+function nativeRepairAttemptState(input: {
+  state: ProviderState | null;
+  taskId: string;
+  repairAttempt: number;
+  operationToken: string;
+  errorSignature: string;
+  stage: "native_repair_send_ready" | "native_repair_send_unknown";
+  repair?: NativeSourceRepairInput;
+  now?: number;
+}) {
+  const now = input.now ?? Date.now();
+  const scoped = transitionProviderState(input.state, {
+    stage: input.stage,
+    taskId: input.taskId,
+    nativeRepairAttempt: input.repairAttempt,
+    nativeLastErrorSignature: input.errorSignature,
+    nativeRepairInput: input.repair,
+    // A rejected verdict belongs to the prior immutable candidate and is
+    // intentionally retained by transitionProviderState. All mutable intake
+    // coordinates are phase-scoped and must start empty for this attempt.
+    nativeSourceFileId: undefined,
+    nativeSourceAttachmentEventId: undefined,
+    nativeSourceAttachmentIdentity: undefined,
+    nativeSourceAttachmentScope: undefined,
+    nativeSourceStaging: undefined,
+    buildCheckpoint: undefined,
+    nativeSourceReadFailureCount: undefined,
+    nativeSourceReadFailureSince: undefined,
+    nativeSourceNextPollAt: undefined,
+    providerReadFailureCount: undefined,
+    providerReadFailureSince: undefined,
+    providerNextPollAt: undefined,
+    providerTaskNotFoundCount: undefined,
+    providerLastReadFailure: undefined,
+    providerSyncStartedAt: undefined,
+    phaseOperationToken: input.operationToken,
+    phaseStartedAt: new Date(now).toISOString(),
+    lastContractProgressAt: undefined,
+    resultPendingSince: undefined,
+    resultPendingOperationToken: undefined,
+    providerStoppedAt: undefined,
+    providerStoppedOperationToken: undefined,
+    buildPhase: "source_repairing",
+  });
+  const cleared = clearedNativeRepairIntakeState(scoped);
+  return input.stage === "native_repair_send_unknown"
+    ? startProviderResultSyncWindow(cleared, now)
+    : cleared;
+}
+
+export function startNativeRepairAttemptState(input: {
+  state: ProviderState | null;
+  taskId: string;
+  repairAttempt: number;
+  operationToken: string;
+  errorSignature: string;
+  now?: number;
+}) {
+  return nativeRepairAttemptState({
+    ...input,
+    stage: "native_repair_send_unknown",
+  });
+}
+
 export function providerResultSyncWindow(
   state: ProviderState,
   now = Date.now(),
@@ -2233,7 +2588,7 @@ function claimsNativeSourceCheckpoint(value: unknown) {
   );
   return Boolean(
     record &&
-      (Object.prototype.hasOwnProperty.call(record, "nativeSourceStaging") ||
+      (record.nativeSourceStaging !== undefined ||
         (!fallbackRetryState &&
           ["archive_validated", "compile_started"].includes(
             String(record.buildCheckpoint ?? ""),
@@ -2949,7 +3304,34 @@ async function pollEvents(
 function nativeSourceReceiptOutputSchema(input: {
   operationToken: string;
   baseSourceSha256: string;
+  contractVersion: 1 | 2;
+  runtime: NativeSourceRuntimeRegistryEntry | null;
 }): ManusV2StructuredOutputSchema {
+  if (input.contractVersion === 2 && !input.runtime) {
+    throw new Error("NATIVE_SOURCE_RUNTIME_COORDINATES_MISSING");
+  }
+  const coordinates = input.runtime?.coordinates;
+  const v2Properties =
+    input.contractVersion === 2
+      ? {
+          runtimeContractVersion: {
+            type: "string" as const,
+            enum: [coordinates!.contractVersion],
+          },
+          runtimeContractSha256: {
+            type: "string" as const,
+            enum: [coordinates!.contractSha256],
+          },
+          executionShellSha256: {
+            type: "string" as const,
+            enum: [coordinates!.executionShellSha256],
+          },
+          executionBaselineSha256: {
+            type: "string" as const,
+            enum: [input.baseSourceSha256],
+          },
+        }
+      : {};
   return assertSiteOpsStructuredOutputSchema({
     type: "object",
     properties: {
@@ -2962,13 +3344,22 @@ function nativeSourceReceiptOutputSchema(input: {
       fileCount: { type: "integer" },
       preflightVersion: {
         type: "string",
-        enum: [NATIVE_SOURCE_PREFLIGHT_VERSION],
+        enum: [
+          input.contractVersion === 2
+            ? coordinates!.preflightVersion
+            : NATIVE_SOURCE_PREFLIGHT_VERSION,
+        ],
       },
       preflightStatus: { type: "string", enum: ["passed"] },
       preflightSha256: {
         type: "string",
-        enum: [NATIVE_SOURCE_PREFLIGHT_SHA256],
+        enum: [
+          input.contractVersion === 2
+            ? coordinates!.preflightSha256
+            : NATIVE_SOURCE_PREFLIGHT_SHA256,
+        ],
       },
+      ...v2Properties,
     },
     required: [
       "operationToken",
@@ -2978,6 +3369,14 @@ function nativeSourceReceiptOutputSchema(input: {
       "preflightVersion",
       "preflightStatus",
       "preflightSha256",
+      ...(input.contractVersion === 2
+        ? [
+            "runtimeContractVersion",
+            "runtimeContractSha256",
+            "executionShellSha256",
+            "executionBaselineSha256",
+          ]
+        : []),
     ],
     additionalProperties: false,
   });
@@ -3095,12 +3494,36 @@ export function nativeSourceAttachmentIdentityConflicts(input: {
   priorFileId?: string;
   priorAttachmentIdentity?: string;
   priorEventId?: string;
+  priorScope?: NativeSourceAttachmentScope;
+  currentScope: NativeSourceAttachmentScope;
   attachment: {
     fileId: string | null;
     eventId: string;
     attachmentIdentity: string;
   };
 }) {
+  const hasPriorIdentity = Boolean(
+    input.priorFileId || input.priorAttachmentIdentity || input.priorEventId,
+  );
+  if (!hasPriorIdentity) return false;
+  // Identity coordinates without their task/attempt/token fence cannot be
+  // proven to belong to this phase. Keep historical states fail-closed rather
+  // than guessing whether an attachment came from the current conversation.
+  if (!input.priorScope) return true;
+  const sameScope =
+    input.priorScope.taskId === input.currentScope.taskId &&
+    input.priorScope.repairAttempt === input.currentScope.repairAttempt &&
+    input.priorScope.operationToken === input.currentScope.operationToken;
+  if (!sameScope) {
+    // The only legitimate scope transition inside one bound task is a forward
+    // repair attempt with its own operation token. Reset/new-build task drift,
+    // attempt rollback, or a token change inside one attempt remains closed.
+    return !(
+      input.priorScope.taskId === input.currentScope.taskId &&
+      input.priorScope.repairAttempt + 1 === input.currentScope.repairAttempt &&
+      input.priorScope.operationToken !== input.currentScope.operationToken
+    );
+  }
   if (input.priorFileId && input.attachment.fileId) {
     return input.priorFileId !== input.attachment.fileId;
   }
@@ -3111,6 +3534,18 @@ export function nativeSourceAttachmentIdentityConflicts(input: {
   }
   return Boolean(
     input.priorEventId && input.priorEventId !== input.attachment.eventId,
+  );
+}
+
+function nativeSourceAttachmentScopeMatches(
+  left: NativeSourceAttachmentScope | undefined,
+  right: NativeSourceAttachmentScope,
+) {
+  return Boolean(
+    left &&
+      left.taskId === right.taskId &&
+      left.repairAttempt === right.repairAttempt &&
+      left.operationToken === right.operationToken,
   );
 }
 
@@ -3158,7 +3593,46 @@ function staticCatalogCoordinatesMatch(
   candidate: VisualSelectionBundleV7["candidates"][number],
   entry: StaticTemplateCatalogEntry,
 ) {
+  const catalogAdmission = entry.executionAdmission;
+  const candidateAdmission = candidate.executionAdmission;
+  const admissionMatches =
+    catalogAdmission.status === "admitted" &&
+    candidateAdmission.status === "admitted" &&
+    candidateAdmission.rawSourceSha256 ===
+      catalogAdmission.binding.rawSourceSha256 &&
+    candidateAdmission.normalizedSourceSha256 ===
+      catalogAdmission.normalizedSourceSha256 &&
+    candidateAdmission.sourceTreeSha256 === catalogAdmission.sourceTreeSha256 &&
+    candidateAdmission.runtimeContractSha256 ===
+      catalogAdmission.runtimeContractSha256 &&
+    candidateAdmission.executionShellSha256 ===
+      catalogAdmission.executionShellSha256 &&
+    candidateAdmission.deliveryContractSha256 ===
+      catalogAdmission.deliveryContractSha256 &&
+    candidateAdmission.distSha256 === catalogAdmission.distSha256 &&
+    candidateAdmission.qaSha256 === catalogAdmission.qaSha256 &&
+    candidateAdmission.browserReceiptSha256 ===
+      catalogAdmission.browserReceiptSha256 &&
+    candidateAdmission.qaStatus === catalogAdmission.qaStatus &&
+    candidateAdmission.admissionEvidenceSha256 ===
+      catalogAdmission.admissionEvidenceSha256 &&
+    candidateAdmission.admissionEvidenceSha256 ===
+      staticTemplateAdmissionEvidenceSha256({
+        catalogVersion: candidate.catalogVersion,
+        candidateId: candidate.catalogCandidateId,
+        rawSourceSha256: candidateAdmission.rawSourceSha256,
+        normalizedSourceSha256: candidateAdmission.normalizedSourceSha256,
+        sourceTreeSha256: candidateAdmission.sourceTreeSha256,
+        runtimeContractSha256: candidateAdmission.runtimeContractSha256,
+        executionShellSha256: candidateAdmission.executionShellSha256,
+        deliveryContractSha256: candidateAdmission.deliveryContractSha256,
+        distSha256: candidateAdmission.distSha256,
+        qaSha256: candidateAdmission.qaSha256,
+        browserReceiptSha256: candidateAdmission.browserReceiptSha256,
+        qaStatus: candidateAdmission.qaStatus,
+      });
   return (
+    admissionMatches &&
     candidate.catalogCandidateId === entry.candidateId &&
     candidate.providerTemplateId === entry.providerTemplateId &&
     candidate.providerSlug === entry.providerSlug &&
@@ -3255,7 +3729,11 @@ export async function selectedStaticNativeSourceArchive(input: {
   );
   if (
     !catalogEntry ||
-    !staticCatalogCoordinatesMatch(candidate, catalogEntry)
+    !("executionAdmission" in catalogEntry) ||
+    !staticCatalogCoordinatesMatch(
+      candidate,
+      catalogEntry as StaticTemplateCatalogEntry,
+    )
   ) {
     throw new SiteOpsManusFailure(
       "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
@@ -3267,7 +3745,16 @@ export async function selectedStaticNativeSourceArchive(input: {
     input.bundle.catalogVersion,
     candidate.catalogCandidateId,
   );
-  if (!staticCatalogCoordinatesMatch(candidate, opened.entry)) {
+  if (!("executionAdmission" in opened.entry)) {
+    opened.stream.destroy();
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
+      "固定模板源码与目录坐标不一致。",
+      "failed",
+    );
+  }
+  const currentOpenedEntry = opened.entry as StaticTemplateCatalogEntry;
+  if (!staticCatalogCoordinatesMatch(candidate, currentOpenedEntry)) {
     opened.stream.destroy();
     throw new SiteOpsManusFailure(
       "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
@@ -3368,7 +3855,7 @@ export function nativeTemplateCoordinateDirective(source: NativeSelection) {
     const bytes = Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
     return {
       manifest,
-      promptInstruction: `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是固定目录中所选完整 Template 的唯一执行坐标。必须使用其中绑定的 catalogCandidateId、providerSlug、sourceSubdirectory、sourceAssetId 和 sourceArchiveSha256，并按原模板源码检查真实入口；不得改选相邻模板、仓库默认首页或重新设计。`,
+      promptInstruction: `${FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME} 是唯一模板坐标；严格使用其 catalogCandidateId、providerSlug、sourceSubdirectory、sourceAssetId、sourceArchiveSha256，从源码确定入口，禁止改选或重设计。`,
       attachment: {
         filename: FRONTMIND_SELECTED_TEMPLATE_COORDINATE_FILENAME,
         mime_type: "application/json",
@@ -3491,39 +3978,49 @@ export function nativeSourceSystemPromptForWorkflow(workflowVersion: string) {
     : TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT;
 }
 
+const NATIVE_RUNTIME_DIAGNOSTICS_FILENAME =
+  "frontmind-native-runtime-diagnostics-v1.json" as const;
+
+function nativeRuntimeDiagnosticsAttachment(repair: NativeSourceRepairInput) {
+  const bytes = Buffer.from(
+    `${canonicalJson({
+      schemaVersion: 1,
+      attempt: repair.attempt,
+      kind: repair.kind,
+      diagnostics: repair.diagnostics.slice(0, 32),
+    })}\n`,
+    "utf8",
+  );
+  return {
+    filename: NATIVE_RUNTIME_DIAGNOSTICS_FILENAME,
+    mime_type: "application/json",
+    file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+  } as const;
+}
+
 function nativeSourcePrompt(input: {
   operationToken: string;
   baseSourceSha256: string;
+  contractVersion: 1 | 2;
+  runtimeCoordinates: NativeSourceRuntimeCoordinates | null;
   workflowVersion: string;
   hasCustomerFeedback?: boolean;
   templateCoordinateInstruction?: string;
-  repair?: {
-    attempt: number;
-    kind: "compile" | "hard_safety";
-    diagnostics: readonly {
-      code: string;
-      file: string | null;
-      line: number | null;
-      column: number | null;
-    }[];
-  };
+  repair?: NativeSourceRepairInput;
 }) {
-  const systemPrompt = nativeSourceSystemPromptForWorkflow(
-    input.workflowVersion,
-  );
+  if (input.contractVersion === 2 && !input.runtimeCoordinates) {
+    throw new Error("NATIVE_SOURCE_RUNTIME_COORDINATES_MISSING");
+  }
+  const systemPrompt = input.repair
+    ? "继续同一 FrontMind AI 建站任务。本轮只修复上一份源码，不是重新设计；原任务中的视觉、内容和事实边界继续有效。"
+    : nativeSourceSystemPromptForWorkflow(input.workflowVersion);
   const repair = input.repair
-    ? `\n\n${
-        input.repair.kind === "hard_safety"
-          ? "上一份完整源码未通过硬安全检查。不得复用该失败输出；必须从本消息重新附加的原始 21st 源码开始生成，不得重新设计。仅允许按机器诊断删除禁止的非运行文件，或替换违规依赖、import、构建配置及远程资源；DOM、CSS、设计 Token、组件结构和本地媒体必须继续冻结。"
-          : "上一份完整源码未通过本地编译。只修复下列编译坐标，不得重新设计。"
-      }完成后仍返回完整源码 ZIP：\n${input.repair.diagnostics
-        .slice(0, 8)
-        .map(
-          (item) =>
-            `- ${item.code} ${item.file ?? "unknown"}:${item.line ?? 0}:${item.column ?? 0}`,
-        )
-        .join("\n")}`
+    ? `\n\n上一份源码未通过${input.repair.kind === "compile" ? "本地编译" : "运行合同或硬安全检查"}。只按 ${NATIVE_RUNTIME_DIAGNOSTICS_FILENAME} 一次性修复全部坐标；不得重新设计或复用失败输出。以本消息重新附加的源码与执行基线为准，重跑 preflight 后返回完整源码 ZIP。`
     : "";
+  const deliveryContract =
+    input.contractVersion === 2
+      ? `Receipt 必须符合 Structured Output schema，并严格使用：operationToken=${input.operationToken}；baseSourceSha256=${input.baseSourceSha256}；executionBaselineSha256=${input.baseSourceSha256}；preflightVersion=${input.runtimeCoordinates!.preflightVersion}；preflightStatus=passed；preflightSha256=${input.runtimeCoordinates!.preflightSha256}；runtimeContractVersion=${input.runtimeCoordinates!.contractVersion}；runtimeContractSha256=${input.runtimeCoordinates!.contractSha256}；executionShellSha256=${input.runtimeCoordinates!.executionShellSha256}；archiveSha256/fileCount 必须对应最终 ZIP。`
+      : `交付前必须运行 ${NATIVE_SOURCE_PREFLIGHT_FILENAME} 并通过 package、文件类型、依赖、源码语法和 production build 自检。Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256、实际 fileCount、preflightVersion=${NATIVE_SOURCE_PREFLIGHT_VERSION}、preflightStatus=passed、preflightSha256=${NATIVE_SOURCE_PREFLIGHT_SHA256}。`;
   return promptWithMarker(
     `${systemPrompt}
 
@@ -3531,9 +4028,9 @@ frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZI
 
 ${input.templateCoordinateInstruction ?? ""}
 
-${input.hasCustomerFeedback ? "本次客户修改要求位于 frontmind-customer-feedback-v1.json；只能在知识事实和原生样式边界内落实。" : ""}
+${input.hasCustomerFeedback ? "客户要求见 frontmind-customer-feedback-v1.json；仅在知识与原生样式边界内实现。" : ""}
 
-交付前必须运行 ${NATIVE_SOURCE_PREFLIGHT_FILENAME} 并通过 package、文件类型、依赖、源码语法和 production build 自检。Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256、实际 fileCount、preflightVersion=${NATIVE_SOURCE_PREFLIGHT_VERSION}、preflightStatus=passed、preflightSha256=${NATIVE_SOURCE_PREFLIGHT_SHA256}。源码包必须命名为 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME}，Receipt 必须命名为 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。恰好返回这一个 ZIP 和一个 Receipt 后立即结束，不得继续解释、复盘、浏览或更新计划。${repair}`,
+${deliveryContract}只返回 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME} 与 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME} 各一份后结束；不得解释、浏览或更新计划。${repair}`,
     input.operationToken,
   );
 }
@@ -3570,6 +4067,7 @@ async function readNativeSourceOfflineResume(input: {
   taskId: string;
   buildTaskId: string | null;
   repairAttempt: number;
+  receiptSchema: z.ZodType<PersistedSiteSourceReceipt>;
   readArtifact: typeof readSiteOpsArtifact;
   now?: number;
 }) {
@@ -3584,9 +4082,9 @@ async function readNativeSourceOfflineResume(input: {
     return null;
   }
   const now = input.now ?? Date.now();
-  let receipt: z.infer<typeof siteSourceReceiptV1Schema>;
+  let receipt: PersistedSiteSourceReceipt;
   try {
-    receipt = siteSourceReceiptV1Schema.parse(staging.receipt);
+    receipt = input.receiptSchema.parse(staging.receipt);
   } catch {
     throw new SiteOpsManusFailure(
       "FRONTMIND_BUILD_STAGED_SOURCE_IDENTITY_CONFLICT",
@@ -3967,6 +4465,7 @@ async function handleNativeReactSiteBuild(input: {
   nativeSelection: NativeSelection;
   materializeNative: typeof materializeNativeReactSource;
   materializeNativeFallback: typeof materializeNativeTrustedFallbackSite;
+  nativeSourceRuntimeRegistry: NativeSourceRuntimeRegistry;
   assetDecisions: ReturnType<typeof frozenAssetDecisions>;
   persist: typeof persistSiteOpsArtifact;
   readArtifact: typeof readSiteOpsArtifact;
@@ -3990,6 +4489,42 @@ async function handleNativeReactSiteBuild(input: {
   );
   let taskId =
     input.state?.taskId ?? input.operation.providerTaskId ?? undefined;
+  const nativeSourceContractVersion: 1 | 2 =
+    input.state?.schemaVersion === 2 &&
+    input.state.nativeSourceContractVersion === 2
+      ? 2
+      : taskId
+        ? 1
+        : 2;
+  const frozenRuntimeCoordinates =
+    input.state?.schemaVersion === 2
+      ? input.state.nativeSourceRuntimeCoordinates
+      : undefined;
+  let nativeSourceRuntime: NativeSourceRuntimeRegistryEntry | null = null;
+  if (nativeSourceContractVersion === 2) {
+    if (frozenRuntimeCoordinates) {
+      nativeSourceRuntime = input.nativeSourceRuntimeRegistry.resolve(
+        frozenRuntimeCoordinates,
+      );
+      if (!nativeSourceRuntime) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_NATIVE_RUNTIME_REPLAY_UNAVAILABLE",
+          "本次 AI 建站任务冻结的运行时合同已不可用；请申请重置后从当前企业知识库重新开始。",
+          "failed",
+          providerStateV2(currentState),
+        );
+      }
+    } else if (taskId || input.state?.stage === "create_unknown") {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_NATIVE_RUNTIME_REPLAY_UNAVAILABLE",
+        "本次 AI 建站任务缺少可重放的运行时坐标；请申请重置后从当前企业知识库重新开始。",
+        "failed",
+        providerStateV2(currentState),
+      );
+    } else {
+      nativeSourceRuntime = input.nativeSourceRuntimeRegistry.current;
+    }
+  }
   const providerSourceAttachment = async (
     sourceClient: ManusV2Client,
   ): Promise<ManusV2Attachment> => {
@@ -4062,6 +4597,7 @@ async function handleNativeReactSiteBuild(input: {
   const sourceAttachments = async (
     token: string,
     sourceClient: ManusV2Client,
+    repair?: NativeSourceRepairInput,
   ): Promise<ManusV2Attachment[]> => [
     ...siteOpsSourceDossierAttachments({
       operationToken: token,
@@ -4076,16 +4612,21 @@ async function handleNativeReactSiteBuild(input: {
       documents: input.documents,
     }),
     await providerSourceAttachment(sourceClient),
-    {
-      filename: NATIVE_SOURCE_PREFLIGHT_FILENAME,
-      mime_type: "text/javascript",
-      file_data: `data:text/javascript;base64,${NATIVE_SOURCE_PREFLIGHT_SCRIPT.toString("base64")}`,
-    },
+    ...(nativeSourceContractVersion === 2
+      ? [...nativeSourceRuntime!.attachments]
+      : [
+          {
+            filename: NATIVE_SOURCE_PREFLIGHT_FILENAME,
+            mime_type: "text/javascript",
+            file_data: `data:text/javascript;base64,${NATIVE_SOURCE_PREFLIGHT_SCRIPT.toString("base64")}`,
+          },
+        ]),
     ...(templateCoordinate ? [templateCoordinate.attachment] : []),
     ...nativeBrandAttachment(input.brandAsset),
     ...(input.input.feedback
       ? [siteOpsCustomerFeedbackAttachment(input.input.feedback)]
       : []),
+    ...(repair ? [nativeRuntimeDiagnosticsAttachment(repair)] : []),
   ];
   let boundBuildTaskId = input.context.build.upstreamManusTaskId;
   const pendingExistingFallback = () => {
@@ -4456,6 +4997,20 @@ async function handleNativeReactSiteBuild(input: {
     }
   }
   if (!taskId) {
+    if (
+      nativeSourceContractVersion === 2 &&
+      !frozenRuntimeCoordinates &&
+      input.state?.stage !== "create_unknown"
+    ) {
+      currentState = transitionProviderState(currentState, {
+        stage: currentState?.stage ?? "native_input_ready",
+        nativeSourceContractVersion: 2,
+        nativeSourceRuntimeCoordinates: nativeSourceRuntime!.coordinates,
+        nativeRepairAttempt: 0,
+        buildPhase: "source_waiting",
+      });
+      await persistOperationProgress(input.db, input.operation, currentState);
+    }
     client = client ?? (await input.getClient());
     if (input.state?.stage === "create_unknown") {
       const found = await findUniqueCreatedTask(
@@ -4481,10 +5036,25 @@ async function handleNativeReactSiteBuild(input: {
       }
       taskId = found.id;
     } else {
+      const createRetryAt = Date.parse(
+        currentState?.schemaVersion === 2
+          ? (currentState.providerNextPollAt ?? "")
+          : "",
+      );
+      if (Number.isFinite(createRetryAt) && createRetryAt > Date.now()) {
+        return pending(
+          currentState!,
+          undefined,
+          "qa_running",
+          Math.max(2_000, createRetryAt - Date.now()),
+        );
+      }
       const createAttachments = await sourceAttachments(operationToken, client);
       const createUnknownState = startProviderResultSyncWindow(
         transitionProviderState(currentState, {
           stage: "create_unknown",
+          nativeSourceContractVersion: 2,
+          nativeSourceRuntimeCoordinates: nativeSourceRuntime!.coordinates,
           nativeRepairAttempt: 0,
           buildPhase: "source_waiting",
         }),
@@ -4494,6 +5064,7 @@ async function handleNativeReactSiteBuild(input: {
         input.operation,
         createUnknownState,
       );
+      currentState = createUnknownState;
       try {
         await input.assertExecutionActive();
         const created = await client.createTask({
@@ -4501,6 +5072,8 @@ async function handleNativeReactSiteBuild(input: {
           prompt: nativeSourcePrompt({
             operationToken,
             baseSourceSha256,
+            contractVersion: nativeSourceContractVersion,
+            runtimeCoordinates: nativeSourceRuntime?.coordinates ?? null,
             workflowVersion: input.context.build.workflowVersion,
             hasCustomerFeedback: Boolean(input.input.feedback),
             templateCoordinateInstruction:
@@ -4512,12 +5085,45 @@ async function handleNativeReactSiteBuild(input: {
           structuredOutputSchema: nativeSourceReceiptOutputSchema({
             operationToken,
             baseSourceSha256,
+            contractVersion: nativeSourceContractVersion,
+            runtime: nativeSourceRuntime,
           }),
         });
         taskId = created.taskId;
       } catch (error) {
         if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
           return pending(createUnknownState, undefined, "qa_running", 60_000);
+        }
+        if (error instanceof ManusV2ApiError && error.retryable) {
+          const retryAfterMs = Math.max(
+            2_000,
+            Math.min(300_000, error.retryAfterMs ?? 10_000),
+          );
+          const retryReadyState = transitionProviderState(createUnknownState, {
+            stage: "native_input_ready",
+            providerSyncStartedAt: undefined,
+            providerNextPollAt: new Date(
+              Date.now() + retryAfterMs,
+            ).toISOString(),
+          });
+          try {
+            await persistOperationProgress(
+              input.db,
+              input.operation,
+              retryReadyState,
+            );
+            currentState = retryReadyState;
+            return pending(
+              retryReadyState,
+              undefined,
+              "qa_running",
+              retryAfterMs,
+            );
+          } catch {
+            // The durable create_unknown fence is safer than retrying when the
+            // explicit-rejection retry journal itself could not be committed.
+            return pending(createUnknownState, undefined, "qa_running", 60_000);
+          }
         }
         throw error;
       }
@@ -4605,6 +5211,7 @@ async function handleNativeReactSiteBuild(input: {
     }[];
   }) => {
     if (
+      nativeSourceContractVersion === 1 ||
       attempt >= 2 ||
       currentState?.nativeLastErrorSignature === repairInput.signature ||
       (currentState?.schemaVersion === 2 && currentState.existingTaskOnly)
@@ -4613,25 +5220,60 @@ async function handleNativeReactSiteBuild(input: {
     }
     const nextAttempt = attempt + 1;
     const nextToken = `siteops-native-source:${input.operation.id}:${nextAttempt}`;
+    const repair = nativeSourceRepairInputSchema.parse({
+      attempt: nextAttempt,
+      kind: repairInput.kind,
+      diagnostics: repairInput.diagnostics.slice(0, 32),
+    });
+    const readyState = nativeRepairAttemptState({
+      state: currentState,
+      taskId,
+      repairAttempt: nextAttempt,
+      operationToken: nextToken,
+      errorSignature: repairInput.signature,
+      stage: "native_repair_send_ready",
+      repair,
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      readyState,
+      taskId,
+    );
+    currentState = readyState;
+    return sendPreparedNativeRepair(repair, readyState);
+  };
+  const sendPreparedNativeRepair = async (
+    repair: NativeSourceRepairInput,
+    readyState: ProviderStateV2,
+  ) => {
+    const nextToken = readyState.phaseOperationToken;
+    if (!nextToken || readyState.nativeRepairAttempt !== repair.attempt) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_NATIVE_REPAIR_REPLAY_UNAVAILABLE",
+        "AI 建站修复轮次缺少可重放坐标；请申请重置后从当前企业知识库重新开始。",
+        "failed",
+        readyState,
+      );
+    }
+    const clearedReadyState = clearedNativeRepairIntakeState(readyState);
+    currentState = clearedReadyState;
     await input.assertExecutionActive();
     client = client ?? (await input.getClient());
-    const repairAttachments = await sourceAttachments(nextToken, client);
+    const repairAttachments = await sourceAttachments(
+      nextToken,
+      client,
+      repair,
+    );
+    await input.assertExecutionActive();
     const unknownState = startProviderResultSyncWindow(
       transitionProviderState(currentState, {
         stage: "native_repair_send_unknown",
-        taskId,
-        nativeRepairAttempt: nextAttempt,
-        nativeLastErrorSignature: repairInput.signature,
-        nativeSourceStaging: undefined,
-        buildCheckpoint: undefined,
+        nativeRepairInput: repair,
+        nativeRepairAttempt: repair.attempt,
         phaseOperationToken: nextToken,
-        phaseStartedAt: new Date().toISOString(),
-        lastContractProgressAt: undefined,
-        resultPendingSince: undefined,
-        resultPendingOperationToken: undefined,
-        providerStoppedAt: undefined,
-        providerStoppedOperationToken: undefined,
         buildPhase: "source_repairing",
+        providerSyncStartedAt: undefined,
       }),
     );
     await persistOperationProgress(
@@ -4640,53 +5282,118 @@ async function handleNativeReactSiteBuild(input: {
       unknownState,
       taskId,
     );
+    currentState = unknownState;
     try {
-      await input.assertExecutionActive();
       await client.sendMessage({
         taskId,
         prompt: nativeSourcePrompt({
           operationToken: nextToken,
           baseSourceSha256,
+          contractVersion: nativeSourceContractVersion,
+          runtimeCoordinates: nativeSourceRuntime?.coordinates ?? null,
           workflowVersion: input.context.build.workflowVersion,
           hasCustomerFeedback: Boolean(input.input.feedback),
           templateCoordinateInstruction: templateCoordinate?.promptInstruction,
-          repair: {
-            attempt: nextAttempt,
-            kind: repairInput.kind,
-            diagnostics: repairInput.diagnostics,
-          },
+          repair,
         }),
         attachments: repairAttachments,
         structuredOutputSchema: nativeSourceReceiptOutputSchema({
           operationToken: nextToken,
           baseSourceSha256,
+          contractVersion: nativeSourceContractVersion,
+          runtime: nativeSourceRuntime,
         }),
       });
     } catch (sendError) {
       if (sendError instanceof ManusV2ApiError && sendError.outcomeUnknown) {
         return pending(unknownState, taskId, "qa_running");
       }
+      if (sendError instanceof ManusV2ApiError && sendError.retryable) {
+        const retryAfterMs = Math.max(
+          2_000,
+          Math.min(300_000, sendError.retryAfterMs ?? 10_000),
+        );
+        const retryReadyState = transitionProviderState(unknownState, {
+          stage: "native_repair_send_ready",
+          nativeRepairInput: repair,
+          providerSyncStartedAt: undefined,
+          providerNextPollAt: new Date(Date.now() + retryAfterMs).toISOString(),
+        });
+        try {
+          await persistOperationProgress(
+            input.db,
+            input.operation,
+            retryReadyState,
+            taskId,
+          );
+          currentState = retryReadyState;
+          return pending(retryReadyState, taskId, "qa_running", retryAfterMs);
+        } catch {
+          return pending(unknownState, taskId, "qa_running");
+        }
+      }
       throw sendError;
     }
     const repairState = transitionProviderState(unknownState, {
       stage: "native_repair_pending",
+      nativeRepairInput: undefined,
+      providerSyncStartedAt: undefined,
       buildPhase: "source_repairing",
     });
-    await persistOperationProgress(
-      input.db,
-      input.operation,
-      repairState,
-      taskId,
-    );
+    delete repairState.nativeRepairInput;
+    try {
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        repairState,
+        taskId,
+      );
+    } catch {
+      return pending(unknownState, taskId, "qa_running");
+    }
     logManusBuildStage({
       stage: "native_repair_scheduled",
       operationId: input.operation.id,
       buildId: input.context.build.id,
-      reason: repairInput.kind,
-      signature: repairInput.signature,
+      reason: repair.kind,
+      signature: readyState.nativeLastErrorSignature,
     });
     return pending(repairState, taskId, "qa_running");
   };
+  if (
+    currentState?.schemaVersion === 2 &&
+    currentState.stage === "native_repair_send_ready"
+  ) {
+    const retryAt = Date.parse(currentState.providerNextPollAt ?? "");
+    if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+      return pending(
+        currentState,
+        taskId,
+        "qa_running",
+        Math.max(2_000, retryAt - Date.now()),
+      );
+    }
+    const replay = nativeSourceRepairInputSchema.safeParse(
+      currentState.nativeRepairInput,
+    );
+    if (
+      !replay.success ||
+      replay.data.attempt !== attempt ||
+      currentState.phaseOperationToken !== operationToken
+    ) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_NATIVE_REPAIR_REPLAY_UNAVAILABLE",
+        "AI 建站修复轮次缺少可重放输入；请申请重置后从当前企业知识库重新开始。",
+        "failed",
+        currentState,
+      );
+    }
+    return sendPreparedNativeRepair(replay.data, currentState);
+  }
+  const sourceReceiptSchema =
+    nativeSourceContractVersion === 2
+      ? nativeSourceRuntime!.receiptSchema
+      : siteSourceReceiptV1Schema;
   const stagingIdempotencyKey = `native-source:${operationToken}`;
   const stagingAssetId = siteOpsArtifactIdForIdempotency({
     userId: input.operation.userId,
@@ -4705,6 +5412,7 @@ async function handleNativeReactSiteBuild(input: {
       taskId,
       buildTaskId: boundBuildTaskId,
       repairAttempt: attempt,
+      receiptSchema: sourceReceiptSchema,
       readArtifact: input.readArtifact,
     });
   } catch (error) {
@@ -4794,9 +5502,11 @@ async function handleNativeReactSiteBuild(input: {
     }
     const pendingState = transitionProviderState(reconciled.providerState, {
       stage: "native_repair_pending",
+      nativeRepairInput: undefined,
       buildPhase: "source_repairing",
       providerSyncStartedAt: undefined,
     });
+    delete pendingState.nativeRepairInput;
     return pending(
       pendingState,
       taskId,
@@ -4858,7 +5568,7 @@ async function handleNativeReactSiteBuild(input: {
         acceptCurrentPhaseWhileRunning: true,
         signal: input.signal,
         validateCandidate: (value) => {
-          siteSourceReceiptV1Schema.parse(value);
+          sourceReceiptSchema.parse(value);
         },
       });
   if (receiptResolution.invalid) {
@@ -4871,6 +5581,11 @@ async function handleNativeReactSiteBuild(input: {
   const attachment = offlineResume
     ? null
     : nativeSourceOutputAttachment(polled!.events, operationToken);
+  const currentNativeAttachmentScope = nativeSourceAttachmentScopeSchema.parse({
+    taskId,
+    repairAttempt: attempt,
+    operationToken,
+  });
   const priorNativeFileId =
     input.state?.schemaVersion === 2
       ? input.state.nativeSourceFileId
@@ -4883,12 +5598,38 @@ async function handleNativeReactSiteBuild(input: {
     input.state?.schemaVersion === 2
       ? input.state.nativeSourceAttachmentIdentity
       : undefined;
+  // Historical V1 tasks froze these three phase coordinates separately.
+  // Recompose their exact scope for same-phase reads without upgrading the
+  // task contract or permitting a cross-attempt attachment drift.
+  const historicalNativeAttachmentScope =
+    input.state?.schemaVersion === 2 &&
+    !input.state.nativeSourceContractVersion &&
+    input.state.taskId &&
+    input.state.nativeRepairAttempt !== undefined &&
+    input.state.phaseOperationToken
+      ? nativeSourceAttachmentScopeSchema.parse({
+          taskId: input.state.taskId,
+          repairAttempt: input.state.nativeRepairAttempt,
+          operationToken: input.state.phaseOperationToken,
+        })
+      : undefined;
+  const priorNativeAttachmentScope =
+    input.state?.schemaVersion === 2
+      ? (input.state.nativeSourceAttachmentScope ??
+        historicalNativeAttachmentScope)
+      : undefined;
+  const sameNativeAttachmentScope = nativeSourceAttachmentScopeMatches(
+    priorNativeAttachmentScope,
+    currentNativeAttachmentScope,
+  );
   if (
     attachment &&
     nativeSourceAttachmentIdentityConflicts({
       priorFileId: priorNativeFileId,
       priorAttachmentIdentity: priorNativeAttachmentIdentity,
       priorEventId: priorNativeAttachmentEventId,
+      priorScope: priorNativeAttachmentScope,
+      currentScope: currentNativeAttachmentScope,
       attachment,
     })
   ) {
@@ -4958,7 +5699,7 @@ async function handleNativeReactSiteBuild(input: {
       fallbackReconciliationPollMs(),
     );
   }
-  const receipt = siteSourceReceiptV1Schema.parse(receiptResolution.value);
+  const receipt = sourceReceiptSchema.parse(receiptResolution.value);
   const rejectedCandidate =
     currentState?.schemaVersion === 2
       ? currentState.nativeRejectedCandidateV1
@@ -5005,9 +5746,12 @@ async function handleNativeReactSiteBuild(input: {
       nativeRepairAttempt: attempt,
       buildPhase: "source_validating",
       buildCheckpoint: "receipt_validated",
-      nativeSourceFileId: attachment.fileId ?? priorNativeFileId ?? undefined,
+      nativeSourceFileId:
+        attachment.fileId ??
+        (sameNativeAttachmentScope ? priorNativeFileId : undefined),
       nativeSourceAttachmentEventId: attachment.eventId,
       nativeSourceAttachmentIdentity: attachment.attachmentIdentity,
+      nativeSourceAttachmentScope: currentNativeAttachmentScope,
     });
     await persistOperationProgress(
       input.db,
@@ -5125,12 +5869,31 @@ async function handleNativeReactSiteBuild(input: {
         byteCount: archive.length,
       });
     }
-    validated = await validateNativeReactSourceArchive({
-      archive,
-      receipt,
-      expectedOperationToken: operationToken,
-      expectedBaseSourceSha256: baseSourceSha256,
-    });
+    validated =
+      nativeSourceContractVersion === 2
+        ? await nativeSourceRuntime!.validate({
+            archive,
+            receipt,
+            expectedOperationToken: operationToken,
+            expectedBaseSourceSha256: baseSourceSha256,
+            expectedExecutionBaselineSha256: baseSourceSha256,
+          })
+        : await validateNativeReactSourceArchive({
+            archive,
+            receipt,
+            expectedOperationToken: operationToken,
+            expectedBaseSourceSha256: baseSourceSha256,
+            requiredReceiptVersion: 1,
+          });
+    if (nativeSourceContractVersion === 2) {
+      const routeAudit = nativeSourceRuntime!.audit({
+        files: validated.files,
+        expectedRoutePaths: input.brief.routes.map((route) => route.slug),
+      });
+      if (!routeAudit.ok) {
+        throw new NativeRuntimeContractAuditError(routeAudit);
+      }
+    }
     if (!stagingExpiresAt || stagingExpiresAt.getTime() <= Date.now()) {
       stagingExpiresAt = new Date(
         Date.now() + NATIVE_SOURCE_STAGING_RETENTION_MS,
@@ -5216,8 +5979,20 @@ async function handleNativeReactSiteBuild(input: {
           currentState,
         );
       }
+      const runtimeDiagnostics =
+        error instanceof NativeRuntimeContractAuditError
+          ? error.audit.issues.slice(0, 32).map((issue) => ({
+              code: issue.code,
+              file: issue.path,
+              line: null,
+              column: null,
+            }))
+          : [{ code: error.code, file: null, line: null, column: null }];
       const signature = createHash("sha256")
-        .update(JSON.stringify({ code: error.code }), "utf8")
+        .update(
+          JSON.stringify({ code: error.code, diagnostics: runtimeDiagnostics }),
+          "utf8",
+        )
         .digest("hex");
       const rejectionAttachmentIdentity =
         attachment?.attachmentIdentity ??
@@ -5256,9 +6031,7 @@ async function handleNativeReactSiteBuild(input: {
       const scheduled = await scheduleNativeRepair({
         kind: "hard_safety",
         signature,
-        diagnostics: [
-          { code: error.code, file: null, line: null, column: null },
-        ],
+        diagnostics: runtimeDiagnostics,
       });
       if (scheduled) return scheduled;
       const fallback = await materializeTrustedFallback(
@@ -5346,6 +6119,10 @@ async function handleNativeReactSiteBuild(input: {
       brief: input.brief,
       mode: "preview",
       abortSignal: input.signal,
+      runtimeAudit:
+        nativeSourceContractVersion === 2
+          ? nativeSourceRuntime!.audit
+          : undefined,
     });
     await input.assertExecutionActive();
   } catch (error) {
@@ -6358,6 +7135,9 @@ export function createManusSiteOpsProviderHandler(
     materializeNativeTrustedFallbackSite;
   const materializeNative =
     dependencies.materializeNativeSite ?? materializeNativeReactSource;
+  const nativeSourceRuntimeRegistry =
+    dependencies.nativeSourceRuntimeRegistry ??
+    DEFAULT_NATIVE_SOURCE_RUNTIME_REGISTRY;
   const socialGenerate = dependencies.generateSocial ?? generateSocialPackage;
 
   return async ({ operation, signal, assertLeaseActive }) => {
@@ -6900,6 +7680,7 @@ export function createManusSiteOpsProviderHandler(
             nativeSelection,
             materializeNative,
             materializeNativeFallback,
+            nativeSourceRuntimeRegistry,
             assetDecisions,
             persist,
             readArtifact,
@@ -6978,6 +7759,7 @@ export function createManusSiteOpsProviderHandler(
           nativeSelection,
           materializeNative,
           materializeNativeFallback,
+          nativeSourceRuntimeRegistry,
           assetDecisions,
           persist,
           readArtifact,

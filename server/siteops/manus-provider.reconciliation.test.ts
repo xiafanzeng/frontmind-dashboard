@@ -19,6 +19,7 @@ import {
   nativeTrustedFallbackReconcileUntil,
   pollManusTaskEvents,
   providerResultSyncWindow,
+  startNativeRepairAttemptState,
   startProviderResultSyncWindow,
   structuredResultGrace,
   shouldMaterializeNativeInitialBaseline,
@@ -959,11 +960,14 @@ describe("Manus bound-task read reconciliation", () => {
   });
 
   it("falls back to event and attachment index when a later GET omits file_id", () => {
+    const scope = { taskId, repairAttempt: 1, operationToken };
     expect(
       nativeSourceAttachmentIdentityConflicts({
         priorFileId: "stable-output-file",
         priorAttachmentIdentity: "attachment-1:attachment:0",
         priorEventId: "attachment-1",
+        priorScope: scope,
+        currentScope: scope,
         attachment: {
           fileId: null,
           eventId: "attachment-1",
@@ -976,6 +980,8 @@ describe("Manus bound-task read reconciliation", () => {
         priorFileId: "stable-output-file",
         priorAttachmentIdentity: "attachment-1:attachment:0",
         priorEventId: "attachment-1",
+        priorScope: scope,
+        currentScope: scope,
         attachment: {
           fileId: null,
           eventId: "attachment-1",
@@ -1002,5 +1008,169 @@ describe("Manus bound-task read reconciliation", () => {
     expect(() =>
       nativeSourceOutputAttachment(duplicateZip as never, operationToken),
     ).toThrow("AI 建站返回了多个不同的完整源码包");
+  });
+
+  it("scopes a frozen output identity to task, repair attempt, and token", () => {
+    const priorScope = {
+      taskId,
+      repairAttempt: 0,
+      operationToken: "siteops-native-source:operation-1:0",
+    };
+    const repairScope = {
+      taskId,
+      repairAttempt: 1,
+      operationToken: "siteops-native-source:operation-1:1",
+    };
+    const attachment = {
+      fileId: null,
+      eventId: "repair-output-event",
+      attachmentIdentity: "repair-output-event:attachment:0",
+    };
+
+    expect(
+      nativeSourceAttachmentIdentityConflicts({
+        priorFileId: "baseline-file",
+        priorAttachmentIdentity: "baseline-event:attachment:0",
+        priorEventId: "baseline-event",
+        priorScope,
+        currentScope: repairScope,
+        attachment,
+      }),
+    ).toBe(false);
+    expect(
+      nativeSourceAttachmentIdentityConflicts({
+        priorAttachmentIdentity: "repair-output-event:attachment:1",
+        priorEventId: "repair-output-event",
+        priorScope: repairScope,
+        currentScope: repairScope,
+        attachment,
+      }),
+    ).toBe(true);
+    expect(
+      nativeSourceAttachmentIdentityConflicts({
+        priorAttachmentIdentity: "unscoped-event:attachment:0",
+        currentScope: repairScope,
+        attachment,
+      }),
+    ).toBe(true);
+    expect(
+      nativeSourceAttachmentIdentityConflicts({
+        priorAttachmentIdentity: "other-task-event:attachment:0",
+        priorScope: { ...priorScope, taskId: "other-task" },
+        currentScope: repairScope,
+        attachment,
+      }),
+    ).toBe(true);
+  });
+
+  it("atomically resets mutable intake state for a new repair attempt", () => {
+    const rejected = createNativeRejectedCandidateV1({
+      taskId,
+      repairAttempt: 0,
+      operationToken: "siteops-native-source:operation-1:0",
+      attachmentIdentity: "baseline-event:attachment:0",
+      archiveSha256: "a".repeat(64),
+      errorCode: "NATIVE_SOURCE_PACKAGE_JSON_INVALID",
+      rejectedAt: new Date("2026-08-29T00:00:00.000Z"),
+    });
+    const now = Date.parse("2026-08-29T00:05:00.000Z");
+    const nextToken = "siteops-native-source:operation-1:1";
+    const next = startNativeRepairAttemptState({
+      state: {
+        schemaVersion: 2,
+        stage: "native_source_pending",
+        taskId,
+        attempts: {
+          extraction: 0,
+          design: 0,
+          content: 0,
+          materialization: 0,
+        },
+        nativeSourceContractVersion: 2,
+        nativeRepairAttempt: 0,
+        nativeLastErrorSignature: "b".repeat(64),
+        nativeRejectedCandidateV1: rejected,
+        nativeSourceFileId: "baseline-file",
+        nativeSourceAttachmentEventId: "baseline-event",
+        nativeSourceAttachmentIdentity: "baseline-event:attachment:0",
+        nativeSourceAttachmentScope: {
+          taskId,
+          repairAttempt: 0,
+          operationToken: "siteops-native-source:operation-1:0",
+        },
+        nativeSourceStaging: {
+          assetId: "50000000-0000-4000-8000-000000000005",
+          sha256: "a".repeat(64),
+          bytes: 128,
+          expiresAt: "2026-08-30T00:00:00.000Z",
+        },
+        buildCheckpoint: "archive_validated",
+        nativeSourceReadFailureCount: 3,
+        nativeSourceReadFailureSince: "2026-08-29T00:01:00.000Z",
+        nativeSourceNextPollAt: "2026-08-29T00:02:00.000Z",
+        providerReadFailureCount: 4,
+        providerReadFailureSince: "2026-08-29T00:01:00.000Z",
+        providerNextPollAt: "2026-08-29T00:02:00.000Z",
+        providerTaskNotFoundCount: 1,
+        providerLastReadFailure: {
+          operation: "task.listMessages",
+          status: 503,
+          code: "HTTP_503",
+          retryable: true,
+          retryAfterMs: null,
+          transportCause: null,
+          transportPhase: null,
+        },
+        providerSyncStartedAt: "2026-08-29T00:01:00.000Z",
+        providerStoppedAt: "2026-08-29T00:02:00.000Z",
+        providerStoppedOperationToken: "siteops-native-source:operation-1:0",
+        resultPendingSince: "2026-08-29T00:02:00.000Z",
+        resultPendingOperationToken: "siteops-native-source:operation-1:0",
+      },
+      taskId,
+      repairAttempt: 1,
+      operationToken: nextToken,
+      errorSignature: "c".repeat(64),
+      now,
+    });
+
+    expect(next).toMatchObject({
+      stage: "native_repair_send_unknown",
+      taskId,
+      nativeSourceContractVersion: 2,
+      nativeRepairAttempt: 1,
+      nativeLastErrorSignature: "c".repeat(64),
+      nativeRejectedCandidateV1: rejected,
+      phaseOperationToken: nextToken,
+      phaseStartedAt: new Date(now).toISOString(),
+      providerSyncStartedAt: new Date(now).toISOString(),
+      buildPhase: "source_repairing",
+    });
+    const persisted = JSON.parse(JSON.stringify(next)) as Record<
+      string,
+      unknown
+    >;
+    for (const key of [
+      "nativeSourceFileId",
+      "nativeSourceAttachmentEventId",
+      "nativeSourceAttachmentIdentity",
+      "nativeSourceAttachmentScope",
+      "nativeSourceStaging",
+      "buildCheckpoint",
+      "nativeSourceReadFailureCount",
+      "nativeSourceReadFailureSince",
+      "nativeSourceNextPollAt",
+      "providerReadFailureCount",
+      "providerReadFailureSince",
+      "providerNextPollAt",
+      "providerTaskNotFoundCount",
+      "providerLastReadFailure",
+      "providerStoppedAt",
+      "providerStoppedOperationToken",
+      "resultPendingSince",
+      "resultPendingOperationToken",
+    ]) {
+      expect(persisted).not.toHaveProperty(key);
+    }
   });
 });

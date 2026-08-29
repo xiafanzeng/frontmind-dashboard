@@ -63,6 +63,11 @@ import {
   referenceBlueprintV3ForFamily,
   referenceBlueprintV4ForFamily,
 } from "../../shared/siteops-design";
+import {
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+} from "./native-react-source";
+import { staticTemplateAdmissionEvidenceSha256 } from "./static-template-catalog";
 
 describe("SiteOps core contracts", () => {
   it("allows local work in a fresh reset epoch while external writes remain gated", () => {
@@ -183,6 +188,67 @@ describe("SiteOps core contracts", () => {
       staticTemplateSelectionMetadataSchema.safeParse({
         ...metadata,
         previewLocalAssetId: "not-a-uuid",
+      }).success,
+    ).toBe(false);
+    const admitted = {
+      ...metadata,
+      catalogVersion: "21st-included-recommended-20260828-v2",
+      executionAdmission: {
+        status: "admitted" as const,
+        rawSourceSha256: "d".repeat(64),
+        normalizedSourceSha256: metadata.sourceArchiveSha256,
+        sourceTreeSha256: "e".repeat(64),
+        runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+        executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+        deliveryContractSha256: "f".repeat(64),
+        distSha256: "1".repeat(64),
+        qaSha256: "2".repeat(64),
+        browserReceiptSha256: "3".repeat(64),
+        qaStatus: "passed" as const,
+        admissionEvidenceSha256: staticTemplateAdmissionEvidenceSha256({
+          catalogVersion: "21st-included-recommended-20260828-v2",
+          candidateId: metadata.catalogCandidateId,
+          rawSourceSha256: "d".repeat(64),
+          normalizedSourceSha256: metadata.sourceArchiveSha256,
+          sourceTreeSha256: "e".repeat(64),
+          runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+          executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+          deliveryContractSha256: "f".repeat(64),
+          distSha256: "1".repeat(64),
+          qaSha256: "2".repeat(64),
+          browserReceiptSha256: "3".repeat(64),
+          qaStatus: "passed",
+        }),
+      },
+    };
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse(admitted).success,
+    ).toBe(true);
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse({
+        ...admitted,
+        executionAdmission: {
+          ...admitted.executionAdmission,
+          runtimeContractSha256: "4".repeat(64),
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse({
+        ...admitted,
+        executionAdmission: {
+          ...admitted.executionAdmission,
+          executionShellSha256: "5".repeat(64),
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      staticTemplateSelectionMetadataSchema.safeParse({
+        ...admitted,
+        executionAdmission: {
+          ...admitted.executionAdmission,
+          admissionEvidenceSha256: "6".repeat(64),
+        },
       }).success,
     ).toBe(false);
   });
@@ -1180,7 +1246,7 @@ describe("SiteOps core contracts", () => {
         hasActiveBuild: false,
         hasBuildAttempt: false,
         workflowVersion: SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
-        catalogVersion: "21st-included-recommended-20260828-v1",
+        catalogVersion: "21st-included-recommended-20260828-v2",
         pageSize: 8,
         pageCount: 4,
       }),
@@ -1191,7 +1257,7 @@ describe("SiteOps core contracts", () => {
       reservedPages: 0,
       maxPages: 4,
       workflowVersion: "2.8.0",
-      catalogVersion: "21st-included-recommended-20260828-v1",
+      catalogVersion: "21st-included-recommended-20260828-v2",
       pageSize: 8,
       pageCount: 4,
       canGenerateMore: false,
@@ -1208,7 +1274,7 @@ describe("SiteOps core contracts", () => {
     expect(coordinates).toMatchObject({
       pristineVisualCycle: true,
       workflowVersion: "2.8.0",
-      catalogVersion: "21st-included-recommended-20260828-v1",
+      catalogVersion: "21st-included-recommended-20260828-v2",
       staticCatalogVisualCycle: true,
       pageSize: 8,
       pageCount: 4,
@@ -1234,7 +1300,7 @@ describe("SiteOps core contracts", () => {
       reservedPages: 0,
       maxPages: 4,
       workflowVersion: "2.8.0",
-      catalogVersion: "21st-included-recommended-20260828-v1",
+      catalogVersion: "21st-included-recommended-20260828-v2",
       pageSize: 8,
       pageCount: 4,
       canGenerateMore: false,
@@ -1245,9 +1311,15 @@ describe("SiteOps core contracts", () => {
     expect(
       projectStaticTemplateCatalogVisualReadiness({
         workflowVersion: "2.8.0",
-        catalogVersion: "21st-included-recommended-20260828-v1",
+        catalogVersion: "21st-included-recommended-20260828-v2",
         pageSize: 8,
         pageCount: 4,
+        entries: [
+          {
+            candidateId: "static-template-22-hirael-agency-landing",
+            executionAdmission: { status: "admitted" },
+          },
+        ],
       }),
     ).toEqual({ status: "configured", reason: undefined });
     expect(projectStaticTemplateCatalogVisualReadiness(null)).toEqual({
@@ -1406,7 +1478,7 @@ describe("SiteOps core contracts", () => {
             schemaVersion: 3,
             knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
             workflowVersion: "2.8.0",
-            catalogVersion: "21st-included-recommended-20260828-v1",
+            catalogVersion: "21st-included-recommended-20260828-v2",
             mode: "initial",
             page: 1,
             admissionRevision: 9,
@@ -1416,7 +1488,7 @@ describe("SiteOps core contracts", () => {
         hasActiveBuild: false,
         hasBuildAttempt: false,
         workflowVersion: "2.8.0",
-        catalogVersion: "21st-included-recommended-20260828-v1",
+        catalogVersion: "21st-included-recommended-20260828-v2",
         pageSize: 8,
         pageCount: 4,
       });

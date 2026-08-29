@@ -1,4 +1,13 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import JSZip from "jszip";
@@ -21,7 +30,12 @@ import {
   openStaticTemplateCatalogVersionSource,
   readStaticTemplateCatalogPreview,
   seedStaticTemplateCatalog,
+  type StaticTemplateExecutionAdmissionBuilder,
 } from "./static-template-catalog";
+import {
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+} from "./native-react-source";
 
 const temporaryRoots: string[] = [];
 
@@ -83,6 +97,38 @@ async function inspectBytes(bytes: Buffer) {
   await writeFile(target, bytes);
   return inspectStaticTemplateSourceArchive(target);
 }
+
+const testExecutionAdmissionBuilder: StaticTemplateExecutionAdmissionBuilder =
+  async ({ definition, rawSourceSha256 }) => {
+    if (definition.candidateId !== "static-template-22-hirael-agency-landing") {
+      return {
+        status: "unavailable",
+        code: "STATIC_TEMPLATE_EXECUTION_ADMISSION_PENDING",
+        reason: "该测试模板尚未完成执行准入。",
+      };
+    }
+    const normalizedSource = await sourceArchive([
+      {
+        name: "template/admission-binding.txt",
+        value: rawSourceSha256,
+      },
+    ]);
+    const digest = (value: string) =>
+      createHash("sha256").update(value).digest("hex");
+    return {
+      status: "admitted",
+      framework: "vite_react",
+      normalizedSource,
+      sourceTreeSha256: digest(`tree:${rawSourceSha256}`),
+      runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+      executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+      contract: Buffer.from('{"passed":true}\n'),
+      dist: Buffer.from("PK-test-dist"),
+      qa: Buffer.from('{"passed":true}\n'),
+      browserReceipt: Buffer.from('{"browser":{"available":true}}\n'),
+      qaStatus: "passed_with_warnings",
+    };
+  };
 
 function frozenSourceUrl(
   definition: (typeof FROZEN_STATIC_TEMPLATE_CATALOG)[number],
@@ -309,6 +355,7 @@ describe("static Template catalog", () => {
       rootDir: root,
       fetchImpl,
       concurrency: 3,
+      executionAdmissionBuilder: testExecutionAdmissionBuilder,
     });
     expect(first.reused).toBe(false);
     expect(first.catalog.catalogVersion).toBe(STATIC_TEMPLATE_CATALOG_VERSION);
@@ -325,19 +372,19 @@ describe("static Template catalog", () => {
     expect(
       new Set(first.catalog.entries.map((entry) => entry.sourceSha256)).size,
     ).toBe(32);
+    expect(
+      first.catalog.entries
+        .filter((entry) => entry.executionAdmission.status === "admitted")
+        .map((entry) => entry.candidateId),
+    ).toEqual(["static-template-22-hirael-agency-landing"]);
     expect(requests).toBe(sources.size + previews.size);
 
     const hirael = first.catalog.entries.filter(
       (entry) => entry.sourceRepo === "hirael",
     );
     expect(hirael).toHaveLength(9);
-    const projectedSource = await openStaticTemplateCatalogSource(
-      hirael[0]!.candidateId,
-      { rootDir: root },
-    );
-    projectedSource.stream.destroy();
     const projected = await JSZip.loadAsync(
-      await readFile(projectedSource.path),
+      await readFile(path.join(root, hirael[0]!.rawSourcePath)),
     );
     const projectedNames = Object.keys(projected.files);
     expect(
@@ -387,9 +434,15 @@ describe("static Template catalog", () => {
       ready: true,
       activeCatalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
       entryCount: 32,
+      admittedCount: 1,
+      requiredAdmissionReady: true,
     });
 
     const candidate = first.catalog.entries[0]!;
+    const admittedCandidate = first.catalog.entries.find(
+      (entry) =>
+        entry.candidateId === "static-template-22-hirael-agency-landing",
+    )!;
     const preview = await readStaticTemplateCatalogPreview(
       candidate.candidateId,
       {
@@ -399,13 +452,106 @@ describe("static Template catalog", () => {
     expect(preview.entry.previewSha256).toBe(candidate.previewSha256);
     expect(preview.bytes.byteLength).toBe(candidate.previewBytes);
     const source = await openStaticTemplateCatalogSource(
-      candidate.candidateId,
+      admittedCandidate.candidateId,
       {
         rootDir: root,
       },
     );
-    expect(source.entry.sourceSha256).toBe(candidate.sourceSha256);
+    expect(source.entry.sourceSha256).toBe(admittedCandidate.sourceSha256);
     source.stream.destroy();
+
+    const legacyVersion = "21st-included-recommended-20260828-v1";
+    const {
+      rawSourceAssetId: _rawSourceAssetId,
+      rawSourcePath: _rawSourcePath,
+      rawSourceSha256: _rawSourceSha256,
+      rawSourceBytes: _rawSourceBytes,
+      rawSourceFileCount: _rawSourceFileCount,
+      rawSourceExpandedBytes: _rawSourceExpandedBytes,
+      executionAdmission: _executionAdmission,
+      ...legacyEntry
+    } = candidate;
+    const legacyManifest = {
+      schemaVersion: "frontmind-static-template-catalog-v1",
+      workflowVersion: first.catalog.workflowVersion,
+      catalogVersion: legacyVersion,
+      pageSize: 1,
+      pageCount: 1,
+      entryCount: 1,
+      entries: [legacyEntry],
+    } as const;
+    const legacyDirectory = path.join(
+      root,
+      "siteops/static-template-catalog/catalogs",
+      legacyVersion,
+    );
+    await mkdir(legacyDirectory, { recursive: true });
+    const legacyManifestBytes = Buffer.from(
+      `${JSON.stringify(legacyManifest)}\n`,
+    );
+    await writeFile(
+      path.join(legacyDirectory, "manifest.json"),
+      legacyManifestBytes,
+    );
+    const legacyAsset = async (
+      kind: "source" | "preview",
+      assetPath: string,
+      sha256: string,
+      bytes: number,
+    ) => {
+      const signature = await stat(path.join(root, assetPath), {
+        bigint: true,
+      });
+      return {
+        candidateId: legacyEntry.candidateId,
+        kind,
+        path: assetPath,
+        sha256,
+        bytes,
+        inode: signature.ino.toString(),
+        modifiedNs: signature.mtimeNs.toString(),
+        changedNs: signature.ctimeNs.toString(),
+      };
+    };
+    await writeFile(
+      path.join(legacyDirectory, "integrity.json"),
+      `${JSON.stringify({
+        schemaVersion: "frontmind-static-template-catalog-integrity-v1",
+        workflowVersion: first.catalog.workflowVersion,
+        catalogVersion: legacyVersion,
+        manifestSha256: createHash("sha256")
+          .update(legacyManifestBytes)
+          .digest("hex"),
+        assets: [
+          await legacyAsset(
+            "source",
+            legacyEntry.sourcePath,
+            legacyEntry.sourceSha256,
+            legacyEntry.sourceBytes,
+          ),
+          await legacyAsset(
+            "preview",
+            legacyEntry.previewPath,
+            legacyEntry.previewSha256,
+            legacyEntry.previewBytes,
+          ),
+        ],
+      })}\n`,
+    );
+    await expect(
+      loadStaticTemplateCatalogVersion(legacyVersion, { rootDir: root }),
+    ).resolves.toMatchObject({
+      schemaVersion: "frontmind-static-template-catalog-v1",
+      catalogVersion: legacyVersion,
+      entryCount: 1,
+    });
+    const legacySource = await openStaticTemplateCatalogVersionSource(
+      legacyVersion,
+      legacyEntry.candidateId,
+      { rootDir: root },
+    );
+    expect(legacySource.entry.sourceSha256).toBe(legacyEntry.sourceSha256);
+    legacySource.stream.destroy();
 
     const activePath = path.join(
       root,
@@ -443,13 +589,25 @@ describe("static Template catalog", () => {
       code: "STATIC_TEMPLATE_CATALOG_PREVIEW_HASH_MISMATCH",
     });
 
+    await expect(
+      seedStaticTemplateCatalog({
+        rootDir: root,
+        fetchImpl,
+        concurrency: 3,
+        executionAdmissionBuilder: testExecutionAdmissionBuilder,
+      }),
+    ).rejects.toMatchObject({
+      code: "STATIC_TEMPLATE_CATALOG_VERSION_CONFLICT",
+    });
+    await writeFile(previewPath, preview.bytes);
     const repaired = await seedStaticTemplateCatalog({
       rootDir: root,
       fetchImpl,
       concurrency: 3,
+      executionAdmissionBuilder: testExecutionAdmissionBuilder,
     });
-    expect(repaired.reused).toBe(false);
-    expect(requests).toBe((sources.size + previews.size) * 2);
+    expect(repaired.reused).toBe(true);
+    expect(requests).toBe(sources.size + previews.size);
     await expect(
       getStaticTemplateCatalogReadiness({ rootDir: root }),
     ).resolves.toMatchObject({ ready: true, entryCount: 32 });
@@ -461,7 +619,7 @@ describe("static Template catalog", () => {
       ).some((name) =>
         name.startsWith(`${STATIC_TEMPLATE_CATALOG_VERSION}.invalid-`),
       ),
-    ).toBe(true);
+    ).toBe(false);
 
     const repairedActiveBytes = await readFile(activePath);
     const futureActive = JSON.parse(repairedActiveBytes.toString("utf8")) as {
@@ -493,10 +651,15 @@ describe("static Template catalog", () => {
     });
     const frozenSource = await openStaticTemplateCatalogVersionSource(
       STATIC_TEMPLATE_CATALOG_VERSION,
-      candidate.candidateId,
+      admittedCandidate.candidateId,
       { rootDir: root },
     );
-    expect(frozenSource.entry.sourceSha256).toBe(candidate.sourceSha256);
+    const repairedAdmittedCandidate = repaired.catalog.entries.find(
+      (entry) => entry.candidateId === admittedCandidate.candidateId,
+    )!;
+    expect(frozenSource.entry.sourceSha256).toBe(
+      repairedAdmittedCandidate.sourceSha256,
+    );
     frozenSource.stream.destroy();
     const frozenPreview = await openStaticTemplateCatalogVersionPreview(
       STATIC_TEMPLATE_CATALOG_VERSION,
@@ -527,5 +690,102 @@ describe("static Template catalog", () => {
     await expect(
       loadActiveStaticTemplateCatalog({ rootDir: root }),
     ).resolves.toBeNull();
+  });
+
+  it("keeps the seed lock until sibling workers settle after admission fails", async () => {
+    const root = await temporaryRoot();
+    const sourceDefinitions = new Map<
+      string,
+      Array<(typeof FROZEN_STATIC_TEMPLATE_CATALOG)[number]>
+    >();
+    for (const definition of FROZEN_STATIC_TEMPLATE_CATALOG) {
+      const url = frozenSourceUrl(definition);
+      sourceDefinitions.set(url, [
+        ...(sourceDefinitions.get(url) ?? []),
+        definition,
+      ]);
+    }
+    const sources = new Map<string, Buffer>();
+    await Promise.all(
+      [...sourceDefinitions].map(async ([url, definitions]) => {
+        sources.set(url, await catalogSourceArchive(definitions));
+      }),
+    );
+    const preview = await sharp({
+      create: {
+        width: 16,
+        height: 9,
+        channels: 4,
+        background: { r: 17, g: 34, b: 51, alpha: 1 },
+      },
+    })
+      .png()
+      .toBuffer();
+
+    let blockNextFetch = false;
+    let blocked = false;
+    let resolveBlocked!: () => void;
+    const blockedFetch = new Promise<void>((resolve) => {
+      resolveBlocked = resolve;
+    });
+    let releaseBlocked!: () => void;
+    const blockedRelease = new Promise<void>((resolve) => {
+      releaseBlocked = resolve;
+    });
+    const fetchImpl = (async (request: string | URL | Request) => {
+      const url = String(request);
+      if (blockNextFetch && !blocked) {
+        blocked = true;
+        resolveBlocked();
+        await blockedRelease;
+      }
+      const source = sources.get(url);
+      const bytes = source ?? preview;
+      return new Response(bytes, {
+        status: 200,
+        headers: { "content-length": String(bytes.length) },
+      });
+    }) as typeof fetch;
+    const admissionFailure = new Error("TEST_EXECUTION_ADMISSION_FAILED");
+    const executionAdmissionBuilder: StaticTemplateExecutionAdmissionBuilder =
+      async (builderInput) => {
+        if (
+          builderInput.definition.candidateId !==
+          "static-template-22-hirael-agency-landing"
+        ) {
+          return testExecutionAdmissionBuilder(builderInput);
+        }
+        blockNextFetch = true;
+        await blockedFetch;
+        throw admissionFailure;
+      };
+
+    let firstSettled = false;
+    const firstSeed = seedStaticTemplateCatalog({
+      rootDir: root,
+      fetchImpl,
+      concurrency: 2,
+      executionAdmissionBuilder,
+    }).finally(() => {
+      firstSettled = true;
+    });
+    await blockedFetch;
+    await Promise.resolve();
+    expect(firstSettled).toBe(false);
+    await expect(
+      seedStaticTemplateCatalog({
+        rootDir: root,
+        fetchImpl,
+        concurrency: 1,
+        executionAdmissionBuilder,
+      }),
+    ).rejects.toMatchObject({
+      code: "STATIC_TEMPLATE_CATALOG_SEED_IN_PROGRESS",
+    });
+    expect(firstSettled).toBe(false);
+
+    releaseBlocked();
+    await expect(firstSeed).rejects.toBe(admissionFailure);
+    expect(firstSettled).toBe(true);
   });
 });

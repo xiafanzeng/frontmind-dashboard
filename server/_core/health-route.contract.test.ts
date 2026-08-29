@@ -93,9 +93,33 @@ describe("runtime health route contract", () => {
     expect(readiness).toContain("imageDigest: applicationImageDigest");
     expect(readiness).toContain("migrationState.schema.status");
     expect(readiness).toContain("templateCatalog.ready === true");
-    expect(readiness).toContain("version: templateCatalog.activeCatalogVersion");
+    expect(readiness).toContain(
+      "templateCatalog.requiredAdmissionReady === true",
+    );
+    expect(readiness).toContain(
+      "version: templateCatalog.activeCatalogVersion",
+    );
     expect(readiness).toContain("degradedBuildCount:");
     expect(readiness).toContain("violationCount:");
+  });
+
+  it("returns unavailable when the required #22 execution admission is absent", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+    const readyStart = source.indexOf("const ready =", readinessStart);
+    const statusStart = source.indexOf("const status =", readyStart);
+    const readinessDecision = source.slice(readyStart, statusStart);
+
+    expect(readinessDecision).toContain("templateCatalog.ready === true");
+    expect(readinessDecision).toContain(
+      "templateCatalog.requiredAdmissionReady === true",
+    );
+    expect(source.slice(statusStart)).toContain(
+      "const status = ready ? 200 : 503",
+    );
   });
 
   it("removes the legacy writer and active-migration rollout control plane", async () => {
@@ -108,7 +132,9 @@ describe("runtime health route contract", () => {
     const readiness = source.slice(readinessStart, listener);
 
     expect(source).not.toContain("knowledgeBaseManusV2WriterEnabled()");
-    expect(source).not.toContain("knowledgeBaseManusV2ActiveMigrationEnabled()");
+    expect(source).not.toContain(
+      "knowledgeBaseManusV2ActiveMigrationEnabled()",
+    );
     expect(readiness).not.toContain("knowledgeBaseManusV2Writer:");
     expect(readiness).not.toContain("knowledgeBaseManusV2ActiveMigration:");
     expect(source).not.toContain('"[KnowledgeBase] manus_v2_writer"');
@@ -167,12 +193,8 @@ describe("runtime health route contract", () => {
     const listener = source.indexOf("server.listen(", readinessStart);
     const readiness = source.slice(readinessStart, listener);
 
-    expect(source).toContain(
-      "runtimeRoleReadinessRequirements(runtimeRole)",
-    );
-    expect(readiness).toContain(
-      "readinessRequirements.knowledgeBaseRecovery",
-    );
+    expect(source).toContain("runtimeRoleReadinessRequirements(runtimeRole)");
+    expect(readiness).toContain("readinessRequirements.knowledgeBaseRecovery");
     expect(readiness).toContain("!readinessRequirements.managedUploads");
   });
 });

@@ -88,6 +88,12 @@ describe("siteops workflow", () => {
         previewMimeType: "image/png",
         previewWidth: 1440,
         previewHeight: 900,
+        executionAdmission: {
+          status: "unavailable",
+          rawSourceSha256: order.toString(16).padStart(64, "0"),
+          code: "STATIC_TEMPLATE_EXECUTION_ADMISSION_PENDING",
+          reason: "测试夹具尚未执行准入。",
+        },
       };
     });
     expect(

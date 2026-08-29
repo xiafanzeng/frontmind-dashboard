@@ -30,6 +30,10 @@ import {
   STATIC_TEMPLATE_CATALOG_WORKFLOW_VERSION,
   type FrozenStaticTemplateDefinition,
 } from "./static-template-catalog-manifest";
+import {
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+} from "./native-react-source";
 
 export {
   FROZEN_STATIC_TEMPLATE_CATALOG,
@@ -43,7 +47,8 @@ export {
 export const STATIC_TEMPLATE_SOURCE_MAX_BYTES = 192 * 1024 * 1024;
 export const STATIC_TEMPLATE_PREVIEW_MAX_BYTES = 16 * 1024 * 1024;
 
-const CATALOG_SCHEMA_VERSION = "frontmind-static-template-catalog-v1";
+const CATALOG_SCHEMA_VERSION = "frontmind-static-template-catalog-v2";
+const LEGACY_CATALOG_SCHEMA_VERSION = "frontmind-static-template-catalog-v1";
 const ACTIVE_SCHEMA_VERSION = "frontmind-static-template-catalog-active-v1";
 const INTEGRITY_SCHEMA_VERSION =
   "frontmind-static-template-catalog-integrity-v1";
@@ -63,6 +68,127 @@ const CANDIDATE_ID =
   /^static-template-[0-9]{2,3}-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u;
 const DECIMAL_BIGINT = /^(?:0|[1-9][0-9]*)$/u;
 
+const executionBindingSchema = z
+  .object({
+    catalogVersion: z.string().regex(CATALOG_VERSION),
+    candidateId: z.string().regex(CANDIDATE_ID),
+    rawSourceSha256: z.string().regex(SHA256),
+  })
+  .strict();
+
+type StaticTemplateAdmissionDigestInput = {
+  catalogVersion: string;
+  candidateId: string;
+  rawSourceSha256: string;
+  normalizedSourceSha256: string;
+  sourceTreeSha256: string;
+  runtimeContractSha256: string;
+  executionShellSha256: string;
+  deliveryContractSha256: string;
+  distSha256: string;
+  qaSha256: string;
+  browserReceiptSha256: string;
+  qaStatus: "passed" | "passed_with_warnings";
+};
+
+/** Canonical cross-layer binding for every cryptographic admission receipt. */
+export function staticTemplateAdmissionEvidenceSha256(
+  input: StaticTemplateAdmissionDigestInput,
+) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        schemaVersion: 1,
+        catalogVersion: input.catalogVersion,
+        candidateId: input.candidateId,
+        rawSourceSha256: input.rawSourceSha256,
+        normalizedSourceSha256: input.normalizedSourceSha256,
+        sourceTreeSha256: input.sourceTreeSha256,
+        runtimeContractSha256: input.runtimeContractSha256,
+        executionShellSha256: input.executionShellSha256,
+        deliveryContractSha256: input.deliveryContractSha256,
+        distSha256: input.distSha256,
+        qaSha256: input.qaSha256,
+        browserReceiptSha256: input.browserReceiptSha256,
+        qaStatus: input.qaStatus,
+      }),
+    )
+    .digest("hex");
+}
+
+const admittedExecutionSchema = z
+  .object({
+    status: z.literal("admitted"),
+    binding: executionBindingSchema,
+    framework: z.literal("vite_react"),
+    normalizedSourceAssetId: z.string().min(1).max(512),
+    normalizedSourcePath: z.string().min(1).max(1_024),
+    normalizedSourceSha256: z.string().regex(SHA256),
+    normalizedSourceBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(STATIC_TEMPLATE_SOURCE_MAX_BYTES),
+    normalizedSourceFileCount: z.number().int().min(1).max(MAX_ARCHIVE_ENTRIES),
+    normalizedSourceExpandedBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_ARCHIVE_EXPANDED_BYTES),
+    sourceTreeSha256: z.string().regex(SHA256),
+    runtimeContractSha256: z.literal(NATIVE_RUNTIME_CONTRACT_V1_SHA256),
+    executionShellSha256: z.literal(NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256),
+    deliveryContractAssetId: z.string().min(1).max(512),
+    deliveryContractPath: z.string().min(1).max(1_024),
+    deliveryContractSha256: z.string().regex(SHA256),
+    deliveryContractBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(4 * 1024 * 1024),
+    distAssetId: z.string().min(1).max(512),
+    distPath: z.string().min(1).max(1_024),
+    distSha256: z.string().regex(SHA256),
+    distBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(64 * 1024 * 1024),
+    qaAssetId: z.string().min(1).max(512),
+    qaPath: z.string().min(1).max(1_024),
+    qaSha256: z.string().regex(SHA256),
+    qaBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(4 * 1024 * 1024),
+    browserReceiptAssetId: z.string().min(1).max(512),
+    browserReceiptPath: z.string().min(1).max(1_024),
+    browserReceiptSha256: z.string().regex(SHA256),
+    browserReceiptBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(4 * 1024 * 1024),
+    qaStatus: z.enum(["passed", "passed_with_warnings"]),
+    admissionEvidenceSha256: z.string().regex(SHA256),
+  })
+  .strict();
+
+const unavailableExecutionSchema = z
+  .object({
+    status: z.literal("unavailable"),
+    binding: executionBindingSchema,
+    code: z.string().regex(/^[A-Z0-9_]{3,120}$/u),
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
+
+const executionAdmissionSchema = z.discriminatedUnion("status", [
+  admittedExecutionSchema,
+  unavailableExecutionSchema,
+]);
+
 const entrySchema = z
   .object({
     order: z.number().int().min(1).max(512),
@@ -79,6 +205,20 @@ const entrySchema = z
     sourceCommitSha: z.string().regex(/^[a-f0-9]{40}$/u),
     sourceSubdirectory: z.string().min(1).max(1_024).nullable(),
     sourceLicense: z.enum(["MIT", "Apache-2.0"]),
+    rawSourceAssetId: z.string().min(1).max(512),
+    rawSourcePath: z.string().min(1).max(1_024),
+    rawSourceSha256: z.string().regex(SHA256),
+    rawSourceBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(STATIC_TEMPLATE_SOURCE_MAX_BYTES),
+    rawSourceFileCount: z.number().int().min(1).max(MAX_ARCHIVE_ENTRIES),
+    rawSourceExpandedBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_ARCHIVE_EXPANDED_BYTES),
     sourceAssetId: z.string().min(1).max(512),
     sourcePath: z.string().min(1).max(1_024),
     sourceSha256: z.string().regex(SHA256),
@@ -101,6 +241,29 @@ const entrySchema = z
     previewWidth: z.number().int().min(1).max(50_000),
     previewHeight: z.number().int().min(1).max(50_000),
     tags: z.array(z.string().min(1).max(80)).max(12),
+    executionAdmission: executionAdmissionSchema,
+  })
+  .strict();
+
+const legacyEntrySchema = entrySchema.omit({
+  rawSourceAssetId: true,
+  rawSourcePath: true,
+  rawSourceSha256: true,
+  rawSourceBytes: true,
+  rawSourceFileCount: true,
+  rawSourceExpandedBytes: true,
+  executionAdmission: true,
+});
+
+const legacyCatalogSchema = z
+  .object({
+    schemaVersion: z.literal(LEGACY_CATALOG_SCHEMA_VERSION),
+    workflowVersion: z.string().regex(WORKFLOW_VERSION),
+    catalogVersion: z.string().regex(CATALOG_VERSION),
+    pageSize: z.number().int().min(1).max(64),
+    pageCount: z.number().int().min(1).max(64),
+    entryCount: z.number().int().min(1).max(512),
+    entries: z.array(legacyEntrySchema).min(1).max(512),
   })
   .strict();
 
@@ -116,10 +279,20 @@ const catalogSchema = z
   })
   .strict();
 
+const readableCatalogSchema = z.union([catalogSchema, legacyCatalogSchema]);
+
 const integrityAssetSchema = z
   .object({
     candidateId: z.string().regex(CANDIDATE_ID),
-    kind: z.enum(["source", "preview"]),
+    kind: z.enum([
+      "raw_source",
+      "normalized_source",
+      "preview",
+      "delivery_contract",
+      "dist",
+      "qa",
+      "browser_receipt",
+    ]),
     path: z.string().min(1).max(1_024),
     sha256: z.string().regex(SHA256),
     bytes: z.number().int().min(1).max(STATIC_TEMPLATE_SOURCE_MAX_BYTES),
@@ -128,6 +301,10 @@ const integrityAssetSchema = z
     changedNs: z.string().regex(DECIMAL_BIGINT),
   })
   .strict();
+
+const legacyIntegrityAssetSchema = integrityAssetSchema.extend({
+  kind: z.enum(["source", "preview"]),
+});
 
 const integritySchema = z
   .object({
@@ -138,6 +315,10 @@ const integritySchema = z
     assets: z.array(integrityAssetSchema).min(2).max(1_024),
   })
   .strict();
+
+const legacyIntegritySchema = integritySchema.extend({
+  assets: z.array(legacyIntegrityAssetSchema).min(2).max(1_024),
+});
 
 const activeSchema = z
   .object({
@@ -153,6 +334,44 @@ const activeSchema = z
 
 export type StaticTemplateCatalogEntry = z.infer<typeof entrySchema>;
 export type StaticTemplateCatalog = z.infer<typeof catalogSchema>;
+export type LegacyStaticTemplateCatalogEntry = z.infer<
+  typeof legacyEntrySchema
+>;
+export type ReadableStaticTemplateCatalog =
+  | StaticTemplateCatalog
+  | z.infer<typeof legacyCatalogSchema>;
+export type StaticTemplateExecutionAdmission = z.infer<
+  typeof executionAdmissionSchema
+>;
+
+export type StaticTemplateExecutionAdmissionMaterial =
+  | {
+      status: "unavailable";
+      code: string;
+      reason: string;
+    }
+  | {
+      status: "admitted";
+      framework: "vite_react";
+      normalizedSource: Buffer;
+      sourceTreeSha256: string;
+      runtimeContractSha256: string;
+      executionShellSha256: string;
+      contract: Buffer;
+      dist: Buffer;
+      qa: Buffer;
+      browserReceipt: Buffer;
+      qaStatus: "passed" | "passed_with_warnings";
+    };
+
+export type StaticTemplateExecutionAdmissionBuilder = (input: {
+  catalogVersion: string;
+  definition: FrozenStaticTemplateDefinition;
+  rawSourcePath: string;
+  rawSourceSha256: string;
+  rawSourceBytes: number;
+  signal: AbortSignal;
+}) => Promise<StaticTemplateExecutionAdmissionMaterial>;
 
 export class StaticTemplateCatalogError extends Error {
   constructor(public readonly code: string) {
@@ -170,6 +389,7 @@ type CatalogOptions = {
 type SeedOptions = CatalogOptions & {
   fetchImpl?: typeof fetch;
   concurrency?: number;
+  executionAdmissionBuilder?: StaticTemplateExecutionAdmissionBuilder;
 };
 
 type DownloadResult = { sha256: string; bytes: number };
@@ -1405,12 +1625,177 @@ function getUpstreamSourceArchive(input: {
   return loading;
 }
 
+function unavailableExecutionAdmission(input: {
+  definition: FrozenStaticTemplateDefinition;
+  rawSourceSha256: string;
+  code?: string;
+  reason?: string;
+}): StaticTemplateExecutionAdmission {
+  return unavailableExecutionSchema.parse({
+    status: "unavailable",
+    binding: {
+      catalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
+      candidateId: input.definition.candidateId,
+      rawSourceSha256: input.rawSourceSha256,
+    },
+    code: input.code ?? "STATIC_TEMPLATE_EXECUTION_NOT_ADMITTED",
+    reason:
+      input.reason ??
+      "该模板尚未完成 FrontMind 受控 Vite 构建与浏览器验收，当前不可选择。",
+  });
+}
+
+async function writeAdmissionAsset(target: string, bytes: Buffer) {
+  await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+  await writeFile(target, bytes, { mode: 0o600 });
+  return {
+    bytes: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+async function materializeExecutionAdmission(input: {
+  root: string;
+  stagingDirectory: string;
+  definition: FrozenStaticTemplateDefinition;
+  rawSourcePath: string;
+  rawSourceSha256: string;
+  rawSourceBytes: number;
+  builder?: StaticTemplateExecutionAdmissionBuilder;
+}) {
+  if (!input.builder) return unavailableExecutionAdmission(input);
+  const controller = new AbortController();
+  let material: StaticTemplateExecutionAdmissionMaterial;
+  try {
+    material = await input.builder({
+      catalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
+      definition: input.definition,
+      rawSourcePath: input.rawSourcePath,
+      rawSourceSha256: input.rawSourceSha256,
+      rawSourceBytes: input.rawSourceBytes,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (
+      input.definition.candidateId ===
+      "static-template-22-hirael-agency-landing"
+    ) {
+      throw error;
+    }
+    return unavailableExecutionAdmission({
+      ...input,
+      code: "STATIC_TEMPLATE_EXECUTION_ADMISSION_FAILED",
+      reason:
+        "该模板未通过 FrontMind 受控 Vite 构建或浏览器验收，当前不可选择。",
+    });
+  } finally {
+    controller.abort();
+  }
+  if (material.status === "unavailable") {
+    return unavailableExecutionAdmission({
+      ...input,
+      code: material.code,
+      reason: material.reason,
+    });
+  }
+  const base = path.join(
+    input.stagingDirectory,
+    "admissions",
+    input.definition.candidateId,
+  );
+  const normalizedTarget = path.join(base, "normalized-source.zip");
+  const [normalized, contract, dist, qa, browserReceipt] = await Promise.all([
+    writeAdmissionAsset(normalizedTarget, material.normalizedSource),
+    writeAdmissionAsset(
+      path.join(base, "delivery-contract.json"),
+      material.contract,
+    ),
+    writeAdmissionAsset(path.join(base, "dist.zip"), material.dist),
+    writeAdmissionAsset(path.join(base, "qa.json"), material.qa),
+    writeAdmissionAsset(
+      path.join(base, "browser-receipt.json"),
+      material.browserReceipt,
+    ),
+  ]);
+  const normalizedArchive =
+    await inspectStaticTemplateSourceArchive(normalizedTarget);
+  const finalBase = path.join(
+    finalCatalogDirectory(input.root),
+    "admissions",
+    input.definition.candidateId,
+  );
+  const assetId = (kind: string) =>
+    `${STATIC_TEMPLATE_CATALOG_VERSION}/admission/${input.definition.candidateId}/${kind}`;
+  const admitted = {
+    status: "admitted",
+    binding: {
+      catalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
+      candidateId: input.definition.candidateId,
+      rawSourceSha256: input.rawSourceSha256,
+    },
+    framework: material.framework,
+    normalizedSourceAssetId: assetId("normalized-source"),
+    normalizedSourcePath: relativeAssetPath(
+      input.root,
+      path.join(finalBase, "normalized-source.zip"),
+    ),
+    normalizedSourceSha256: normalized.sha256,
+    normalizedSourceBytes: normalized.bytes,
+    normalizedSourceFileCount: normalizedArchive.fileCount,
+    normalizedSourceExpandedBytes: normalizedArchive.expandedBytes,
+    sourceTreeSha256: material.sourceTreeSha256,
+    runtimeContractSha256: material.runtimeContractSha256,
+    executionShellSha256: material.executionShellSha256,
+    deliveryContractAssetId: assetId("delivery-contract"),
+    deliveryContractPath: relativeAssetPath(
+      input.root,
+      path.join(finalBase, "delivery-contract.json"),
+    ),
+    deliveryContractSha256: contract.sha256,
+    deliveryContractBytes: contract.bytes,
+    distAssetId: assetId("dist"),
+    distPath: relativeAssetPath(input.root, path.join(finalBase, "dist.zip")),
+    distSha256: dist.sha256,
+    distBytes: dist.bytes,
+    qaAssetId: assetId("qa"),
+    qaPath: relativeAssetPath(input.root, path.join(finalBase, "qa.json")),
+    qaSha256: qa.sha256,
+    qaBytes: qa.bytes,
+    browserReceiptAssetId: assetId("browser-receipt"),
+    browserReceiptPath: relativeAssetPath(
+      input.root,
+      path.join(finalBase, "browser-receipt.json"),
+    ),
+    browserReceiptSha256: browserReceipt.sha256,
+    browserReceiptBytes: browserReceipt.bytes,
+    qaStatus: material.qaStatus,
+  } as const;
+  return admittedExecutionSchema.parse({
+    ...admitted,
+    admissionEvidenceSha256: staticTemplateAdmissionEvidenceSha256({
+      catalogVersion: admitted.binding.catalogVersion,
+      candidateId: admitted.binding.candidateId,
+      rawSourceSha256: admitted.binding.rawSourceSha256,
+      normalizedSourceSha256: admitted.normalizedSourceSha256,
+      sourceTreeSha256: admitted.sourceTreeSha256,
+      runtimeContractSha256: admitted.runtimeContractSha256,
+      executionShellSha256: admitted.executionShellSha256,
+      deliveryContractSha256: admitted.deliveryContractSha256,
+      distSha256: admitted.distSha256,
+      qaSha256: admitted.qaSha256,
+      browserReceiptSha256: admitted.browserReceiptSha256,
+      qaStatus: admitted.qaStatus,
+    }),
+  });
+}
+
 async function materializeEntry(input: {
   root: string;
   stagingDirectory: string;
   definition: FrozenStaticTemplateDefinition;
   fetchImpl: typeof fetch;
   sourceArchives: Map<string, Promise<UpstreamSourceArchive>>;
+  executionAdmissionBuilder?: StaticTemplateExecutionAdmissionBuilder;
 }) {
   const sourceTarget = path.join(
     input.stagingDirectory,
@@ -1466,7 +1851,7 @@ async function materializeEntry(input: {
     preview = await inspectPreview(previewTarget);
   }
   const finalDirectory = finalCatalogDirectory(input.root);
-  const sourcePath = relativeAssetPath(
+  const rawSourcePath = relativeAssetPath(
     input.root,
     path.join(finalDirectory, "sources", sourceFilename(input.definition)),
   );
@@ -1474,6 +1859,33 @@ async function materializeEntry(input: {
     input.root,
     path.join(finalDirectory, "previews", previewFilename(input.definition)),
   );
+  const executionAdmission = await materializeExecutionAdmission({
+    root: input.root,
+    stagingDirectory: input.stagingDirectory,
+    definition: input.definition,
+    rawSourcePath: sourceTarget,
+    rawSourceSha256: sourceHash.sha256,
+    rawSourceBytes: sourceHash.bytes,
+    builder: input.executionAdmissionBuilder,
+  });
+  const executionSource =
+    executionAdmission.status === "admitted"
+      ? {
+          assetId: executionAdmission.normalizedSourceAssetId,
+          path: executionAdmission.normalizedSourcePath,
+          sha256: executionAdmission.normalizedSourceSha256,
+          bytes: executionAdmission.normalizedSourceBytes,
+          fileCount: executionAdmission.normalizedSourceFileCount,
+          expandedBytes: executionAdmission.normalizedSourceExpandedBytes,
+        }
+      : {
+          assetId: `${STATIC_TEMPLATE_CATALOG_VERSION}/source/${input.definition.candidateId}`,
+          path: rawSourcePath,
+          sha256: sourceHash.sha256,
+          bytes: sourceHash.bytes,
+          fileCount: archive.fileCount,
+          expandedBytes: archive.expandedBytes,
+        };
   const entry = entrySchema.parse({
     order: input.definition.order,
     page: Math.ceil(input.definition.order / STATIC_TEMPLATE_CATALOG_PAGE_SIZE),
@@ -1489,12 +1901,18 @@ async function materializeEntry(input: {
     sourceCommitSha: input.definition.sourceCommitSha,
     sourceSubdirectory: input.definition.sourceSubdirectory,
     sourceLicense: input.definition.sourceLicense,
-    sourceAssetId: `${STATIC_TEMPLATE_CATALOG_VERSION}/source/${input.definition.candidateId}`,
-    sourcePath,
-    sourceSha256: sourceHash.sha256,
-    sourceBytes: sourceHash.bytes,
-    sourceFileCount: archive.fileCount,
-    sourceExpandedBytes: archive.expandedBytes,
+    rawSourceAssetId: `${STATIC_TEMPLATE_CATALOG_VERSION}/raw-source/${input.definition.candidateId}`,
+    rawSourcePath,
+    rawSourceSha256: sourceHash.sha256,
+    rawSourceBytes: sourceHash.bytes,
+    rawSourceFileCount: archive.fileCount,
+    rawSourceExpandedBytes: archive.expandedBytes,
+    sourceAssetId: executionSource.assetId,
+    sourcePath: executionSource.path,
+    sourceSha256: executionSource.sha256,
+    sourceBytes: executionSource.bytes,
+    sourceFileCount: executionSource.fileCount,
+    sourceExpandedBytes: executionSource.expandedBytes,
     previewAssetId: `${STATIC_TEMPLATE_CATALOG_VERSION}/preview/${input.definition.candidateId}`,
     previewPath,
     previewSha256: previewHash.sha256,
@@ -1503,6 +1921,7 @@ async function materializeEntry(input: {
     previewWidth: preview.width,
     previewHeight: preview.height,
     tags: [...input.definition.tags],
+    executionAdmission,
   });
   await writeAtomicJson(
     path.join(input.stagingDirectory, "records", `${entry.candidateId}.json`),
@@ -1530,10 +1949,13 @@ function assertCatalogCoordinates(catalog: StaticTemplateCatalog) {
   }
   const candidateIds = new Set<string>();
   const providerIds = new Set<string>();
+  const rawSourceAssetIds = new Set<string>();
   const sourceAssetIds = new Set<string>();
   const previewAssetIds = new Set<string>();
+  const rawSourcePaths = new Set<string>();
   const sourcePaths = new Set<string>();
   const previewPaths = new Set<string>();
+  const rawSourceHashes = new Set<string>();
   const sourceHashes = new Set<string>();
   const previewHashes = new Set<string>();
   const catalogPathPrefix = `${CATALOG_RELATIVE_ROOT}/catalogs/${catalog.catalogVersion}`;
@@ -1545,6 +1967,7 @@ function assertCatalogCoordinates(catalog: StaticTemplateCatalog) {
       .every((part) => part !== "" && part !== "." && part !== "..");
   for (let index = 0; index < catalog.entries.length; index += 1) {
     const entry = catalog.entries[index]!;
+    const admission = entry.executionAdmission;
     const definition = strictCurrent
       ? FROZEN_STATIC_TEMPLATE_CATALOG[index]
       : undefined;
@@ -1564,20 +1987,61 @@ function assertCatalogCoordinates(catalog: StaticTemplateCatalog) {
       entry.page > catalog.pageCount ||
       entry.pageIndex !== index % catalog.pageSize ||
       entry.providerVersion !== entry.sourceCommitSha ||
-      entry.sourceAssetId !==
-        `${catalog.catalogVersion}/source/${entry.candidateId}` ||
+      entry.rawSourceAssetId !==
+        `${catalog.catalogVersion}/raw-source/${entry.candidateId}` ||
+      admission.binding.catalogVersion !== catalog.catalogVersion ||
+      admission.binding.candidateId !== entry.candidateId ||
+      admission.binding.rawSourceSha256 !== entry.rawSourceSha256 ||
+      (admission.status === "unavailable" &&
+        (entry.sourceAssetId !==
+          `${catalog.catalogVersion}/source/${entry.candidateId}` ||
+          entry.sourcePath !== entry.rawSourcePath ||
+          entry.sourceSha256 !== entry.rawSourceSha256 ||
+          entry.sourceBytes !== entry.rawSourceBytes ||
+          entry.sourceFileCount !== entry.rawSourceFileCount ||
+          entry.sourceExpandedBytes !== entry.rawSourceExpandedBytes)) ||
+      (admission.status === "admitted" &&
+        (entry.sourceAssetId !== admission.normalizedSourceAssetId ||
+          entry.sourcePath !== admission.normalizedSourcePath ||
+          entry.sourceSha256 !== admission.normalizedSourceSha256 ||
+          entry.sourceBytes !== admission.normalizedSourceBytes ||
+          entry.sourceFileCount !== admission.normalizedSourceFileCount ||
+          entry.sourceExpandedBytes !==
+            admission.normalizedSourceExpandedBytes ||
+          admission.admissionEvidenceSha256 !==
+            staticTemplateAdmissionEvidenceSha256({
+              catalogVersion: admission.binding.catalogVersion,
+              candidateId: admission.binding.candidateId,
+              rawSourceSha256: admission.binding.rawSourceSha256,
+              normalizedSourceSha256: admission.normalizedSourceSha256,
+              sourceTreeSha256: admission.sourceTreeSha256,
+              runtimeContractSha256: admission.runtimeContractSha256,
+              executionShellSha256: admission.executionShellSha256,
+              deliveryContractSha256: admission.deliveryContractSha256,
+              distSha256: admission.distSha256,
+              qaSha256: admission.qaSha256,
+              browserReceiptSha256: admission.browserReceiptSha256,
+              qaStatus: admission.qaStatus,
+            }))) ||
       entry.previewAssetId !==
         `${catalog.catalogVersion}/preview/${entry.candidateId}` ||
+      !pathIsSafe(entry.rawSourcePath) ||
       !pathIsSafe(entry.sourcePath) ||
       !pathIsSafe(entry.previewPath) ||
-      !entry.sourcePath.startsWith(`${catalogPathPrefix}/sources/`) ||
+      !entry.rawSourcePath.startsWith(`${catalogPathPrefix}/sources/`) ||
+      (admission.status === "unavailable"
+        ? !entry.sourcePath.startsWith(`${catalogPathPrefix}/sources/`)
+        : !entry.sourcePath.startsWith(`${catalogPathPrefix}/admissions/`)) ||
       !entry.previewPath.startsWith(`${catalogPathPrefix}/previews/`) ||
       candidateIds.has(entry.candidateId) ||
       providerIds.has(entry.providerTemplateId) ||
+      rawSourceAssetIds.has(entry.rawSourceAssetId) ||
       sourceAssetIds.has(entry.sourceAssetId) ||
       previewAssetIds.has(entry.previewAssetId) ||
+      rawSourcePaths.has(entry.rawSourcePath) ||
       sourcePaths.has(entry.sourcePath) ||
       previewPaths.has(entry.previewPath) ||
+      rawSourceHashes.has(entry.rawSourceSha256) ||
       sourceHashes.has(entry.sourceSha256) ||
       previewHashes.has(entry.previewSha256) ||
       (definition !== undefined &&
@@ -1591,7 +2055,7 @@ function assertCatalogCoordinates(catalog: StaticTemplateCatalog) {
           entry.sourceCommitSha !== definition.sourceCommitSha ||
           entry.sourceSubdirectory !== definition.sourceSubdirectory ||
           entry.sourceLicense !== definition.sourceLicense ||
-          entry.sourcePath !==
+          entry.rawSourcePath !==
             `${catalogPathPrefix}/sources/${sourceFilename(definition)}` ||
           entry.previewPath !==
             `${catalogPathPrefix}/previews/${previewFilename(definition)}` ||
@@ -1606,71 +2070,182 @@ function assertCatalogCoordinates(catalog: StaticTemplateCatalog) {
     }
     candidateIds.add(entry.candidateId);
     providerIds.add(entry.providerTemplateId);
+    rawSourceAssetIds.add(entry.rawSourceAssetId);
     sourceAssetIds.add(entry.sourceAssetId);
     previewAssetIds.add(entry.previewAssetId);
+    rawSourcePaths.add(entry.rawSourcePath);
     sourcePaths.add(entry.sourcePath);
     previewPaths.add(entry.previewPath);
+    rawSourceHashes.add(entry.rawSourceSha256);
     sourceHashes.add(entry.sourceSha256);
     previewHashes.add(entry.previewSha256);
+  }
+  if (
+    strictCurrent &&
+    catalog.entries.find(
+      (entry) =>
+        entry.candidateId === "static-template-22-hirael-agency-landing",
+    )?.executionAdmission.status !== "admitted"
+  ) {
+    throw new StaticTemplateCatalogError(
+      "STATIC_TEMPLATE_CATALOG_REQUIRED_ADMISSION_MISSING",
+    );
+  }
+}
+
+function assertReadableCatalogCoordinates(
+  catalog: ReadableStaticTemplateCatalog,
+) {
+  if (catalog.schemaVersion === CATALOG_SCHEMA_VERSION) {
+    assertCatalogCoordinates(catalog);
+    return;
+  }
+  safeCatalogVersion(catalog.catalogVersion);
+  if (
+    catalog.entryCount !== catalog.entries.length ||
+    catalog.pageCount !== Math.ceil(catalog.entryCount / catalog.pageSize)
+  ) {
+    throw new StaticTemplateCatalogError(
+      "STATIC_TEMPLATE_CATALOG_MANIFEST_INVALID",
+    );
+  }
+  const candidateIds = new Set<string>();
+  for (let index = 0; index < catalog.entries.length; index += 1) {
+    const entry = catalog.entries[index]!;
+    if (
+      entry.order !== index + 1 ||
+      entry.page !== Math.floor(index / catalog.pageSize) + 1 ||
+      entry.pageIndex !== index % catalog.pageSize ||
+      entry.providerVersion !== entry.sourceCommitSha ||
+      candidateIds.has(entry.candidateId)
+    ) {
+      throw new StaticTemplateCatalogError(
+        "STATIC_TEMPLATE_CATALOG_MANIFEST_INVALID",
+      );
+    }
+    candidateIds.add(entry.candidateId);
   }
 }
 
 async function validateCatalogAssets(
   root: string,
-  catalog: StaticTemplateCatalog,
+  catalog: ReadableStaticTemplateCatalog,
 ) {
-  assertCatalogCoordinates(catalog);
+  assertReadableCatalogCoordinates(catalog);
   await Promise.all(
-    catalog.entries.flatMap((entry) => [
-      (async () => {
-        const source = resolveCatalogAssetPath(root, entry.sourcePath);
-        if ((await regularFileSize(source)) !== entry.sourceBytes) {
-          throw new StaticTemplateCatalogError(
-            "STATIC_TEMPLATE_CATALOG_SOURCE_SIZE_MISMATCH",
-          );
-        }
-      })(),
-      (async () => {
-        const preview = resolveCatalogAssetPath(root, entry.previewPath);
-        if ((await regularFileSize(preview)) !== entry.previewBytes) {
-          throw new StaticTemplateCatalogError(
-            "STATIC_TEMPLATE_CATALOG_PREVIEW_SIZE_MISMATCH",
-          );
-        }
-      })(),
-    ]),
+    expectedCatalogAssets(catalog).map(async (asset) => {
+      if (
+        (await regularFileSize(resolveCatalogAssetPath(root, asset.path))) !==
+        asset.bytes
+      ) {
+        throw new StaticTemplateCatalogError(asset.sizeMismatchCode);
+      }
+    }),
   );
 }
 
-function expectedCatalogAssets(catalog: StaticTemplateCatalog) {
-  return catalog.entries.flatMap((entry) => [
-    {
-      candidateId: entry.candidateId,
-      kind: "source" as const,
-      path: entry.sourcePath,
-      sha256: entry.sourceSha256,
-      bytes: entry.sourceBytes,
-      mismatchCode: "STATIC_TEMPLATE_CATALOG_SOURCE_HASH_MISMATCH",
-    },
-    {
-      candidateId: entry.candidateId,
-      kind: "preview" as const,
-      path: entry.previewPath,
-      sha256: entry.previewSha256,
-      bytes: entry.previewBytes,
-      mismatchCode: "STATIC_TEMPLATE_CATALOG_PREVIEW_HASH_MISMATCH",
-    },
-  ]);
+function expectedCatalogAssets(catalog: ReadableStaticTemplateCatalog) {
+  if (catalog.schemaVersion === LEGACY_CATALOG_SCHEMA_VERSION) {
+    return catalog.entries.flatMap((entry) => [
+      {
+        candidateId: entry.candidateId,
+        kind: "source" as const,
+        path: entry.sourcePath,
+        sha256: entry.sourceSha256,
+        bytes: entry.sourceBytes,
+        mismatchCode: "STATIC_TEMPLATE_CATALOG_SOURCE_HASH_MISMATCH",
+        sizeMismatchCode: "STATIC_TEMPLATE_CATALOG_SOURCE_SIZE_MISMATCH",
+      },
+      {
+        candidateId: entry.candidateId,
+        kind: "preview" as const,
+        path: entry.previewPath,
+        sha256: entry.previewSha256,
+        bytes: entry.previewBytes,
+        mismatchCode: "STATIC_TEMPLATE_CATALOG_PREVIEW_HASH_MISMATCH",
+        sizeMismatchCode: "STATIC_TEMPLATE_CATALOG_PREVIEW_SIZE_MISMATCH",
+      },
+    ]);
+  }
+  return catalog.entries.flatMap((entry) => {
+    const assets = [
+      {
+        candidateId: entry.candidateId,
+        kind: "raw_source" as const,
+        path: entry.rawSourcePath,
+        sha256: entry.rawSourceSha256,
+        bytes: entry.rawSourceBytes,
+        mismatchCode: "STATIC_TEMPLATE_CATALOG_RAW_SOURCE_HASH_MISMATCH",
+        sizeMismatchCode: "STATIC_TEMPLATE_CATALOG_RAW_SOURCE_SIZE_MISMATCH",
+      },
+      {
+        candidateId: entry.candidateId,
+        kind: "preview" as const,
+        path: entry.previewPath,
+        sha256: entry.previewSha256,
+        bytes: entry.previewBytes,
+        mismatchCode: "STATIC_TEMPLATE_CATALOG_PREVIEW_HASH_MISMATCH",
+        sizeMismatchCode: "STATIC_TEMPLATE_CATALOG_PREVIEW_SIZE_MISMATCH",
+      },
+    ];
+    if (entry.executionAdmission.status !== "admitted") return assets;
+    const admission = entry.executionAdmission;
+    return [
+      assets[0]!,
+      {
+        candidateId: entry.candidateId,
+        kind: "normalized_source" as const,
+        path: admission.normalizedSourcePath,
+        sha256: admission.normalizedSourceSha256,
+        bytes: admission.normalizedSourceBytes,
+        mismatchCode: "STATIC_TEMPLATE_CATALOG_SOURCE_HASH_MISMATCH",
+        sizeMismatchCode: "STATIC_TEMPLATE_CATALOG_SOURCE_SIZE_MISMATCH",
+      },
+      assets[1]!,
+      ...(
+        [
+          [
+            "delivery_contract",
+            admission.deliveryContractPath,
+            admission.deliveryContractSha256,
+            admission.deliveryContractBytes,
+          ],
+          [
+            "dist",
+            admission.distPath,
+            admission.distSha256,
+            admission.distBytes,
+          ],
+          ["qa", admission.qaPath, admission.qaSha256, admission.qaBytes],
+          [
+            "browser_receipt",
+            admission.browserReceiptPath,
+            admission.browserReceiptSha256,
+            admission.browserReceiptBytes,
+          ],
+        ] as const
+      ).map(([kind, assetPath, sha256, bytes]) => ({
+        candidateId: entry.candidateId,
+        kind,
+        path: assetPath,
+        sha256,
+        bytes,
+        mismatchCode: "STATIC_TEMPLATE_CATALOG_ADMISSION_HASH_MISMATCH",
+        sizeMismatchCode: "STATIC_TEMPLATE_CATALOG_ADMISSION_SIZE_MISMATCH",
+      })),
+    ];
+  });
 }
 
 async function verifyCatalogAssetHashes(
   root: string,
-  catalog: StaticTemplateCatalog,
+  catalog: ReadableStaticTemplateCatalog,
 ) {
   const expected = expectedCatalogAssets(catalog);
-  const verified = new Array<z.infer<typeof integrityAssetSchema>>(
-    expected.length,
-  );
+  const verified = new Array<
+    | z.infer<typeof integrityAssetSchema>
+    | z.infer<typeof legacyIntegrityAssetSchema>
+  >(expected.length);
   let next = 0;
   await Promise.all(
     Array.from({ length: 2 }, async () => {
@@ -1690,7 +2265,11 @@ async function verifyCatalogAssetHashes(
         ) {
           throw new StaticTemplateCatalogError(asset.mismatchCode);
         }
-        verified[index] = integrityAssetSchema.parse({
+        const assetSchema =
+          catalog.schemaVersion === LEGACY_CATALOG_SCHEMA_VERSION
+            ? legacyIntegrityAssetSchema
+            : integrityAssetSchema;
+        verified[index] = assetSchema.parse({
           candidateId: asset.candidateId,
           kind: asset.kind,
           path: asset.path,
@@ -1708,13 +2287,15 @@ async function verifyCatalogAssetHashes(
 
 async function validateIntegrityReceipt(input: {
   root: string;
-  catalog: StaticTemplateCatalog;
+  catalog: ReadableStaticTemplateCatalog;
   manifestSha256: string;
   integrityPath: string;
   integritySha256?: string;
   verifyStats?: boolean;
 }) {
-  let receipt: z.infer<typeof integritySchema>;
+  let receipt:
+    | z.infer<typeof integritySchema>
+    | z.infer<typeof legacyIntegritySchema>;
   try {
     const loaded = await readJson(
       resolveCatalogAssetPath(input.root, input.integrityPath),
@@ -1728,7 +2309,11 @@ async function validateIntegrityReceipt(input: {
         "STATIC_TEMPLATE_CATALOG_INTEGRITY_HASH_MISMATCH",
       );
     }
-    receipt = integritySchema.parse(loaded.value);
+    receipt = (
+      input.catalog.schemaVersion === LEGACY_CATALOG_SCHEMA_VERSION
+        ? legacyIntegritySchema
+        : integritySchema
+    ).parse(loaded.value);
   } catch (error) {
     if (error instanceof StaticTemplateCatalogError) throw error;
     throw new StaticTemplateCatalogError(
@@ -1739,7 +2324,7 @@ async function validateIntegrityReceipt(input: {
     receipt.manifestSha256 !== input.manifestSha256 ||
     receipt.catalogVersion !== input.catalog.catalogVersion ||
     receipt.workflowVersion !== input.catalog.workflowVersion ||
-    receipt.assets.length !== input.catalog.entryCount * 2
+    receipt.assets.length !== expectedCatalogAssets(input.catalog).length
   ) {
     throw new StaticTemplateCatalogError(
       "STATIC_TEMPLATE_CATALOG_INTEGRITY_INVALID",
@@ -1808,8 +2393,8 @@ async function loadCatalogManifestAt(
 ) {
   const resolved = resolveCatalogAssetPath(root, manifestPath);
   const { bytes, value } = await readJson(resolved);
-  const catalog = catalogSchema.parse(value);
-  assertCatalogCoordinates(catalog);
+  const catalog = readableCatalogSchema.parse(value);
+  assertReadableCatalogCoordinates(catalog);
   if (options.verifyAssetSizes) {
     await validateCatalogAssets(root, catalog);
   }
@@ -1842,7 +2427,7 @@ function catalogVersionRelativePath(
 export async function loadStaticTemplateCatalogVersion(
   catalogVersion: string,
   options: CatalogOptions = {},
-): Promise<StaticTemplateCatalog | null> {
+): Promise<ReadableStaticTemplateCatalog | null> {
   const version = safeCatalogVersion(catalogVersion);
   const root = assetRoot(options);
   const manifestPath = catalogVersionRelativePath(
@@ -1944,6 +2529,11 @@ export async function loadActiveStaticTemplateCatalog(
       );
     }
     const loaded = await loadCatalogManifestAt(root, active.manifestPath);
+    if (loaded.catalog.schemaVersion !== CATALOG_SCHEMA_VERSION) {
+      throw new StaticTemplateCatalogError(
+        "STATIC_TEMPLATE_CATALOG_VERSION_MISMATCH",
+      );
+    }
     if (loaded.sha256 !== active.manifestSha256) {
       throw new StaticTemplateCatalogError(
         "STATIC_TEMPLATE_CATALOG_MANIFEST_HASH_MISMATCH",
@@ -2038,7 +2628,7 @@ export async function openStaticTemplateCatalogVersionSource(
   candidateId: string,
   options: CatalogOptions = {},
 ): Promise<{
-  entry: StaticTemplateCatalogEntry;
+  entry: StaticTemplateCatalogEntry | LegacyStaticTemplateCatalogEntry;
   path: string;
   stream: ReadStream;
 }> {
@@ -2048,6 +2638,15 @@ export async function openStaticTemplateCatalogVersionSource(
     candidateId,
     options,
   );
+  if (
+    "executionAdmission" in entry &&
+    (entry as StaticTemplateCatalogEntry).executionAdmission.status !==
+      "admitted"
+  ) {
+    throw new StaticTemplateCatalogError(
+      "STATIC_TEMPLATE_CATALOG_EXECUTION_NOT_ADMITTED",
+    );
+  }
   const sourcePath = resolveCatalogAssetPath(root, entry.sourcePath);
   const actual = await hashFile(sourcePath);
   if (
@@ -2066,7 +2665,7 @@ export async function openStaticTemplateCatalogVersionPreview(
   candidateId: string,
   options: CatalogOptions = {},
 ): Promise<{
-  entry: StaticTemplateCatalogEntry;
+  entry: StaticTemplateCatalogEntry | LegacyStaticTemplateCatalogEntry;
   path: string;
   stream: ReadStream;
 }> {
@@ -2113,6 +2712,11 @@ export async function openStaticTemplateCatalogSource(
 }> {
   const root = assetRoot(options);
   const entry = await getActiveStaticTemplateCatalogEntry(candidateId, options);
+  if (entry.executionAdmission.status !== "admitted") {
+    throw new StaticTemplateCatalogError(
+      "STATIC_TEMPLATE_CATALOG_EXECUTION_NOT_ADMITTED",
+    );
+  }
   const sourcePath = resolveCatalogAssetPath(root, entry.sourcePath);
   const actual = await hashFile(sourcePath);
   if (
@@ -2222,11 +2826,15 @@ async function activateExistingFinalCatalog(root: string) {
   const loaded = await loadCatalogManifestAt(root, manifestPath, {
     verifyAssetHashes: true,
   });
+  if (loaded.catalog.schemaVersion !== CATALOG_SCHEMA_VERSION) {
+    throw new StaticTemplateCatalogError(
+      "STATIC_TEMPLATE_CATALOG_VERSION_CONFLICT",
+    );
+  }
   const integrity = await writeCatalogIntegrityReceipt({
     root,
     catalog: loaded.catalog,
     manifestSha256: loaded.sha256,
-    verifiedAssets: loaded.verifiedAssets,
   });
   await activateCatalog(root, loaded.sha256, integrity.sha256);
   return loaded.catalog;
@@ -2278,9 +2886,8 @@ export async function seedStaticTemplateCatalog(options: SeedOptions = {}) {
         } as const;
       } catch (error) {
         if (!isRecoverableCatalogCorruption(error)) throw error;
-        await rename(
-          finalDirectory,
-          `${finalDirectory}.invalid-${randomUUID()}`,
+        throw new StaticTemplateCatalogError(
+          "STATIC_TEMPLATE_CATALOG_VERSION_CONFLICT",
         );
       }
     }
@@ -2306,12 +2913,15 @@ export async function seedStaticTemplateCatalog(options: SeedOptions = {}) {
       1,
       Math.min(options.concurrency ?? SEED_CONCURRENCY, SEED_CONCURRENCY),
     );
-    await Promise.all(
-      Array.from({ length: concurrency }, async () => {
-        while (true) {
-          const index = next;
-          next += 1;
-          if (index >= FROZEN_STATIC_TEMPLATE_CATALOG.length) return;
+    let workerFailed = false;
+    let firstWorkerError: unknown;
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        if (workerFailed) return;
+        const index = next;
+        next += 1;
+        if (index >= FROZEN_STATIC_TEMPLATE_CATALOG.length) return;
+        try {
           await lock.heartbeat();
           entries[index] = await materializeEntry({
             root,
@@ -2319,10 +2929,19 @@ export async function seedStaticTemplateCatalog(options: SeedOptions = {}) {
             definition: FROZEN_STATIC_TEMPLATE_CATALOG[index]!,
             fetchImpl: options.fetchImpl ?? fetch,
             sourceArchives,
+            executionAdmissionBuilder: options.executionAdmissionBuilder,
           });
+        } catch (error) {
+          if (!workerFailed) {
+            workerFailed = true;
+            firstWorkerError = error;
+          }
+          return;
         }
-      }),
-    );
+      }
+    });
+    await Promise.all(workers);
+    if (workerFailed) throw firstWorkerError;
     await rm(path.join(stagingDirectory, ".upstream"), {
       recursive: true,
       force: true,
@@ -2363,19 +2982,36 @@ export async function getStaticTemplateCatalogReadiness(
       verifyIntegrityStats: true,
     });
     return catalog
-      ? {
-          ready: true as const,
-          expectedCatalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
-          activeCatalogVersion: catalog.catalogVersion,
-          workflowVersion: catalog.workflowVersion,
-          entryCount: catalog.entryCount,
-          pageSize: catalog.pageSize,
-          pageCount: catalog.pageCount,
-        }
+      ? (() => {
+          const admittedCount = catalog.entries.filter(
+            (entry) => entry.executionAdmission.status === "admitted",
+          ).length;
+          const requiredAdmissionReady =
+            catalog.entries.find(
+              (entry) =>
+                entry.candidateId ===
+                "static-template-22-hirael-agency-landing",
+            )?.executionAdmission.status === "admitted";
+          return {
+            ready: true as const,
+            expectedCatalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
+            activeCatalogVersion: catalog.catalogVersion,
+            workflowVersion: catalog.workflowVersion,
+            entryCount: catalog.entryCount,
+            pageSize: catalog.pageSize,
+            pageCount: catalog.pageCount,
+            admittedCount,
+            unavailableCount: catalog.entryCount - admittedCount,
+            requiredAdmissionReady,
+          };
+        })()
       : {
           ready: false as const,
           expectedCatalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
           activeCatalogVersion: null,
+          admittedCount: 0,
+          unavailableCount: STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
+          requiredAdmissionReady: false,
           code: "STATIC_TEMPLATE_CATALOG_NOT_ACTIVE",
         };
   } catch (error) {
@@ -2383,6 +3019,9 @@ export async function getStaticTemplateCatalogReadiness(
       ready: false as const,
       expectedCatalogVersion: STATIC_TEMPLATE_CATALOG_VERSION,
       activeCatalogVersion: null,
+      admittedCount: 0,
+      unavailableCount: STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
+      requiredAdmissionReady: false,
       code:
         error instanceof StaticTemplateCatalogError
           ? error.code

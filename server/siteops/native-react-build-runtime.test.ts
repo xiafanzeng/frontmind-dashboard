@@ -1,10 +1,19 @@
 import { createHash } from "node:crypto";
 
 import JSZip from "jszip";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { SiteBrief } from "../../shared/siteops";
 import {
+  NATIVE_RUNTIME_CONTRACT_V1,
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+  NATIVE_RUNTIME_ROUTE_MANIFEST_EXPORT,
+  NATIVE_RUNTIME_ROUTE_MODULE,
+  NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+  NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+  auditNativeRuntimeContractV1,
   validateNativeReactSourceArchive,
   type ValidatedNativeReactSource,
 } from "./native-react-source";
@@ -60,6 +69,14 @@ const OPERATION_TOKEN = "native-runtime-test-operation-token";
 const FIXED_DATE = new Date("2000-01-01T00:00:00.000Z");
 const browserIt =
   process.env.FRONTMIND_RUN_SITEOPS_BROWSER_INTEGRATION === "1" ? it : it.skip;
+const currentRuntimeAudit = (input: {
+  files: ReadonlyMap<string, Buffer>;
+  expectedRoutePaths: readonly string[];
+}) =>
+  auditNativeRuntimeContractV1({
+    ...input,
+    contract: NATIVE_RUNTIME_CONTRACT_V1,
+  });
 
 function sha256(bytes: Buffer) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -150,6 +167,65 @@ createRoot(document.getElementById("root")!).render(<App />);`,
   });
 }
 
+async function validatedRuntimeV2Source(routePaths: readonly string[]) {
+  const files = new Map<string, Buffer>();
+  for (const file of NATIVE_RUNTIME_EXECUTION_SHELL_V1.files) {
+    files.set(file.path, Buffer.from(file.text, "utf8"));
+  }
+  files.set(
+    NATIVE_RUNTIME_ROUTE_MODULE,
+    Buffer.from(
+      `import Home from "./home";\nimport Applications from "./applications";\nexport const ${NATIVE_RUNTIME_ROUTE_MANIFEST_EXPORT} = ${JSON.stringify(routePaths)} as const;\nexport default function FrontMindRoutes() { return location.pathname === "/applications/" ? <Applications /> : <Home />; }\n`,
+    ),
+  );
+  files.set(
+    "src/home.tsx",
+    Buffer.from(
+      "export default function Home() { return <main>Home</main>; }\n",
+    ),
+  );
+  files.set(
+    "src/applications.tsx",
+    Buffer.from(
+      "export default function Applications() { return <main>Applications</main>; }\n",
+    ),
+  );
+  const archive = new JSZip();
+  for (const [filename, bytes] of files) {
+    archive.file(filename, bytes, {
+      date: FIXED_DATE,
+      createFolders: false,
+      unixPermissions: 0o100644,
+    });
+  }
+  const sourceZip = await archive.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 },
+    platform: "UNIX",
+  });
+  return validateNativeReactSourceArchive({
+    archive: sourceZip,
+    receipt: {
+      operationToken: OPERATION_TOKEN,
+      baseSourceSha256: BASE_SOURCE_SHA256,
+      archiveSha256: sha256(sourceZip),
+      fileCount: files.size,
+      preflightVersion: NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+      preflightStatus: "passed",
+      preflightSha256: NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+      runtimeContractVersion: NATIVE_RUNTIME_CONTRACT_V1.contractVersion,
+      runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+      executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+      executionBaselineSha256: "c".repeat(64),
+    },
+    expectedOperationToken: OPERATION_TOKEN,
+    expectedBaseSourceSha256: BASE_SOURCE_SHA256,
+    expectedExecutionBaselineSha256: "c".repeat(64),
+    requiredReceiptVersion: 2,
+  });
+}
+
 describe("native React build runtime", () => {
   it("builds the exact validated source and materializes every frozen route", async () => {
     const source = await validatedSource();
@@ -187,6 +263,72 @@ describe("native React build runtime", () => {
       '"providerPackageScriptsExecuted":false',
     );
   }, 30_000);
+
+  it("binds v2 literal routes to canonical SiteBrief paths before compilation", async () => {
+    const matching = await validatedRuntimeV2Source(["/", "/applications/"]);
+    const runtimeAudit = vi.fn(currentRuntimeAudit);
+    await expect(
+      materializeNativeReactSource({
+        sourceZip: matching.sourceZip,
+        validatedSource: matching,
+        build: BUILD,
+        brief: {
+          ...BRIEF,
+          routes: BRIEF.routes.map((route) =>
+            route.id === "applications"
+              ? { ...route, slug: "/applications" }
+              : route,
+          ),
+        },
+        mode: "preview",
+        browserQa: false,
+        runtimeAudit,
+      }),
+    ).resolves.toMatchObject({
+      contract: { routes: ["/", "/applications/"] },
+    });
+    expect(runtimeAudit).toHaveBeenCalledWith({
+      files: matching.files,
+      expectedRoutePaths: ["/", "/applications"],
+    });
+
+    const mismatched = await validatedRuntimeV2Source(["/", "/contact/"]);
+    await expect(
+      materializeNativeReactSource({
+        sourceZip: mismatched.sourceZip,
+        validatedSource: mismatched,
+        build: BUILD,
+        brief: BRIEF,
+        mode: "preview",
+        browserQa: false,
+        runtimeAudit: currentRuntimeAudit,
+      }),
+    ).rejects.toMatchObject<Partial<NativeReactBuildError>>({
+      code: "NATIVE_BUILD_INPUT_INVALID",
+      diagnostics: [
+        expect.objectContaining({
+          code: "ROUTE_MANIFEST_MISMATCH",
+          file: NATIVE_RUNTIME_ROUTE_MODULE,
+        }),
+      ],
+    });
+  }, 30_000);
+
+  it("fails closed when a v2 source has no frozen runtime auditor", async () => {
+    const source = await validatedRuntimeV2Source(["/", "/applications/"]);
+    await expect(
+      materializeNativeReactSource({
+        sourceZip: source.sourceZip,
+        validatedSource: source,
+        build: BUILD,
+        brief: BRIEF,
+        mode: "preview",
+        browserQa: false,
+      }),
+    ).rejects.toMatchObject<Partial<NativeReactBuildError>>({
+      code: "NATIVE_BUILD_RUNTIME_AUDIT_UNAVAILABLE",
+    });
+  });
 
   it("compiles a common Tailwind v4 source through the trusted host plugin", async () => {
     const source = await validatedSource({

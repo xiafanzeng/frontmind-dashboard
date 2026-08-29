@@ -12,7 +12,18 @@ import {
   visualSelectionBundleV6Schema,
 } from "../../shared/siteops";
 import type { NormalizedTwentyFirstCandidate } from "../../shared/siteops-workflow";
-import { validateNativeReactSourceArchive } from "./native-react-source";
+import {
+  NATIVE_RUNTIME_CONTRACT_FILENAME,
+  NATIVE_RUNTIME_CONTRACT_V1,
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+  NATIVE_RUNTIME_CONTRACT_VERSION,
+  NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+  NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+  auditNativeRuntimeContractV1,
+  validateNativeReactSourceArchive,
+} from "./native-react-source";
 import {
   compileValidatedNativeReactSource,
   materializeNativeReactSource,
@@ -29,6 +40,7 @@ import {
   normalizeTwentyFirstNativeSource,
   prepareLegacyNativeTemplateCandidate,
   prepareNativeTemplateCandidate,
+  prepareStaticTemplateExecutionSource,
   readNativeSourceArchive,
   readVisualSelectionBundleArtifact,
   renderNativeReactSourcePreview,
@@ -344,6 +356,274 @@ describe("21st native visual source", () => {
       "Registry documentation",
     );
   });
+
+  it("prepares a complete registry template as an offline eager Vite execution archive", async () => {
+    const zip = new JSZip();
+    zip.file(
+      "hirael/package.json",
+      JSON.stringify({
+        private: true,
+        dependencies: {
+          react: "19.2.1",
+          "react-dom": "19.2.1",
+          shaders: "3.1.457",
+        },
+      }),
+    );
+    zip.file(
+      "hirael/registry/hirael/templates/agency-landing/agency-landing.tsx",
+      'import { Hero } from "./hero"; export default function AgencyLanding(){return <Hero/>}',
+    );
+    zip.file(
+      "hirael/registry/hirael/templates/agency-landing/hero.tsx",
+      [
+        'import dynamic from "next/dynamic";',
+        'import { Details } from "./details";',
+        'const ShaderBackground = dynamic(() => import("./shader-background").then((m) => m.ShaderBackground), { ssr: false });',
+        'const HERO_IMAGE = "https://assets.example.com/hero.png";',
+        'const HERO_VIDEO = "https://assets.example.com/hero.mp4";',
+        'export function Hero(){return <main><ShaderBackground/><img alt="" src={HERO_IMAGE}/><video muted src={HERO_VIDEO}/><h1>Agency</h1><Details/></main>}',
+      ].join("\n"),
+    );
+    zip.file(
+      "hirael/registry/hirael/templates/agency-landing/details.tsx",
+      "export function Details(){return <section>Complete registry subtree</section>}",
+    );
+    zip.file(
+      "hirael/registry/hirael/templates/agency-landing/shader-background.tsx",
+      [
+        'import { ChromaFlow, FilmGrain, FlutedGlass, Shader, Swirl } from "shaders/react";',
+        "export function ShaderBackground(){return <Shader style={{width:'100%',height:'100%'}}><Swirl colorA='#fff' colorB='#eee'/><ChromaFlow baseColor='#fff' downColor='#f60' leftColor='#f60' rightColor='#f60' upColor='#f60'/><FlutedGlass/><FilmGrain/></Shader>}",
+      ].join("\n"),
+    );
+    const providerArchive = await zip.generateAsync({ type: "nodebuffer" });
+    const mirroredImage = await sharp({
+      create: {
+        width: 24,
+        height: 16,
+        channels: 4,
+        background: { r: 240, g: 90, b: 20, alpha: 1 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const mirroredVideo = Buffer.concat([
+      Buffer.from([0, 0, 0, 24]),
+      Buffer.from("ftypisom", "latin1"),
+      Buffer.from("frontmind-mp4-fixture", "utf8"),
+    ]);
+    const prepared = await prepareStaticTemplateExecutionSource({
+      templateId: 790,
+      slug: "hirael-agency-landing",
+      version: "8".repeat(40),
+      archive: providerArchive,
+      expectedArchiveSha256: digest(providerArchive),
+      sourceSubdirectory: "registry/hirael/templates/agency-landing",
+      signal: new AbortController().signal,
+      fetchRemoteAsset: async ({ url }) => ({
+        finalUrl: url,
+        mimeType: "image/png" as const,
+        buffer: mirroredImage,
+        width: 24,
+        height: 16,
+        sha256: digest(mirroredImage),
+        visualSignals: {
+          dominantHex: "#f05a14",
+          brightness: 120,
+          contrast: 40,
+        },
+      }),
+      fetchRemoteRuntimeMedia: async ({ url }) => ({
+        finalUrl: url,
+        mimeType: "video/mp4",
+        buffer: mirroredVideo,
+      }),
+      frozenRuntimeMedia: [
+        {
+          kind: "image",
+          url: "https://assets.example.com/hero.png",
+          bytes: mirroredImage.length,
+          sha256: digest(mirroredImage),
+        },
+        {
+          kind: "video",
+          url: "https://assets.example.com/hero.mp4",
+          bytes: mirroredVideo.length,
+          sha256: digest(mirroredVideo),
+        },
+      ],
+    });
+
+    expect(prepared.framework).toBe("vite_react");
+    const files = new Map(
+      prepared.files.map((file) => [file.path, file.bytes.toString("utf8")]),
+    );
+    const hero = files.get("registry/hirael/templates/agency-landing/hero.tsx");
+    const shader = files.get(
+      "registry/hirael/templates/agency-landing/shader-background.tsx",
+    );
+    expect(hero).toContain(
+      'import { ShaderBackground } from "./shader-background";',
+    );
+    expect(hero).not.toContain("next/dynamic");
+    expect(hero).not.toContain("import(");
+    expect(shader).toContain('from "shaders/react/bundle"');
+    expect(shader).toContain("<Shader disableTelemetry={true}");
+    expect(files.keys()).toContain(
+      "registry/hirael/templates/agency-landing/details.tsx",
+    );
+    expect(files.get("src/main.tsx")).toContain(
+      'import FrontMindRoutes from "./frontmind-routes";',
+    );
+    expect(files.get("src/frontmind-routes.tsx")).toContain(
+      'export const FRONTMIND_ROUTE_PATHS = ["/"] as const;',
+    );
+    expect(files.has(NATIVE_RUNTIME_CONTRACT_FILENAME)).toBe(true);
+    expect(files.has(NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME)).toBe(true);
+    expect(
+      prepared.files.filter((file) =>
+        file.path.startsWith("public/frontmind-native-media/"),
+      ),
+    ).toHaveLength(2);
+    const mirroredMp4 = prepared.files.find((file) =>
+      file.path.endsWith(".mp4"),
+    );
+    expect(mirroredMp4?.bytes.equals(mirroredVideo)).toBe(true);
+    expect(hero).toContain(mirroredMp4!.path.slice("public".length));
+    expect(
+      prepared.files
+        .filter((file) => /\.(?:css|html|[cm]?[jt]sx?)$/u.test(file.path))
+        .some((file) => file.bytes.includes("https://")),
+    ).toBe(false);
+
+    await expect(
+      prepareStaticTemplateExecutionSource({
+        templateId: 790,
+        slug: "hirael-agency-landing",
+        version: "8".repeat(40),
+        archive: providerArchive,
+        expectedArchiveSha256: digest(providerArchive),
+        sourceSubdirectory: "registry/hirael/templates/agency-landing",
+        signal: new AbortController().signal,
+        fetchRemoteAsset: async ({ url }) => ({
+          finalUrl: url,
+          mimeType: "image/png" as const,
+          buffer: mirroredImage,
+          width: 24,
+          height: 16,
+          sha256: digest(mirroredImage),
+          visualSignals: {
+            dominantHex: "#f05a14",
+            brightness: 120,
+            contrast: 40,
+          },
+        }),
+        fetchRemoteRuntimeMedia: async ({ url }) => ({
+          finalUrl: url,
+          mimeType: "video/mp4",
+          buffer: mirroredVideo,
+        }),
+        frozenRuntimeMedia: [
+          {
+            kind: "image",
+            url: "https://assets.example.com/hero.png",
+            bytes: mirroredImage.length,
+            sha256: digest(mirroredImage),
+          },
+          {
+            kind: "video",
+            url: "https://assets.example.com/hero.mp4",
+            bytes: mirroredVideo.length,
+            sha256: "0".repeat(64),
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+    });
+
+    const operationToken = "static-template-registry-admission-test";
+    const validated = await validateNativeReactSourceArchive({
+      archive: prepared.sourceArchive,
+      receipt: {
+        operationToken,
+        baseSourceSha256: prepared.sourceArchiveSha256,
+        archiveSha256: prepared.sourceArchiveSha256,
+        fileCount: prepared.files.length + 1,
+        preflightVersion: NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+        preflightStatus: "passed",
+        preflightSha256: NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+        runtimeContractVersion: NATIVE_RUNTIME_CONTRACT_VERSION,
+        runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+        executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+        executionBaselineSha256: prepared.sourceArchiveSha256,
+      },
+      expectedOperationToken: operationToken,
+      expectedBaseSourceSha256: prepared.sourceArchiveSha256,
+      requiredReceiptVersion: 2,
+      expectedExecutionBaselineSha256: prepared.sourceArchiveSha256,
+      runtimeContract: NATIVE_RUNTIME_CONTRACT_V1,
+    });
+    expect(validated.files.size).toBe(prepared.files.length + 1);
+    expect(
+      validated.files.has(
+        "registry/hirael/templates/agency-landing/shader-background.tsx",
+      ),
+    ).toBe(true);
+    const materialized = await materializeNativeReactSource({
+      sourceZip: prepared.sourceArchive,
+      validatedSource: validated,
+      build: {
+        id: "79000000-0000-4000-8000-000000000001",
+        projectId: "79000000-0000-4000-8000-000000000002",
+        workflowVersion: "2.8.0",
+        selectionHash: digest("registry-execution-admission"),
+      },
+      brief: {
+        companyName: "FrontMind catalog admission",
+        primaryLanguage: "zh-CN",
+        contacts: [],
+        offerings: ["受控模板执行验证"],
+        audience: ["FrontMind catalog admission"],
+        conversionGoal: "验证模板执行能力",
+        contentInventory: {
+          schemaVersion: 1,
+          source: "frozen_knowledge_snapshot",
+          entries: [],
+        },
+        routes: [
+          {
+            id: "home",
+            slug: "/",
+            title: "首页",
+            sourceDocumentIds: ["catalog-admission-source"],
+          },
+        ],
+        verifiedFacts: [
+          {
+            statement: "该内容仅用于模板执行准入。",
+            sourceDocumentIds: ["catalog-admission-source"],
+          },
+        ],
+        publicAssetIds: [],
+        unknowns: [],
+      },
+      mode: "preview",
+      timeoutMs: 120_000,
+      browserQa: false,
+      lighthouseQa: false,
+      runtimeAudit: (auditInput) =>
+        auditNativeRuntimeContractV1({
+          ...auditInput,
+          contract: NATIVE_RUNTIME_CONTRACT_V1,
+        }),
+    });
+    expect(JSON.parse(materialized.qaJson.toString("utf8"))).toMatchObject({
+      passed: true,
+      browser: { available: false },
+    });
+    expect(materialized.distZip.length).toBeGreaterThan(0);
+  }, 30_000);
 
   it("binds shared-repository Hirael archives to distinct opaque slug entrypoints and hashes", async () => {
     const zip = new JSZip();

@@ -9,7 +9,7 @@
 
 export const STATIC_TEMPLATE_CATALOG_WORKFLOW_VERSION = "2.8.0" as const;
 export const STATIC_TEMPLATE_CATALOG_VERSION =
-  "21st-included-recommended-20260828-v1" as const;
+  "21st-included-recommended-20260828-v2" as const;
 export const STATIC_TEMPLATE_CATALOG_PAGE_SIZE = 8 as const;
 export const STATIC_TEMPLATE_CATALOG_PAGE_COUNT = 4 as const;
 export const STATIC_TEMPLATE_CATALOG_ENTRY_COUNT = 32 as const;

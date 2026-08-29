@@ -537,7 +537,7 @@ describe("21st SiteOps provider", () => {
       schemaVersion: 3,
       knowledgeSnapshotId: snapshotId,
       workflowVersion: "2.8.0",
-      catalogVersion: "21st-included-recommended-20260828-v1",
+      catalogVersion: "21st-included-recommended-20260828-v2",
       mode: "initial",
       page: 1,
       admissionRevision: 4,
@@ -566,9 +566,9 @@ describe("21st SiteOps provider", () => {
       }),
     );
     const catalog = {
-      schemaVersion: "frontmind-static-template-catalog-v1" as const,
+      schemaVersion: "frontmind-static-template-catalog-v2" as const,
       workflowVersion: "2.8.0" as const,
-      catalogVersion: "21st-included-recommended-20260828-v1" as const,
+      catalogVersion: "21st-included-recommended-20260828-v2" as const,
       pageSize: 8 as const,
       pageCount: 4 as const,
       entryCount: 32 as const,
@@ -576,6 +576,7 @@ describe("21st SiteOps provider", () => {
         const order = index + 1;
         const preview = previewFixtures[index]!;
         const candidateId = `static-template-${String(order).padStart(2, "0")}-fixture-${order}`;
+        const sourceSha256 = order.toString(16).padStart(64, "0");
         return {
           order,
           page: Math.floor(index / 8) + 1,
@@ -591,9 +592,15 @@ describe("21st SiteOps provider", () => {
           sourceCommitSha: order.toString(16).padStart(40, "0"),
           sourceSubdirectory: null,
           sourceLicense: "MIT" as const,
+          rawSourceAssetId: `catalog/raw-source/${candidateId}`,
+          rawSourcePath: `catalog/sources/${candidateId}.zip`,
+          rawSourceSha256: sourceSha256,
+          rawSourceBytes: 1_024 + order,
+          rawSourceFileCount: 10,
+          rawSourceExpandedBytes: 2_048 + order,
           sourceAssetId: `catalog/source/${candidateId}`,
           sourcePath: `catalog/sources/${candidateId}.zip`,
-          sourceSha256: order.toString(16).padStart(64, "0"),
+          sourceSha256,
           sourceBytes: 1_024 + order,
           sourceFileCount: 10,
           sourceExpandedBytes: 2_048 + order,
@@ -605,6 +612,16 @@ describe("21st SiteOps provider", () => {
           previewWidth: 16,
           previewHeight: 10,
           tags: ["fixture"],
+          executionAdmission: {
+            status: "unavailable" as const,
+            binding: {
+              catalogVersion: "21st-included-recommended-20260828-v2",
+              candidateId,
+              rawSourceSha256: sourceSha256,
+            },
+            code: "STATIC_TEMPLATE_EXECUTION_ADMISSION_PENDING",
+            reason: "该测试模板尚未完成执行准入。",
+          },
         };
       }),
     };

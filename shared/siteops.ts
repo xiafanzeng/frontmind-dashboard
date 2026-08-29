@@ -1543,6 +1543,34 @@ export const visualSelectionBundleV6Schema = z
  * source archives remain catalog assets and are read only after selection;
  * they are never copied into a per-page bundle.
  */
+export const staticTemplateExecutionAdmissionEvidenceSchema =
+  z.discriminatedUnion("status", [
+    z
+      .object({
+        status: z.literal("admitted"),
+        rawSourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        normalizedSourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        runtimeContractSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        executionShellSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        deliveryContractSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        distSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        qaSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        browserReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        qaStatus: z.enum(["passed", "passed_with_warnings"]),
+        admissionEvidenceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+      })
+      .strict(),
+    z
+      .object({
+        status: z.literal("unavailable"),
+        rawSourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        code: z.string().regex(/^[A-Z0-9_]{3,120}$/u),
+        reason: z.string().trim().min(1).max(500),
+      })
+      .strict(),
+  ]);
+
 export const visualCandidateV7Schema = z
   .object({
     id: z.string().trim().min(1).max(191),
@@ -1578,6 +1606,7 @@ export const visualCandidateV7Schema = z
     ]),
     previewWidth: z.number().int().positive().max(50_000),
     previewHeight: z.number().int().positive().max(50_000),
+    executionAdmission: staticTemplateExecutionAdmissionEvidenceSchema,
   })
   .strict()
   .superRefine((value, context) => {
@@ -1586,6 +1615,17 @@ export const visualCandidateV7Schema = z
         code: "custom",
         path: ["sampleId"],
         message: "V7 sample ID must match the canonical candidate ID",
+      });
+    }
+    if (
+      value.executionAdmission.status === "admitted" &&
+      value.executionAdmission.normalizedSourceSha256 !==
+        value.sourceArchiveSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceArchiveSha256"],
+        message: "V7 execution source hash must match its admission receipt",
       });
     }
   });

@@ -197,6 +197,30 @@ const completeRecommendationQuestion = {
   selectable: true,
 } as const;
 
+function waitingStatusEvent(
+  eventType: string | null,
+  overrides: Partial<ManusV2MessageEvent> = {},
+): ManusV2MessageEvent {
+  return {
+    id: "provider-waiting-event-secret",
+    type: "status_update",
+    timestamp: 10,
+    status_update: {
+      agent_status: "waiting",
+      ...(eventType
+        ? {
+            status_detail: {
+              waiting_for_event_id: "provider-waiting-input-secret",
+              waiting_for_event_type: eventType,
+              waiting_description: "sensitive waiting description",
+            },
+          }
+        : {}),
+    },
+    ...overrides,
+  };
+}
+
 function sampleRestrictedStructuredValue(schema: Record<string, unknown>): any {
   const allowed = Array.isArray(schema.enum) ? schema.enum : [];
   if (allowed.length > 0) return allowed[0];
@@ -1076,6 +1100,9 @@ describe("Presales v2 public contract", () => {
       status: "running",
       errorCode: null,
       providerStartedAt: now.toISOString(),
+      providerRunDeadlineAt: new Date(
+        now.getTime() + 60 * 60_000,
+      ).toISOString(),
     });
   });
 
@@ -2490,6 +2517,10 @@ describe("Presales v2 public contract", () => {
       status: "running",
       providerTaskId: "provider-bound-from-operation-marker",
       errorCode: null,
+      providerStartedAt: now.toISOString(),
+      providerRunDeadlineAt: new Date(
+        now.getTime() + 60 * 60_000,
+      ).toISOString(),
     });
     expect(harness.providerCalls.findCreatedTask).toHaveBeenCalledOnce();
     expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
@@ -3262,6 +3293,387 @@ describe("Presales v2 public contract", () => {
     expect(harness.providerCalls.stopTask).not.toHaveBeenCalled();
     expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
   });
+
+  it("keeps a question cascade running and accepts its stopped structured result", async () => {
+    const now = new Date("2026-08-29T07:00:00.000Z");
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const harness = reconcileHarness({
+      now,
+      events: [
+        waitingStatusEvent("cascadeJobCall"),
+        {
+          id: "assistant-body-secret",
+          type: "assistant_message",
+          timestamp: 11,
+          assistant_message: { content: "sensitive provider body" },
+        },
+      ],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        errorCode: "STALE_ERROR",
+        terminalAt: new Date(now.getTime() - 1_000).toISOString(),
+        providerStartedAt: new Date(now.getTime() - 5 * 60_000).toISOString(),
+        providerRunDeadlineAt: new Date(
+          now.getTime() + 55 * 60_000,
+        ).toISOString(),
+      }),
+    });
+    try {
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({
+        status: "running",
+        structuredResult: null,
+        errorCode: null,
+        terminalAt: null,
+      });
+      expect(harness.current().safeEvents).toHaveLength(2);
+      expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+      expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.stopTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
+
+      harness.setEvents([
+        {
+          id: "question-result",
+          type: "structured_output_result",
+          timestamp: 20,
+          structured_output_result: {
+            success: true,
+            value: { questions: [completeRecommendationQuestion] },
+            error: null,
+          },
+        },
+        {
+          id: "question-stopped",
+          type: "status_update",
+          timestamp: 21,
+          status_update: { agent_status: "stopped" },
+        },
+      ]);
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({
+        status: "succeeded",
+        structuredResult: { questions: [completeRecommendationQuestion] },
+        errorCode: null,
+      });
+
+      const serializedLogs = JSON.stringify(info.mock.calls);
+      expect(serializedLogs).toContain('"waitingClassification":"cascade"');
+      for (const secret of [
+        "provider-waiting-event-secret",
+        "provider-waiting-input-secret",
+        "sensitive waiting description",
+        "assistant-body-secret",
+        "sensitive provider body",
+      ]) {
+        expect(serializedLogs).not.toContain(secret);
+      }
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it("keeps a knowledge-base cascade running and accepts its stopped ZIP", async () => {
+    const now = new Date("2026-08-29T07:00:00.000Z");
+    const harness = reconcileHarness({
+      now,
+      events: [waitingStatusEvent("cascadeJobCall")],
+      record: taskRecord({
+        contract: {
+          name: "website.knowledge-base-candidate",
+          revision: 2,
+          schemaHash:
+            PRESALES_V2_CONTRACT_HASHES["website.knowledge-base-candidate"],
+        },
+        profile: "frontmind-base",
+        status: "running",
+        structuredResult: null,
+        artifacts: [],
+        errorCode: null,
+        terminalAt: null,
+        providerStartedAt: new Date(now.getTime() - 5 * 60_000).toISOString(),
+        providerRunDeadlineAt: new Date(
+          now.getTime() + 55 * 60_000,
+        ).toISOString(),
+      }),
+    });
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "running",
+      errorCode: null,
+      terminalAt: null,
+      artifacts: [],
+    });
+    expect(harness.localizeArtifact).not.toHaveBeenCalled();
+
+    harness.setEvents([
+      {
+        id: "kb-zip-result",
+        type: "assistant_message",
+        timestamp: 20,
+        assistant_message: {
+          content: "completed",
+          attachments: [
+            {
+              filename: "frontmind-knowledge-base.zip",
+              content_type: "application/zip",
+              url: "https://files.example.test/result.zip",
+            },
+          ],
+        },
+      },
+      {
+        id: "kb-stopped",
+        type: "status_update",
+        timestamp: 21,
+        status_update: { agent_status: "stopped" },
+      },
+    ]);
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+      artifacts: [
+        {
+          artifactId: "00000000-0000-4000-8000-000000000099",
+          filename: "frontmind-knowledge-base.zip",
+        },
+      ],
+    });
+    expect(harness.localizeArtifact).toHaveBeenCalledOnce();
+    expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+    expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+    expect(harness.providerCalls.stopTask).not.toHaveBeenCalled();
+    expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("moves only canonical messageAskUser waiting into attention", async () => {
+    const now = new Date("2026-08-29T07:00:00.000Z");
+    const harness = reconcileHarness({
+      now,
+      events: [waitingStatusEvent("message-Ask_User")],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        errorCode: null,
+        terminalAt: null,
+        providerStartedAt: new Date(now.getTime() - 5 * 60_000).toISOString(),
+        providerRunDeadlineAt: new Date(
+          now.getTime() + 55 * 60_000,
+        ).toISOString(),
+      }),
+    });
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      errorCode: "PROVIDER_ACTION_REQUIRED",
+      terminalAt: now.toISOString(),
+    });
+    expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+    expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+    expect(harness.providerCalls.stopTask).not.toHaveBeenCalled();
+    expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["mapreduceAction", "other"],
+    [null, "missing"],
+  ] as const)(
+    "keeps %s waiting classified as %s running",
+    async (eventType, classification) => {
+      const now = new Date("2026-08-29T07:00:00.000Z");
+      const info = vi
+        .spyOn(console, "info")
+        .mockImplementation(() => undefined);
+      const harness = reconcileHarness({
+        now,
+        events: [waitingStatusEvent(eventType)],
+        record: taskRecord({
+          status: "running",
+          structuredResult: null,
+          errorCode: "STALE_ERROR",
+          terminalAt: new Date(now.getTime() - 1_000).toISOString(),
+          providerStartedAt: new Date(now.getTime() - 5 * 60_000).toISOString(),
+          providerRunDeadlineAt: new Date(
+            now.getTime() + 55 * 60_000,
+          ).toISOString(),
+        }),
+      });
+      try {
+        await expect(
+          presalesV2ReconcileTestHooks.reconcileTask(
+            harness.current().localTaskId,
+            harness.dependencies,
+          ),
+        ).resolves.toMatchObject({
+          status: "running",
+          errorCode: null,
+          terminalAt: null,
+        });
+        expect(JSON.stringify(info.mock.calls)).toContain(
+          `\"waitingClassification\":\"${classification}\"`,
+        );
+        expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+        expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+        expect(harness.providerCalls.stopTask).not.toHaveBeenCalled();
+        expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
+      } finally {
+        info.mockRestore();
+      }
+    },
+  );
+
+  it("uses a 60 minute fallback deadline without rewriting persisted deadlines", async () => {
+    const startedAt = new Date("2026-08-29T07:00:00.000Z");
+    const beforeDeadline = new Date(startedAt.getTime() + 60 * 60_000 - 1);
+    const before = reconcileHarness({
+      now: beforeDeadline,
+      events: [
+        {
+          id: "running-before-deadline",
+          type: "status_update",
+          timestamp: 10,
+          status_update: { agent_status: "running" },
+        },
+      ],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        errorCode: null,
+        terminalAt: null,
+        providerStartedAt: startedAt.toISOString(),
+        providerRunDeadlineAt: null,
+      }),
+    });
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        before.current().localTaskId,
+        before.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "running",
+      providerRunDeadlineAt: new Date(
+        startedAt.getTime() + 60 * 60_000,
+      ).toISOString(),
+    });
+
+    const exactDeadline = new Date(startedAt.getTime() + 60 * 60_000);
+    const atBoundary = reconcileHarness({
+      now: exactDeadline,
+      events: [
+        {
+          id: "running-at-deadline",
+          type: "status_update",
+          timestamp: 10,
+          status_update: { agent_status: "running" },
+        },
+      ],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        errorCode: null,
+        terminalAt: null,
+        providerStartedAt: startedAt.toISOString(),
+        providerRunDeadlineAt: null,
+      }),
+    });
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        atBoundary.current().localTaskId,
+        atBoundary.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      errorCode: "PROVIDER_RUN_DEADLINE_EXCEEDED",
+      providerRunDeadlineAt: exactDeadline.toISOString(),
+    });
+
+    const persistedDeadline = new Date(startedAt.getTime() + 30 * 60_000);
+    const persisted = reconcileHarness({
+      now: new Date(persistedDeadline.getTime() - 1),
+      events: [
+        {
+          id: "legacy-running-before-persisted-deadline",
+          type: "status_update",
+          timestamp: 10,
+          status_update: { agent_status: "running" },
+        },
+      ],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        errorCode: null,
+        terminalAt: null,
+        providerStartedAt: startedAt.toISOString(),
+        providerRunDeadlineAt: persistedDeadline.toISOString(),
+      }),
+    });
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        persisted.current().localTaskId,
+        persisted.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "running",
+      providerRunDeadlineAt: persistedDeadline.toISOString(),
+    });
+  });
+
+  it.each([
+    ["attention_required", "PROVIDER_ACTION_REQUIRED"],
+    ["failed", "RESULT_INVALID_OR_MISSING"],
+  ] as const)(
+    "keeps historical %s terminal state frozen with zero Provider I/O",
+    async (status, errorCode) => {
+      const now = new Date("2026-08-29T07:00:00.000Z");
+      const harness = reconcileHarness({
+        now,
+        events: [waitingStatusEvent("cascadeJobCall")],
+        record: taskRecord({
+          status,
+          errorCode,
+          structuredResult: null,
+          terminalAt: new Date(now.getTime() - 60_000).toISOString(),
+        }),
+      });
+
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({ status, errorCode });
+      expect(harness.dependencies.clientForTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.listAllMessages).not.toHaveBeenCalled();
+      expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+      expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.stopTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails after the 120 second result grace without repairing the Provider task", async () => {
     const now = new Date("2026-08-15T13:00:00.000Z");

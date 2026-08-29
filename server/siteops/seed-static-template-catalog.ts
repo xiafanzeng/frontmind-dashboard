@@ -2,6 +2,10 @@ import {
   getStaticTemplateCatalogReadiness,
   seedStaticTemplateCatalog,
 } from "./static-template-catalog";
+import {
+  REQUIRED_STATIC_TEMPLATE_EXECUTION_CANDIDATE_ID,
+  buildStaticTemplateExecutionAdmission,
+} from "./static-template-execution-admission";
 
 async function main() {
   const args = process.argv.slice(2);
@@ -16,7 +20,9 @@ async function main() {
     if (!readiness.ready) process.exitCode = 1;
     return;
   }
-  const seeded = await seedStaticTemplateCatalog();
+  const seeded = await seedStaticTemplateCatalog({
+    executionAdmissionBuilder: buildStaticTemplateExecutionAdmission,
+  });
   process.stdout.write(
     `${JSON.stringify({
       ok: true,
@@ -24,6 +30,15 @@ async function main() {
       workflowVersion: seeded.catalog.workflowVersion,
       catalogVersion: seeded.catalog.catalogVersion,
       entryCount: seeded.catalog.entryCount,
+      admittedCount: seeded.catalog.entries.filter(
+        (entry) => entry.executionAdmission.status === "admitted",
+      ).length,
+      requiredAdmissionReady:
+        seeded.catalog.entries.find(
+          (entry) =>
+            entry.candidateId ===
+            REQUIRED_STATIC_TEMPLATE_EXECUTION_CANDIDATE_ID,
+        )?.executionAdmission.status === "admitted",
       pageSize: seeded.catalog.pageSize,
       pageCount: seeded.catalog.pageCount,
     })}\n`,

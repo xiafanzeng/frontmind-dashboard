@@ -1053,6 +1053,13 @@
   line-height: 1.55;
 }
 
+.siteops-visual-copy .siteops-visual-unavailable {
+  border-radius: 9px;
+  background: #fff7ed;
+  color: #9a3412;
+  padding: 8px 10px;
+}
+
 .siteops-primary-button,
 .siteops-secondary-button,
 .siteops-build-actions a {

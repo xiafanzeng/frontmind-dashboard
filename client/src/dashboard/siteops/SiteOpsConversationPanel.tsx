@@ -616,6 +616,12 @@ function VisualCandidateCard({
           <small className="siteops-hero-badge">{presentation.badge}</small>
         </div>
         {presentation.note && <p>{presentation.note}</p>}
+        {candidate.executionAdmitted === false && (
+          <p className="siteops-visual-unavailable" role="status">
+            {candidate.executionUnavailableReason ??
+              "该模板尚未完成执行准入，当前不可选择。"}
+          </p>
+        )}
         <button
           type="button"
           className="siteops-primary-button"
@@ -627,11 +633,13 @@ function VisualCandidateCard({
           ) : (
             candidate.selected && <Check size={15} aria-hidden="true" />
           )}
-          {selecting
-            ? `正在选择 ${candidate.label}`
-            : candidate.selected
-              ? "已选择"
-              : `选择 ${candidate.label}`}
+          {candidate.executionAdmitted === false
+            ? "暂不可选择"
+            : selecting
+              ? `正在选择 ${candidate.label}`
+              : candidate.selected
+                ? "已选择"
+                : `选择 ${candidate.label}`}
         </button>
       </div>
     </article>
@@ -1898,6 +1906,7 @@ export default function SiteOpsConversationPanel({
                 candidate={candidate}
                 disabled={
                   visualSelectionDisabled ||
+                  candidate.executionAdmitted === false ||
                   Boolean(
                     selectVisual?.phase === "failed" &&
                       selectVisual.sampleId === candidate.id,

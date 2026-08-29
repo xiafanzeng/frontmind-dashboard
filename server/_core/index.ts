@@ -340,6 +340,7 @@ async function startServer() {
             managedUploads.storageReady === true)) &&
         knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&
         templateCatalog.ready === true &&
+        templateCatalog.requiredAdmissionReady === true &&
         migrationState.journal.status === "exact" &&
         migrationState.schema.status === "exact";
       const status = ready ? 200 : 503;
@@ -367,9 +368,10 @@ async function startServer() {
         templateCatalog: {
           status: templateCatalog.ready ? "ok" : "unavailable",
           version: templateCatalog.activeCatalogVersion,
-          entryCount: templateCatalog.ready
-            ? templateCatalog.entryCount
-            : 0,
+          entryCount: templateCatalog.ready ? templateCatalog.entryCount : 0,
+          admittedCount: templateCatalog.admittedCount,
+          unavailableCount: templateCatalog.unavailableCount,
+          requiredAdmissionReady: templateCatalog.requiredAdmissionReady,
         },
         // Build-local findings are observable, but never participate in the
         // readiness decision above. Do not expose their internal codes.
@@ -385,6 +387,9 @@ async function startServer() {
           managedUploadsStarted: managedUploads.started,
           managedUploadsStorageReady: managedUploads.storageReady,
           templateCatalogReady: templateCatalog.ready,
+          templateCatalogAdmittedCount: templateCatalog.admittedCount,
+          templateCatalogRequiredAdmissionReady:
+            templateCatalog.requiredAdmissionReady,
         });
         res.status(status).json({
           ...response,

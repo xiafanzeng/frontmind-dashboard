@@ -858,6 +858,50 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
+  it("keeps an unadmitted catalog template visible while disabling selection with its reason", () => {
+    const onAction = vi.fn();
+    const page = staticCatalogPage(1);
+    const unavailableReason =
+      "该模板尚未完成 FrontMind 受控 Vite 构建与浏览器验收，当前不可选择。";
+    const candidates = page.candidates.map((candidate, index) =>
+      index === 0
+        ? {
+            ...candidate,
+            executionAdmitted: false,
+            executionUnavailableReason: unavailableReason,
+          }
+        : candidate,
+    );
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          visualCandidates: candidates,
+          visualCandidatePages: [{ ...page, candidates }],
+          visualGeneration: {
+            status: "idle",
+            targetPage: null,
+            generatedPages: 4,
+            availablePages: 4,
+            reservedPages: 0,
+            maxPages: 4,
+            canGenerateMore: false,
+            canSelectExisting: true,
+            workflowVersion: "2.8.0",
+            catalogVersion: "21st-included-recommended-20260828-v2",
+            pageSize: 8,
+            pageCount: 4,
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    expect(screen.getByText(unavailableReason)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "暂不可选择" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "暂不可选择" }));
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
   it("locks every template choice around the selected item and renders an adjacent explicit retry", async () => {
     const pages = [
       staticCatalogPage(1),

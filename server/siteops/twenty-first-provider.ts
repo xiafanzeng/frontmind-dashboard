@@ -254,6 +254,7 @@ type StaticTemplateBoardCandidate = {
   previewMimeType: "image/avif" | "image/jpeg" | "image/png" | "image/webp";
   previewWidth: number;
   previewHeight: number;
+  executionAdmission: VisualSelectionBundleV7["candidates"][number]["executionAdmission"];
 };
 
 type BoardCandidate =
@@ -3101,6 +3102,11 @@ export async function persistDefaultStaticTemplateCatalogBoards(
       "attention_required",
     );
   }
+  const admittedCount = input.pages
+    .flatMap((page) => page.candidates)
+    .filter(
+      (candidate) => candidate.executionAdmission.status === "admitted",
+    ).length;
   return db.transaction(
     async (tx: any): Promise<StaticTemplateCatalogBoardsPersistenceResult> => {
       const projectRows = await tx
@@ -3255,10 +3261,13 @@ export async function persistDefaultStaticTemplateCatalogBoards(
               previewMimeType: candidate.previewMimeType,
               previewWidth: candidate.previewWidth,
               previewHeight: candidate.previewHeight,
+              executionAdmission: candidate.executionAdmission,
               title: candidate.title,
               description: candidate.description,
               rationale:
-                "该候选来自 FrontMind 固定完整 Template 目录；选择后读取同一精确源码归档交由 Manus 适配。",
+                candidate.executionAdmission.status === "admitted"
+                  ? "该候选已绑定 FrontMind 标准化执行源码、production build、QA 与浏览器验收回执；选择后只读取同一不可变执行归档。"
+                  : candidate.executionAdmission.reason,
             },
             label: candidate.optionLabel,
             note: candidate.title,
@@ -3276,7 +3285,7 @@ export async function persistDefaultStaticTemplateCatalogBoards(
         turnId: input.operation.conversationTurnId,
         userId: input.operation.userId,
         role: "assistant",
-        content: "固定目录中的 32 个完整 Template 已准备完成，请选择一个方向。",
+        content: `固定目录中的 32 个 Template 预览已准备完成；${admittedCount} 个已通过执行准入，可直接选择。`,
         sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
         metadata: {
           siteOps: {
@@ -5025,6 +5034,33 @@ async function runNativeTemplateVisualSearch(input: {
   };
 }
 
+function staticTemplateExecutionAdmissionEvidence(
+  entry: StaticTemplateCatalog["entries"][number],
+): VisualSelectionBundleV7["candidates"][number]["executionAdmission"] {
+  const admission = entry.executionAdmission;
+  return admission.status === "admitted"
+    ? {
+        status: "admitted",
+        rawSourceSha256: admission.binding.rawSourceSha256,
+        normalizedSourceSha256: admission.normalizedSourceSha256,
+        sourceTreeSha256: admission.sourceTreeSha256,
+        runtimeContractSha256: admission.runtimeContractSha256,
+        executionShellSha256: admission.executionShellSha256,
+        deliveryContractSha256: admission.deliveryContractSha256,
+        distSha256: admission.distSha256,
+        qaSha256: admission.qaSha256,
+        browserReceiptSha256: admission.browserReceiptSha256,
+        qaStatus: admission.qaStatus,
+        admissionEvidenceSha256: admission.admissionEvidenceSha256,
+      }
+    : {
+        status: "unavailable",
+        rawSourceSha256: admission.binding.rawSourceSha256,
+        code: admission.code,
+        reason: admission.reason,
+      };
+}
+
 async function runStaticTemplateCatalogVisualSearch(input: {
   operation: SiteOperation;
   assertLeaseActive?: () => Promise<void>;
@@ -5247,6 +5283,7 @@ async function runStaticTemplateCatalogVisualSearch(input: {
         previewMimeType: entry.previewMimeType,
         previewWidth: entry.previewWidth,
         previewHeight: entry.previewHeight,
+        executionAdmission: staticTemplateExecutionAdmissionEvidence(entry),
       }),
     );
     const selectionBundle = visualSelectionBundleV7Schema.parse({
@@ -5283,6 +5320,7 @@ async function runStaticTemplateCatalogVisualSearch(input: {
         previewMimeType: candidate.previewMimeType,
         previewWidth: candidate.previewWidth,
         previewHeight: candidate.previewHeight,
+        executionAdmission: candidate.executionAdmission,
       })),
       selectedCandidateId: null,
       delegated: false,
@@ -5334,6 +5372,9 @@ async function runStaticTemplateCatalogVisualSearch(input: {
     catalogVersion: input.catalog.catalogVersion,
     pages,
   });
+  const admittedCount = sortedEntries.filter(
+    (entry) => entry.executionAdmission.status === "admitted",
+  ).length;
   return {
     status: "succeeded" as const,
     projectStatus: "awaiting_visual_selection" as const,
@@ -5347,8 +5388,10 @@ async function runStaticTemplateCatalogVisualSearch(input: {
       availablePages: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
       reservedPages: 0,
       canGenerateMore: false,
+      admittedCount,
+      unavailableCount: STATIC_TEMPLATE_CATALOG_ENTRY_COUNT - admittedCount,
     },
-    message: "32 个固定完整 Template 已准备完成，请选择一个方向。",
+    message: `32 个固定 Template 预览已准备完成；${admittedCount} 个已通过执行准入，可直接选择。`,
   };
 }
 
@@ -5573,7 +5616,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
         const catalog = await loadStaticTemplateCatalog(
           parsedInput.catalogVersion,
         );
-        if (catalog.catalogVersion !== parsedInput.catalogVersion) {
+        if (
+          catalog.catalogVersion !== parsedInput.catalogVersion ||
+          catalog.schemaVersion !== "frontmind-static-template-catalog-v2"
+        ) {
           throw new TwentyFirstProviderFailure(
             "STATIC_TEMPLATE_CATALOG_VERSION_MISMATCH",
             "固定 Template 目录版本已更新，请重置后重试。",

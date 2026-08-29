@@ -30,6 +30,7 @@ import { canonicalJson } from "../../shared/siteops-workflow";
 import {
   NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
   NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
+  type NativeRuntimeAudit,
   type ValidatedNativeReactSource,
 } from "./native-react-source";
 
@@ -43,6 +44,8 @@ const MAX_BUILD_TIMEOUT_MS = 120_000;
 const NATIVE_RENDERER = "twenty_first_native" as const;
 const NATIVE_QA_POLICY = "siteops-native-hard-safety-v1" as const;
 const SAFE_BUILD_ERROR_MARKER = "__FRONTMIND_NATIVE_BUILD_ERROR__";
+const PINNED_SHADERS_REACT_BUNDLE_SHA256 =
+  "ca34b0dbc19593b44b4dd017f2e763f8463b3b46383df769a41b1a5202400033";
 const NATIVE_DOCUMENT_CSP =
   "default-src 'self'; img-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; media-src 'self' data:; manifest-src 'none'; base-uri 'self'; form-action 'none'";
 const HOST_DEPENDENCY_ALLOWLIST = new Set<string>(
@@ -81,6 +84,12 @@ export type NativeReactBuildInput = {
    * hard compile/static-safety decision. Omission is recorded as a warning. */
   browserQa?: boolean;
   lighthouseQa?: boolean;
+  /** V2 tasks must replay the auditor frozen with their receipt coordinates.
+   * Direct V1 rebuilds retain the historical host-owned validation path. */
+  runtimeAudit?: (input: {
+    files: ReadonlyMap<string, Buffer>;
+    expectedRoutePaths: readonly string[];
+  }) => NativeRuntimeAudit;
 };
 
 export type NativeReactBuildWarning = {
@@ -159,6 +168,7 @@ export type NativeReactBuildErrorCode =
   | "NATIVE_BUILD_INPUT_INVALID"
   | "NATIVE_BUILD_SOURCE_MISMATCH"
   | "NATIVE_BUILD_DEPENDENCY_UNAVAILABLE"
+  | "NATIVE_BUILD_RUNTIME_AUDIT_UNAVAILABLE"
   | "NATIVE_BUILD_RUNTIME_UNAVAILABLE"
   | "NATIVE_BUILD_COMPILE_FAILED"
   | "NATIVE_BUILD_RENDER_FAILED"
@@ -382,6 +392,7 @@ function controlledViteBuilderSource(input: {
   sourceAliasRoot: "." | "src";
 }) {
   return `
+import { createHash } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
@@ -431,6 +442,28 @@ const sourceBoundary = {
     return null;
   },
 };
+const dependencyCompatibility = {
+  name: "frontmind-native-dependency-compatibility",
+  enforce: "pre",
+  transform(code, id) {
+    const cleanId = typeof id === "string" ? id.split("?", 1)[0].replaceAll("\\\\", "/") : "";
+    if (!cleanId.endsWith("/node_modules/shaders/dist/react/bundle.js")) return null;
+    const digest = createHash("sha256").update(code).digest("hex");
+    if (digest !== ${JSON.stringify(PINNED_SHADERS_REACT_BUNDLE_SHA256)}) {
+      throw Object.assign(new Error("NATIVE_BUILD_DEPENDENCY_DRIFT"), { code: "NATIVE_BUILD_DEPENDENCY_DRIFT" });
+    }
+    // The pinned official bundle includes inert documentation URLs and an
+    // opt-out telemetry endpoint. Customer builds run with telemetry disabled;
+    // neutralize those literals so hard static QA remains fail-closed without
+    // replacing or otherwise changing the shader implementation.
+    return {
+      code: code
+        .replaceAll("https://", "about:blank#https-")
+        .replaceAll("http://", "about:blank#http-"),
+      map: null,
+    };
+  },
+};
 const safeDiagnostic = (error) => {
   const nested = Array.isArray(error?.errors) && error.errors.length > 0
     ? error.errors[0]
@@ -464,7 +497,7 @@ const safeDiagnostic = (error) => {
 
 try {
   const { build } = await import(${JSON.stringify(input.viteModuleUrl)});
-  const plugins = [sourceBoundary];
+  const plugins = [sourceBoundary, dependencyCompatibility];
   const postcssPlugins = [];
   if (${JSON.stringify(Boolean(input.tailwindV3Config))}) {
     const tailwindModule = await import(${JSON.stringify(input.tailwindV3ModuleUrl)});
@@ -651,7 +684,11 @@ async function runControlledViteBuild(input: {
   return await new Promise<Buffer>((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ["--max-old-space-size=512", builder],
+      // The admitted #22 template retains its original `shaders/react`
+      // component subtree. Vite/Rollup peaks above 512 MiB while bundling the
+      // frozen shader modules, so keep the child bounded but leave enough
+      // headroom to compile the unmodified visual baseline.
+      ["--max-old-space-size=768", builder],
       {
         cwd: input.root,
         stdio: ["ignore", "pipe", "pipe"],
@@ -1599,6 +1636,26 @@ export async function materializeNativeReactSource(
     throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
   }
   const sourceSha256 = validateSourceBinding(input);
+  if ("runtimeContractVersion" in input.validatedSource.receipt) {
+    if (!input.runtimeAudit) {
+      throw new NativeReactBuildError("NATIVE_BUILD_RUNTIME_AUDIT_UNAVAILABLE");
+    }
+    const runtimeAudit = input.runtimeAudit({
+      files: input.validatedSource.files,
+      expectedRoutePaths: brief.routes.map((route) => route.slug),
+    });
+    if (!runtimeAudit.ok) {
+      throw new NativeReactBuildError(
+        "NATIVE_BUILD_INPUT_INVALID",
+        runtimeAudit.issues.map((issue) => ({
+          code: issue.code,
+          file: issue.path,
+          line: null,
+          column: null,
+        })),
+      );
+    }
+  }
   const dependencies = archiveDependencies(input.validatedSource.packageJson);
   const root = await mkdtemp(path.join(tmpdir(), "frontmind-native-react-"));
   try {

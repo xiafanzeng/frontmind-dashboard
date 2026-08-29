@@ -55,7 +55,12 @@ import {
 import { SITEOPS_MATERIALIZER_V2_6 } from "../../shared/siteops";
 import { referenceBlueprintV4ForFamily } from "../../shared/siteops-design";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
+import {
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+} from "./native-react-source";
 import { actOnSiteOps, siteBriefFromSnapshot } from "./service";
+import { staticTemplateAdmissionEvidenceSha256 } from "./static-template-catalog";
 
 type Insert = { table: unknown; values: Record<string, unknown> };
 
@@ -309,6 +314,7 @@ function serviceDatabaseFixture() {
     userRows,
     inspirationTaxonomy,
     referenceBlueprint,
+    visualOperationInput,
   };
 }
 
@@ -658,6 +664,210 @@ describe("SiteOps visual selection and current-task revisions", () => {
     });
   });
 
+  it("delegates a static catalog choice only to an execution-admitted candidate", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    const catalogVersion = "21st-included-recommended-20260828-v2";
+    const staticMetadata = (
+      input: Readonly<{
+        catalogPosition: number;
+        candidateId: string;
+        previewLocalAssetId: string;
+        admitted: boolean;
+      }>,
+    ) => {
+      const rawSourceSha256 = input.catalogPosition
+        .toString(16)
+        .repeat(64)
+        .slice(0, 64);
+      const normalizedSourceSha256 = (input.catalogPosition + 1)
+        .toString(16)
+        .repeat(64)
+        .slice(0, 64);
+      const sourceTreeSha256 = (input.catalogPosition + 2)
+        .toString(16)
+        .repeat(64)
+        .slice(0, 64);
+      const executionAdmission = input.admitted
+        ? {
+            status: "admitted" as const,
+            rawSourceSha256,
+            normalizedSourceSha256,
+            sourceTreeSha256,
+            runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+            executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+            deliveryContractSha256: "a".repeat(64),
+            distSha256: "b".repeat(64),
+            qaSha256: "c".repeat(64),
+            browserReceiptSha256: "d".repeat(64),
+            qaStatus: "passed" as const,
+            admissionEvidenceSha256: staticTemplateAdmissionEvidenceSha256({
+              catalogVersion,
+              candidateId: input.candidateId,
+              rawSourceSha256,
+              normalizedSourceSha256,
+              sourceTreeSha256,
+              runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+              executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+              deliveryContractSha256: "a".repeat(64),
+              distSha256: "b".repeat(64),
+              qaSha256: "c".repeat(64),
+              browserReceiptSha256: "d".repeat(64),
+              qaStatus: "passed",
+            }),
+          }
+        : {
+            status: "unavailable" as const,
+            rawSourceSha256,
+            code: "STATIC_TEMPLATE_EXECUTION_ADMISSION_PENDING",
+            reason: "尚未完成执行准入。",
+          };
+      return {
+        schemaVersion: 7,
+        renderer: "frontmind_static_template_catalog_v1",
+        workflowVersion: "2.8.0",
+        catalogVersion,
+        catalogPosition: input.catalogPosition,
+        catalogCandidateId: input.candidateId,
+        providerTemplateId: `provider-${input.catalogPosition}`,
+        providerSlug: `provider-${input.catalogPosition}`,
+        providerVersion: "a".repeat(40),
+        providerItemKey: `n:${input.catalogPosition}`,
+        sourceOwner: "FrontMind",
+        sourceRepo: "templates",
+        sourceCommitSha: "e".repeat(40),
+        sourceSubdirectory: "registry/template",
+        sourceLicense: "MIT",
+        sourceAssetId: `catalog/source/${input.candidateId}`,
+        sourceArchiveSha256: input.admitted
+          ? normalizedSourceSha256
+          : rawSourceSha256,
+        sourceArchiveBytes: 1024,
+        previewAssetId: `catalog/preview/${input.candidateId}`,
+        previewLocalAssetId: input.previewLocalAssetId,
+        previewSha256: "f".repeat(64),
+        previewMimeType: "image/jpeg",
+        previewWidth: 1440,
+        previewHeight: 900,
+        executionAdmission,
+        title: `Template ${input.catalogPosition}`,
+        description: null,
+      };
+    };
+    const bindStaticOperation = (
+      target: ReturnType<typeof serviceDatabaseFixture>,
+    ) => {
+      const frozenInput = target.visualOperationInput as unknown as Record<
+        string,
+        unknown
+      >;
+      delete frozenInput.credentialId;
+      delete frozenInput.credentialVersion;
+      Object.assign(frozenInput, {
+        schemaVersion: 3,
+        workflowVersion: "2.8.0",
+        catalogVersion,
+        mode: "initial",
+        page: 1,
+        admissionRevision: target.project.revision,
+      });
+    };
+    const tamperedFixture = serviceDatabaseFixture();
+    tamperedFixture.project.currentBuildId = null;
+    const tamperedId = "48200000-0000-4000-8000-000000000022";
+    const tamperedPreviewId = "48300000-0000-4000-8000-000000000022";
+    const tamperedMetadata = staticMetadata({
+      catalogPosition: 22,
+      candidateId: "static-template-22-hirael-agency-landing",
+      previewLocalAssetId: tamperedPreviewId,
+      admitted: true,
+    });
+    if (tamperedMetadata.executionAdmission.status !== "admitted") {
+      throw new Error("TEST_ADMISSION_FIXTURE_INVALID");
+    }
+    tamperedMetadata.executionAdmission.admissionEvidenceSha256 = "0".repeat(
+      64,
+    );
+    tamperedFixture.visualRows.splice(0, tamperedFixture.visualRows.length, {
+      batch: tamperedFixture.batch,
+      sample: {
+        ...tamperedFixture.sample,
+        id: tamperedId,
+        previewLocalAssetId: tamperedPreviewId,
+        sourceMetadata: tamperedMetadata,
+      },
+    });
+    bindStaticOperation(tamperedFixture);
+    dependencies.getDb.mockResolvedValue(tamperedFixture.db);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        selectVisualInput(tamperedFixture.project.revision, tamperedId),
+      ),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+    expect(
+      tamperedFixture.inserts.some((entry) => entry.table === siteBuilds),
+    ).toBe(false);
+    expect(
+      tamperedFixture.inserts.some((entry) => entry.table === siteOperations),
+    ).toBe(false);
+
+    const unavailableId = "48000000-0000-4000-8000-000000000001";
+    const admittedId = "48000000-0000-4000-8000-000000000022";
+    const unavailablePreviewId = "48100000-0000-4000-8000-000000000001";
+    const admittedPreviewId = "48100000-0000-4000-8000-000000000022";
+    fixture.visualRows.splice(
+      0,
+      fixture.visualRows.length,
+      {
+        batch: fixture.batch,
+        sample: {
+          ...fixture.sample,
+          id: unavailableId,
+          previewLocalAssetId: unavailablePreviewId,
+          sourceMetadata: {
+            ...staticMetadata({
+              catalogPosition: 1,
+              candidateId: "static-template-01-unavailable",
+              previewLocalAssetId: unavailablePreviewId,
+              admitted: false,
+            }),
+            score: 10_000,
+          },
+        },
+      },
+      {
+        batch: fixture.batch,
+        sample: {
+          ...fixture.sample,
+          id: admittedId,
+          previewLocalAssetId: admittedPreviewId,
+          sourceMetadata: staticMetadata({
+            catalogPosition: 22,
+            candidateId: "static-template-22-hirael-agency-landing",
+            previewLocalAssetId: admittedPreviewId,
+            admitted: true,
+          }),
+        },
+      },
+    );
+    bindStaticOperation(fixture);
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      delegateVisualInput(fixture.project.revision),
+    );
+
+    expect(
+      fixture.inserts.find((entry) => entry.table === siteBuilds)?.values,
+    ).toMatchObject({
+      styleSampleId: admittedId,
+      workflowVersion: "2.8.0",
+    });
+  });
+
   it("reserves the first website build quota and makes the root build current", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;
@@ -854,26 +1064,51 @@ describe("SiteOps visual selection and current-task revisions", () => {
       selectVisualInput(fixture.project.revision, fixture.sample.id),
     );
 
+    const buildInsert = fixture.inserts.find(
+      (entry) => entry.table === siteBuilds,
+    )?.values;
+    const operationInsert = fixture.inserts.find(
+      (entry) =>
+        entry.table === siteOperations && entry.values.kind === "site_build",
+    )?.values;
     expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
-    expect(
-      fixture.inserts.find((entry) => entry.table === siteBuilds)?.values,
-    ).toMatchObject({
+    expect(buildInsert).toMatchObject({
       parentBuildId: null,
       knowledgeSnapshotId: fixture.snapshots[0]!.id,
       knowledgeArchiveHash: fixture.snapshots[0]!.archiveHash,
       workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
     });
-    expect(
-      fixture.inserts.find(
-        (entry) =>
-          entry.table === siteOperations && entry.values.kind === "site_build",
-      )?.values,
-    ).toMatchObject({
+    expect(operationInsert).toMatchObject({
       input: {
         workflowVersion: SITEOPS_MATERIALIZER_V2_6.frontMindVersion,
         referenceBlueprint: fixture.referenceBlueprint,
       },
     });
+    expect(operationInsert?.buildId).toBe(buildInsert?.id);
+    expect(buildInsert).not.toHaveProperty("upstreamManusTaskId");
+    for (const key of [
+      "providerTaskId",
+      "providerOperationId",
+      "result",
+      "errorCode",
+    ]) {
+      expect(operationInsert).not.toHaveProperty(key);
+    }
+    for (const key of [
+      "nativeInputProviderFile",
+      "nativeSourceFileId",
+      "nativeSourceAttachmentEventId",
+      "nativeSourceAttachmentIdentity",
+      "nativeSourceAttachmentScope",
+      "nativeSourceStaging",
+      "buildCheckpoint",
+      "providerReadFailureCount",
+      "nativeSourceReadFailureCount",
+      "nativeRepairAttempt",
+      "nativeLastErrorSignature",
+    ]) {
+      expect(operationInsert?.input).not.toHaveProperty(key);
+    }
   });
 
   it("starts a new visual root while the old external reset boundary is still reconciling", async () => {

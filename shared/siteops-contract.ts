@@ -77,6 +77,14 @@ export const siteOpsVisualCandidateProjectionSchema = z
       .nullable()
       .default(null),
     selected: z.boolean().default(false),
+    executionAdmitted: z.boolean().optional(),
+    executionUnavailableReason: z
+      .string()
+      .trim()
+      .min(1)
+      .max(500)
+      .nullable()
+      .optional(),
   })
   .strict();
 

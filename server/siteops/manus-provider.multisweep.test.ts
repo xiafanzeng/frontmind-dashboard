@@ -37,6 +37,18 @@ import {
 import { siteOpsArtifactIdForIdempotency } from "./artifact-store";
 import { SiteOpsMaterializationError } from "./materialization-error";
 import {
+  NATIVE_RUNTIME_CONTRACT_FILENAME,
+  NATIVE_RUNTIME_CONTRACT_V1,
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+  NATIVE_RUNTIME_ROUTE_MODULE,
+  NATIVE_SOURCE_PREFLIGHT_V2_FILENAME,
+  NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+  NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+} from "./native-react-source";
+import {
   createNativeSourceArchive,
   createVisualSelectionBundleV5Artifact,
   normalizeTwentyFirstNativeSource,
@@ -915,20 +927,16 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     });
 
     const finalZip = new JSZip();
+    for (const file of NATIVE_RUNTIME_EXECUTION_SHELL_V1.files) {
+      finalZip.file(file.path, file.text);
+    }
     finalZip.file(
-      "package.json",
-      JSON.stringify({
-        type: "module",
-        dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
-      }),
+      NATIVE_RUNTIME_ROUTE_MODULE,
+      'import Home from "./home";\nexport const FRONTMIND_ROUTE_PATHS = ["/"] as const;\nexport default function FrontMindRoutes() { return <Home />; }\n',
     );
     finalZip.file(
-      "index.html",
-      '<!doctype html><div id="root"></div><script type="module" src="/src/main.tsx"></script>',
-    );
-    finalZip.file(
-      "src/main.tsx",
-      'import React from "react";import{createRoot}from"react-dom/client";createRoot(document.getElementById("root")!).render(<main>企业官网</main>);',
+      "src/home.tsx",
+      "export default function Home() { return <main>企业官网</main>; }\n",
     );
     const finalSourceZip = await finalZip.generateAsync({ type: "nodebuffer" });
     const finalSourceSha256 = sha256(finalSourceZip);
@@ -938,7 +946,14 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       operationToken,
       baseSourceSha256: selectedBaseSha256,
       archiveSha256: finalSourceSha256,
-      fileCount: 3,
+      fileCount: 5,
+      preflightVersion: NATIVE_SOURCE_PREFLIGHT_V2_VERSION,
+      preflightStatus: "passed",
+      preflightSha256: NATIVE_SOURCE_PREFLIGHT_V2_SHA256,
+      runtimeContractVersion: NATIVE_RUNTIME_CONTRACT_V1.contractVersion,
+      runtimeContractSha256: NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+      executionShellSha256: NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+      executionBaselineSha256: selectedBaseSha256,
     };
     const context = {
       build: {
@@ -1271,6 +1286,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       providerTaskId: taskId,
       result: {
         stage: "native_source_pending",
+        nativeSourceContractVersion: 2,
         nativeRepairAttempt: 0,
         buildPhase: "source_waiting",
       },
@@ -1279,9 +1295,11 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     expect(createInput.prompt).toContain("不是视觉设计师");
     expect(createInput.prompt).toContain(selectedBaseSha256);
     expect(createInput.prompt).toContain("preflightStatus=passed");
-    expect(createInput.prompt).toContain("恰好返回这一个 ZIP 和一个 Receipt");
+    expect(createInput.prompt).toContain(
+      "只返回 frontmind-site-source-v1.zip 与 frontmind-site-source-receipt-v1.json 各一份后结束",
+    );
     const preflightAttachment = createInput.attachments.find(
-      (item: any) => item.filename === "frontmind-native-preflight-v1.mjs",
+      (item: any) => item.filename === NATIVE_SOURCE_PREFLIGHT_V2_FILENAME,
     );
     expect(preflightAttachment.mime_type).toBe("text/javascript");
     expect(
@@ -1289,7 +1307,18 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         preflightAttachment.file_data.split(",", 2)[1],
         "base64",
       ).toString("utf8"),
-    ).toContain("PREFLIGHT_BUILD_FAILED");
+    ).toContain("PREFLIGHT_V2_FAILED");
+    expect(
+      createInput.attachments.some(
+        (item: any) => item.filename === NATIVE_RUNTIME_CONTRACT_FILENAME,
+      ),
+    ).toBe(true);
+    expect(
+      createInput.attachments.some(
+        (item: any) =>
+          item.filename === NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+      ),
+    ).toBe(true);
     expect(createInput.structuredOutputSchema.required).toEqual(
       expect.arrayContaining([
         "preflightVersion",

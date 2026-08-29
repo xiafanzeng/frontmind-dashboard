@@ -54,6 +54,7 @@ import {
   siteOpsObserveInputSchema,
   siteOpsSendMessageInputSchema,
   siteOpsVisualFailureCategorySchema,
+  staticTemplateExecutionAdmissionEvidenceSchema,
   visualEvidenceV1Schema,
   type SiteOpsVisualFailureCategory,
   type SiteOpsActInput,
@@ -81,7 +82,12 @@ import {
   STATIC_TEMPLATE_CATALOG_VERSION,
   loadActiveStaticTemplateCatalog,
   requireActiveStaticTemplateCatalog,
+  staticTemplateAdmissionEvidenceSha256,
 } from "./static-template-catalog";
+import {
+  NATIVE_RUNTIME_CONTRACT_V1_SHA256,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
+} from "./native-react-source";
 import {
   visualSearchOperationInputSchema,
   type VisualSearchOperationInput,
@@ -813,10 +819,38 @@ function publicVisualMetadata(value: unknown) {
       ? (value as Record<string, unknown>)
       : {};
   const visualFamily = publicVisualFamilySchema.safeParse(metadata.heroFamily);
+  const staticTemplate =
+    metadata.renderer === "frontmind_static_template_catalog_v1";
+  const executionAdmission =
+    staticTemplateExecutionAdmissionEvidenceSchema.safeParse(
+      metadata.executionAdmission,
+    );
+  const staticTemplateMetadata = staticTemplate
+    ? staticTemplateSelectionMetadataSchema.safeParse(metadata)
+    : null;
+  const executionAdmissionBound =
+    staticTemplateMetadata?.success === true &&
+    executionAdmission.success &&
+    executionAdmission.data.status === "admitted" &&
+    executionAdmission.data.normalizedSourceSha256 ===
+      metadata.sourceArchiveSha256 &&
+    executionAdmission.data.runtimeContractSha256 ===
+      NATIVE_RUNTIME_CONTRACT_V1_SHA256 &&
+    executionAdmission.data.executionShellSha256 ===
+      NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256;
   return {
     providerTitle:
       typeof metadata.title === "string" ? metadata.title.trim() : "",
     visualFamily: visualFamily.success ? visualFamily.data : null,
+    executionAdmitted: !staticTemplate || executionAdmissionBound,
+    executionUnavailableReason:
+      staticTemplate &&
+      executionAdmission.success &&
+      executionAdmission.data.status === "unavailable"
+        ? executionAdmission.data.reason
+        : staticTemplate && !executionAdmissionBound
+          ? "该模板尚未完成 FrontMind 执行准入，当前不可选择。"
+          : null,
   };
 }
 
@@ -876,8 +910,71 @@ export const staticTemplateSelectionMetadataSchema = z
     ]),
     previewWidth: z.number().int().positive().max(50_000),
     previewHeight: z.number().int().positive().max(50_000),
+    executionAdmission:
+      staticTemplateExecutionAdmissionEvidenceSchema.optional(),
   })
-  .passthrough();
+  .passthrough()
+  .superRefine((value, context) => {
+    if (
+      value.executionAdmission?.status === "admitted" &&
+      value.executionAdmission.normalizedSourceSha256 !==
+        value.sourceArchiveSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceArchiveSha256"],
+        message: "Static Template execution source is not admission-bound",
+      });
+    }
+    if (
+      value.executionAdmission?.status === "admitted" &&
+      value.executionAdmission.runtimeContractSha256 !==
+        NATIVE_RUNTIME_CONTRACT_V1_SHA256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["executionAdmission", "runtimeContractSha256"],
+        message: "Static Template runtime contract is not admission-bound",
+      });
+    }
+    if (
+      value.executionAdmission?.status === "admitted" &&
+      value.executionAdmission.executionShellSha256 !==
+        NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["executionAdmission", "executionShellSha256"],
+        message: "Static Template execution shell is not admission-bound",
+      });
+    }
+    if (
+      value.executionAdmission?.status === "admitted" &&
+      value.executionAdmission.admissionEvidenceSha256 !==
+        staticTemplateAdmissionEvidenceSha256({
+          catalogVersion: value.catalogVersion,
+          candidateId: value.catalogCandidateId,
+          rawSourceSha256: value.executionAdmission.rawSourceSha256,
+          normalizedSourceSha256:
+            value.executionAdmission.normalizedSourceSha256,
+          sourceTreeSha256: value.executionAdmission.sourceTreeSha256,
+          runtimeContractSha256: value.executionAdmission.runtimeContractSha256,
+          executionShellSha256: value.executionAdmission.executionShellSha256,
+          deliveryContractSha256:
+            value.executionAdmission.deliveryContractSha256,
+          distSha256: value.executionAdmission.distSha256,
+          qaSha256: value.executionAdmission.qaSha256,
+          browserReceiptSha256: value.executionAdmission.browserReceiptSha256,
+          qaStatus: value.executionAdmission.qaStatus,
+        })
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["executionAdmission", "admissionEvidenceSha256"],
+        message: "Static Template admission evidence digest is not bound",
+      });
+    }
+  });
 
 export function isNativeVisualSelectionMetadata(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -1128,13 +1225,23 @@ export function projectStaticTemplateCatalogVisualReadiness(
     catalogVersion: string;
     pageSize: number;
     pageCount: number;
+    entries: readonly {
+      candidateId: string;
+      executionAdmission: { status: "admitted" | "unavailable" };
+    }[];
   } | null,
 ) {
+  const requiredAdmissionReady = catalog?.entries.some(
+    (entry) =>
+      entry.candidateId === "static-template-22-hirael-agency-landing" &&
+      entry.executionAdmission.status === "admitted",
+  );
   const ready =
     catalog?.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion &&
     catalog.catalogVersion === STATIC_TEMPLATE_CATALOG_VERSION &&
     catalog.pageSize === STATIC_TEMPLATE_CATALOG_PAGE_SIZE &&
-    catalog.pageCount === STATIC_TEMPLATE_CATALOG_PAGE_COUNT;
+    catalog.pageCount === STATIC_TEMPLATE_CATALOG_PAGE_COUNT &&
+    requiredAdmissionReady;
   return {
     status: ready ? ("configured" as const) : ("not_configured" as const),
     reason: ready ? undefined : "固定 Template 目录尚未就绪，请联系 FrontMind",
@@ -4472,17 +4579,63 @@ async function selectVisualSample(
       409,
     );
   }
-  const selected = input.delegated
-    ? [...sampleRows].sort(
+  const selectableRows = sampleRows as Array<{
+    sample: typeof websiteStyleSamples.$inferSelect;
+    batch: typeof websiteStyleSampleBatches.$inferSelect;
+  }>;
+  let selected = selectableRows[0];
+  if (input.delegated) {
+    const containsStaticCatalogRows = selectableRows.some(
+      ({ sample }) =>
+        sample.sourceMetadata &&
+        typeof sample.sourceMetadata === "object" &&
+        !Array.isArray(sample.sourceMetadata) &&
+        (sample.sourceMetadata as Record<string, unknown>).renderer ===
+          "frontmind_static_template_catalog_v1",
+    );
+    if (containsStaticCatalogRows) {
+      const admittedStaticRows = selectableRows
+        .flatMap((row) => {
+          const parsed = staticTemplateSelectionMetadataSchema.safeParse(
+            row.sample.sourceMetadata,
+          );
+          return parsed.success &&
+            parsed.data.executionAdmission?.status === "admitted"
+            ? [{ row, catalogPosition: parsed.data.catalogPosition }]
+            : [];
+        })
+        .sort(
+          (left, right) =>
+            left.catalogPosition - right.catalogPosition ||
+            left.row.sample.id.localeCompare(right.row.sample.id),
+        );
+      if (!admittedStaticRows[0]) {
+        throw new SiteOpsServiceError(
+          "STATE_CONFLICT",
+          "固定模板目录尚无已完成 FrontMind 执行准入的候选。",
+          409,
+        );
+      }
+      selected = admittedStaticRows[0].row;
+    } else {
+      selected = [...selectableRows].sort(
         (left, right) =>
           Number(right.sample.sourceMetadata?.score ?? 0) -
           Number(left.sample.sourceMetadata?.score ?? 0),
-      )[0]
-    : sampleRows[0];
+      )[0];
+    }
+  }
   const selectedStaticTemplate =
     staticTemplateSelectionMetadataSchema.safeParse(
       selected?.sample.sourceMetadata,
     );
+  const selectedClaimsStaticTemplate = Boolean(
+    selected?.sample.sourceMetadata &&
+      typeof selected.sample.sourceMetadata === "object" &&
+      !Array.isArray(selected.sample.sourceMetadata) &&
+      (selected.sample.sourceMetadata as Record<string, unknown>).renderer ===
+        "frontmind_static_template_catalog_v1",
+  );
   const selectedStaticPreviewCoordinateMatches = selectedStaticTemplate.success
     ? Boolean(
         selected?.sample.previewLocalAssetId &&
@@ -4490,6 +4643,25 @@ async function selectVisualSample(
             selected.sample.previewLocalAssetId,
       )
     : true;
+  if (selectedClaimsStaticTemplate && !selectedStaticTemplate.success) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "所选固定模板的执行准入证明无法通过校验。",
+      409,
+    );
+  }
+  if (
+    selectedStaticTemplate.success &&
+    selectedStaticTemplate.data.executionAdmission?.status !== "admitted"
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      selectedStaticTemplate.data.executionAdmission?.status === "unavailable"
+        ? selectedStaticTemplate.data.executionAdmission.reason
+        : "该模板尚未完成 FrontMind 执行准入，当前不可选择。",
+      409,
+    );
+  }
   if (
     !selected?.sample.sourceMetadata ||
     (!selected.sample.previewLocalAssetId && !selectedStaticTemplate.success) ||
@@ -4501,7 +4673,10 @@ async function selectVisualSample(
       409,
     );
   }
-  const selectedMetadata = selected.sample.sourceMetadata;
+  const selectedMetadata = selected.sample.sourceMetadata as unknown as Record<
+    string,
+    unknown
+  >;
   const selectedMetadataRecord = selectedMetadata as unknown as Record<
     string,
     unknown

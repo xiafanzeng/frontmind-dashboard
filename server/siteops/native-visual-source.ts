@@ -28,6 +28,12 @@ import {
   type NormalizedTwentyFirstCandidate,
 } from "../../shared/siteops-workflow";
 import {
+  NATIVE_RUNTIME_CONTRACT_FILENAME,
+  NATIVE_RUNTIME_CONTRACT_V1_BYTES,
+  NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1,
+  NATIVE_RUNTIME_EXECUTION_SHELL_V1_BYTES,
+  NATIVE_RUNTIME_ROUTE_MODULE,
   NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
   NATIVE_SOURCE_DEFAULT_LIMITS,
   NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
@@ -85,6 +91,8 @@ const MAX_REMOTE_STYLESHEETS = 8;
 const MAX_REMOTE_STYLESHEET_BYTES = 256 * 1024;
 const MAX_REMOTE_FONT_BYTES = 3 * 1024 * 1024;
 const MAX_REMOTE_STYLE_ASSET_BYTES = 12 * 1024 * 1024;
+const MAX_REMOTE_VIDEO_BYTES = 8 * 1024 * 1024;
+const MAX_REMOTE_VIDEO_TOTAL_BYTES = 12 * 1024 * 1024;
 const MAX_TEMPLATE_ARCHIVE_ENTRIES = 4096;
 const MAX_OPAQUE_TEMPLATE_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_OPAQUE_TEMPLATE_EXPANDED_BYTES = 192 * 1024 * 1024;
@@ -237,6 +245,19 @@ export type FetchNativeTemplateStaticAsset = (input: {
   kind: "css" | "font";
   signal: AbortSignal;
 }) => Promise<NativeTemplateStaticAsset>;
+
+export type FetchNativeTemplateRuntimeMedia = (input: {
+  url: string;
+  kind: "video";
+  signal: AbortSignal;
+}) => Promise<NativeTemplateStaticAsset>;
+
+export type FrozenNativeTemplateRuntimeMedia = Readonly<{
+  kind: "image" | "video";
+  url: string;
+  sha256: string;
+  bytes: number;
+}>;
 
 type PayloadRecord = Record<string, unknown>;
 
@@ -809,15 +830,33 @@ function staticRemoteMediaUrls(text: string) {
     const value = match[1] ?? match[2];
     if (value) urls.add(value);
   }
+  for (const match of text.matchAll(
+    /\bconst\s+([A-Z][A-Z0-9_]*)\s*=\s*["'](https:\/\/[^"'\s]+)["']\s*;/gu,
+  )) {
+    const binding = match[1]!;
+    const escaped = binding.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    if (
+      new RegExp(
+        `<(?:img|video|source)\\b[^>]{0,2048}\\b(?:src|poster)\\s*=\\s*\\{\\s*${escaped}\\s*\\}`,
+        "iu",
+      ).test(text)
+    ) {
+      urls.add(match[2]!);
+    }
+  }
   return [...urls];
 }
 
 function withoutAllowedStaticRemoteMedia(text: string) {
-  return text
+  let safe = text
     .replace(staticRemoteMediaPattern(), (matched, first, second) =>
       matched.replace(String(first ?? second ?? ""), ""),
     )
     .replace(/@import\s+(?:url\(\s*)?["']https:\/\/[^;\r\n]{1,2048};/giu, "");
+  for (const url of staticRemoteMediaUrls(text)) {
+    safe = safe.replaceAll(url, "");
+  }
+  return safe;
 }
 
 function remoteCssImportPattern() {
@@ -842,6 +881,14 @@ function remoteRuntimeMediaIsUnsupported(raw: string) {
     );
   } catch {
     return true;
+  }
+}
+
+function remoteRuntimeVideoExtension(raw: string) {
+  try {
+    return new URL(raw).pathname.toLowerCase().endsWith(".mp4") ? "mp4" : null;
+  } catch {
+    return null;
   }
 }
 
@@ -965,6 +1012,45 @@ async function fetchSafeNativeTemplateStaticAsset(input: {
   const buffer = await readBoundedStaticAssetBody(
     fetched.response,
     input.kind === "css" ? MAX_REMOTE_STYLESHEET_BYTES : MAX_REMOTE_FONT_BYTES,
+  );
+  return {
+    buffer,
+    mimeType,
+    finalUrl: fetched.finalUrl.toString(),
+  };
+}
+
+async function fetchSafeNativeTemplateRuntimeMedia(input: {
+  url: string;
+  kind: "video";
+  signal: AbortSignal;
+}): Promise<NativeTemplateStaticAsset> {
+  const timeout = AbortSignal.timeout(30_000);
+  const signal = AbortSignal.any([input.signal, timeout]);
+  const fetched = await fetchPinnedPublicHttps({
+    url: input.url,
+    signal,
+    maxRedirects: 3,
+    headers: {
+      Accept: "video/mp4",
+      "User-Agent": "FrontMind-SiteOps-Template-Media/1.0",
+    },
+  });
+  if (!fetched.response.ok) {
+    await fetched.response.body?.cancel().catch(() => undefined);
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+  const mimeType = (fetched.response.headers.get("content-type") ?? "")
+    .split(";", 1)[0]!
+    .trim()
+    .toLowerCase();
+  if (mimeType !== "video/mp4") {
+    await fetched.response.body?.cancel().catch(() => undefined);
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE");
+  }
+  const buffer = await readBoundedStaticAssetBody(
+    fetched.response,
+    MAX_REMOTE_VIDEO_BYTES,
   );
   return {
     buffer,
@@ -1972,6 +2058,7 @@ function normalizedTemplateRootHint(value: string | null | undefined) {
 async function extractNativeTemplateFiles(
   archive: Buffer,
   sourceSubdirectory?: string | null,
+  templateSlug?: string,
 ) {
   if (
     archive.length < 1 ||
@@ -2016,11 +2103,27 @@ async function extractNativeTemplateFiles(
     });
   const hintedSuffix = rootHint ? `/${rootHint}/package.json` : null;
   const packagePaths = hintedSuffix
-    ? allPackagePaths.filter(
-        (filename) =>
-          filename === `${rootHint}/package.json` ||
-          filename.endsWith(hintedSuffix),
-      )
+    ? (() => {
+        const nestedPackagePaths = allPackagePaths.filter(
+          (filename) =>
+            filename === `${rootHint}/package.json` ||
+            filename.endsWith(hintedSuffix),
+        );
+        if (nestedPackagePaths.length > 0) return nestedPackagePaths;
+        // Registry templates commonly share one repository-root package.json
+        // while the selected visual root lives below
+        // registry/<registry>/templates/<template>. The catalog projection
+        // intentionally retains that root manifest plus only the selected
+        // registry subtree. Bind the hint to the unique package root that
+        // actually contains it; never fall back to an unrelated workspace.
+        return allPackagePaths.filter((packagePath) => {
+          const rootPrefix = packagePath.slice(0, -"package.json".length);
+          const selectedPrefix = `${rootPrefix}${rootHint}/`;
+          return safeEntries.some(({ path: filename }) =>
+            filename.startsWith(selectedPrefix),
+          );
+        });
+      })()
     : allPackagePaths;
   if (rootHint && packagePaths.length !== 1) {
     throw new NativeVisualSourceError("NATIVE_TEMPLATE_SOURCE_UNSAFE");
@@ -2110,7 +2213,11 @@ async function extractNativeTemplateFiles(
       if (!templateManifestHasReact(packageManifest)) continue;
       const hasViteRoot =
         files.has("index.html") && Boolean(findViteEntrypoint(files));
-      const hasNextRoot = Boolean(findNextStaticEntrypoint(files));
+      const hasRegistryRoot = Boolean(
+        templateSlug && findRegistryTemplateEntrypoint(files, templateSlug),
+      );
+      const hasNextRoot =
+        hasRegistryRoot || Boolean(findNextStaticEntrypoint(files));
       if (!hasViteRoot && !hasNextRoot) continue;
       buildableRoots.push({
         files,
@@ -2326,6 +2433,32 @@ function rewriteNextStaticImports(files: ReadonlyMap<string, Buffer>) {
       continue;
     }
     let text = bytes.toString("utf8");
+    const importsShadersReact = sourceImports(text).includes("shaders/react");
+    // A statically named local export wrapped by next/dynamic({ ssr:false })
+    // has no runtime variability. Convert that exact form to an eager ESM
+    // import so the controlled Vite build never executes dynamic import while
+    // retaining the same component and complete local dependency closure.
+    text = text.replace(
+      /\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*dynamic\(\s*\(\s*\)\s*=>\s*import\(\s*(["'])([^"']+)\2\s*\)\.then\(\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*=>\s*\4\.([A-Za-z_$][\w$]*)\s*\)\s*,\s*\{\s*ssr\s*:\s*false\s*,?\s*\}\s*,?\s*\)\s*;?/gu,
+      (
+        _matched,
+        localName: string,
+        _quote: string,
+        specifier: string,
+        _moduleName: string,
+        exportName: string,
+      ) => {
+        return localName === exportName
+          ? `import { ${exportName} } from ${JSON.stringify(specifier)};`
+          : `import { ${exportName} as ${localName} } from ${JSON.stringify(specifier)};`;
+      },
+    );
+    if (!/\bdynamic\s*\(/u.test(text)) {
+      text = text.replace(
+        /\bimport\s+dynamic\s+from\s*["']next\/dynamic["']\s*;?\s*/gu,
+        "",
+      );
+    }
     const nextImports = sourceImports(text).filter((value) =>
       value.startsWith("next/"),
     );
@@ -2348,7 +2481,21 @@ function rewriteNextStaticImports(files: ReadonlyMap<string, Buffer>) {
       .replaceAll(
         "'@devnomic/marquee/dist/index.css'",
         "'@/frontmind-next/marquee.css'",
+      )
+      // `shaders/react` is a barrel over the package's complete component
+      // graph. Its supported bundled export has the same public React API and
+      // visual implementation, while keeping the controlled 512 MB compiler
+      // from loading hundreds of unrelated shader modules during tree-shake.
+      .replaceAll('"shaders/react"', '"shaders/react/bundle"')
+      .replaceAll("'shaders/react'", "'shaders/react/bundle'");
+    if (importsShadersReact) {
+      // Catalog execution is always offline. Keep the exact shader component
+      // stack while explicitly disabling the package's opt-out telemetry.
+      text = text.replace(
+        /<Shader(?![^>]*\bdisableTelemetry\s*=)(?=\s|>)/gu,
+        "<Shader disableTelemetry={true}",
       );
+    }
     rewritten.set(filename, Buffer.from(text, "utf8"));
   }
   return rewritten;
@@ -2559,6 +2706,7 @@ export async function normalizeTwentyFirstNativeTemplateArchive(input: {
   let templateFiles = await extractNativeTemplateFiles(
     archive,
     input.sourceSubdirectory,
+    templateSlug,
   );
   const manifest = packageManifestFromTemplateFiles(templateFiles);
   assertTemplatePackageIsInert(manifest);
@@ -2879,6 +3027,11 @@ async function mirrorNativeStaticMedia(input: {
   signal: AbortSignal;
   fetchRemoteAsset: typeof fetchSafeVisualPreview;
   fetchRemoteStyleAsset: FetchNativeTemplateStaticAsset;
+  fetchRemoteRuntimeMedia: FetchNativeTemplateRuntimeMedia;
+  frozenRuntimeMedia?: ReadonlyMap<
+    string,
+    Readonly<{ kind: "image" | "video"; sha256: string; bytes: number }>
+  >;
 }) {
   const inlined = await inlineRemoteTemplateStylesheets({
     files: input.source.files,
@@ -2893,6 +3046,11 @@ async function mirrorNativeStaticMedia(input: {
     );
   }
   if (urls.size === 0) {
+    if (input.frozenRuntimeMedia?.size) {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+      );
+    }
     const files = [...inlined.files].sort((left, right) =>
       left.path.localeCompare(right.path),
     );
@@ -2908,9 +3066,78 @@ async function mirrorNativeStaticMedia(input: {
   }
   const replacements = new Map<string, string>();
   const assets: NativeSourceFile[] = [];
+  const consumedFrozenRuntimeMedia = new Set<string>();
   let fetchedStaticBytes = inlined.fetchedBytes;
+  let fetchedRuntimeMediaBytes = 0;
   for (const url of [...urls].sort()) {
     if (input.signal.aborted) throw input.signal.reason;
+    const frozen = input.frozenRuntimeMedia?.get(url);
+    if (input.frozenRuntimeMedia && !frozen) {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+      );
+    }
+    const videoExtension = remoteRuntimeVideoExtension(url);
+    if (videoExtension) {
+      if (frozen && frozen.kind !== "video") {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+        );
+      }
+      let fetched: NativeTemplateStaticAsset;
+      try {
+        fetched = await input.fetchRemoteRuntimeMedia({
+          url,
+          kind: "video",
+          signal: input.signal,
+        });
+      } catch (error) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          error,
+        );
+      }
+      let finalUrl: URL;
+      try {
+        finalUrl = new URL(fetched.finalUrl);
+      } catch (error) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+          error,
+        );
+      }
+      if (
+        finalUrl.protocol !== "https:" ||
+        fetched.mimeType.toLowerCase() !== "video/mp4" ||
+        fetched.buffer.length < 12 ||
+        fetched.buffer.length > MAX_REMOTE_VIDEO_BYTES ||
+        fetched.buffer.subarray(4, 8).toString("latin1") !== "ftyp"
+      ) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+        );
+      }
+      if (
+        frozen &&
+        (fetched.buffer.length !== frozen.bytes ||
+          sha256(fetched.buffer) !== frozen.sha256)
+      ) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+        );
+      }
+      if (frozen) consumedFrozenRuntimeMedia.add(url);
+      fetchedRuntimeMediaBytes += fetched.buffer.length;
+      if (fetchedRuntimeMediaBytes > MAX_REMOTE_VIDEO_TOTAL_BYTES) {
+        throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+      }
+      const filename = `public/frontmind-native-media/${sha256(fetched.buffer)}.${videoExtension}`;
+      replacements.set(url, `/${filename.slice("public/".length)}`);
+      if (!assets.some((asset) => asset.path === filename)) {
+        assets.push({ path: filename, bytes: Buffer.from(fetched.buffer) });
+      }
+      continue;
+    }
     if (remoteRuntimeMediaIsUnsupported(url)) {
       throw new NativeVisualSourceError(
         "NATIVE_SOURCE_STATIC_MEDIA_UNSUPPORTED",
@@ -2950,6 +3177,17 @@ async function mirrorNativeStaticMedia(input: {
         url,
         signal: input.signal,
       });
+      if (
+        frozen &&
+        (frozen.kind !== "image" ||
+          fetched.buffer.length !== frozen.bytes ||
+          sha256(fetched.buffer) !== frozen.sha256)
+      ) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+        );
+      }
+      if (frozen) consumedFrozenRuntimeMedia.add(url);
       bytes = await sharp(fetched.buffer)
         .rotate()
         .resize({
@@ -2973,6 +3211,12 @@ async function mirrorNativeStaticMedia(input: {
           .toBuffer();
       }
     } catch (error) {
+      if (frozen) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+          error,
+        );
+      }
       if (!optionalStaticMediaMayUsePlaceholder(inlined.files, url)) {
         throw new NativeVisualSourceError(
           "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
@@ -2990,6 +3234,14 @@ async function mirrorNativeStaticMedia(input: {
     if (!assets.some((asset) => asset.path === filename)) {
       assets.push({ path: filename, bytes });
     }
+  }
+  if (
+    input.frozenRuntimeMedia &&
+    consumedFrozenRuntimeMedia.size !== input.frozenRuntimeMedia.size
+  ) {
+    throw new NativeVisualSourceError(
+      "NATIVE_SOURCE_STATIC_MEDIA_INTEGRITY_MISMATCH",
+    );
   }
   const files = inlined.files.map((file) => {
     if (!isTextSourcePath(file.path)) return file;
@@ -4012,6 +4264,7 @@ export async function prepareNativeVisualCandidate(input: {
   signal: AbortSignal;
   fetchRemoteAsset?: typeof fetchSafeVisualPreview;
   fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
+  fetchRemoteRuntimeMedia?: FetchNativeTemplateRuntimeMedia;
 }): Promise<PreparedNativeVisualCandidate> {
   const normalized = normalizeTwentyFirstNativeSource({
     candidate: input.candidate,
@@ -4024,6 +4277,8 @@ export async function prepareNativeVisualCandidate(input: {
     fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
     fetchRemoteStyleAsset:
       input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
+    fetchRemoteRuntimeMedia:
+      input.fetchRemoteRuntimeMedia ?? fetchSafeNativeTemplateRuntimeMedia,
   });
   const sourceArchive = await createNativeSourceArchive(source);
   const preview = await renderNativeReactSourcePreview({
@@ -4081,6 +4336,7 @@ export async function prepareNativeTemplateCandidate(input: {
   signal: AbortSignal;
   fetchRemoteAsset?: typeof fetchSafeVisualPreview;
   fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
+  fetchRemoteRuntimeMedia?: FetchNativeTemplateRuntimeMedia;
   renderPreview?: typeof renderNativeReactSourcePreview;
 }): Promise<PreparedNativeTemplateCandidate> {
   if (input.signal.aborted) throw input.signal.reason;
@@ -4140,6 +4396,8 @@ export async function prepareNativeTemplateCandidate(input: {
     fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
     fetchRemoteStyleAsset:
       input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
+    fetchRemoteRuntimeMedia:
+      input.fetchRemoteRuntimeMedia ?? fetchSafeNativeTemplateRuntimeMedia,
   });
   const buildArchive = await createNativeSourceArchive(source);
   const preview = await (input.renderPreview ?? renderNativeReactSourcePreview)(
@@ -4209,6 +4467,150 @@ export async function prepareNativeTemplateCandidate(input: {
     preview,
     previewSha256,
     styleTokens,
+  };
+}
+
+/** Catalog admission boundary. Unlike the V7 raw-provider attachment path,
+ * this returns the exact mirrored, controlled Vite archive that passed the
+ * FrontMind normalizer. Callers must still validate and materialize this
+ * immutable archive before marking a catalog entry admitted. */
+export async function prepareStaticTemplateExecutionSource(input: {
+  templateId: string | number;
+  slug: string;
+  version: string | null;
+  archive: Uint8Array;
+  expectedArchiveSha256: string;
+  sourceSubdirectory?: string | null;
+  signal: AbortSignal;
+  fetchRemoteAsset?: typeof fetchSafeVisualPreview;
+  fetchRemoteStyleAsset?: FetchNativeTemplateStaticAsset;
+  fetchRemoteRuntimeMedia?: FetchNativeTemplateRuntimeMedia;
+  frozenRuntimeMedia?: readonly FrozenNativeTemplateRuntimeMedia[];
+}) {
+  const normalized = await normalizeTwentyFirstNativeTemplateArchive({
+    templateId: input.templateId,
+    slug: input.slug,
+    version: input.version,
+    archive: input.archive,
+    expectedArchiveSha256: input.expectedArchiveSha256,
+    sourceSubdirectory: input.sourceSubdirectory,
+  });
+  const mirrored = await mirrorNativeStaticMedia({
+    source: normalized,
+    signal: input.signal,
+    fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
+    fetchRemoteStyleAsset:
+      input.fetchRemoteStyleAsset ?? fetchSafeNativeTemplateStaticAsset,
+    fetchRemoteRuntimeMedia:
+      input.fetchRemoteRuntimeMedia ?? fetchSafeNativeTemplateRuntimeMedia,
+    frozenRuntimeMedia: input.frozenRuntimeMedia
+      ? new Map(
+          input.frozenRuntimeMedia.map((asset) => [
+            asset.url,
+            {
+              kind: asset.kind,
+              sha256: asset.sha256,
+              bytes: asset.bytes,
+            },
+          ]),
+        )
+      : undefined,
+  });
+  const shellFiles = new Map(
+    NATIVE_RUNTIME_EXECUTION_SHELL_V1.files.map((file) => [
+      file.path,
+      Buffer.from(file.text, "utf8"),
+    ]),
+  );
+  const replacedPaths = new Set<string>([
+    ...shellFiles.keys(),
+    NATIVE_RUNTIME_ROUTE_MODULE,
+    NATIVE_RUNTIME_CONTRACT_FILENAME,
+    NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+  ]);
+  const retainedFiles = mirrored.files.filter(
+    (file) => !replacedPaths.has(file.path),
+  );
+  const stylesheetImports = retainedFiles
+    .filter((file) => file.path.endsWith(".css"))
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .map(
+      (file) =>
+        `import ${JSON.stringify(
+          relativeSourceImport(NATIVE_RUNTIME_ROUTE_MODULE, file.path, false),
+        )};`,
+    );
+  const routeModule = Buffer.from(
+    [
+      ...stylesheetImports,
+      `import NativeTemplate from ${JSON.stringify(
+        relativeSourceImport(
+          NATIVE_RUNTIME_ROUTE_MODULE,
+          mirrored.demoEntrypoint,
+        ),
+      )};`,
+      "",
+      'export const FRONTMIND_ROUTE_PATHS = ["/"] as const;',
+      "",
+      "export default function FrontMindRoutes() {",
+      "  return <NativeTemplate />;",
+      "}",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const dependencies = [...mirrored.dependencies]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((dependency) => ({
+      name: dependency.name,
+      installedVersion: installedNativeSourceDependencyVersion(dependency.name),
+    }));
+  const packageJson = Buffer.from(
+    `${canonicalJson({
+      name: "frontmind-native-site",
+      private: true,
+      version: "1.0.0",
+      scripts: { build: "vite build" },
+      dependencies: Object.fromEntries(
+        dependencies.map((dependency) => [
+          dependency.name,
+          dependency.installedVersion,
+        ]),
+      ),
+    })}\n`,
+    "utf8",
+  );
+  const files: NativeSourceFile[] = [
+    ...retainedFiles,
+    { path: "package.json", bytes: packageJson },
+    ...[...shellFiles]
+      .filter(([pathname]) => pathname !== "package.json")
+      .map(([pathname, bytes]) => ({ path: pathname, bytes })),
+    { path: NATIVE_RUNTIME_ROUTE_MODULE, bytes: routeModule },
+    {
+      path: NATIVE_RUNTIME_CONTRACT_FILENAME,
+      bytes: Buffer.from(NATIVE_RUNTIME_CONTRACT_V1_BYTES),
+    },
+    {
+      path: NATIVE_RUNTIME_EXECUTION_SHELL_FILENAME,
+      bytes: Buffer.from(NATIVE_RUNTIME_EXECUTION_SHELL_V1_BYTES),
+    },
+  ].sort((left, right) => left.path.localeCompare(right.path));
+  const executionSource: NormalizedTwentyFirstNativeSource = {
+    ...mirrored,
+    entrypoint: NATIVE_RUNTIME_ROUTE_MODULE,
+    demoEntrypoint: NATIVE_RUNTIME_ROUTE_MODULE,
+    dependencies,
+    files,
+    sourceTreeSha256: nativeSourceTreeSha256(files),
+  };
+  const sourceArchive = await createNativeSourceArchive(executionSource);
+  return {
+    framework: "vite_react" as const,
+    sourceArchive,
+    sourceArchiveSha256: sha256(sourceArchive),
+    sourceTreeSha256: executionSource.sourceTreeSha256,
+    files: executionSource.files,
   };
 }
 

@@ -26,6 +26,7 @@ import {
 import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
 import {
   classifyManusV2StructuredResultEnvelope,
+  latestManusV2WaitingDetail,
   latestManusV2TaskState,
   ManusV2ApiError,
   ManusV2Client,
@@ -111,7 +112,7 @@ const historicalOptimizationForecastSchema = (() => {
   } as NonNullable<PresalesV2Contract["structuredOutputSchema"]>;
 })();
 const CREATE_RECONCILE_WINDOW_MS = 5 * 60_000;
-const PROVIDER_RUN_DEADLINE_MS = 30 * 60_000;
+const PROVIDER_RUN_DEADLINE_MS = 60 * 60_000;
 const PROVIDER_TASK_VISIBILITY_GRACE_MS = 180_000;
 const MAX_STRUCTURED_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_STRUCTURED_RESULT_DEPTH = 64;
@@ -1794,6 +1795,47 @@ function presalesV2EventTypeCounts(events: ReadonlyArray<ManusV2MessageEvent>) {
   return counts;
 }
 
+type PresalesV2WaitingClassification =
+  | "cascade"
+  | "ask_user"
+  | "other"
+  | "missing";
+
+function classifyPresalesV2Waiting(
+  waiting: ReturnType<typeof latestManusV2WaitingDetail>,
+): PresalesV2WaitingClassification {
+  if (!waiting) return "missing";
+  const canonicalType = waiting.eventType
+    .replace(/[^a-z]/giu, "")
+    .toLowerCase();
+  if (canonicalType === "messageaskuser") return "ask_user";
+  if (canonicalType === "cascadejobcall") return "cascade";
+  return "other";
+}
+
+function logPresalesV2WaitingObservation(input: {
+  localTaskId: string;
+  contractName: string;
+  providerState: string;
+  waitingClassification: PresalesV2WaitingClassification;
+  eventTypeCounts: Readonly<Record<string, number>>;
+  decodeConclusion: PresalesV2StructuredResultDecode["kind"] | "not_applicable";
+  artifactConclusion: "missing" | "single" | "multiple" | "not_applicable";
+}) {
+  console.info("[Presales v2] Provider waiting observation", {
+    taskHash: createHash("sha256")
+      .update(input.localTaskId, "utf8")
+      .digest("hex")
+      .slice(0, 16),
+    contractName: input.contractName,
+    providerState: input.providerState === "waiting" ? "waiting" : "unknown",
+    waitingClassification: input.waitingClassification,
+    eventTypeCounts: input.eventTypeCounts,
+    decodeConclusion: input.decodeConclusion,
+    artifactConclusion: input.artifactConclusion,
+  });
+}
+
 type AssistantAttachment = {
   eventId: string;
   attachmentIndex: number;
@@ -2401,6 +2443,11 @@ async function reconcileTask(
   const eventSummary = presalesV2SafeEvents(localTaskId, events);
   const relevantEvents = presalesV2LatestOperationSegment(events);
   const state = latestManusV2TaskState(relevantEvents);
+  let decodeConclusion:
+    | PresalesV2StructuredResultDecode["kind"]
+    | "not_applicable" = "not_applicable";
+  let artifactConclusion: "missing" | "single" | "multiple" | "not_applicable" =
+    "not_applicable";
 
   if (record.contract.name === "website.knowledge-base-candidate") {
     const candidates = presalesV2AssistantAttachments(relevantEvents).filter(
@@ -2408,6 +2455,12 @@ async function reconcileTask(
         item.filename.toLowerCase().endsWith(".zip") ||
         item.contentType.toLowerCase() === "application/zip",
     );
+    artifactConclusion =
+      candidates.length === 0
+        ? "missing"
+        : candidates.length === 1
+          ? "single"
+          : "multiple";
     if (state === "stopped" && candidates.length === 1) {
       const artifact = await dependencies.localizeArtifact({
         record,
@@ -2474,6 +2527,7 @@ async function reconcileTask(
         allowAssistantFallback: true,
       },
     );
+    decodeConclusion = decode.kind;
     if (
       decode.kind !== "missing" ||
       state === "stopped" ||
@@ -2592,6 +2646,39 @@ async function reconcileTask(
   }
 
   if (state === "waiting") {
+    const waitingClassification = classifyPresalesV2Waiting(
+      latestManusV2WaitingDetail(relevantEvents),
+    );
+    logPresalesV2WaitingObservation({
+      localTaskId,
+      contractName: record.contract.name,
+      providerState: state,
+      waitingClassification,
+      eventTypeCounts: presalesV2EventTypeCounts(events),
+      decodeConclusion,
+      artifactConclusion,
+    });
+    if (waitingClassification !== "ask_user") {
+      return (
+        (await dependencies.updateTask(
+          localTaskId,
+          (current) =>
+            applyProviderObservation(current, record, (candidate) =>
+              withRepairStatus(
+                {
+                  ...candidate,
+                  status: "running",
+                  errorCode: null,
+                  safeEvents: eventSummary,
+                  terminalAt: null,
+                },
+                "running",
+              ),
+            ),
+          events,
+        )) ?? record
+      );
+    }
     return (
       (await dependencies.updateTask(
         localTaskId,
