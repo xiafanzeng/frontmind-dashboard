@@ -27,6 +27,10 @@ import {
   type KnowledgeBaseLocalUploadCoordinate,
 } from "@shared/knowledge-base-local-upload";
 import {
+  siteOpsComposerLocalUploadHeaders,
+  type SiteOpsComposerLocalUploadCoordinate,
+} from "@shared/siteops-composer-local-upload";
+import {
   dispatchKnowledgeBaseProgressUpdated,
   knowledgeBaseObservationFromPayload,
   type KnowledgeBaseObservationDto,
@@ -871,6 +875,7 @@ export async function uploadChatLocalAsset(
     mimeType?: string;
     signal?: AbortSignal;
     knowledgeBaseCoordinate?: KnowledgeBaseLocalUploadCoordinate;
+    siteOpsComposerCoordinate?: SiteOpsComposerLocalUploadCoordinate;
     attempt?: number;
     onTransfer?: (loadedBytes: number, totalBytes: number) => void;
     onUploadComplete?: () => void;
@@ -885,6 +890,12 @@ export async function uploadChatLocalAsset(
   traceId?: string;
 }> {
   assertChatAttachmentSizes([file]);
+  if (options.knowledgeBaseCoordinate && options.siteOpsComposerCoordinate) {
+    throw new FileUploadError("附件上传坐标冲突，请重新上传", {
+      code: "INVALID_UPLOAD_OPTIONS",
+      retryable: false,
+    });
+  }
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const filename = options.filename || file.name || "attachment.bin";
@@ -909,6 +920,9 @@ export async function uploadChatLocalAsset(
             options.knowledgeBaseCoordinate,
             Math.max(1, Number(options.attempt || 1)),
           )
+        : {}),
+      ...(options.siteOpsComposerCoordinate
+        ? siteOpsComposerLocalUploadHeaders(options.siteOpsComposerCoordinate)
         : {}),
     });
     Object.entries(headers).forEach(([name, value]) => {

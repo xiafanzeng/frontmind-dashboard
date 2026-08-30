@@ -1265,7 +1265,7 @@ describe("SiteOps core contracts", () => {
     });
   });
 
-  it("projects a pristine project as the fixed 2.8 catalog before any visual operation exists", () => {
+  it("projects a pristine project as the dynamic-IA 2.9 catalog before any visual operation exists", () => {
     const coordinates = resolveVisualCatalogObservationCoordinates({
       frozenVisualInput: null,
       hasAnyVisualOperation: false,
@@ -1273,7 +1273,7 @@ describe("SiteOps core contracts", () => {
     });
     expect(coordinates).toMatchObject({
       pristineVisualCycle: true,
-      workflowVersion: "2.8.0",
+      workflowVersion: "2.9.0",
       catalogVersion: "21st-included-recommended-20260828-v2",
       staticCatalogVisualCycle: true,
       pageSize: 8,
@@ -1299,7 +1299,7 @@ describe("SiteOps core contracts", () => {
       availablePages: 4,
       reservedPages: 0,
       maxPages: 4,
-      workflowVersion: "2.8.0",
+      workflowVersion: "2.9.0",
       catalogVersion: "21st-included-recommended-20260828-v2",
       pageSize: 8,
       pageCount: 4,
@@ -1666,6 +1666,24 @@ describe("SiteOps core contracts", () => {
     expect(isSiteOpsOperationReplay(null, requestHash)).toBe(false);
   });
 
+  it("checks a lost-response message replay before re-freezing revision images", async () => {
+    const source = await readFile(
+      path.join(process.cwd(), "server/siteops/service.ts"),
+      "utf8",
+    );
+    const body = source.slice(
+      source.indexOf("export async function sendSiteOpsMessage("),
+      source.indexOf("export function parseSiteOpsActionPayload("),
+    );
+    const replay = body.indexOf(
+      "isSiteOpsOperationReplay(replayRows[0], requestHash)",
+    );
+    const freeze = body.indexOf("freezeSiteOpsRevisionInputAssets({");
+
+    expect(replay).toBeGreaterThanOrEqual(0);
+    expect(freeze).toBeGreaterThan(replay);
+  });
+
   it("normalizes an IDN to its lower-case ASCII identity", () => {
     const domain = normalizeSiteOpsDomain("例子.公司.");
     expect(domain.domain).toBe("xn--fsqu00a.xn--55qx5d");
@@ -1960,6 +1978,35 @@ describe("SiteOps core contracts", () => {
     expect(siteOpsSendMessageInputSchema.parse(message)).toEqual(message);
     expect(() =>
       siteOpsSendMessageInputSchema.parse({ ...message, apiKey: "secret" }),
+    ).toThrow();
+
+    const assetIds = Array.from(
+      { length: 8 },
+      (_, index) => `asset_revision_${index}`,
+    );
+    expect(
+      siteOpsSendMessageInputSchema.parse({
+        ...message,
+        localAssetIds: assetIds,
+      }).localAssetIds,
+    ).toEqual(assetIds);
+    expect(() =>
+      siteOpsSendMessageInputSchema.parse({
+        ...message,
+        localAssetIds: [...assetIds, "asset_revision_8"],
+      }),
+    ).toThrow();
+    expect(() =>
+      siteOpsSendMessageInputSchema.parse({
+        ...message,
+        localAssetIds: ["00000000-0000-4000-8000-000000000001"],
+      }),
+    ).toThrow();
+    expect(() =>
+      siteOpsSendMessageInputSchema.parse({
+        ...message,
+        localAssetIds: ["asset_duplicate", "asset_duplicate"],
+      }),
     ).toThrow();
 
     expect(() =>

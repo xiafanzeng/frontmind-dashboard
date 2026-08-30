@@ -11,9 +11,11 @@ import {
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   knowledgeBaseResetStates,
+  knowledgeBaseSnapshots,
   localAssets,
   messages,
   providerFileLeases,
+  siteProjects,
   upstreamResources,
   userUsageOwners,
   type ConversationTurn,
@@ -162,9 +164,11 @@ interface TurnServiceStore {
   resources: any[];
   localAssets: any[];
   providerFileLeases: any[];
+  snapshots: any[];
   nodes: any[];
   usageOwnerId: number | null;
   resetRevision: number;
+  siteProject: { knowledgeInputEpochId: string | null } | null;
 }
 
 function createTurnServiceExecutor(input: {
@@ -178,9 +182,12 @@ function createTurnServiceExecutor(input: {
   resources?: any[];
   localAssets?: any[];
   providerFileLeases?: any[];
+  snapshots?: any[];
   nodes?: any[];
   usageOwnerId?: number | null;
   resetRevision?: number;
+  siteProjectKnowledgeInputEpochId?: string | null;
+  hasSiteProject?: boolean;
   selectAllMessages?: boolean;
   turnSelections: TurnSelection[][];
   failConversationInsertAtTransaction?: number;
@@ -205,9 +212,17 @@ function createTurnServiceExecutor(input: {
     resources: [...(input.resources || [])],
     localAssets: [...(input.localAssets || [])],
     providerFileLeases: [...(input.providerFileLeases || [])],
+    snapshots: [...(input.snapshots || [])],
     nodes: structuredClone(input.nodes || []),
     usageOwnerId: input.usageOwnerId ?? null,
     resetRevision: input.resetRevision ?? 0,
+    siteProject:
+      input.hasSiteProject === false
+        ? null
+        : {
+            knowledgeInputEpochId:
+              input.siteProjectKnowledgeInputEpochId ?? null,
+          },
   };
   const events: string[] = [];
   let transactionIndex = 0;
@@ -251,6 +266,12 @@ function createTurnServiceExecutor(input: {
         }
         if (table === knowledgeBaseResetStates) {
           return [{ userId: 1, revision: store.resetRevision }];
+        }
+        if (table === siteProjects) {
+          return store.siteProject ? [store.siteProject] : [];
+        }
+        if (table === knowledgeBaseSnapshots) {
+          return store.snapshots;
         }
         if (table === messages) {
           if (input.selectAllMessages) return store.messages;
@@ -436,9 +457,11 @@ function createTurnServiceExecutor(input: {
         store.resources = snapshot.resources;
         store.localAssets = snapshot.localAssets;
         store.providerFileLeases = snapshot.providerFileLeases;
+        store.snapshots = snapshot.snapshots;
         store.nodes = snapshot.nodes;
         store.usageOwnerId = snapshot.usageOwnerId;
         store.resetRevision = snapshot.resetRevision;
+        store.siteProject = snapshot.siteProject;
         throw error;
       }
     },
@@ -4519,6 +4542,181 @@ describe("knowledge-base atomic start reservation", () => {
     expect(store.build).toBeNull();
     expect(store.turns).toHaveLength(0);
     expect(store.messages).toHaveLength(0);
+  });
+
+  it("copies the locked SiteOps epoch into the immutable build reservation", async () => {
+    const knowledgeInputEpochId = "63000000-0000-4000-8000-000000000001";
+    const { executor, store } = createTurnServiceExecutor({
+      siteProjectKnowledgeInputEpochId: knowledgeInputEpochId,
+      turnSelections: [[[], []]],
+    });
+
+    await reserveKnowledgeBaseStartBuild(startInput, executor);
+
+    expect(store.build?.siteOpsKnowledgeInputEpochId).toBe(
+      knowledgeInputEpochId,
+    );
+  });
+
+  it("starts a fresh SiteOps epoch without the pre-reset active snapshot", async () => {
+    const knowledgeInputEpochId = "63000000-0000-4000-8000-000000000002";
+    const { executor, store } = createTurnServiceExecutor({
+      siteProjectKnowledgeInputEpochId: knowledgeInputEpochId,
+      snapshots: [
+        {
+          id: "62000000-0000-4000-8000-000000000001",
+          userId: 1,
+          siteOpsKnowledgeInputEpochId: "61000000-0000-4000-8000-000000000001",
+        },
+      ],
+      turnSelections: [[[], []]],
+    });
+
+    const result = await reserveKnowledgeBaseStartBuild(
+      {
+        ...startInput,
+        userAttachmentCount: 0,
+        expectedAttachmentCount: 2,
+        prefillSnapshotId: null,
+        deferDispatchUntilAttachments: true,
+        clientAttachmentManifest: [],
+        requestPayload: {
+          ...startInput.requestPayload,
+          prefillSnapshotId: null,
+        },
+        recoveryMetadata: {
+          ...startInput.recoveryMetadata,
+          includePrefill: false,
+          prefillSnapshotId: null,
+        },
+      },
+      executor,
+    );
+
+    expect(result.reservation.turn).toMatchObject({
+      expectedUserAttachmentCount: 0,
+      attachmentFileIds: [],
+    });
+    expect((store.turns[0]?.metadata as any)?.expectedAttachmentCount).toBe(2);
+    expect((store.turns[0]?.metadata as any)?.recovery).toMatchObject({
+      includePrefill: false,
+      prefillSnapshotId: null,
+    });
+  });
+
+  it("rejects a pre-reset prefill snapshot after the SiteOps epoch rotates", async () => {
+    const currentEpochId = "63000000-0000-4000-8000-000000000003";
+    const oldSnapshotId = "62000000-0000-4000-8000-000000000002";
+    const { executor, store } = createTurnServiceExecutor({
+      siteProjectKnowledgeInputEpochId: currentEpochId,
+      snapshots: [
+        {
+          id: oldSnapshotId,
+          userId: 1,
+          siteOpsKnowledgeInputEpochId: "61000000-0000-4000-8000-000000000002",
+        },
+      ],
+      turnSelections: [[]],
+    });
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          userAttachmentCount: 0,
+          expectedAttachmentCount: 3,
+          prefillSnapshotId: oldSnapshotId,
+          deferDispatchUntilAttachments: true,
+          clientAttachmentManifest: [],
+          requestPayload: {
+            ...startInput.requestPayload,
+            prefillSnapshotId: oldSnapshotId,
+          },
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            includePrefill: true,
+            prefillSnapshotId: oldSnapshotId,
+          },
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+    });
+    expect(store.build).toBeNull();
+    expect(store.turns).toHaveLength(0);
+  });
+
+  it("rejects a null/id split across the start prefill ledgers", async () => {
+    const snapshotId = "62000000-0000-4000-8000-000000000004";
+    const { executor, store } = createTurnServiceExecutor({
+      siteProjectKnowledgeInputEpochId: "63000000-0000-4000-8000-000000000005",
+      turnSelections: [],
+    });
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          prefillSnapshotId: null,
+          requestPayload: {
+            ...startInput.requestPayload,
+            prefillSnapshotId: snapshotId,
+          },
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            includePrefill: false,
+            prefillSnapshotId: null,
+          },
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    expect(store.build).toBeNull();
+  });
+
+  it("accepts a prefill snapshot only from the exact locked SiteOps epoch", async () => {
+    const currentEpochId = "63000000-0000-4000-8000-000000000004";
+    const snapshotId = "62000000-0000-4000-8000-000000000003";
+    const { executor, store } = createTurnServiceExecutor({
+      siteProjectKnowledgeInputEpochId: currentEpochId,
+      snapshots: [
+        {
+          id: snapshotId,
+          userId: 1,
+          siteOpsKnowledgeInputEpochId: currentEpochId,
+        },
+      ],
+      turnSelections: [[[], []]],
+    });
+
+    await reserveKnowledgeBaseStartBuild(
+      {
+        ...startInput,
+        userAttachmentCount: 0,
+        expectedAttachmentCount: 3,
+        prefillSnapshotId: snapshotId,
+        deferDispatchUntilAttachments: true,
+        clientAttachmentManifest: [],
+        requestPayload: {
+          ...startInput.requestPayload,
+          prefillSnapshotId: snapshotId,
+        },
+        recoveryMetadata: {
+          ...startInput.recoveryMetadata,
+          includePrefill: true,
+          prefillSnapshotId: snapshotId,
+        },
+      },
+      executor,
+    );
+
+    expect(store.build?.siteOpsKnowledgeInputEpochId).toBe(currentEpochId);
+    expect((store.turns[0]?.metadata as any)?.expectedAttachmentCount).toBe(3);
+    expect((store.turns[0]?.metadata as any)?.recovery).toMatchObject({
+      includePrefill: true,
+      prefillSnapshotId: snapshotId,
+    });
   });
 
   it("rejects a tombstoned conversation before reserving a build", async () => {

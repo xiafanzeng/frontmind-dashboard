@@ -12,8 +12,15 @@ const mocks = vi.hoisted(() => ({
   openObservation: null as SiteOpsObservationV1 | null,
   actFast: vi.fn(),
   actReset: vi.fn(),
+  sendMessage: vi.fn(),
+  sendMessageReset: vi.fn(),
+  uploadChatLocalAsset: vi.fn(),
   observeRefetch: vi.fn(),
   observeOptions: null as Record<string, unknown> | null,
+}));
+
+vi.mock("@/lib/frontmind-api", () => ({
+  uploadChatLocalAsset: mocks.uploadChatLocalAsset,
 }));
 
 vi.mock("@/lib/trpc", () => ({
@@ -49,6 +56,14 @@ vi.mock("@/lib/trpc", () => ({
           useMutation: () => ({
             mutateAsync: mocks.actFast,
             reset: mocks.actReset,
+            error: null,
+          }),
+        },
+        sendMessage: {
+          useMutation: () => ({
+            mutateAsync: mocks.sendMessage,
+            reset: mocks.sendMessageReset,
+            isPending: false,
             error: null,
           }),
         },
@@ -192,10 +207,53 @@ function acceptedAck(clientRequestId: string) {
   };
 }
 
+function revisionReadyObservation(): SiteOpsObservationV1 {
+  const current = staticCatalogObservation();
+  return {
+    ...current,
+    project: {
+      ...current.project,
+      status: "preview_ready",
+    },
+    visualGeneration: {
+      ...current.visualGeneration,
+      workflowVersion: "2.9.0",
+    },
+    builds: [
+      {
+        id: "44444444-4444-4444-8444-444444444444",
+        ordinal: 1,
+        parentBuildId: null,
+        status: "preview_ready",
+        previewUrl:
+          "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/preview/",
+        sourceUrl: null,
+        buildDelivery: null,
+        needsHelp: false,
+        createdAt: "2026-08-29T00:01:00.000Z",
+        updatedAt: "2026-08-29T00:02:00.000Z",
+      },
+    ],
+    interactionState: "preview_ready",
+  };
+}
+
 describe("ConnectedSiteOpsConversationPanel select_visual", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.openObservation = staticCatalogObservation();
+    mocks.sendMessage.mockResolvedValue(undefined);
+    mocks.uploadChatLocalAsset.mockImplementation(
+      async (_file: File, onProgress?: (percent: number) => void) => {
+        onProgress?.(100);
+        return {
+          fileId: "asset_siteops_revision_local",
+          filename: "product.png",
+          expiresAt: Date.now() + 60_000,
+          replayed: false,
+        };
+      },
+    );
     mocks.observeRefetch.mockResolvedValue({
       data: mocks.openObservation,
     });
@@ -365,5 +423,168 @@ describe("ConnectedSiteOpsConversationPanel select_visual", () => {
     expect(
       screen.getByRole("heading", { name: "已选择的视觉方案" }),
     ).toBeInTheDocument();
+  });
+
+  it("uploads revision images as local assets and reuses their asset ids on an exact retry", async () => {
+    const current = revisionReadyObservation();
+    mocks.openObservation = current;
+    mocks.observeRefetch.mockResolvedValue({ data: current });
+    mocks.sendMessage
+      .mockRejectedValueOnce(new Error("revision dispatch failed"))
+      .mockResolvedValueOnce(undefined);
+    render(<ConnectedSiteOpsConversationPanel />);
+
+    const file = new File([new Uint8Array([1, 2, 3])], "product.png", {
+      type: "image/png",
+      lastModified: 9,
+    });
+    fireEvent.change(screen.getByLabelText("修改要求"), {
+      target: { value: "把图片放到产品介绍区" },
+    });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [file] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "生成修改版本" }));
+
+    await screen.findByText("revision dispatch failed");
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledOnce();
+    expect(mocks.sendMessage).toHaveBeenCalledOnce();
+    const firstRequest = mocks.sendMessage.mock.calls[0]![0];
+    expect(firstRequest).toMatchObject({
+      conversationId: current.project.conversationId,
+      text: "把图片放到产品介绍区",
+      localAssetIds: ["asset_siteops_revision_local"],
+      expectedProjectRevision: current.project.revision,
+    });
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledWith(
+      file,
+      expect.any(Function),
+      {
+        siteOpsComposerCoordinate: {
+          clientRequestId: firstRequest.clientRequestId,
+          contentSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          ordinal: 1,
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "重试提交" }));
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(2));
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledOnce();
+    expect(mocks.sendMessage.mock.calls[1]![0]).toEqual(firstRequest);
+  });
+
+  it("reuses a still-running sibling upload after a partial multi-image failure", async () => {
+    const current = revisionReadyObservation();
+    mocks.openObservation = current;
+    mocks.observeRefetch.mockResolvedValue({ data: current });
+    let firstAttempts = 0;
+    let resolveSecond: (receipt: {
+      fileId: string;
+      filename: string;
+      expiresAt: number;
+      replayed: boolean;
+    }) => void = () => undefined;
+    mocks.uploadChatLocalAsset.mockImplementation((file: File) => {
+      if (file.name === "first.png") {
+        firstAttempts += 1;
+        return firstAttempts === 1
+          ? Promise.reject(new Error("first upload failed"))
+          : Promise.resolve({
+              fileId: "asset_first_retry",
+              filename: file.name,
+              expiresAt: Date.now() + 60_000,
+              replayed: false,
+            });
+      }
+      return new Promise((resolve) => {
+        resolveSecond = resolve;
+      });
+    });
+    render(<ConnectedSiteOpsConversationPanel />);
+
+    const first = new File([new Uint8Array([1])], "first.png", {
+      type: "image/png",
+      lastModified: 1,
+    });
+    const second = new File([new Uint8Array([2])], "second.png", {
+      type: "image/png",
+      lastModified: 2,
+    });
+    fireEvent.change(screen.getByLabelText("修改要求"), {
+      target: { value: "分别加入两张图片" },
+    });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [first, second] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "生成修改版本" }));
+    await screen.findByText("first upload failed");
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "重试提交" }));
+    await waitFor(() =>
+      expect(mocks.uploadChatLocalAsset).toHaveBeenCalledTimes(3),
+    );
+    expect(
+      mocks.uploadChatLocalAsset.mock.calls.filter(
+        ([file]) => (file as File).name === "second.png",
+      ),
+    ).toHaveLength(1);
+    resolveSecond({
+      fileId: "asset_second_in_flight",
+      filename: second.name,
+      expiresAt: Date.now() + 60_000,
+      replayed: false,
+    });
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledOnce());
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        localAssetIds: ["asset_first_retry", "asset_second_in_flight"],
+      }),
+    );
+  });
+
+  it("admits only one synchronous revision submission", async () => {
+    const current = revisionReadyObservation();
+    mocks.openObservation = current;
+    mocks.observeRefetch.mockResolvedValue({ data: current });
+    let resolveUpload: (receipt: {
+      fileId: string;
+      filename: string;
+      expiresAt: number;
+      replayed: boolean;
+    }) => void = () => undefined;
+    mocks.uploadChatLocalAsset.mockImplementation(
+      (file: File) =>
+        new Promise((resolve) => {
+          resolveUpload = resolve;
+        }),
+    );
+    render(<ConnectedSiteOpsConversationPanel />);
+    const file = new File([new Uint8Array([3])], "single.png", {
+      type: "image/png",
+      lastModified: 3,
+    });
+    fireEvent.change(screen.getByLabelText("修改要求"), {
+      target: { value: "加入图片" },
+    });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [file] },
+    });
+    const submit = screen.getByRole("button", { name: "生成修改版本" });
+    act(() => {
+      submit.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      submit.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await waitFor(() =>
+      expect(mocks.uploadChatLocalAsset).toHaveBeenCalledOnce(),
+    );
+    resolveUpload({
+      fileId: "asset_single_flight",
+      filename: file.name,
+      expiresAt: Date.now() + 60_000,
+      replayed: false,
+    });
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledOnce());
   });
 });

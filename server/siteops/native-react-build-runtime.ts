@@ -26,13 +26,19 @@ import { chromium, type Page } from "playwright";
 import { z } from "zod";
 
 import { siteBriefSchema, type SiteBrief } from "../../shared/siteops";
+import {
+  siteContentPlanV2Schema,
+  type SiteContentPlanV2,
+} from "../../shared/siteops-content-plan";
 import { canonicalJson } from "../../shared/siteops-workflow";
 import {
   NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
+  NATIVE_SOURCE_MAX_FILES,
   NATIVE_SOURCE_TAILWIND_V3_CONFIG_PATH,
   type NativeRuntimeAudit,
   type ValidatedNativeReactSource,
 } from "./native-react-source";
+import { previewNavigationBridgeSource } from "./preview-routing";
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 const MAX_BUILD_LOG_BYTES = 256 * 1024;
@@ -84,11 +90,27 @@ export type NativeReactBuildInput = {
    * hard compile/static-safety decision. Omission is recorded as a warning. */
   browserQa?: boolean;
   lighthouseQa?: boolean;
+  requiredUserMedia?: readonly {
+    publicPath: string;
+    contentSha256: string;
+  }[];
+  requiredKnowledgeMedia?: readonly {
+    assetId: string;
+    publicPath: string;
+    contentSha256: string;
+    routePaths: readonly string[];
+  }[];
+  /** The immutable information architecture and content contract for 2.9.
+   * Its SHA is over `${canonicalJson(plan)}\n`, exactly matching the private
+   * local-asset bytes persisted by the provider. */
+  contentPlan?: SiteContentPlanV2 | unknown;
+  contentPlanSha256?: string | null;
   /** V2 tasks must replay the auditor frozen with their receipt coordinates.
    * Direct V1 rebuilds retain the historical host-owned validation path. */
   runtimeAudit?: (input: {
     files: ReadonlyMap<string, Buffer>;
     expectedRoutePaths: readonly string[];
+    requireCanonicalSitePathname?: boolean;
   }) => NativeRuntimeAudit;
 };
 
@@ -116,6 +138,43 @@ export type NativeReactBuildContractV1 = {
   routes: string[];
   sourceSha256: string;
   distSha256: string;
+  contentPlanSha256?: string;
+  contentReceiptSha256?: string;
+  contentReceipt?: NativeContentReceiptV1;
+};
+
+export type NativeContentReceiptV1 = {
+  schemaVersion: 1;
+  contentPlanSha256: string;
+  routes: Array<{
+    path: string;
+    renderedTextSha256: string;
+    sections: Array<{
+      id: string;
+      sourceDocumentIds: string[];
+      mediaIds: string[];
+      renderedTextSha256: string;
+    }>;
+  }>;
+};
+
+export type NativeContentPlanDomSnapshot = {
+  path: string;
+  pageText: string;
+  mainText: string;
+  h1Texts: string[];
+  paragraphTexts: string[];
+  links: Array<{
+    text: string;
+    pathname: string | null;
+    protocol: string;
+    sameOrigin: boolean;
+    inGlobalNavigation: boolean;
+  }>;
+  sectionCandidates: Array<{
+    id: string | null;
+    text: string;
+  }>;
 };
 
 export type NativeReactQaReportV1 = {
@@ -159,6 +218,8 @@ export type MaterializedNativeReactSite = {
   visualQaSha256: string;
   provenanceJson: Buffer;
   provenanceSha256: string;
+  contentReceiptJson: Buffer | null;
+  contentReceiptSha256: string | null;
   buildLog: Buffer;
   files: ReadonlyMap<string, Buffer>;
   buildDelivery: NativeReactBuildDelivery;
@@ -179,6 +240,8 @@ export type NativeReactBuildErrorCode =
   | "NATIVE_BUILD_DIST_LIMIT_EXCEEDED"
   | "NATIVE_BUILD_ROUTE_MISSING"
   | "NATIVE_BUILD_LOCAL_ASSET_MISSING"
+  | "NATIVE_BUILD_USER_MEDIA_INVALID"
+  | "NATIVE_BUILD_CONTENT_PLAN_INVALID"
   | "NATIVE_BUILD_NETWORK_FORBIDDEN"
   | "NATIVE_BUILD_SECRET_FORBIDDEN";
 
@@ -272,6 +335,413 @@ function routePath(raw: string) {
     throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
   }
   return parts.length === 0 ? "/" : `/${parts.join("/")}/`;
+}
+
+function normalizedRenderedText(value: string) {
+  return value
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200D\uFEFF]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function contentPlanDiagnostic(code: string, file: string | null = null) {
+  return { code, file, line: null, column: null } as const;
+}
+
+function throwContentPlanInvalid(
+  code: string,
+  file: string | null = null,
+): never {
+  throw new NativeReactBuildError("NATIVE_BUILD_CONTENT_PLAN_INVALID", [
+    contentPlanDiagnostic(code, file),
+  ]);
+}
+
+function isWorkflowV29(workflowVersion: string | null | undefined) {
+  return /^2\.9(?:\.|$)/u.test(workflowVersion ?? "");
+}
+
+function parseFrozenContentPlan(input: {
+  contentPlan: unknown;
+  contentPlanSha256: string | null | undefined;
+  required: boolean;
+  allowCoordinateOnly: boolean;
+}) {
+  if (input.contentPlan === undefined || input.contentPlan === null) {
+    if (input.required) throwContentPlanInvalid("CONTENT_PLAN_REQUIRED");
+    if (input.contentPlanSha256) {
+      if (
+        !input.allowCoordinateOnly ||
+        !/^[a-f0-9]{64}$/u.test(input.contentPlanSha256)
+      ) {
+        throwContentPlanInvalid("CONTENT_PLAN_ARTIFACT_WITHOUT_PLAN");
+      }
+      return { plan: null, sha256: input.contentPlanSha256 };
+    }
+    return null;
+  }
+  const parsed = siteContentPlanV2Schema.safeParse(input.contentPlan);
+  if (!parsed.success) {
+    throw new NativeReactBuildError(
+      "NATIVE_BUILD_CONTENT_PLAN_INVALID",
+      parsed.error.issues
+        .slice(0, 32)
+        .map((issue) =>
+          contentPlanDiagnostic(
+            `CONTENT_PLAN_SCHEMA:${issue.code}`,
+            issue.path.length > 0 ? issue.path.join(".") : null,
+          ),
+        ),
+    );
+  }
+  if (!/^[a-f0-9]{64}$/u.test(input.contentPlanSha256 ?? "")) {
+    throwContentPlanInvalid("CONTENT_PLAN_SHA_REQUIRED");
+  }
+  const actualSha256 = sha256(
+    Buffer.from(`${canonicalJson(parsed.data)}\n`, "utf8"),
+  );
+  if (actualSha256 !== input.contentPlanSha256) {
+    throwContentPlanInvalid("CONTENT_PLAN_SHA_MISMATCH");
+  }
+  return {
+    plan: parsed.data,
+    sha256: actualSha256,
+  };
+}
+
+function snapshotSectionCandidate(input: {
+  candidates: NativeContentPlanDomSnapshot["sectionCandidates"];
+  id: string;
+  heading: string;
+  body: string;
+}) {
+  const semanticText = (value: string) =>
+    normalizedRenderedText(value).replace(
+      /([\p{Script=Han}\p{P}])\s+(?=[\p{Script=Han}\p{P}])/gu,
+      "$1",
+    );
+  const expectedHeading = semanticText(input.heading);
+  const expectedBodyFragments = input.body
+    .split(/\n\s*\n/gu)
+    .map(semanticText)
+    .filter(Boolean);
+  const containsBodyInOrder = (text: string) => {
+    const rendered = semanticText(text);
+    let cursor = 0;
+    for (const fragment of expectedBodyFragments) {
+      const index = rendered.indexOf(fragment, cursor);
+      if (index < 0) return false;
+      cursor = index + fragment.length;
+    }
+    return true;
+  };
+  const exactIdCandidates = input.candidates.filter(
+    (candidate) => candidate.id === input.id,
+  );
+  const candidates =
+    exactIdCandidates.length > 0 ? exactIdCandidates : input.candidates;
+  return candidates
+    .map((candidate) => ({
+      candidate,
+      text: normalizedRenderedText(candidate.text),
+    }))
+    .filter(
+      ({ text }) =>
+        semanticText(text).includes(expectedHeading) &&
+        containsBodyInOrder(text),
+    )
+    .sort((left, right) => left.text.length - right.text.length)[0];
+}
+
+function observedSiteContentReceipt(input: {
+  plan: SiteContentPlanV2;
+  contentPlanSha256: string;
+  snapshots: readonly NativeContentPlanDomSnapshot[];
+}): NativeContentReceiptV1 {
+  const snapshotsByPath = new Map(
+    input.snapshots.map((snapshot) => [snapshot.path, snapshot] as const),
+  );
+  return {
+    schemaVersion: 1,
+    contentPlanSha256: input.contentPlanSha256,
+    routes: input.plan.routes.map((route) => {
+      const snapshot = snapshotsByPath.get(route.path);
+      return {
+        path: route.path,
+        renderedTextSha256: sha256(
+          normalizedRenderedText(snapshot?.mainText ?? ""),
+        ),
+        sections: route.sections.map((section) => {
+          const candidate = snapshot
+            ? snapshotSectionCandidate({
+                candidates: snapshot.sectionCandidates,
+                id: section.id,
+                heading: section.heading,
+                body: section.body,
+              })
+            : undefined;
+          return {
+            id: section.id,
+            sourceDocumentIds: [
+              ...new Set(
+                section.sourceBindings.map(
+                  (binding) => binding.sourceDocumentId,
+                ),
+              ),
+            ],
+            mediaIds: [...section.mediaIds],
+            renderedTextSha256: sha256(candidate?.text ?? ""),
+          };
+        }),
+      };
+    }),
+  };
+}
+
+function contentPlanAdvisoryWarnings(
+  diagnostics: readonly NativeReactBuildDiagnostic[],
+): NativeReactBuildWarning[] {
+  const values =
+    diagnostics.length > 0
+      ? diagnostics
+      : [contentPlanDiagnostic("CONTENT_PLAN_RENDER_DIAGNOSTIC")];
+  return values.slice(0, 32).map((diagnostic, index) => ({
+    phase: "browser_qa" as const,
+    code: "NATIVE_CONTENT_PLAN_WARNING",
+    checkId: `content-plan:${diagnostic.code}:${index + 1}`,
+  }));
+}
+
+/** Audits browser-derived DOM snapshots against the frozen semantic plan.
+ * The receipt contains hashes and evidence coordinates only; rendered customer
+ * prose is deliberately not copied into build metadata. */
+export function auditSiteContentPlanRenderedRoutes(input: {
+  plan: SiteContentPlanV2;
+  contentPlanSha256: string;
+  snapshots: readonly NativeContentPlanDomSnapshot[];
+}): NativeContentReceiptV1 {
+  const manifest = input.plan.routes.map((route) => route.path);
+  const manifestSet = new Set(manifest);
+  if (
+    input.snapshots.length !== manifest.length ||
+    input.snapshots.some((snapshot, index) => snapshot.path !== manifest[index])
+  ) {
+    throwContentPlanInvalid("CONTENT_PLAN_BROWSER_ROUTE_MISMATCH");
+  }
+
+  const diagnostics: NativeReactBuildDiagnostic[] = [];
+  const diagnosticKeys = new Set<string>();
+  const recordDiagnostic = (code: string, file: string | null = null) => {
+    const key = `${code}\0${file ?? ""}`;
+    if (diagnosticKeys.has(key)) return;
+    diagnosticKeys.add(key);
+    diagnostics.push(contentPlanDiagnostic(code, file));
+  };
+  const linkTarget = (link: NativeContentPlanDomSnapshot["links"][number]) => {
+    if (link.pathname === null) return null;
+    try {
+      return routePath(link.pathname);
+    } catch {
+      return null;
+    }
+  };
+  const matchesPlannedLinkLabel = (
+    link: NativeContentPlanDomSnapshot["links"][number],
+    label: string,
+  ) => {
+    const text = normalizedRenderedText(link.text);
+    return text === label || text.includes(label);
+  };
+
+  const routeById = new Map(
+    input.plan.routes.map((route) => [route.id, route]),
+  );
+  for (const coverage of input.plan.coverage) {
+    if (coverage.status !== "used") continue;
+    for (const routeId of coverage.routeIds) {
+      const route = routeById.get(routeId);
+      if (
+        !route?.sections.some((section) =>
+          section.sourceBindings.some(
+            (binding) => binding.sourceDocumentId === coverage.sourceDocumentId,
+          ),
+        )
+      ) {
+        recordDiagnostic(
+          "CONTENT_PLAN_USED_SOURCE_NOT_BOUND",
+          route?.path ?? routeId,
+        );
+      }
+    }
+  }
+
+  const exactMainTextOwners = new Map<string, string>();
+  const paragraphOwners = new Map<string, string>();
+  const receiptRoutes: NativeContentReceiptV1["routes"] = [];
+  for (const [routeIndex, route] of input.plan.routes.entries()) {
+    const snapshot = input.snapshots[routeIndex]!;
+    const pageText = normalizedRenderedText(snapshot.pageText);
+    const mainText = normalizedRenderedText(snapshot.mainText);
+    const h1 = normalizedRenderedText(route.h1);
+    const summary = normalizedRenderedText(route.summary);
+    if (
+      !snapshot.h1Texts.some((value) => normalizedRenderedText(value) === h1)
+    ) {
+      recordDiagnostic("CONTENT_PLAN_H1_MISSING", route.path);
+    }
+    if (!pageText.includes(summary)) {
+      recordDiagnostic("CONTENT_PLAN_SUMMARY_MISSING", route.path);
+    }
+
+    const priorMainOwner = exactMainTextOwners.get(mainText);
+    if (mainText && priorMainOwner && priorMainOwner !== route.path) {
+      recordDiagnostic("CONTENT_PLAN_DUPLICATE_ROUTE_BODY", route.path);
+    }
+    if (mainText) exactMainTextOwners.set(mainText, route.path);
+    for (const paragraph of snapshot.paragraphTexts) {
+      const normalized = normalizedRenderedText(paragraph);
+      if (normalized.length < 80) continue;
+      const priorOwner = paragraphOwners.get(normalized);
+      if (priorOwner && priorOwner !== route.path) {
+        recordDiagnostic("CONTENT_PLAN_DUPLICATE_ROUTE_PARAGRAPH", route.path);
+      }
+      paragraphOwners.set(normalized, route.path);
+    }
+
+    for (const link of snapshot.links) {
+      if (!link.sameOrigin) {
+        if (link.protocol === "http:" || link.protocol === "https:") {
+          recordDiagnostic(
+            "CONTENT_PLAN_EXTERNAL_HTTP_LINK_FORBIDDEN",
+            route.path,
+          );
+        }
+        continue;
+      }
+      if (link.protocol !== "http:" && link.protocol !== "https:") {
+        recordDiagnostic("CONTENT_PLAN_INTERNAL_LINK_INVALID", route.path);
+        continue;
+      }
+      const target = linkTarget(link);
+      if (target === null) {
+        recordDiagnostic("CONTENT_PLAN_INTERNAL_LINK_INVALID", route.path);
+        continue;
+      }
+      if (!manifestSet.has(target)) {
+        recordDiagnostic(
+          "CONTENT_PLAN_INTERNAL_LINK_OUTSIDE_MANIFEST",
+          route.path,
+        );
+      }
+    }
+    for (const navigation of input.plan.navigation) {
+      const label = normalizedRenderedText(navigation.label);
+      if (
+        !snapshot.links.some(
+          (link) =>
+            link.inGlobalNavigation &&
+            link.sameOrigin &&
+            matchesPlannedLinkLabel(link, label) &&
+            linkTarget(link) === navigation.targetPath,
+        )
+      ) {
+        recordDiagnostic("CONTENT_PLAN_NAVIGATION_MISSING", route.path);
+      }
+    }
+    if (route.cta) {
+      const label = normalizedRenderedText(route.cta.label);
+      if (route.cta.targetPath) {
+        const targetLinks = snapshot.links.filter(
+          (link) =>
+            link.sameOrigin && linkTarget(link) === route.cta!.targetPath,
+        );
+        if (!targetLinks.some((link) => matchesPlannedLinkLabel(link, label))) {
+          recordDiagnostic(
+            targetLinks.length > 0
+              ? "CONTENT_PLAN_CTA_TEXT_MISMATCH"
+              : "CONTENT_PLAN_CTA_MISSING",
+            route.path,
+          );
+        }
+      } else if (!mainText.includes(label)) {
+        recordDiagnostic("CONTENT_PLAN_CTA_MISSING", route.path);
+      }
+    }
+
+    const receiptSections: NativeContentReceiptV1["routes"][number]["sections"] =
+      [];
+    for (const section of route.sections) {
+      const candidate = snapshotSectionCandidate({
+        candidates: snapshot.sectionCandidates,
+        id: section.id,
+        heading: section.heading,
+        body: section.body,
+      });
+      if (!candidate) {
+        const headingPresent = mainText.includes(
+          normalizedRenderedText(section.heading),
+        );
+        recordDiagnostic(
+          headingPresent
+            ? "CONTENT_PLAN_SECTION_BODY_MISSING"
+            : "CONTENT_PLAN_SECTION_HEADING_MISSING",
+          `${route.path}#${section.id}`,
+        );
+        continue;
+      }
+      receiptSections.push({
+        id: section.id,
+        sourceDocumentIds: [
+          ...new Set(
+            section.sourceBindings.map((binding) => binding.sourceDocumentId),
+          ),
+        ],
+        mediaIds: [...section.mediaIds],
+        renderedTextSha256: sha256(candidate.text),
+      });
+    }
+    receiptRoutes.push({
+      path: route.path,
+      renderedTextSha256: sha256(mainText),
+      sections: receiptSections,
+    });
+  }
+  if (diagnostics.length > 0) {
+    const sorted = [...diagnostics].sort((left, right) => {
+      const leftKey = `${left.code}\0${left.file ?? ""}`;
+      const rightKey = `${right.code}\0${right.file ?? ""}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    const firstByCode: NativeReactBuildDiagnostic[] = [];
+    const representedCodes = new Set<string>();
+    for (const diagnostic of sorted) {
+      if (representedCodes.has(diagnostic.code)) continue;
+      representedCodes.add(diagnostic.code);
+      firstByCode.push(diagnostic);
+    }
+    const selectedKeys = new Set(
+      firstByCode.map(
+        (diagnostic) => `${diagnostic.code}\0${diagnostic.file ?? ""}`,
+      ),
+    );
+    const repairDiagnostics = [
+      ...firstByCode,
+      ...sorted.filter(
+        (diagnostic) =>
+          !selectedKeys.has(`${diagnostic.code}\0${diagnostic.file ?? ""}`),
+      ),
+    ].slice(0, 32);
+    throw new NativeReactBuildError(
+      "NATIVE_BUILD_CONTENT_PLAN_INVALID",
+      repairDiagnostics,
+    );
+  }
+  return {
+    schemaVersion: 1,
+    contentPlanSha256: input.contentPlanSha256,
+    routes: receiptRoutes,
+  };
 }
 
 function routeOutput(route: string) {
@@ -866,6 +1336,11 @@ function normalizeRoutePages(input: {
   const rootHtml = root.toString("utf8");
   const routeOutputs = new Set(input.routes.map(routeOutput));
   routeOutputs.add("404.html");
+  for (const filename of fileMap.keys()) {
+    if (/\.html$/iu.test(filename) && !routeOutputs.has(filename)) {
+      fileMap.delete(filename);
+    }
+  }
   for (const output of routeOutputs) {
     const route =
       output === "404.html"
@@ -1184,10 +1659,20 @@ async function assertNativeBrowserRouteRendered(
         hasVisibleContent: false,
       };
     }
-    const visible = (element: Element) => {
+    const hasDirectText = [...root.childNodes].some(
+      (node) =>
+        node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim()),
+    );
+    const visibleCandidates = [
+      ...(hasDirectText ? [root] : []),
+      ...root.querySelectorAll("*"),
+    ];
+    let hasVisibleContent = false;
+    for (const element of visibleCandidates) {
       const bounds = element.getBoundingClientRect();
-      if (bounds.width <= 0 || bounds.height <= 0) return false;
+      if (bounds.width <= 0 || bounds.height <= 0) continue;
       let current: Element | null = element;
+      let visible = true;
       while (current) {
         const style = window.getComputedStyle(current);
         if (
@@ -1196,24 +1681,22 @@ async function assertNativeBrowserRouteRendered(
           style.contentVisibility === "hidden" ||
           Number.parseFloat(style.opacity) === 0
         ) {
-          return false;
+          visible = false;
+          break;
         }
         current = current.parentElement;
       }
-      return true;
-    };
+      if (visible) {
+        hasVisibleContent = true;
+        break;
+      }
+    }
     const rootBounds = root.getBoundingClientRect();
-    const hasDirectText = [...root.childNodes].some(
-      (node) =>
-        node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim()),
-    );
     return {
       exists: true,
       hasContent: hasDirectText || root.children.length > 0,
       hasLayout: rootBounds.width > 0 && rootBounds.height > 0,
-      hasVisibleContent:
-        (hasDirectText && visible(root)) ||
-        [...root.querySelectorAll("*")].some(visible),
+      hasVisibleContent,
     };
   });
   if (
@@ -1234,7 +1717,22 @@ async function runBrowserQaStrict(input: {
   workRoot: string;
   runLighthouse: boolean;
   abortSignal?: AbortSignal;
+  requiredUserMedia: readonly {
+    publicPath: string;
+    contentSha256: string;
+  }[];
+  requiredKnowledgeMedia: readonly {
+    assetId: string;
+    publicPath: string;
+    contentSha256: string;
+    routePaths: readonly string[];
+  }[];
+  contentPlan: SiteContentPlanV2 | null;
+  contentPlanSha256: string | null;
 }) {
+  const privatePreviewPrefix = "/__frontmind-siteops-preview-qa__/";
+  const privatePreviewQa =
+    input.mode === "preview" && Boolean(input.contentPlan);
   const fileMap = new Map(input.files.map((file) => [file.path, file.bytes]));
   const warnings: NativeReactBuildWarning[] = [];
   const screenshots: OutputFile[] = [];
@@ -1250,7 +1748,11 @@ async function runBrowserQaStrict(input: {
         response.writeHead(400).end();
         return;
       }
-      const clean = decoded.replace(/^\/+|\/+$/gu, "");
+      const canonicalDecoded =
+        privatePreviewQa && decoded.startsWith(privatePreviewPrefix)
+          ? `/${decoded.slice(privatePreviewPrefix.length)}`
+          : decoded;
+      const clean = canonicalDecoded.replace(/^\/+|\/+$/gu, "");
       const candidates = clean
         ? path.posix.extname(clean)
           ? [clean]
@@ -1291,6 +1793,9 @@ async function runBrowserQaStrict(input: {
   let axeViolationCount = 0;
   const axeViolationIds = new Set<string>();
   let browserAvailable = false;
+  let contentReceipt: NativeContentReceiptV1 | null = null;
+  const contentPlanSnapshots: NativeContentPlanDomSnapshot[] = [];
+  const renderedUserMedia = new Set<string>();
   try {
     assertNotAborted(input.abortSignal);
     const browser = await chromium.launch({
@@ -1312,6 +1817,7 @@ async function runBrowserQaStrict(input: {
         serviceWorkers: "block",
       });
       const page = await context.newPage();
+      const renderedKnowledgeMedia = new Set<string>();
       const runtimeFailureCodes = new Set<NativeBrowserRuntimeFailureCode>();
       let externalRequestDetected = false;
       let cspViolationDetected = false;
@@ -1324,6 +1830,11 @@ async function runBrowserQaStrict(input: {
       await page.exposeBinding("__frontmindNativePolicyViolation", () => {
         cspViolationDetected = true;
       });
+      if (privatePreviewQa) {
+        await page.addInitScript({
+          content: `if(location.pathname.startsWith(${JSON.stringify(privatePreviewPrefix)})){${previewNavigationBridgeSource(privatePreviewPrefix)}}`,
+        });
+      }
       await page.addInitScript(() => {
         const scope = globalThis as typeof globalThis & {
           __frontmindNativeConsoleError: () => Promise<void>;
@@ -1354,9 +1865,16 @@ async function runBrowserQaStrict(input: {
         }
         await route.continue();
       });
-      const navigateAndAssertRendered = async (route: string) => {
+      const navigateAndAssertRendered = async (
+        route: string,
+        usePrivatePreviewPath: boolean,
+        recordEvidence: boolean,
+      ) => {
         runtimeFailureCodes.clear();
-        const response = await page.goto(`${origin}${route}`, {
+        const browserPath = usePrivatePreviewPath
+          ? `${privatePreviewPrefix}${route.slice(1)}`
+          : route;
+        const response = await page.goto(`${origin}${browserPath}`, {
           waitUntil: "networkidle",
           timeout: 15_000,
         });
@@ -1367,12 +1885,170 @@ async function runBrowserQaStrict(input: {
           throw new NativeReactBuildError("NATIVE_BUILD_NETWORK_FORBIDDEN");
         }
         await assertNativeBrowserRouteRendered(page, runtimeFailureCodes);
+        const imageReferences = await page
+          .locator("img")
+          .evaluateAll((images) =>
+            images.map((image) => ({
+              pathname: new URL(
+                (image as HTMLImageElement).currentSrc ||
+                  (image as HTMLImageElement).src,
+                document.baseURI,
+              ).pathname,
+              alt: image.getAttribute("alt")?.trim() ?? "",
+            })),
+          );
+        if (recordEvidence) {
+          for (const required of input.requiredUserMedia) {
+            if (
+              imageReferences.some(
+                (reference) =>
+                  reference.pathname === required.publicPath &&
+                  reference.alt.length > 0,
+              )
+            ) {
+              renderedUserMedia.add(required.publicPath);
+            }
+          }
+          for (const required of input.requiredKnowledgeMedia) {
+            if (
+              required.routePaths.includes(route) &&
+              imageReferences.some(
+                (reference) =>
+                  reference.pathname === required.publicPath &&
+                  reference.alt.length > 0,
+              )
+            ) {
+              renderedKnowledgeMedia.add(`${required.assetId}:${route}`);
+            }
+          }
+        }
         if (externalRequestDetected || cspViolationDetected) {
           throw new NativeReactBuildError("NATIVE_BUILD_NETWORK_FORBIDDEN");
         }
+        return await page.evaluate((currentPath) => {
+          const main =
+            document.querySelector("main") ?? document.querySelector("#root");
+          const candidateElements: Element[] = [];
+          const seenCandidates = new Set<Element>();
+          for (const element of document.querySelectorAll(
+            "[data-siteops-section-id], [data-section-id], section, article",
+          )) {
+            if (seenCandidates.has(element)) continue;
+            seenCandidates.add(element);
+            candidateElements.push(element);
+          }
+          if (main && !seenCandidates.has(main)) {
+            candidateElements.push(main);
+          }
+          const visibleTextParts: string[] = [];
+          const walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+          );
+          let node = walker.nextNode();
+          while (node) {
+            const parent = node.parentElement;
+            if (
+              parent &&
+              !parent.closest("script, style, nav, footer, [role=navigation]")
+            ) {
+              let current: Element | null = parent;
+              let visible = true;
+              while (current) {
+                const style = window.getComputedStyle(current);
+                if (
+                  style.display === "none" ||
+                  style.visibility === "hidden" ||
+                  style.contentVisibility === "hidden" ||
+                  Number.parseFloat(style.opacity) === 0
+                ) {
+                  visible = false;
+                  break;
+                }
+                current = current.parentElement;
+              }
+              if (visible && node.textContent?.trim()) {
+                visibleTextParts.push(node.textContent);
+              }
+            }
+            node = walker.nextNode();
+          }
+          const h1Texts: string[] = [];
+          for (const element of document.querySelectorAll("h1")) {
+            h1Texts.push(
+              ((element as HTMLElement).innerText ?? "")
+                .replace(/\s+/gu, " ")
+                .trim(),
+            );
+          }
+          const paragraphTexts: string[] = [];
+          for (const element of document.querySelectorAll(
+            "main p, main li, main blockquote",
+          )) {
+            paragraphTexts.push(
+              ((element as HTMLElement).innerText ?? "")
+                .replace(/\s+/gu, " ")
+                .trim(),
+            );
+          }
+          const links: NativeContentPlanDomSnapshot["links"] = [];
+          for (const element of document.querySelectorAll("a[href]")) {
+            const anchor = element as HTMLAnchorElement;
+            let target: URL | null = null;
+            try {
+              target = new URL(anchor.href, document.baseURI);
+            } catch {
+              target = null;
+            }
+            links.push({
+              text: (anchor.innerText || anchor.textContent || "")
+                .replace(/\s+/gu, " ")
+                .trim(),
+              pathname: target?.pathname ?? null,
+              protocol: target?.protocol ?? "invalid:",
+              sameOrigin: target?.origin === window.location.origin,
+              inGlobalNavigation: Boolean(
+                anchor.closest("nav, header, footer, [role=navigation]"),
+              ),
+            });
+          }
+          const sectionCandidates: NativeContentPlanDomSnapshot["sectionCandidates"] =
+            [];
+          for (const element of candidateElements) {
+            sectionCandidates.push({
+              id:
+                element.getAttribute("data-siteops-section-id")?.trim() ||
+                element.getAttribute("data-section-id")?.trim() ||
+                element.id.trim() ||
+                null,
+              text: ((element as HTMLElement).innerText ?? "")
+                .replace(/\s+/gu, " ")
+                .trim(),
+            });
+          }
+          return {
+            path: currentPath,
+            pageText: visibleTextParts.join(" ").replace(/\s+/gu, " ").trim(),
+            mainText: ((main as HTMLElement | null)?.innerText ?? "")
+              .replace(/\s+/gu, " ")
+              .trim(),
+            h1Texts,
+            paragraphTexts,
+            links,
+            sectionCandidates,
+          } satisfies NativeContentPlanDomSnapshot;
+        }, route);
       };
       for (const [routeIndex, route] of input.routes.entries()) {
-        await navigateAndAssertRendered(route);
+        if (privatePreviewQa) {
+          await navigateAndAssertRendered(route, false, false);
+        }
+        const snapshot = await navigateAndAssertRendered(
+          route,
+          privatePreviewQa,
+          true,
+        );
+        if (input.contentPlan) contentPlanSnapshots.push(snapshot);
         if (routeIndex >= 3) continue;
         const axe = await new AxeBuilder({ page })
           .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
@@ -1384,8 +2060,52 @@ async function runBrowserQaStrict(input: {
           axeViolationIds.add(violation.id);
         }
       }
+      if (input.contentPlan) {
+        if (!input.contentPlanSha256) {
+          throwContentPlanInvalid("CONTENT_PLAN_SHA_REQUIRED");
+        }
+        contentReceipt = auditSiteContentPlanRenderedRoutes({
+          plan: input.contentPlan,
+          contentPlanSha256: input.contentPlanSha256,
+          snapshots: contentPlanSnapshots,
+        });
+      }
+      const missingUserMedia = input.requiredUserMedia.filter(
+        (asset) => !renderedUserMedia.has(asset.publicPath),
+      );
+      if (missingUserMedia.length > 0) {
+        throw new NativeReactBuildError(
+          "NATIVE_BUILD_USER_MEDIA_INVALID",
+          missingUserMedia.map((asset) => ({
+            code: "USER_MEDIA_IMG_ALT_REQUIRED",
+            file: asset.publicPath,
+            line: null,
+            column: null,
+          })),
+        );
+      }
+      const missingKnowledgeMedia = input.requiredKnowledgeMedia.flatMap(
+        (asset) =>
+          asset.routePaths
+            .filter(
+              (route) =>
+                !renderedKnowledgeMedia.has(`${asset.assetId}:${route}`),
+            )
+            .map((route) => ({ asset, route })),
+      );
+      if (missingKnowledgeMedia.length > 0) {
+        throw new NativeReactBuildError(
+          "NATIVE_BUILD_CONTENT_PLAN_INVALID",
+          missingKnowledgeMedia.map(({ asset, route }) => ({
+            code: "CONTENT_PLAN_MEDIA_IMG_ALT_REQUIRED",
+            file: `${route}#${asset.assetId}`,
+            line: null,
+            column: null,
+          })),
+        );
+      }
       await page.setViewportSize({ width: 1440, height: 1000 });
-      await navigateAndAssertRendered("/");
+      await navigateAndAssertRendered("/", privatePreviewQa, false);
       screenshots.push({
         path: "screenshots/home-1440.png",
         bytes: Buffer.from(
@@ -1408,14 +2128,65 @@ async function runBrowserQaStrict(input: {
       throw new NativeReactBuildError("NATIVE_BUILD_ABORTED");
     }
     if (error instanceof NativeReactBuildError) {
-      await closeServer();
-      throw error;
+      if (
+        error.code === "NATIVE_BUILD_CONTENT_PLAN_INVALID" &&
+        input.contentPlan &&
+        input.contentPlanSha256
+      ) {
+        const missingUserMedia = input.requiredUserMedia.filter(
+          (asset) => !renderedUserMedia.has(asset.publicPath),
+        );
+        if (missingUserMedia.length > 0) {
+          await closeServer();
+          throw new NativeReactBuildError(
+            "NATIVE_BUILD_USER_MEDIA_INVALID",
+            missingUserMedia.map((asset) => ({
+              code: "USER_MEDIA_IMG_ALT_REQUIRED",
+              file: asset.publicPath,
+              line: null,
+              column: null,
+            })),
+          );
+        }
+        warnings.push(...contentPlanAdvisoryWarnings(error.diagnostics));
+        contentReceipt ??= observedSiteContentReceipt({
+          plan: input.contentPlan,
+          contentPlanSha256: input.contentPlanSha256,
+          snapshots: contentPlanSnapshots,
+        });
+      } else {
+        await closeServer();
+        throw error;
+      }
+    } else if (input.contentPlan && input.contentPlanSha256) {
+      if (input.requiredUserMedia.length > 0) {
+        await closeServer();
+        throw new NativeReactBuildError("NATIVE_BUILD_USER_MEDIA_INVALID", [
+          {
+            code: "USER_MEDIA_BROWSER_AUDIT_UNAVAILABLE",
+            file: null,
+            line: null,
+            column: null,
+          },
+        ]);
+      }
+      warnings.push({
+        phase: "browser_qa",
+        code: "NATIVE_BROWSER_QA_UNAVAILABLE",
+        checkId: "browser:runtime",
+      });
+      contentReceipt ??= observedSiteContentReceipt({
+        plan: input.contentPlan,
+        contentPlanSha256: input.contentPlanSha256,
+        snapshots: contentPlanSnapshots,
+      });
+    } else {
+      warnings.push({
+        phase: "browser_qa",
+        code: "NATIVE_BROWSER_QA_UNAVAILABLE",
+        checkId: "browser:runtime",
+      });
     }
-    warnings.push({
-      phase: "browser_qa",
-      code: "NATIVE_BROWSER_QA_UNAVAILABLE",
-      checkId: "browser:runtime",
-    });
   }
   for (const violationId of [...axeViolationIds].sort()) {
     warnings.push({
@@ -1523,6 +2294,7 @@ async function runBrowserQaStrict(input: {
     },
     warnings,
     screenshots,
+    contentReceipt,
   };
 }
 
@@ -1538,6 +2310,24 @@ async function runBrowserQa(input: Parameters<typeof runBrowserQaStrict>[0]) {
       throw new NativeReactBuildError("NATIVE_BUILD_ABORTED");
     }
     if (error instanceof NativeReactBuildError) throw error;
+    if (input.requiredUserMedia.length > 0) {
+      throw new NativeReactBuildError("NATIVE_BUILD_USER_MEDIA_INVALID", [
+        {
+          code: "USER_MEDIA_BROWSER_AUDIT_UNAVAILABLE",
+          file: null,
+          line: null,
+          column: null,
+        },
+      ]);
+    }
+    const contentReceipt =
+      input.contentPlan && input.contentPlanSha256
+        ? observedSiteContentReceipt({
+            plan: input.contentPlan,
+            contentPlanSha256: input.contentPlanSha256,
+            snapshots: [],
+          })
+        : null;
     return {
       summary: {
         available: false,
@@ -1560,6 +2350,7 @@ async function runBrowserQa(input: Parameters<typeof runBrowserQaStrict>[0]) {
         },
       ],
       screenshots: [] as OutputFile[],
+      contentReceipt,
     };
   }
 }
@@ -1618,7 +2409,24 @@ export async function materializeNativeReactSource(
   }
   const build = parsedBuild.data;
   const brief = parsedBrief.data;
-  const routes = brief.routes.map((route) => routePath(route.slug));
+  const frozenContentPlan = parseFrozenContentPlan({
+    contentPlan: input.contentPlan,
+    contentPlanSha256: input.contentPlanSha256,
+    required: isWorkflowV29(build.workflowVersion),
+    allowCoordinateOnly:
+      input.mode === "production" && !isWorkflowV29(build.workflowVersion),
+  });
+  const briefRoutes = brief.routes.map((route) => routePath(route.slug));
+  const planRoutes = frozenContentPlan?.plan?.routes.map((route) => route.path);
+  if (
+    input.mode === "preview" &&
+    planRoutes &&
+    (briefRoutes.length !== planRoutes.length ||
+      briefRoutes.some((route, index) => route !== planRoutes[index]))
+  ) {
+    throwContentPlanInvalid("CONTENT_PLAN_ROUTE_MANIFEST_MISMATCH");
+  }
+  const routes = planRoutes ?? briefRoutes;
   if (new Set(routes).size !== routes.length) {
     throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
   }
@@ -1636,13 +2444,86 @@ export async function materializeNativeReactSource(
     throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
   }
   const sourceSha256 = validateSourceBinding(input);
+  const requiredUserMedia = input.requiredUserMedia ?? [];
+  if (
+    // Eight is the per-message admission limit. A verified child build may
+    // inherit media from many completed revisions, so replay is bounded by
+    // the immutable native source archive's file ceiling instead.
+    requiredUserMedia.length > NATIVE_SOURCE_MAX_FILES ||
+    new Set(requiredUserMedia.map((asset) => asset.publicPath)).size !==
+      requiredUserMedia.length ||
+    requiredUserMedia.some(
+      (asset) =>
+        !/^\/frontmind-user-media\/[a-f0-9]{64}\.(?:png|jpg|webp)$/u.test(
+          asset.publicPath,
+        ) || !/^[a-f0-9]{64}$/u.test(asset.contentSha256),
+    )
+  ) {
+    throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
+  }
+  const requiredKnowledgeMedia = input.requiredKnowledgeMedia ?? [];
+  if (
+    requiredKnowledgeMedia.length > 100 ||
+    new Set(requiredKnowledgeMedia.map((asset) => asset.assetId)).size !==
+      requiredKnowledgeMedia.length ||
+    new Set(requiredKnowledgeMedia.map((asset) => asset.publicPath)).size !==
+      requiredKnowledgeMedia.length ||
+    requiredKnowledgeMedia.some(
+      (asset) =>
+        !asset.assetId.trim() ||
+        asset.assetId.length > 191 ||
+        !/^\/frontmind-knowledge-media\/[a-f0-9]{64}\.(?:png|jpg|webp)$/u.test(
+          asset.publicPath,
+        ) ||
+        !/^[a-f0-9]{64}$/u.test(asset.contentSha256) ||
+        asset.routePaths.length < 1 ||
+        new Set(asset.routePaths).size !== asset.routePaths.length ||
+        asset.routePaths.some((route) => !routes.includes(route)),
+    )
+  ) {
+    throw new NativeReactBuildError("NATIVE_BUILD_INPUT_INVALID");
+  }
+  if (frozenContentPlan?.plan) {
+    const expectedKnowledgeMedia = new Map<string, Set<string>>();
+    for (const route of frozenContentPlan.plan.routes) {
+      for (const mediaId of new Set(
+        route.sections.flatMap((section) => section.mediaIds),
+      )) {
+        if (mediaId.startsWith("customer-media:")) continue;
+        const routePaths = expectedKnowledgeMedia.get(mediaId) ?? new Set();
+        routePaths.add(route.path);
+        expectedKnowledgeMedia.set(mediaId, routePaths);
+      }
+    }
+    const actualById = new Map(
+      requiredKnowledgeMedia.map((asset) => [asset.assetId, asset] as const),
+    );
+    if (
+      actualById.size !== expectedKnowledgeMedia.size ||
+      [...expectedKnowledgeMedia].some(([assetId, expectedRoutes]) => {
+        const actual = actualById.get(assetId);
+        return (
+          !actual ||
+          actual.routePaths.length !== expectedRoutes.size ||
+          actual.routePaths.some((route) => !expectedRoutes.has(route))
+        );
+      })
+    ) {
+      throwContentPlanInvalid("CONTENT_PLAN_MEDIA_COORDINATES_MISMATCH");
+    }
+  } else if (requiredKnowledgeMedia.length > 0) {
+    throwContentPlanInvalid("CONTENT_PLAN_MEDIA_WITHOUT_PLAN");
+  }
   if ("runtimeContractVersion" in input.validatedSource.receipt) {
     if (!input.runtimeAudit) {
       throw new NativeReactBuildError("NATIVE_BUILD_RUNTIME_AUDIT_UNAVAILABLE");
     }
     const runtimeAudit = input.runtimeAudit({
       files: input.validatedSource.files,
-      expectedRoutePaths: brief.routes.map((route) => route.slug),
+      expectedRoutePaths: frozenContentPlan?.plan
+        ? routes
+        : brief.routes.map((route) => route.slug),
+      requireCanonicalSitePathname: isWorkflowV29(build.workflowVersion),
     });
     if (!runtimeAudit.ok) {
       throw new NativeReactBuildError(
@@ -1680,6 +2561,46 @@ export async function materializeNativeReactSource(
       canonicalOrigin,
       forbiddenTokens: [input.validatedSource.receipt.operationToken],
     });
+    for (const asset of requiredUserMedia) {
+      const outputPath = asset.publicPath.replace(/^\//u, "");
+      const output = files.find((file) => file.path === outputPath);
+      if (!output || sha256(output.bytes) !== asset.contentSha256) {
+        throw new NativeReactBuildError("NATIVE_BUILD_USER_MEDIA_INVALID", [
+          {
+            code: "USER_MEDIA_DIST_FILE_MISSING_OR_CHANGED",
+            file: asset.publicPath,
+            line: null,
+            column: null,
+          },
+        ]);
+      }
+    }
+    for (const asset of requiredKnowledgeMedia) {
+      const outputPath = asset.publicPath.replace(/^\//u, "");
+      const output = files.find((file) => file.path === outputPath);
+      if (!output || sha256(output.bytes) !== asset.contentSha256) {
+        throw new NativeReactBuildError("NATIVE_BUILD_CONTENT_PLAN_INVALID", [
+          {
+            code: "CONTENT_PLAN_MEDIA_DIST_FILE_MISSING_OR_CHANGED",
+            file: asset.publicPath,
+            line: null,
+            column: null,
+          },
+        ]);
+      }
+    }
+    if (input.browserQa === false) {
+      if (requiredUserMedia.length > 0) {
+        throw new NativeReactBuildError("NATIVE_BUILD_USER_MEDIA_INVALID", [
+          {
+            code: "USER_MEDIA_BROWSER_AUDIT_REQUIRED",
+            file: null,
+            line: null,
+            column: null,
+          },
+        ]);
+      }
+    }
     const browserQa =
       input.browserQa === false
         ? {
@@ -1704,6 +2625,14 @@ export async function materializeNativeReactSource(
               },
             ],
             screenshots: [] as OutputFile[],
+            contentReceipt:
+              frozenContentPlan?.plan && frozenContentPlan.sha256
+                ? observedSiteContentReceipt({
+                    plan: frozenContentPlan.plan,
+                    contentPlanSha256: frozenContentPlan.sha256,
+                    snapshots: [],
+                  })
+                : null,
           }
         : await runBrowserQa({
             files,
@@ -1712,7 +2641,28 @@ export async function materializeNativeReactSource(
             workRoot: root,
             runLighthouse: input.lighthouseQa !== false,
             abortSignal: input.abortSignal,
+            requiredUserMedia,
+            requiredKnowledgeMedia,
+            contentPlan: frozenContentPlan?.plan ?? null,
+            contentPlanSha256: frozenContentPlan?.sha256 ?? null,
           });
+    if (frozenContentPlan?.plan && !browserQa.contentReceipt) {
+      throwContentPlanInvalid("CONTENT_PLAN_BROWSER_RECEIPT_MISSING");
+    }
+    if (requiredUserMedia.length > 0) {
+      checks.push({
+        id: "user-media:dist-and-dom",
+        passed: true,
+        detail: `${requiredUserMedia.length} frozen user media assets retain exact bytes and render as img elements with non-empty alt text.`,
+      });
+    }
+    if (requiredKnowledgeMedia.length > 0) {
+      checks.push({
+        id: "knowledge-media:dist",
+        passed: true,
+        detail: `${requiredKnowledgeMedia.length} frozen knowledge media assets retain exact bytes in the compiled output.`,
+      });
+    }
     const screenshotBytes = browserQa.screenshots.reduce(
       (total, file) => total + file.bytes.length,
       0,
@@ -1737,6 +2687,13 @@ export async function materializeNativeReactSource(
     };
     const distZip = await deterministicZip(files, MAX_DIST_BYTES);
     const distSha256 = sha256(distZip);
+    const contentReceipt = browserQa.contentReceipt;
+    const contentReceiptJson = contentReceipt
+      ? Buffer.from(`${canonicalJson(contentReceipt)}\n`, "utf8")
+      : null;
+    const contentReceiptSha256 = contentReceiptJson
+      ? sha256(contentReceiptJson)
+      : null;
     const contract: NativeReactBuildContractV1 = {
       schemaVersion: 1,
       contractKind: "twenty_first_native_build_contract",
@@ -1749,6 +2706,15 @@ export async function materializeNativeReactSource(
       routes,
       sourceSha256,
       distSha256,
+      ...(frozenContentPlan?.plan
+        ? {
+            contentPlanSha256: frozenContentPlan.sha256,
+            contentReceiptSha256: contentReceiptSha256!,
+            contentReceipt: contentReceipt!,
+          }
+        : frozenContentPlan
+          ? { contentPlanSha256: frozenContentPlan.sha256 }
+          : {}),
     };
     const contractJson = jsonBuffer(contract);
     const qa: NativeReactQaReportV1 = {
@@ -1786,6 +2752,15 @@ export async function materializeNativeReactSource(
       runtimeInstallPerformed: false,
       linkedHostDependencies: dependencies,
       buildDelivery,
+      ...(frozenContentPlan?.plan
+        ? {
+            contentPlanSha256: frozenContentPlan.sha256,
+            contentReceiptSha256: contentReceiptSha256!,
+            contentReceipt: contentReceipt!,
+          }
+        : frozenContentPlan
+          ? { contentPlanSha256: frozenContentPlan.sha256 }
+          : {}),
     };
     const provenanceJson = jsonBuffer(provenance);
     return {
@@ -1802,6 +2777,8 @@ export async function materializeNativeReactSource(
       visualQaSha256: sha256(visualQaZip),
       provenanceJson,
       provenanceSha256: sha256(provenanceJson),
+      contentReceiptJson,
+      contentReceiptSha256,
       buildLog,
       files: new Map(files.map((file) => [file.path, file.bytes])),
       buildDelivery,

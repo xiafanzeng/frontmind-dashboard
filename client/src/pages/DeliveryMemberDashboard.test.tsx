@@ -800,7 +800,7 @@ describe("DeliveryMemberDashboard project context", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "确认后，旧官网将进入安全下线流程；下线确认完成后，当前官网轮次将重置，企业知识库保持不变，客户可点击“从知识库开始建站”创建全新官网任务。",
+        "确认后，旧官网将进入安全下线流程；当前官网轮次将重置，旧知识库版本不会复用。客户需全新上传并发布知识库后，才能创建全新官网任务。",
       ),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "确认通过" }));
@@ -851,7 +851,7 @@ describe("DeliveryMemberDashboard project context", () => {
     expect(screen.getByText("重置需求已通过")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "旧官网已下线；企业知识库保持不变，客户可点击“从知识库开始建站”。",
+        "旧官网已下线；旧知识库版本不会复用，客户需全新上传并发布知识库后再开始建站。",
       ),
     ).toBeInTheDocument();
     expect(
@@ -1067,7 +1067,7 @@ describe("DeliveryMemberDashboard project context", () => {
     [false, "当前需求状态：待通过重置。"],
     [
       true,
-      "当前需求状态：旧官网已下线，企业知识库保持不变；客户可点击“从知识库开始建站”。",
+      "当前需求状态：旧官网已下线，旧知识库版本不会复用；客户需全新上传并发布知识库后再开始建站。",
     ],
   ] as const)(
     "projects the real site-rebuild state in the focused customer card (applied: %s)",

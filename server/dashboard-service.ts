@@ -12,6 +12,7 @@ import {
   knowledgeBaseSnapshots,
   serviceContracts,
   serviceProgressReports,
+  siteProjects,
   upstreamResources,
   userAdminAssignments,
   userDashboardContents,
@@ -1035,6 +1036,71 @@ export async function getLatestKnowledgeSnapshot(userId: number) {
   return rows[0] ? publicKnowledgeSnapshot(rows[0]) : null;
 }
 
+/**
+ * Returns the only knowledge snapshot that may seed a newly approved SiteOps
+ * 2.9 task. Approved reset rotates an opaque project epoch without deleting
+ * historical snapshots, so a fresh epoch must never fall back to the globally
+ * active pre-reset snapshot. A null project epoch preserves pre-2.9 behavior.
+ *
+ * The start reservation revalidates this binding while holding the project
+ * row lock; this read-side filter keeps the normal post-reset request on the
+ * empty-prefill path while that transactional check closes reset races.
+ */
+export async function getLatestKnowledgeSnapshotForSiteOpsInput(
+  userId: number,
+) {
+  const db = await requireDb();
+  const [projectRows, snapshotRows] = await Promise.all([
+    db
+      .select({ knowledgeInputEpochId: siteProjects.knowledgeInputEpochId })
+      .from(siteProjects)
+      .where(eq(siteProjects.userId, userId))
+      .limit(1),
+    db
+      .select()
+      .from(knowledgeBaseSnapshots)
+      .where(
+        and(
+          eq(knowledgeBaseSnapshots.userId, userId),
+          eq(knowledgeBaseSnapshots.status, "active"),
+        ),
+      )
+      .orderBy(desc(knowledgeBaseSnapshots.version))
+      .limit(1),
+  ]);
+  const knowledgeInputEpochId = projectRows[0]?.knowledgeInputEpochId ?? null;
+  const snapshot = snapshotRows[0];
+  if (
+    !snapshot ||
+    (knowledgeInputEpochId &&
+      snapshot.siteOpsKnowledgeInputEpochId !== knowledgeInputEpochId)
+  ) {
+    return null;
+  }
+  return publicKnowledgeSnapshot(snapshot);
+}
+
+export function assertSiteOpsKnowledgeSnapshotPublicationEpoch(input: {
+  currentProjectEpochId: string | null;
+  immutableSourceEpochId: string | null;
+  hasImmutableSource: boolean;
+}) {
+  if (
+    input.currentProjectEpochId === null &&
+    input.immutableSourceEpochId === null
+  ) {
+    return;
+  }
+  if (
+    !input.hasImmutableSource ||
+    input.immutableSourceEpochId !== input.currentProjectEpochId
+  ) {
+    throw new Error(
+      "知识库来源任务已早于当前官网重置批次，请全新上传后重跑",
+    );
+  }
+}
+
 export async function getKnowledgeSnapshotById(input: {
   userId: number;
   snapshotId: string;
@@ -1172,8 +1238,22 @@ export async function createKnowledgeSnapshot(input: {
         importProjectBindings[0].projectId,
       );
     }
+    // Preserve import reservation's website-project -> SiteOps-project lock
+    // order, then match approved reset's SiteOps-project -> user order. This
+    // keeps all three paths acyclic while making the source epoch comparison
+    // and active-snapshot replacement one atomic publication boundary.
+    const siteProjectRows = await tx
+      .select({ knowledgeInputEpochId: siteProjects.knowledgeInputEpochId })
+      .from(siteProjects)
+      .where(eq(siteProjects.userId, input.userId))
+      .limit(1)
+      .for("update");
+    const currentSiteOpsKnowledgeInputEpochId =
+      siteProjectRows[0]?.knowledgeInputEpochId ?? null;
     let publicationUsesArchiveHash = false;
     let publicationStateEpoch: number | null = null;
+    let siteOpsKnowledgeInputEpochId: string | null = null;
+    let hasImmutableEpochSource = false;
     const lockedUsers = await tx
       .select({ id: users.id })
       .from(users)
@@ -1190,6 +1270,8 @@ export async function createKnowledgeSnapshot(input: {
           userId: knowledgeImportReceipts.userId,
           status: knowledgeImportReceipts.status,
           revision: knowledgeImportReceipts.revision,
+          siteOpsKnowledgeInputEpochId:
+            knowledgeImportReceipts.siteOpsKnowledgeInputEpochId,
         })
         .from(knowledgeImportReceipts)
         .where(
@@ -1206,6 +1288,9 @@ export async function createKnowledgeSnapshot(input: {
       ) {
         throw new Error("知识库导入回执已由其他请求接管");
       }
+      siteOpsKnowledgeInputEpochId =
+        receipt.siteOpsKnowledgeInputEpochId ?? null;
+      hasImmutableEpochSource = true;
     }
     if (input.sourceBuildId) {
       const builds = await tx
@@ -1231,6 +1316,8 @@ export async function createKnowledgeSnapshot(input: {
           packageDescriptorHash: knowledgeBaseBuilds.packageDescriptorHash,
           packageArchiveSha256: knowledgeBaseBuilds.packageArchiveSha256,
           stateEpoch: knowledgeBaseBuilds.stateEpoch,
+          siteOpsKnowledgeInputEpochId:
+            knowledgeBaseBuilds.siteOpsKnowledgeInputEpochId,
         })
         .from(knowledgeBaseBuilds)
         .where(
@@ -1272,7 +1359,22 @@ export async function createKnowledgeSnapshot(input: {
       }
       publicationUsesArchiveHash = Boolean(builds[0].packageArchiveSha256);
       publicationStateEpoch = builds[0].stateEpoch;
+      const buildKnowledgeInputEpochId =
+        builds[0].siteOpsKnowledgeInputEpochId ?? null;
+      if (
+        hasImmutableEpochSource &&
+        siteOpsKnowledgeInputEpochId !== buildKnowledgeInputEpochId
+      ) {
+        throw new Error("知识库来源任务与当前官网重置批次不一致");
+      }
+      siteOpsKnowledgeInputEpochId = buildKnowledgeInputEpochId;
+      hasImmutableEpochSource = true;
     }
+    assertSiteOpsKnowledgeSnapshotPublicationEpoch({
+      currentProjectEpochId: currentSiteOpsKnowledgeInputEpochId,
+      immutableSourceEpochId: siteOpsKnowledgeInputEpochId,
+      hasImmutableSource: hasImmutableEpochSource,
+    });
     const latest = await tx
       .select({ version: knowledgeBaseSnapshots.version })
       .from(knowledgeBaseSnapshots)
@@ -1298,6 +1400,7 @@ export async function createKnowledgeSnapshot(input: {
       sourceBuildId: input.sourceBuildId,
       sourceBuildRevision: input.sourceBuildRevision,
       sourceTaskId: input.sourceTaskId,
+      siteOpsKnowledgeInputEpochId,
       sourceArtifactHash: input.sourceArtifactHash,
       archiveHash: input.archiveHash,
       maintenanceTicketId: input.maintenanceTicketId,

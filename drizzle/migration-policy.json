@@ -19,6 +19,8 @@
     "0063_lean_blue_marvel": "expand",
     "0064_siteops_v1": "contract",
     "0065_siteops_alidns_oauth": "contract",
-    "0066_visual_candidate_pools": "expand"
+    "0066_visual_candidate_pools": "expand",
+    "0067_siteops_revision_inputs": "expand",
+    "0068_siteops_knowledge_input_epoch": "expand"
   }
 }

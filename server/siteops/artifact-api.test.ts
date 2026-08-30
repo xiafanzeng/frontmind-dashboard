@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import express from "express";
 import JSZip from "jszip";
 import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const buildId = "123e4567-e89b-42d3-a456-426614174000";
@@ -39,7 +40,12 @@ vi.mock("./static-template-catalog", () => ({
     mocks.openStaticTemplateCatalogVersionPreview,
 }));
 
-import { publicSiteOpsArtifactError, siteOpsArtifactApi } from "./artifact-api";
+import {
+  createSandboxedPreviewDocument,
+  publicSiteOpsArtifactError,
+  rewriteSiteOpsPreviewDocument,
+  siteOpsArtifactApi,
+} from "./artifact-api";
 import {
   CUSTOMER_VISIBLE_STYLE_BATCH_STATUSES,
   customerVisibleStyleBatchStatusCondition,
@@ -65,7 +71,18 @@ beforeEach(async () => {
       <a href="https://example.com/">外部链接</a>
     </body></html>`,
   );
-  archive.file("about/index.html", '<!doctype html><a href="/">返回首页</a>');
+  for (const route of [
+    "about",
+    "offerings",
+    "applications",
+    "cases",
+    "contact",
+  ]) {
+    archive.file(
+      `${route}/index.html`,
+      `<!doctype html><a href="/">返回首页</a><h1>${route}</h1>`,
+    );
+  }
   archive.file(
     "styles.css",
     `.hero{background-image:url(/images/hero.png)}\n@import "/fonts/site.css";`,
@@ -90,6 +107,7 @@ beforeEach(async () => {
                 build: {
                   id: buildId,
                   userId: 42,
+                  workflowVersion: "2.8.0",
                   distLocalAssetId: "dist-asset",
                   distHash: "a".repeat(64),
                 },
@@ -450,6 +468,251 @@ describe("SiteOps private preview proxy", () => {
     expect(csp).toContain("frame-src 'none'");
     expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).toContain("base-uri 'none'");
+  });
+
+  it("serves every real route entry and never falls back unknown paths to the SPA shell", async () => {
+    const origin = await startApp();
+    const prefix = `/api/site-ops/builds/${buildId}/preview/`;
+    const routes = [
+      "",
+      "about/",
+      "offerings/",
+      "applications/",
+      "cases/",
+      "contact/",
+    ];
+
+    const responses = await Promise.all(
+      routes.map((route) => fetch(`${origin}${prefix}${route}`)),
+    );
+    expect(responses.map((response) => response.status)).toEqual(
+      routes.map(() => 200),
+    );
+    expect((await fetch(`${origin}${prefix}not-a-real-route/`)).status).toBe(
+      404,
+    );
+  });
+
+  it("serves 2.9 HTML only when the frozen content-plan manifest allows it", async () => {
+    const sourceDocumentId = "source-1";
+    const section = (id: string, heading: string) => ({
+      id,
+      blockKind: "hero",
+      heading,
+      purpose: `${heading} purpose`,
+      body: `${heading} verified body`,
+      sourceBindings: [
+        { sourceDocumentId, evidenceExcerpt: `${heading} evidence` },
+      ],
+      mediaIds: [],
+      entityIds: [],
+      faqIds: [],
+    });
+    const plan = {
+      schemaVersion: 2,
+      inventorySha256: "b".repeat(64),
+      routes: [
+        {
+          id: "home",
+          path: "/",
+          title: "Home",
+          navigation: "primary",
+          parentPath: null,
+          detailOfPath: null,
+          purpose: "Home purpose",
+          userQuestions: [],
+          h1: "Home",
+          summary: "Home summary",
+          cta: { label: "About", targetPath: "/about/" },
+          sections: [section("home-hero", "Home")],
+        },
+        {
+          id: "about",
+          path: "/about/",
+          title: "About",
+          navigation: "primary",
+          parentPath: null,
+          detailOfPath: null,
+          purpose: "About purpose",
+          userQuestions: [],
+          h1: "About",
+          summary: "About summary",
+          cta: { label: "Home", targetPath: "/" },
+          sections: [section("about-hero", "About")],
+        },
+      ],
+      navigation: [
+        { label: "Home", targetPath: "/" },
+        { label: "About", targetPath: "/about/" },
+      ],
+      coverage: [
+        {
+          sourceDocumentId,
+          status: "used",
+          routeIds: ["home", "about"],
+          omissionReason: null,
+        },
+      ],
+    };
+    const planBytes = Buffer.from(JSON.stringify(plan));
+    const archive = new JSZip();
+    archive.file("index.html", "<!doctype html><h1>Home</h1>");
+    archive.file("about/index.html", "<!doctype html><h1>About</h1>");
+    archive.file("extra/index.html", "<!doctype html><h1>Extra</h1>");
+    const v29Dist = await archive.generateAsync({ type: "nodebuffer" });
+    mocks.getDb.mockResolvedValue({
+      select: () => ({
+        from: () => ({
+          innerJoin: () => ({
+            where: () => ({
+              limit: async () => [
+                {
+                  build: {
+                    id: buildId,
+                    userId: 42,
+                    workflowVersion: "2.9.0",
+                    contentPlanLocalAssetId: "plan-asset",
+                    contentPlanSha256: "c".repeat(64),
+                    distLocalAssetId: "dist-asset",
+                    distHash: "a".repeat(64),
+                  },
+                  project: { id: "project-1", userId: 42 },
+                },
+              ],
+            }),
+          }),
+        }),
+      }),
+    });
+    mocks.readSiteOpsArtifact.mockImplementation(async ({ localAssetId }) =>
+      localAssetId === "plan-asset"
+        ? {
+            row: {
+              id: "plan-asset",
+              mimeType: "application/json",
+              sizeBytes: planBytes.length,
+              contentSha256: "c".repeat(64),
+              filename: "plan.json",
+            },
+            stored: { createReadStream: () => Readable.from([planBytes]) },
+          }
+        : {
+            row: {
+              id: "dist-asset",
+              mimeType: "application/zip",
+              sizeBytes: v29Dist.length,
+              contentSha256: "a".repeat(64),
+              filename: "dist.zip",
+            },
+            stored: { createReadStream: () => Readable.from([v29Dist]) },
+          },
+    );
+    const origin = await startApp();
+    const prefix = `/api/site-ops/builds/${buildId}/preview/`;
+
+    expect((await fetch(`${origin}${prefix}`)).status).toBe(200);
+    expect((await fetch(`${origin}${prefix}about/`)).status).toBe(200);
+    expect((await fetch(`${origin}${prefix}extra/`)).status).toBe(404);
+    expect((await fetch(`${origin}${prefix}unknown/`)).status).toBe(404);
+  });
+
+  it("executes minified legacy and canonical routers without a double preview prefix", async () => {
+    const prefix = `/api/site-ops/builds/${buildId}/preview/`;
+    const routes = [
+      ["", "home"],
+      ["about/", "about"],
+      ["offerings/", "offerings"],
+      ["applications/", "applications"],
+      ["cases/", "cases"],
+      ["contact/", "contact"],
+    ] as const;
+    const routeTable =
+      '{"/":"home","/about/":"about","/offerings/":"offerings","/applications/":"applications","/cases/":"cases","/contact/":"contact"}';
+
+    for (const previewRoutingMode of [
+      "legacy_static_literals",
+      "canonical_pathname",
+    ] as const) {
+      const archive = new JSZip();
+      const pathnameExpression =
+        previewRoutingMode === "canonical_pathname"
+          ? "canonicalSitePathname()"
+          : "location.pathname";
+      archive.file(
+        "assets/router.js",
+        `(()=>{const r=${routeTable},p=${pathnameExpression},u=s=>\`/\${s}/\`;document.body.dataset.route=r[p]??"404";document.body.dataset.canonical=canonicalSitePathname();const a=document.createElement("a");a.id="dynamic-route";a.href=u("contact")+"?from=nav#form";a.textContent="contact";document.body.append(a);window.__routeTo=s=>history.pushState({},"",u(s)+"?from=history#section")})();`,
+      );
+      for (const [route] of routes) {
+        archive.file(
+          route ? `${route}index.html` : "index.html",
+          '<!doctype html><html><head></head><body><script src="/assets/router.js"></script></body></html>',
+        );
+      }
+
+      for (const [route, expected] of routes) {
+        const document = await createSandboxedPreviewDocument({
+          zip: archive,
+          entryName: route ? `${route}index.html` : "index.html",
+          previewPrefix: prefix,
+          previewRoutingMode,
+        });
+        const html = document.bytes.toString("utf8");
+        expect(html).not.toContain(`${prefix}${prefix}`);
+        const dom = new JSDOM(html, {
+          runScripts: "dangerously",
+          url: `https://dashboard.frontmind.net${prefix}${route}`,
+        });
+        try {
+          expect(dom.window.document.body.dataset.route).toBe(expected);
+          expect(dom.window.document.body.dataset.canonical).toBe(
+            route ? `/${route}` : "/",
+          );
+
+          const anchor =
+            dom.window.document.querySelector<HTMLAnchorElement>(
+              "#dynamic-route",
+            );
+          expect(anchor?.getAttribute("href")).toBe("/contact/?from=nav#form");
+          anchor?.addEventListener("click", (event) => event.preventDefault());
+          anchor?.dispatchEvent(
+            new dom.window.MouseEvent("click", {
+              bubbles: true,
+              cancelable: true,
+              button: 0,
+            }),
+          );
+          expect(anchor?.getAttribute("href")).toBe(
+            `${prefix}contact/?from=nav#form`,
+          );
+
+          (
+            dom.window as unknown as { __routeTo: (slug: string) => void }
+          ).__routeTo("cases");
+          expect(dom.window.location.pathname).toBe(`${prefix}cases/`);
+          expect(dom.window.location.search).toBe("?from=history");
+          expect(dom.window.location.hash).toBe("#section");
+        } finally {
+          dom.window.close();
+        }
+      }
+    }
+  });
+
+  it("keeps legacy static route keys scoped but leaves dynamic templates to the navigation bridge", () => {
+    const prefix = `/api/site-ops/builds/${buildId}/preview/`;
+    const source =
+      'const routes={"/":"home","/about/":"about"};const route=(segment)=>`/${segment}/`;';
+    const rewritten = rewriteSiteOpsPreviewDocument({
+      bytes: Buffer.from(source),
+      mimeType: "text/javascript; charset=utf-8",
+      previewPrefix: prefix,
+      previewRoutingMode: "legacy_static_literals",
+    }).toString("utf8");
+
+    expect(rewritten).toContain(`"${prefix}":"home"`);
+    expect(rewritten).toContain(`"${prefix}about/":"about"`);
+    expect(rewritten).toContain("`/${segment}/`");
+    expect(rewritten).not.toContain(`${prefix}${prefix}`);
   });
 });
 

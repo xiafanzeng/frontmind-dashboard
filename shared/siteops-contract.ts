@@ -137,6 +137,33 @@ export const siteOpsBuildProjectionSchema = z
     status: siteOpsBuildStatusSchema,
     previewUrl: z.string().max(2_048).nullable().default(null),
     sourceUrl: z.string().max(2_048).nullable().default(null),
+    contentPlan: z
+      .object({
+        status: z.enum(["pending", "ready"]),
+        sha256: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/u)
+          .nullable(),
+      })
+      .strict()
+      .optional(),
+    revisionInputs: z
+      .array(
+        z
+          .object({
+            filename: z.string().trim().min(1).max(512),
+            mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+            sizeBytes: z.number().int().positive().max(8 * 1024 * 1024),
+            publicPath: z
+              .string()
+              .regex(
+                /^\/frontmind-user-media\/[a-f0-9]{64}\.(?:png|jpg|webp)$/u,
+              ),
+          })
+          .strict(),
+      )
+      .max(8)
+      .optional(),
     buildDelivery: z
       .object({
         renderMode: z.enum([
@@ -400,7 +427,9 @@ export const siteOpsObservationV1Schema = z
   })
   .strict()
   .superRefine((value, context) => {
-    const staticCatalog = value.visualGeneration.workflowVersion === "2.8.0";
+    const staticCatalog =
+      value.visualGeneration.workflowVersion === "2.8.0" ||
+      value.visualGeneration.workflowVersion === "2.9.0";
     const expectedPageSize = staticCatalog
       ? 8
       : SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE;
@@ -410,7 +439,7 @@ export const siteOpsObservationV1Schema = z
           code: "custom",
           path: ["visualCandidatePages", index, "candidates"],
           message: staticCatalog
-            ? "Workflow 2.8 visual pages must contain exactly 8 candidates"
+            ? "Static catalog visual pages must contain exactly 8 candidates"
             : "Historical visual pages must contain exactly 9 candidates",
         });
       }

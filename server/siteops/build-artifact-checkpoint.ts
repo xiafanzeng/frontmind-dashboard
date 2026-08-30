@@ -2,6 +2,11 @@ import { z } from "zod";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 
+/** Initial source delivery is attempt 0; three bounded same-task repairs are
+ * available for independent compile, archive-integrity and browser-contract
+ * failures. Keep every durable attempt coordinate aligned with this ceiling. */
+export const NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS = 3;
+
 const buildArtifactBindingSchema = (
   mimeType: "application/json" | "application/zip",
 ) =>
@@ -68,8 +73,12 @@ export const formalBuildArtifactStagingSchema = z
     taskId: z.string().min(1).max(255),
     operationToken: z
       .string()
-      .regex(/^siteops-native-source:[a-f0-9-]{36}:[0-2]$/u),
-    nativeRepairAttempt: z.number().int().min(0).max(2),
+      .regex(/^siteops-native-source:[a-f0-9-]{36}:[0-3]$/u),
+    nativeRepairAttempt: z
+      .number()
+      .int()
+      .min(0)
+      .max(NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS),
     artifactBindings: buildArtifactBindingsSchema,
     specHash: z.string().regex(SHA256),
     distHash: z.string().regex(SHA256),

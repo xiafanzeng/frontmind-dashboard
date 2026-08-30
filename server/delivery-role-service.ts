@@ -1122,7 +1122,7 @@ type ReconciledDeliveryTicketTerminal = {
 };
 
 const SITE_REBUILD_COMPLETED_SUMMARY =
-  "官网重置已完成，企业知识库保持不变；客户可从知识库开始建站。";
+  "官网重置已完成，旧知识库版本不会复用；客户需全新上传并发布知识库后再开始建站。";
 const SITE_REBUILD_INVALIDATED_SUMMARY =
   "原官网重置申请已失效，项目状态已变化；请客户重新提交重置申请。";
 
@@ -5147,7 +5147,7 @@ export async function approveMySiteOpsRebuild(input: {
       const completed = terminalDisposition === "complete";
       const terminalStatus = completed ? "completed" : "cancelled";
       const message = completed
-        ? "官网重置已完成，企业知识库保持不变；客户可从知识库开始建站。"
+        ? "官网重置已完成，旧知识库版本不会复用；客户需全新上传并发布知识库后再开始建站。"
         : "原官网重置申请已失效，项目状态已变化；请客户重新提交重置申请。";
       const terminalUpdate = await tx
         .update(deliveryTickets)
@@ -5263,9 +5263,9 @@ export async function approveMySiteOpsRebuild(input: {
       "resetRequeued" in approval && approval.resetRequeued === true;
     const message = resetPending
       ? resetRequeued
-        ? "官网重置下线已重新排队；完成后企业知识库保持不变。"
-        : "官网重制需求已通过，正在安全下线旧网站；完成后企业知识库保持不变。"
-      : "官网重制需求已通过，旧网站已下线；客户可从知识库开始建站。";
+        ? "官网重置下线已重新排队；旧知识库版本不会用于新任务。"
+        : "官网重制需求已通过，正在安全下线旧网站；旧知识库版本不会用于新任务。"
+      : "官网重制需求已通过，旧网站已下线；客户需全新上传并发布知识库后再开始建站。";
     const ticketUpdate = await tx
       .update(deliveryTickets)
       .set({

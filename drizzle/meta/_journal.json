@@ -470,6 +470,20 @@
       "when": 1787822850162,
       "tag": "0066_visual_candidate_pools",
       "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "5",
+      "when": 1788054566855,
+      "tag": "0067_siteops_revision_inputs",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "5",
+      "when": 1788088151053,
+      "tag": "0068_siteops_knowledge_input_epoch",
+      "breakpoints": true
     }
   ]
 }

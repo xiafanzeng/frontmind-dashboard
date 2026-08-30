@@ -58,6 +58,7 @@ import {
 const operationToken = "siteops-build:10000000-0000-4000-8000-000000000001";
 const baseSourceSha256 = "a".repeat(64);
 const executionBaselineSha256 = "d".repeat(64);
+const contentPlanSha256 = "e".repeat(64);
 
 function sha256(value: Buffer) {
   return createHash("sha256").update(value).digest("hex");
@@ -489,6 +490,47 @@ describe("native React source archive boundary", () => {
     expect(siteSourceReceiptV2Schema.safeParse(missingBaseline).success).toBe(
       false,
     );
+    expect(
+      siteSourceReceiptV2Schema.parse({
+        ...current,
+        contentPlanSha256,
+      }).contentPlanSha256,
+    ).toBe(contentPlanSha256);
+  });
+
+  it("requires the exact frozen content plan when a 2.9 coordinate is supplied", async () => {
+    const archive = await runtimeV2Archive();
+    await expect(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receiptV2(archive, { contentPlanSha256 }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        requiredReceiptVersion: 2,
+        expectedExecutionBaselineSha256: executionBaselineSha256,
+        expectedContentPlanSha256: contentPlanSha256,
+      }),
+    ).resolves.toBeDefined();
+    await expect(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receiptV2(archive),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        requiredReceiptVersion: 2,
+        expectedExecutionBaselineSha256: executionBaselineSha256,
+        expectedContentPlanSha256: contentPlanSha256,
+      }),
+    ).rejects.toMatchObject({ code: "NATIVE_SOURCE_RECEIPT_INVALID" });
+    await expect(
+      validateNativeReactSourceArchive({
+        archive,
+        receipt: receipt(archive, { fileCount: 5 }),
+        expectedOperationToken: operationToken,
+        expectedBaseSourceSha256: baseSourceSha256,
+        expectedContentPlanSha256: contentPlanSha256,
+      }),
+    ).rejects.toMatchObject({ code: "NATIVE_SOURCE_RECEIPT_INVALID" });
   });
 
   it("accepts a bounded complete React archive and normalizes one wrapper directory", async () => {
@@ -765,6 +807,27 @@ describe("native React source archive boundary", () => {
     expect(
       auditNativeRuntimeContractV1({
         files,
+        expectedRoutePaths: ["/", "/about", "contact"],
+        requireCanonicalSitePathname: true,
+      }).issues.map((issue) => issue.code),
+    ).toContain("CANONICAL_PATHNAME_REQUIRED");
+
+    files.set(
+      NATIVE_RUNTIME_ROUTE_MODULE,
+      Buffer.from(
+        `import Home from "./home";\nimport About from "./about";\nimport Contact from "./contact";\nexport const ${NATIVE_RUNTIME_ROUTE_MANIFEST_EXPORT} = ["/", "/about/", "/contact/"] as const;\ntype PreviewWindow = Window & { canonicalSitePathname?: () => string };\nconst pathname = () => (window as PreviewWindow).canonicalSitePathname?.() ?? window.location.pathname;\nexport default function FrontMindRoutes() { const route = pathname(); return route === "/about/" ? <About /> : route === "/contact/" ? <Contact /> : <Home />; }\n`,
+      ),
+    );
+    expect(
+      auditNativeRuntimeContractV1({
+        files,
+        expectedRoutePaths: ["/", "/about", "contact"],
+        requireCanonicalSitePathname: true,
+      }),
+    ).toMatchObject({ ok: true, issues: [] });
+    expect(
+      auditNativeRuntimeContractV1({
+        files,
         expectedRoutePaths: ["/", "/contact/"],
       }).issues.map((issue) => issue.code),
     ).toContain("ROUTE_MANIFEST_MISMATCH");
@@ -781,6 +844,20 @@ describe("native React source archive boundary", () => {
         expectedRoutePaths: ["/"],
       }).issues.map((issue) => issue.code),
     ).toContain("ROUTE_MANIFEST_INVALID");
+
+    files.set(
+      NATIVE_RUNTIME_ROUTE_MODULE,
+      Buffer.from(
+        `import Home from "./home";\nexport const ${NATIVE_RUNTIME_ROUTE_MANIFEST_EXPORT} = ["/"] as const;\nexport default function FrontMindRoutes() { return <Home />; }\n`,
+      ),
+    );
+    expect(
+      auditNativeRuntimeContractV1({
+        files,
+        expectedRoutePaths: ["/"],
+        requireCanonicalSitePathname: true,
+      }),
+    ).toMatchObject({ ok: true, issues: [] });
   });
 
   it("reports precise ZIP, package syntax, package shape, and file-type reasons", async () => {

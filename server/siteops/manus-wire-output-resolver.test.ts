@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { siteContentPlanWireV2Schema } from "../../shared/siteops-content-plan";
 import {
   resolveSiteOpsWireOutput as resolveWireOutput,
   SITEOPS_WIRE_OUTPUT_FILES,
@@ -93,6 +94,216 @@ function jsonResponse(value: unknown, headers: Record<string, string> = {}) {
 }
 
 describe("SiteOps wire output resolver", () => {
+  it("accepts the exact V2 content-plan attachment in the design phase while preserving strict validation", async () => {
+    const planToken =
+      "siteops-content-plan:10000000-0000-4000-8000-000000000001:0";
+    const value = {
+      wireSchemaVersion: 2,
+      operationToken: planToken,
+      inventorySha256: "a".repeat(64),
+      routes: [
+        {
+          routeId: "home",
+          path: "/",
+          title: "首页",
+          navigation: "primary",
+          parentPath: null,
+          detailOfPath: null,
+          purpose: "介绍企业",
+          userQuestions: ["企业提供什么？"],
+          h1: "星河智造",
+          summary: "可信的设备服务。",
+          ctaLabel: null,
+          ctaTargetPath: null,
+        },
+      ],
+      sections: [
+        {
+          routeId: "home",
+          sectionId: "overview",
+          blockKind: "prose",
+          heading: "企业简介",
+          purpose: "呈现企业事实",
+          body: "星河智造提供设备服务。",
+          sourceDocumentIds: ["overview"],
+          evidenceExcerpts: ["星河智造提供设备服务。"],
+          mediaIds: [],
+          entityIds: [],
+          faqIds: [],
+        },
+      ],
+      navigation: [{ label: "首页", targetPath: "/" }],
+      coverage: [
+        {
+          sourceDocumentId: "overview",
+          status: "used",
+          routeIds: ["home"],
+          omissionReason: null,
+        },
+      ],
+    };
+    const fetchPinned = vi.fn(async () => ({
+      response: jsonResponse(value),
+      finalUrl: new URL("https://files.example.test/content-plan.json"),
+    }));
+
+    const events = [
+      marker(planToken),
+      {
+        id: "rejected-content-plan",
+        type: "structured_output_result",
+        timestamp: 2,
+        structured_output_result: {
+          success: false,
+          value: [],
+          error: "structured extraction returned an empty array",
+        },
+      },
+      assistant({
+        attachments: [
+          {
+            filename: "frontmind_site_content_plan_v2_repair_1.json",
+            content_type: "application/json",
+            url: "https://files.example.test/content-plan.json",
+          },
+        ],
+      }),
+    ] as never;
+    await expect(
+      resolveWireOutput({
+        events,
+        operationToken: planToken,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2,
+        taskCompleted: false,
+        fetchPinned: fetchPinned as never,
+        validateCandidate: (candidate) => {
+          siteContentPlanWireV2Schema.parse(candidate);
+        },
+      }),
+    ).resolves.toBeNull();
+    expect(fetchPinned).not.toHaveBeenCalled();
+
+    await expect(
+      resolveWireOutput({
+        events,
+        operationToken: planToken,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2,
+        taskCompleted: false,
+        acceptCurrentPhaseWhileRunning: true,
+        fetchPinned: fetchPinned as never,
+        validateCandidate: (candidate) => {
+          siteContentPlanWireV2Schema.parse(candidate);
+        },
+      }),
+    ).resolves.toMatchObject({ value, source: "attachment" });
+    expect(fetchPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a token-bound nested alias payload instead of adapting it into SiteContentPlanWireV2", async () => {
+    const planToken =
+      "siteops-content-plan:10000000-0000-4000-8000-000000000001:1";
+    const aliasPayload = {
+      wireSchemaVersion: 2,
+      operationToken: planToken,
+      inventorySha256: "a".repeat(64),
+      routes: [
+        {
+          id: "home",
+          slug: "/",
+          sections: [
+            {
+              id: "overview",
+              sourceBindings: [{ documentId: "overview" }],
+            },
+          ],
+        },
+      ],
+      navigation: [],
+      coverages: [{ documentId: "overview", status: "used", routes: ["home"] }],
+    };
+
+    await expect(
+      resolveWireOutput({
+        events: [marker(planToken), accepted(aliasPayload)] as never,
+        operationToken: planToken,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2,
+        taskCompleted: false,
+        acceptCurrentPhaseWhileRunning: true,
+        validateCandidate: (candidate) => {
+          siteContentPlanWireV2Schema.parse(candidate);
+        },
+      }),
+    ).rejects.toMatchObject({ code: "SITEOPS_WIRE_OUTPUT_INVALID" });
+  });
+
+  it("uses the content-plan 16 MiB budget instead of the design 256 KiB budget", async () => {
+    const planToken =
+      "siteops-content-plan:10000000-0000-4000-8000-000000000001:0";
+    const value = {
+      wireSchemaVersion: 2,
+      operationToken: planToken,
+      inventorySha256: "a".repeat(64),
+      routes: [
+        {
+          routeId: "home",
+          path: "/",
+          title: "首页",
+          navigation: "primary",
+          parentPath: null,
+          detailOfPath: null,
+          purpose: "介绍企业",
+          userQuestions: [],
+          h1: "星河智造",
+          summary: "可信的设备服务。",
+          ctaLabel: null,
+          ctaTargetPath: null,
+        },
+      ],
+      sections: Array.from({ length: 16 }, (_, index) => ({
+        routeId: "home",
+        sectionId: `section-${index}`,
+        blockKind: "prose",
+        heading: `企业资料 ${index}`,
+        purpose: "呈现有来源的企业资料",
+        body: "资".repeat(19_000),
+        sourceDocumentIds: ["overview"],
+        evidenceExcerpts: ["星河智造提供设备服务。"],
+        mediaIds: [],
+        entityIds: [],
+        faqIds: [],
+      })),
+      navigation: [{ label: "首页", targetPath: "/" }],
+      coverage: [
+        {
+          sourceDocumentId: "overview",
+          status: "used",
+          routeIds: ["home"],
+          omissionReason: null,
+        },
+      ],
+    };
+    expect(Buffer.byteLength(JSON.stringify(value), "utf8")).toBeGreaterThan(
+      256 * 1024,
+    );
+
+    await expect(
+      resolveWireOutput({
+        events: [marker(planToken), accepted(value)] as never,
+        operationToken: planToken,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2,
+        taskCompleted: false,
+        acceptCurrentPhaseWhileRunning: true,
+        validateCandidate: (candidate) => {
+          siteContentPlanWireV2Schema.parse(candidate);
+        },
+      }),
+    ).resolves.toMatchObject({ value, source: "structured" });
+  });
+
   it("accepts the exact V3 design filename when the React workflow requests it", async () => {
     const value = {
       operationToken: token,
@@ -412,6 +623,39 @@ describe("SiteOps wire output resolver", () => {
     });
     expect(resultFromOldWindow).toBeNull();
     expect(fetchPinned).not.toHaveBeenCalled();
+  });
+
+  it("reports assistant JSON validation instead of a rejected structured-output placeholder", async () => {
+    const placeholder = { operationToken: token, kind: "placeholder" };
+    const assistantValue = { operationToken: token, kind: "assistant" };
+
+    await expect(
+      resolveSiteOpsWireOutput({
+        events: [
+          marker(),
+          {
+            id: "rejected-placeholder",
+            type: "structured_output_result",
+            timestamp: 2,
+            structured_output_result: {
+              success: false,
+              error: "Failed to extract structured output",
+              value: placeholder,
+            },
+          },
+          assistant({ content: JSON.stringify(assistantValue) }),
+        ] as never,
+        operationToken: token,
+        taskCompleted: true,
+        validateCandidate: (value, source) => {
+          throw new Error(`${source}:${String(value.kind)}`);
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "SITEOPS_WIRE_OUTPUT_INVALID",
+      validationError: { message: "assistant_json:assistant" },
+      validationCandidate: { source: "assistant_json" },
+    });
   });
 
   it("does not let a structured-result token cut the user-message causal window", async () => {

@@ -2,6 +2,7 @@ import type { SiteOpsObservationV1 } from "@shared/siteops-contract";
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import type { SiteOpsActInput } from "@shared/siteops";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { uploadChatLocalAsset } from "@/lib/frontmind-api";
 import { trpc } from "@/lib/trpc";
 import SiteOpsConversationPanel, {
   siteOpsSelectVisualFailureMessage,
@@ -239,6 +240,54 @@ export function siteOpsClientRequestId() {
   return crypto.randomUUID();
 }
 
+export type SiteOpsRevisionAttempt = {
+  signature: string;
+  clientRequestId: string;
+  expectedProjectRevision: number;
+  contentSha256s: string[];
+  localAssetIds: Map<number, string>;
+  inFlightUploads: Map<
+    number,
+    Promise<Awaited<ReturnType<typeof uploadChatLocalAsset>>>
+  >;
+};
+
+async function siteOpsRevisionFileSha256(file: File) {
+  const bytes = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+export async function siteOpsRevisionAttempt(
+  previous: SiteOpsRevisionAttempt | null,
+  input: { text: string; files: File[]; expectedProjectRevision: number },
+) {
+  const contentSha256s = await Promise.all(
+    input.files.map(siteOpsRevisionFileSha256),
+  );
+  const signature = JSON.stringify({
+    text: input.text,
+    files: input.files.map((file, index) => ({
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      lastModified: file.lastModified,
+      contentSha256: contentSha256s[index],
+    })),
+  });
+  if (previous?.signature === signature) return previous;
+  return {
+    signature,
+    clientRequestId: siteOpsClientRequestId(),
+    expectedProjectRevision: input.expectedProjectRevision,
+    contentSha256s,
+    localAssetIds: new Map<number, string>(),
+    inFlightUploads: new Map(),
+  } satisfies SiteOpsRevisionAttempt;
+}
+
 export function shouldPollSiteOpsObservation(
   observation: SiteOpsObservationV1 | null,
 ) {
@@ -397,6 +446,8 @@ export default function ConnectedSiteOpsConversationPanel({
   const observeRequestGeneration = useRef(0);
   const acceptedObserveGeneration = useRef(0);
   const pollEpoch = useRef({ coordinate: "idle", startedAt: Date.now() });
+  const revisionAttemptRef = useRef<SiteOpsRevisionAttempt | null>(null);
+  const revisionSubmissionInFlightRef = useRef(false);
   const [observation, setObservation] = useState<SiteOpsObservationV1 | null>(
     null,
   );
@@ -493,6 +544,7 @@ export default function ConnectedSiteOpsConversationPanel({
     },
   );
   const actMutation = trpc.workspace.siteOps.actFast.useMutation();
+  const sendMessageMutation = trpc.workspace.siteOps.sendMessage.useMutation();
   const aliyunBeginMutation =
     trpc.workspace.siteOps.aliyunConnection.beginOAuth.useMutation();
   const aliyunDomainsQuery =
@@ -744,11 +796,117 @@ export default function ConnectedSiteOpsConversationPanel({
     await submitSelectVisual(scope, current);
   }
 
+  async function submitRevision(input: {
+    text: string;
+    files: File[];
+    onProgress: (fileIndex: number, percent: number) => void;
+  }) {
+    const currentObservation = observationRef.current;
+    if (
+      !currentObservation ||
+      sendMessageMutation.isPending ||
+      revisionSubmissionInFlightRef.current
+    ) {
+      return;
+    }
+    // React mutation state updates on the next render. This ref is the
+    // synchronous click boundary and closes that otherwise-visible gap.
+    revisionSubmissionInFlightRef.current = true;
+    try {
+      revisionAttemptRef.current = await siteOpsRevisionAttempt(
+        revisionAttemptRef.current,
+        {
+          text: input.text,
+          files: input.files,
+          expectedProjectRevision: currentObservation.project.revision,
+        },
+      );
+      const attempt = revisionAttemptRef.current;
+      const clientRequestId = attempt.clientRequestId;
+      sendMessageMutation.reset();
+      setSubmissionNotice(
+        input.files.length > 0 ? "正在安全上传图片…" : "正在提交修改要求…",
+      );
+
+      const uploadAtIndex = (file: File, index: number) => {
+        const settledId = attempt.localAssetIds.get(index);
+        if (settledId) {
+          input.onProgress(index, 100);
+          return Promise.resolve({ fileId: settledId, filename: file.name });
+        }
+        const inFlight = attempt.inFlightUploads.get(index);
+        if (inFlight) {
+          return inFlight.then((receipt) => {
+            input.onProgress(index, 100);
+            return receipt;
+          });
+        }
+        const contentSha256 = attempt.contentSha256s[index];
+        if (!contentSha256) {
+          throw new Error("图片完整性坐标缺失，请重新选择图片。");
+        }
+        let tracked: Promise<Awaited<ReturnType<typeof uploadChatLocalAsset>>>;
+        tracked = uploadChatLocalAsset(
+          file,
+          (percent) => input.onProgress(index, percent),
+          {
+            siteOpsComposerCoordinate: {
+              clientRequestId,
+              contentSha256,
+              ordinal: index + 1,
+            },
+          },
+        )
+          .then((receipt) => {
+            if (!receipt.fileId.startsWith("asset_")) {
+              throw new Error("图片没有完成安全留存，请重新上传。");
+            }
+            attempt.localAssetIds.set(index, receipt.fileId);
+            return receipt;
+          })
+          .finally(() => {
+            if (attempt.inFlightUploads.get(index) === tracked) {
+              attempt.inFlightUploads.delete(index);
+            }
+          });
+        attempt.inFlightUploads.set(index, tracked);
+        return tracked;
+      };
+
+      const receipts = await Promise.all(input.files.map(uploadAtIndex));
+      const localAssetIds = receipts.map((receipt) => receipt.fileId);
+      if (localAssetIds.some((id) => !id.startsWith("asset_"))) {
+        throw new Error("图片没有完成安全留存，请重新上传。");
+      }
+      await sendMessageMutation.mutateAsync({
+        conversationId: currentObservation.project.conversationId,
+        clientRequestId,
+        text: input.text,
+        localAssetIds,
+        expectedProjectRevision: attempt.expectedProjectRevision,
+      });
+      revisionAttemptRef.current = null;
+      setSubmissionNotice("修改版本已创建；当前预览会保留到新版本完成。");
+      const generation = ++observeRequestGeneration.current;
+      const refreshed = await observeQuery.refetch({ cancelRefetch: true });
+      if (refreshed.data && generation >= acceptedObserveGeneration.current) {
+        acceptedObserveGeneration.current = generation;
+        acceptObservation(refreshed.data);
+      }
+    } catch (error) {
+      setSubmissionNotice(null);
+      throw error;
+    } finally {
+      revisionSubmissionInFlightRef.current = false;
+    }
+  }
+
   const requestError =
     openMutation.error?.message ||
     observeQuery.error?.message ||
     aliyunBeginMutation.error?.message ||
     aliyunDisconnectMutation.error?.message ||
+    sendMessageMutation.error?.message ||
     null;
 
   return (
@@ -772,6 +930,7 @@ export default function ConnectedSiteOpsConversationPanel({
       }}
       onAction={runSiteOpsAction}
       onRetrySelectVisual={retrySelectVisual}
+      onSubmitRevision={submitRevision}
       onBeginAliyun={async () => {
         if (!observation) {
           throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);

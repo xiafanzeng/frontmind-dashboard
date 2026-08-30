@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import { createReadStream, type ReadStream } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { Readable } from "node:stream";
+import { and, eq, gte, inArray, isNull, or } from "drizzle-orm";
 import JSZip from "jszip";
 import { z } from "zod";
 
 import {
   knowledgeBaseSnapshots,
+  siteBuildInputAssets,
   siteBuilds,
   siteOperations,
   siteProjects,
@@ -23,6 +25,7 @@ import {
   SITEOPS_MATERIALIZER_V2_3,
   SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_MATERIALIZER_V2_5,
+  SITEOPS_MATERIALIZER_V2_9,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   visualEvidenceV1Schema,
@@ -39,6 +42,15 @@ import {
   type VisualSelectionBundleV7,
   type VisualCandidateStyleTokensV1,
 } from "../../shared/siteops";
+import {
+  SITEOPS_CONTENT_PLAN_V2_FILENAME,
+  SiteContentPlanValidationError,
+  siteContentPlanRoutes,
+  siteContentPlanV2FromWire,
+  siteContentPlanWireV2Schema,
+  validateSiteContentPlanV2,
+  type SiteContentPlanV2,
+} from "../../shared/siteops-content-plan";
 import { createHostOwnedSiteDesignResultV2 } from "../../shared/siteops-host-design";
 import {
   managedAgentProfileModel,
@@ -107,6 +119,18 @@ import {
 } from "./providers";
 import { readSelectedOfficialLogoFromKnowledgeArchive } from "./knowledge-brand-asset";
 import {
+  freezeSelectedKnowledgeMediaFromArchive,
+  freezeSiteKnowledgeMedia,
+  overlaySiteOpsKnowledgeMedia,
+  type TrustedSiteKnowledgeMedia,
+} from "./knowledge-content-media";
+import {
+  knowledgeCoverageInventoryAttachment,
+  knowledgeCoverageInventoryFromSnapshot,
+  type SupplementalKnowledgeDocument,
+  type SupplementalKnowledgeMedia,
+} from "./site-content-plan";
+import {
   pageContentResultFromWire,
   pageContentResultV2FromWire,
   pageContentWireOutputSchema,
@@ -157,6 +181,8 @@ import {
   NATIVE_RUNTIME_EXECUTION_SHELL_V1_BYTES,
   NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
   NATIVE_RUNTIME_EXECUTION_SHELL_VERSION,
+  NATIVE_RUNTIME_ROUTE_MANIFEST_EXPORT,
+  NATIVE_RUNTIME_ROUTE_MODULE,
   FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
   NativeRuntimeContractAuditError,
   NativeReactSourceError,
@@ -200,6 +226,7 @@ import {
   buildArtifactBindingsSchema,
   buildDeliveryCheckpointSchema,
   formalBuildArtifactStagingSchema,
+  NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS,
 } from "./build-artifact-checkpoint";
 
 export { terminalTaskState } from "./task-terminal-state";
@@ -228,11 +255,49 @@ const operationInputSchema = z
     buildId: z.string().uuid().optional(),
     childBuildId: z.string().uuid().optional(),
     parentBuildId: z.string().uuid().optional(),
-    feedback: z.string().trim().min(1).max(8_000).optional(),
+    feedback: z.string().trim().min(1).max(20_000).optional(),
     channel: z.enum(["wechat", "xiaohongshu"]).optional(),
     packageId: z.string().uuid().optional(),
     topic: z.string().trim().max(500).optional(),
     referenceBlueprint: referenceBlueprintSchema.optional(),
+    revisionBaseline: z
+      .object({
+        schemaVersion: z.literal(1),
+        parentBuildId: z.string().uuid(),
+        sourceLocalAssetId: z.string().uuid(),
+        sourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        contentPlanLocalAssetId: z.string().uuid(),
+        contentPlanSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+      })
+      .strict()
+      .optional(),
+    revisionInputAssets: z
+      .array(
+        z
+          .object({
+            schemaVersion: z.literal(1),
+            localAssetId: z.string().uuid(),
+            filename: z.string().trim().min(1).max(512),
+            mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+            sizeBytes: z
+              .number()
+              .int()
+              .positive()
+              .max(8 * 1024 * 1024),
+            contentSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+            width: z.number().int().positive(),
+            height: z.number().int().positive(),
+            publicPath: z
+              .string()
+              .regex(
+                /^\/frontmind-user-media\/[a-f0-9]{64}\.(?:png|jpg|webp)$/u,
+              ),
+            siteOpsKnowledgeInputEpochId: z.string().uuid().nullable(),
+          })
+          .strict(),
+      )
+      .max(8)
+      .default([]),
   })
   .passthrough();
 
@@ -268,6 +333,12 @@ const repairReasonSchema = z.enum([
 type RepairReason = z.infer<typeof repairReasonSchema>;
 
 const providerStageSchema = z.enum([
+  "content_plan_pending",
+  "content_plan_repair_send_ready",
+  "content_plan_repair_send_unknown",
+  "content_plan_repair_pending",
+  "native_source_send_ready",
+  "native_source_send_unknown",
   "native_input_ready",
   "create_unknown",
   "native_source_pending",
@@ -310,12 +381,16 @@ const providerBuildCheckpointSchema = z.enum([
  * releases must not make a known-bad provider attachment hot-loop again.
  */
 export const NATIVE_SOURCE_VALIDATOR_VERSION =
-  "native-react-source-and-build-v3.2026-08-29" as const;
+  "native-react-source-and-build-v5.2026-08-30" as const;
 
 const nativeSourceAttachmentScopeSchema = z
   .object({
     taskId: z.string().min(1).max(255),
-    repairAttempt: z.number().int().min(0).max(2),
+    repairAttempt: z
+      .number()
+      .int()
+      .min(0)
+      .max(NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS),
     operationToken: z.string().min(1).max(512),
   })
   .strict();
@@ -352,6 +427,10 @@ const replayableSiteSourceReceiptV2Schema = z
     runtimeContractSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     executionShellSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     executionBaselineSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    contentPlanSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
   })
   .strict();
 
@@ -366,7 +445,11 @@ type PersistedSiteSourceReceipt = z.infer<
 const nativeRejectedCandidateV1Schema = z
   .object({
     taskId: z.string().min(1).max(255),
-    repairAttempt: z.number().int().min(0).max(2),
+    repairAttempt: z
+      .number()
+      .int()
+      .min(0)
+      .max(NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS),
     operationToken: z.string().min(1).max(512),
     attachmentIdentity: z.string().min(1).max(768),
     archiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -512,7 +595,12 @@ const providerStateV1Schema = z
     handledWaitingEventId: z.string().min(1).max(512).optional(),
     handledWaitingAt: z.string().datetime().optional(),
     providerDraftUnavailable: z.boolean().optional(),
-    nativeRepairAttempt: z.number().int().min(0).max(2).optional(),
+    nativeRepairAttempt: z
+      .number()
+      .int()
+      .min(0)
+      .max(NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS)
+      .optional(),
     nativeLastErrorSignature: z
       .string()
       .regex(/^[a-f0-9]{64}$/u)
@@ -532,7 +620,7 @@ const providerAttemptsSchema = z
 
 const nativeSourceRepairInputSchema = z
   .object({
-    attempt: z.number().int().min(1).max(2),
+    attempt: z.number().int().min(1).max(NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS),
     kind: z.enum(["compile", "hard_safety"]),
     diagnostics: z
       .array(
@@ -588,6 +676,17 @@ const providerStateV2Schema = providerStateV1Schema
     nativeSourceContractVersion: z.literal(2).optional(),
     nativeSourceRuntimeCoordinates:
       nativeSourceRuntimeCoordinatesSchema.optional(),
+    contentPlanAttempt: z.number().int().min(0).max(1).optional(),
+    contentPlanOperationToken: z.string().min(1).max(512).optional(),
+    contentPlanInventorySha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
+    contentPlanLocalAssetId: z.string().uuid().optional(),
+    contentPlanSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
     nativeRepairInput: nativeSourceRepairInputSchema.optional(),
     nativeSourceFileId: z.string().min(1).max(512).optional(),
     nativeSourceAttachmentEventId: z.string().min(1).max(512).optional(),
@@ -630,7 +729,12 @@ const providerStateV2Schema = providerStateV1Schema
           .max(100 * 1024 * 1024),
         expiresAt: z.string().datetime(),
         taskId: z.string().min(1).max(255).optional(),
-        repairAttempt: z.number().int().min(0).max(2).optional(),
+        repairAttempt: z
+          .number()
+          .int()
+          .min(0)
+          .max(NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS)
+          .optional(),
         // Optional for operations staged before provider-offline resume was
         // introduced. New archive_validated checkpoints always freeze it.
         receipt: persistedSiteSourceReceiptSchema.optional(),
@@ -668,6 +772,7 @@ type NativeSourceRuntimeValidationInput = {
   expectedOperationToken: string;
   expectedBaseSourceSha256: string;
   expectedExecutionBaselineSha256: string;
+  expectedContentPlanSha256?: string;
 };
 
 export type NativeSourceRuntimeRegistryEntry = Readonly<{
@@ -680,6 +785,7 @@ export type NativeSourceRuntimeRegistryEntry = Readonly<{
   audit: (input: {
     files: ReadonlyMap<string, Buffer>;
     expectedRoutePaths: readonly string[];
+    requireCanonicalSitePathname?: boolean;
   }) => NativeRuntimeAudit;
 }>;
 
@@ -2614,6 +2720,13 @@ function nativeSourceCheckpointMatchesOperation(
   ) {
     return false;
   }
+  if (
+    state.contentPlanSha256 !== undefined &&
+    (!("contentPlanSha256" in staging.receipt) ||
+      staging.receipt.contentPlanSha256 !== state.contentPlanSha256)
+  ) {
+    return false;
+  }
   return (
     staging.taskId === state.taskId &&
     staging.taskId === operation.providerTaskId &&
@@ -3307,6 +3420,7 @@ function nativeSourceReceiptOutputSchema(input: {
   baseSourceSha256: string;
   contractVersion: 1 | 2;
   runtime: NativeSourceRuntimeRegistryEntry | null;
+  contentPlanSha256?: string;
 }): ManusV2StructuredOutputSchema {
   if (input.contractVersion === 2 && !input.runtime) {
     throw new Error("NATIVE_SOURCE_RUNTIME_COORDINATES_MISSING");
@@ -3360,6 +3474,14 @@ function nativeSourceReceiptOutputSchema(input: {
             : NATIVE_SOURCE_PREFLIGHT_SHA256,
         ],
       },
+      ...(input.contentPlanSha256
+        ? {
+            contentPlanSha256: {
+              type: "string" as const,
+              enum: [input.contentPlanSha256],
+            },
+          }
+        : {}),
       ...v2Properties,
     },
     required: [
@@ -3370,6 +3492,7 @@ function nativeSourceReceiptOutputSchema(input: {
       "preflightVersion",
       "preflightStatus",
       "preflightSha256",
+      ...(input.contentPlanSha256 ? ["contentPlanSha256"] : []),
       ...(input.contractVersion === 2
         ? [
             "runtimeContractVersion",
@@ -3378,6 +3501,157 @@ function nativeSourceReceiptOutputSchema(input: {
             "executionBaselineSha256",
           ]
         : []),
+    ],
+    additionalProperties: false,
+  });
+}
+
+function siteContentPlanOutputSchema(input: {
+  operationToken: string;
+  inventorySha256: string;
+}): ManusV2StructuredOutputSchema {
+  const nullableString = {
+    anyOf: [{ type: "string" }, { type: "null" }],
+  } as const;
+  return assertSiteOpsStructuredOutputSchema({
+    type: "object",
+    properties: {
+      wireSchemaVersion: { type: "integer", enum: [2] },
+      operationToken: { type: "string", enum: [input.operationToken] },
+      inventorySha256: { type: "string", enum: [input.inventorySha256] },
+      routes: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string" },
+            path: { type: "string" },
+            title: { type: "string" },
+            navigation: {
+              type: "string",
+              enum: ["primary", "footer", "contextual", "hidden"],
+            },
+            parentPath: nullableString,
+            detailOfPath: nullableString,
+            purpose: { type: "string" },
+            userQuestions: { type: "array", items: { type: "string" } },
+            h1: { type: "string" },
+            summary: { type: "string" },
+            ctaLabel: nullableString,
+            ctaTargetPath: nullableString,
+          },
+          required: [
+            "routeId",
+            "path",
+            "title",
+            "navigation",
+            "parentPath",
+            "detailOfPath",
+            "purpose",
+            "userQuestions",
+            "h1",
+            "summary",
+            "ctaLabel",
+            "ctaTargetPath",
+          ],
+          additionalProperties: false,
+        },
+      },
+      sections: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string" },
+            sectionId: { type: "string" },
+            blockKind: {
+              type: "string",
+              enum: [
+                "hero",
+                "prose",
+                "feature_list",
+                "steps",
+                "metrics",
+                "entity_grid",
+                "faq",
+                "quote",
+                "media",
+                "cta",
+              ],
+            },
+            heading: { type: "string" },
+            purpose: { type: "string" },
+            body: { type: "string" },
+            sourceDocumentIds: {
+              type: "array",
+              items: { type: "string" },
+            },
+            evidenceExcerpts: {
+              type: "array",
+              items: { type: "string" },
+            },
+            mediaIds: { type: "array", items: { type: "string" } },
+            entityIds: { type: "array", items: { type: "string" } },
+            faqIds: { type: "array", items: { type: "string" } },
+          },
+          required: [
+            "routeId",
+            "sectionId",
+            "blockKind",
+            "heading",
+            "purpose",
+            "body",
+            "sourceDocumentIds",
+            "evidenceExcerpts",
+            "mediaIds",
+            "entityIds",
+            "faqIds",
+          ],
+          additionalProperties: false,
+        },
+      },
+      navigation: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            label: { type: "string" },
+            targetPath: { type: "string" },
+          },
+          required: ["label", "targetPath"],
+          additionalProperties: false,
+        },
+      },
+      coverage: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            sourceDocumentId: {
+              type: "string",
+            },
+            status: { type: "string", enum: ["used", "omitted"] },
+            routeIds: { type: "array", items: { type: "string" } },
+            omissionReason: nullableString,
+          },
+          required: [
+            "sourceDocumentId",
+            "status",
+            "routeIds",
+            "omissionReason",
+          ],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: [
+      "wireSchemaVersion",
+      "operationToken",
+      "inventorySha256",
+      "routes",
+      "sections",
+      "navigation",
+      "coverage",
     ],
     additionalProperties: false,
   });
@@ -3590,6 +3864,530 @@ function nativeSelectionInlineBytes(selection: NativeSelection) {
   return selection.archiveBytes;
 }
 
+async function nativeSelectionBytesForMediaOverlay(selection: NativeSelection) {
+  if (selection.archiveBytes) return Buffer.from(selection.archiveBytes);
+  if (!isStaticNativeSelection(selection)) {
+    throw new Error("NATIVE_SOURCE_OVERLAY_BYTES_MISSING");
+  }
+  const chunks: Buffer[] = [];
+  const digest = createHash("sha256");
+  let total = 0;
+  const stream = selection.createArchiveReadStream();
+  for await (const raw of stream) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    total += chunk.length;
+    if (
+      total > selection.archiveByteLength ||
+      total > NATIVE_SOURCE_DEFAULT_LIMITS.maxArchiveBytes
+    ) {
+      stream.destroy();
+      throw new SiteOpsManusFailure(
+        "SITEOPS_KNOWLEDGE_MEDIA_SOURCE_LIMIT_EXCEEDED",
+        "知识库媒体加入后超过网站源码上限。",
+        "failed",
+      );
+    }
+    digest.update(chunk);
+    chunks.push(chunk);
+  }
+  if (
+    total !== selection.archiveByteLength ||
+    digest.digest("hex") !== selection.archiveSha256
+  ) {
+    throw new SiteOpsManusFailure(
+      "STATIC_TEMPLATE_SOURCE_COORDINATES_MISMATCH",
+      "固定模板源码与目录坐标不一致。",
+      "failed",
+    );
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function knowledgeMediaManifestAttachment(
+  media: readonly TrustedSiteKnowledgeMedia[],
+) {
+  if (media.length === 0) return [];
+  const bytes = Buffer.from(
+    `${canonicalJson({
+      schemaVersion: 1,
+      files: freezeSiteKnowledgeMedia(media).map((asset) => ({
+        assetId: asset.assetId,
+        publicUrl: asset.publicPath,
+        sha256: asset.sha256,
+        mimeType: asset.mimeType,
+        sizeBytes: asset.sizeBytes,
+        width: asset.width,
+        height: asset.height,
+        alt: asset.alt,
+      })),
+    })}\n`,
+    "utf8",
+  );
+  return [
+    {
+      filename: "frontmind-knowledge-media-manifest-v1.json",
+      mime_type: "application/json",
+      file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+    } satisfies ManusV2Attachment,
+  ];
+}
+
+type SiteOpsRevisionMedia = z.infer<
+  typeof operationInputSchema
+>["revisionInputAssets"][number] & { bytes: Buffer };
+type SiteOpsRevisionLineageMedia = SiteOpsRevisionMedia & {
+  sourceDocumentIds: string[];
+};
+
+function siteOpsCustomerMediaPlanId(publicPath: string) {
+  return `customer-media:${sha256(publicPath).slice(0, 32)}`;
+}
+
+export function siteOpsContentPlanMediaSelection<
+  T extends { publicPath: string },
+>(plan: SiteContentPlanV2, userMedia: readonly T[]) {
+  const customerMediaById = new Map(
+    userMedia.map((asset) => [
+      siteOpsCustomerMediaPlanId(asset.publicPath),
+      asset,
+    ]),
+  );
+  const selectedCustomerMedia = new Map<string, T>();
+  const knowledgeRoutePaths = new Map<string, Set<string>>();
+  const unknownCustomerMediaIds = new Set<string>();
+  for (const route of plan.routes) {
+    for (const mediaId of new Set(
+      route.sections.flatMap((section) => section.mediaIds),
+    )) {
+      if (mediaId.startsWith("customer-media:")) {
+        const customerMedia = customerMediaById.get(mediaId);
+        if (customerMedia) selectedCustomerMedia.set(mediaId, customerMedia);
+        else unknownCustomerMediaIds.add(mediaId);
+        continue;
+      }
+      const routePaths = knowledgeRoutePaths.get(mediaId) ?? new Set<string>();
+      routePaths.add(route.path);
+      knowledgeRoutePaths.set(mediaId, routePaths);
+    }
+  }
+  return {
+    selectedCustomerMedia: [...selectedCustomerMedia.values()],
+    knowledgeRoutePaths,
+    unknownCustomerMediaIds: [...unknownCustomerMediaIds],
+  };
+}
+
+type SiteOpsRevisionLineageAsset = {
+  row: typeof siteBuildInputAssets.$inferSelect;
+  sourceDocumentId: string;
+};
+
+export function siteOpsRevisionLineageFromRows(input: {
+  currentBuild: Pick<
+    typeof siteBuilds.$inferSelect,
+    | "id"
+    | "parentBuildId"
+    | "projectId"
+    | "userId"
+    | "knowledgeSnapshotId"
+    | "knowledgeArchiveHash"
+  >;
+  projectId: string;
+  userId: number;
+  taskStartedAt: Date;
+  knowledgeInputEpochId: string | null;
+  builds: Array<
+    Pick<
+      typeof siteBuilds.$inferSelect,
+      | "id"
+      | "parentBuildId"
+      | "projectId"
+      | "userId"
+      | "knowledgeSnapshotId"
+      | "knowledgeArchiveHash"
+      | "workflowVersion"
+      | "sourceLocalAssetId"
+      | "sourceHash"
+      | "contentPlanLocalAssetId"
+      | "contentPlanSha256"
+      | "createdAt"
+    >
+  >;
+  operations: Array<
+    Pick<
+      typeof siteOperations.$inferSelect,
+      | "id"
+      | "buildId"
+      | "projectId"
+      | "userId"
+      | "kind"
+      | "status"
+      | "input"
+      | "createdAt"
+    >
+  >;
+  assets: Array<typeof siteBuildInputAssets.$inferSelect>;
+  /** Provider generation inherits completed ancestors only. Production replay
+   * runs after the current revision succeeded, so it includes that immutable
+   * child as the newest lineage node as well. */
+  includeCurrentBuild?: boolean;
+}): {
+  documents: SupplementalKnowledgeDocument[];
+  assets: SiteOpsRevisionLineageAsset[];
+} {
+  const fail = () => {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_REVISION_LINEAGE_INVALID",
+      "连续修订的父版本来源链已不完整或不属于当前任务。",
+      "failed",
+    );
+  };
+  if (
+    input.currentBuild.projectId !== input.projectId ||
+    input.currentBuild.userId !== input.userId ||
+    !input.currentBuild.parentBuildId
+  ) {
+    return fail();
+  }
+  const buildById = new Map(input.builds.map((row) => [row.id, row]));
+  const newestFirst: typeof input.builds = [];
+  const visited = new Set<string>();
+  let cursor: string | null = input.includeCurrentBuild
+    ? input.currentBuild.id
+    : input.currentBuild.parentBuildId;
+  if (!input.includeCurrentBuild) visited.add(input.currentBuild.id);
+  while (cursor) {
+    if (visited.has(cursor)) return fail();
+    visited.add(cursor);
+    const row = buildById.get(cursor);
+    if (
+      !row ||
+      row.projectId !== input.projectId ||
+      row.userId !== input.userId ||
+      row.workflowVersion !== SITEOPS_MATERIALIZER_V2_9.frontMindVersion ||
+      row.knowledgeSnapshotId !== input.currentBuild.knowledgeSnapshotId ||
+      row.knowledgeArchiveHash !== input.currentBuild.knowledgeArchiveHash ||
+      row.createdAt.getTime() < input.taskStartedAt.getTime()
+    ) {
+      return fail();
+    }
+    newestFirst.push(row);
+    cursor = row.parentBuildId;
+  }
+  const oldestFirst = newestFirst.reverse();
+  const revisionBuilds = oldestFirst.filter((row) => row.parentBuildId);
+  const revisionBuildIds = new Set(revisionBuilds.map((row) => row.id));
+  const operationsByBuild = new Map<
+    string,
+    Array<(typeof input.operations)[number]>
+  >();
+  for (const operation of input.operations) {
+    if (
+      operation.kind !== "build_revision" ||
+      !operation.buildId ||
+      !revisionBuildIds.has(operation.buildId)
+    ) {
+      continue;
+    }
+    const rows = operationsByBuild.get(operation.buildId) ?? [];
+    rows.push(operation);
+    operationsByBuild.set(operation.buildId, rows);
+  }
+  const sourceDocumentIdByBuild = new Map<string, string>();
+  const expectedAssetsByBuild = new Map<
+    string,
+    z.infer<typeof operationInputSchema>["revisionInputAssets"]
+  >();
+  const documents: SupplementalKnowledgeDocument[] = [];
+  for (const build of revisionBuilds) {
+    const operations = operationsByBuild.get(build.id) ?? [];
+    if (operations.length !== 1) return fail();
+    const operation = operations[0]!;
+    const parsed = operationInputSchema.safeParse(operation.input);
+    const parent = build.parentBuildId
+      ? buildById.get(build.parentBuildId)
+      : undefined;
+    if (
+      !parent ||
+      operation.projectId !== input.projectId ||
+      operation.userId !== input.userId ||
+      operation.kind !== "build_revision" ||
+      operation.status !== "succeeded" ||
+      operation.createdAt.getTime() < input.taskStartedAt.getTime() ||
+      !parsed.success ||
+      !parsed.data.feedback ||
+      parsed.data.childBuildId !== build.id ||
+      parsed.data.buildId !== build.parentBuildId ||
+      parsed.data.revisionBaseline?.parentBuildId !== build.parentBuildId ||
+      parsed.data.revisionBaseline.sourceLocalAssetId !==
+        parent.sourceLocalAssetId ||
+      parsed.data.revisionBaseline.sourceSha256 !== parent.sourceHash ||
+      parsed.data.revisionBaseline.contentPlanLocalAssetId !==
+        parent.contentPlanLocalAssetId ||
+      parsed.data.revisionBaseline.contentPlanSha256 !==
+        parent.contentPlanSha256
+    ) {
+      return fail();
+    }
+    const sourceDocumentId = `customer-revision:${operation.id}`;
+    sourceDocumentIdByBuild.set(build.id, sourceDocumentId);
+    expectedAssetsByBuild.set(build.id, parsed.data.revisionInputAssets);
+    documents.push({
+      id: sourceDocumentId,
+      path: `customer-revision/${operation.id}.md`,
+      title: "历史客户明确修订要求",
+      content: parsed.data.feedback,
+      kind: "customer_revision",
+      customerVisible: true,
+    });
+  }
+
+  const seenAssetOrdinals = new Set<string>();
+  const actualAssetsByBuild = new Map<
+    string,
+    Array<typeof siteBuildInputAssets.$inferSelect>
+  >();
+  const assets: SiteOpsRevisionLineageAsset[] = [];
+  for (const row of input.assets) {
+    if (!revisionBuildIds.has(row.buildId)) continue;
+    const ordinalKey = `${row.buildId}:${row.ordinal}`;
+    const sourceDocumentId = sourceDocumentIdByBuild.get(row.buildId);
+    if (
+      !sourceDocumentId ||
+      row.projectId !== input.projectId ||
+      row.userId !== input.userId ||
+      row.taskStartedAt.getTime() !== input.taskStartedAt.getTime() ||
+      row.siteOpsKnowledgeInputEpochId !== input.knowledgeInputEpochId ||
+      row.ordinal < 1 ||
+      row.ordinal > 8 ||
+      seenAssetOrdinals.has(ordinalKey)
+    ) {
+      return fail();
+    }
+    seenAssetOrdinals.add(ordinalKey);
+    const buildAssets = actualAssetsByBuild.get(row.buildId) ?? [];
+    buildAssets.push(row);
+    actualAssetsByBuild.set(row.buildId, buildAssets);
+    assets.push({ row, sourceDocumentId });
+  }
+  for (const build of revisionBuilds) {
+    const expected = expectedAssetsByBuild.get(build.id) ?? [];
+    const actual = (actualAssetsByBuild.get(build.id) ?? []).sort(
+      (left, right) => left.ordinal - right.ordinal,
+    );
+    if (actual.length !== expected.length) return fail();
+    for (const [index, descriptor] of expected.entries()) {
+      const row = actual[index];
+      if (
+        !row ||
+        row.ordinal !== index + 1 ||
+        row.localAssetId !== descriptor.localAssetId ||
+        row.filename !== descriptor.filename ||
+        row.mimeType !== descriptor.mimeType ||
+        row.sizeBytes !== descriptor.sizeBytes ||
+        row.contentSha256 !== descriptor.contentSha256 ||
+        row.width !== descriptor.width ||
+        row.height !== descriptor.height ||
+        row.publicPath !== descriptor.publicPath ||
+        row.siteOpsKnowledgeInputEpochId !==
+          descriptor.siteOpsKnowledgeInputEpochId
+      ) {
+        return fail();
+      }
+    }
+  }
+  const buildOrder = new Map(
+    revisionBuilds.map((row, index) => [row.id, index]),
+  );
+  assets.sort(
+    (left, right) =>
+      (buildOrder.get(left.row.buildId) ?? 0) -
+        (buildOrder.get(right.row.buildId) ?? 0) ||
+      left.row.ordinal - right.row.ordinal,
+  );
+  return { documents, assets };
+}
+
+function archiveWrapperRoot(zip: JSZip) {
+  const paths = Object.values(zip.files)
+    .filter((entry) => !entry.dir)
+    .map((entry) => entry.name);
+  if (paths.length === 0) return null;
+  const first = paths[0]!.split("/");
+  if (first.length < 2) return null;
+  const root = first[0]!;
+  return paths.every((pathname) => pathname.startsWith(`${root}/`))
+    ? root
+    : null;
+}
+
+export async function overlaySiteOpsRevisionMedia(
+  parentSource: Buffer,
+  media: readonly SiteOpsRevisionMedia[],
+) {
+  if (media.length === 0) return Buffer.from(parentSource);
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(parentSource, {
+      checkCRC32: true,
+      createFolders: false,
+    });
+  } catch {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_REVISION_BASE_INVALID",
+      "父版本源码无法作为连续修订基线。",
+      "failed",
+    );
+  }
+  const wrapper = archiveWrapperRoot(zip);
+  for (const asset of [...media].sort((left, right) =>
+    left.publicPath.localeCompare(right.publicPath, "en-US"),
+  )) {
+    if (
+      asset.bytes.length !== asset.sizeBytes ||
+      sha256(asset.bytes) !== asset.contentSha256
+    ) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_MEDIA_INVALID",
+        "修订图片未通过冻结哈希校验。",
+        "failed",
+      );
+    }
+    const sourcePath = `public${asset.publicPath}`;
+    const archivePath = wrapper ? `${wrapper}/${sourcePath}` : sourcePath;
+    zip.file(archivePath, asset.bytes, {
+      binary: true,
+      createFolders: false,
+      date: FIXED_ZIP_DATE,
+      unixPermissions: 0o100644,
+    });
+  }
+  const overlaid = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 },
+    platform: "UNIX",
+  });
+  if (overlaid.length > NATIVE_SOURCE_DEFAULT_LIMITS.maxArchiveBytes) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_REVISION_MEDIA_TOO_LARGE",
+      "修订图片加入后超过网站源码上限，请减少图片数量或压缩图片。",
+      "failed",
+    );
+  }
+  return overlaid;
+}
+
+async function loadInheritedSiteOpsRevisionLineage(input: {
+  db: any;
+  operation: SiteOperation;
+  build: typeof siteBuilds.$inferSelect;
+  taskStartedAt: Date;
+  knowledgeInputEpochId: string | null;
+  readArtifact: typeof readSiteOpsArtifact;
+}): Promise<{
+  documents: SupplementalKnowledgeDocument[];
+  media: SiteOpsRevisionLineageMedia[];
+}> {
+  const builds = (await input.db
+    .select()
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.projectId, input.operation.projectId),
+        eq(siteBuilds.userId, input.operation.userId),
+        gte(siteBuilds.createdAt, input.taskStartedAt),
+      ),
+    )) as Array<typeof siteBuilds.$inferSelect>;
+  const buildIds = builds.map((row) => row.id);
+  if (buildIds.length === 0) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_REVISION_LINEAGE_INVALID",
+      "连续修订的父版本来源链已不完整或不属于当前任务。",
+      "failed",
+    );
+  }
+  const [operations, assets] = await Promise.all([
+    input.db
+      .select()
+      .from(siteOperations)
+      .where(inArray(siteOperations.buildId, buildIds)),
+    input.db
+      .select()
+      .from(siteBuildInputAssets)
+      .where(inArray(siteBuildInputAssets.buildId, buildIds)),
+  ]);
+  const lineage = siteOpsRevisionLineageFromRows({
+    currentBuild: input.build,
+    projectId: input.operation.projectId,
+    userId: input.operation.userId,
+    taskStartedAt: input.taskStartedAt,
+    knowledgeInputEpochId: input.knowledgeInputEpochId,
+    builds,
+    operations,
+    assets,
+  });
+  const media: SiteOpsRevisionLineageMedia[] = [];
+  for (const { row, sourceDocumentId } of lineage.assets) {
+    if (
+      !["image/png", "image/jpeg", "image/webp"].includes(row.mimeType) ||
+      !/^[a-f0-9]{64}$/u.test(row.contentSha256) ||
+      !/^\/frontmind-user-media\/[a-f0-9]{64}\.(?:png|jpg|webp)$/u.test(
+        row.publicPath,
+      ) ||
+      row.sizeBytes < 1 ||
+      row.sizeBytes > 8 * 1024 * 1024 ||
+      row.width < 1 ||
+      row.height < 1
+    ) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_LINEAGE_MEDIA_INVALID",
+        "连续修订的历史图片坐标无法通过校验。",
+        "failed",
+      );
+    }
+    const artifact = await input.readArtifact({
+      userId: input.operation.userId,
+      localAssetId: row.localAssetId,
+      expectedSha256: row.contentSha256,
+      expectedMimeTypes: [row.mimeType],
+    });
+    if (!artifact) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_LINEAGE_MEDIA_UNAVAILABLE",
+        "连续修订的历史图片稳定副本不可用。",
+        "failed",
+      );
+    }
+    const bytes = await storedArtifactBytes(
+      artifact,
+      NATIVE_SOURCE_DEFAULT_LIMITS.maxSingleFileBytes,
+    );
+    if (bytes.length !== row.sizeBytes || sha256(bytes) !== row.contentSha256) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_LINEAGE_MEDIA_INVALID",
+        "连续修订的历史图片未通过冻结哈希校验。",
+        "failed",
+      );
+    }
+    media.push({
+      schemaVersion: 1,
+      localAssetId: row.localAssetId,
+      filename: row.filename,
+      mimeType: row.mimeType as "image/png" | "image/jpeg" | "image/webp",
+      sizeBytes: row.sizeBytes,
+      contentSha256: row.contentSha256,
+      width: row.width,
+      height: row.height,
+      publicPath: row.publicPath,
+      siteOpsKnowledgeInputEpochId: row.siteOpsKnowledgeInputEpochId,
+      bytes,
+      sourceDocumentIds: [sourceDocumentId],
+    });
+  }
+  return { documents: lineage.documents, media };
+}
+
 function staticCatalogCoordinatesMatch(
   candidate: VisualSelectionBundleV7["candidates"][number],
   entry: StaticTemplateCatalogEntry,
@@ -3706,7 +4504,10 @@ export async function selectedStaticNativeSourceArchive(input: {
     );
   }
   if (
-    input.bundle.workflowVersion !== SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+    (input.bundle.workflowVersion !==
+      SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION &&
+      input.bundle.workflowVersion !==
+        SITEOPS_MATERIALIZER_V2_9.frontMindVersion) ||
     candidate.catalogVersion !== input.bundle.catalogVersion
   ) {
     throw new SiteOpsManusFailure(
@@ -3973,12 +4774,126 @@ function nativeBrandAttachment(
 }
 
 export function nativeSourceSystemPromptForWorkflow(workflowVersion: string) {
+  if (workflowVersion === SITEOPS_MATERIALIZER_V2_9.frontMindVersion) {
+    return `你是生产级企业官网的前端、内容与构建工程师。返回完整可构建源码 ZIP，不返回 diff、解释或思考过程。
+
+执行合同：
+1. Template ZIP 是唯一源码与视觉基线；保留组件、布局和响应式风格，只做内容与静态运行所需修改，不得重设计。
+2. ${SITEOPS_CONTENT_PLAN_V2_FILENAME} 给出完整 route manifest 与内容坐标；按其 routes.path 生成页面。企业事实只取 dossier、冻结计划、客户反馈和已验证媒体，删除模板品牌、演示文案、占位资源及外部链接，不得编造。
+3. 导航和有目标 CTA 使用计划内规范路径的真实 <a href>，可见链接文字必须包含计划 cta.label。计划图片使用可信 publicUrl 和非空 alt。
+4. 不得加入认证、支付、数据库、后台、统计、webhook、外部脚本、远程请求、远程资源、动态执行或动态 import。
+5. 输出 FrontMind Vite SPA；保留 execution shell，在 ${NATIVE_RUNTIME_ROUTE_MODULE} 用 eager static import 导出 ${NATIVE_RUNTIME_ROUTE_MANIFEST_EXPORT}。多页初始化与 popstate 调用 window.canonicalSitePathname()；仅函数不存在时回退 window.location.pathname。每个包含 JSX 的模块都必须显式绑定或 import React。
+6. 运行 production build 和 ${NATIVE_SOURCE_PREFLIGHT_V2_FILENAME}，逐路由确认无 pageerror、console.error 和空白 root。只交付 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME} 与 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。`;
+  }
   if (workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION) {
     return TWENTY_FIRST_STATIC_TEMPLATE_V2_8_SYSTEM_PROMPT;
   }
   return workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION
     ? TWENTY_FIRST_NATIVE_TEMPLATE_V2_7_SYSTEM_PROMPT
     : TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT;
+}
+
+function siteContentPlanPrompt(input: {
+  operationToken: string;
+  inventorySha256: string;
+  hasRevisionBaseline?: boolean;
+  repairIssues?: readonly string[];
+}) {
+  const repair = input.repairIssues?.length
+    ? `上一份计划未通过严格合同：${input.repairIssues.join(", ")}。这是唯一一次定向修复；返回完整替代计划，不得只返回补丁。`
+    : "先完成信息架构计划，不得在本阶段改源码或生成网站 ZIP。";
+  const revision = input.hasRevisionBaseline
+    ? "这是连续修订。frontmind-parent-content-plan-v1.json 是父版本完整计划基线，coverage inventory 已累积此前 customer_revision 来源与冻结图片。只改变本轮客户明确要求涉及的页面、区块、路由或媒体；未涉及内容必须原样保留。若本轮明确删除或替代了历史来源，才可 omitted，并须给出具体原因。"
+    : "";
+  return promptWithMarker(
+    `你是 FrontMind 官网信息架构师。完整企业事实只来自 frontmind-siteops-source-dossier-v1.json，完整覆盖清单只来自 frontmind-knowledge-coverage-inventory-v1.json。frontmind-site-content-plan-wire-v2-contract.json 是唯一输出字段合同，必须逐字段遵守。
+
+除技术入口 / 必须存在外，页面数量、名称、层级、导航、页面合并拆分和详情页均由你根据知识资料决定；不得套用固定的关于、产品、案例、联系页面清单。最多 30 条规范小写 ASCII 尾斜杠路径，禁止 /api/、/dashboard/、/preview/、/internal/、/_frontmind/、/admin/。每个导航、父级、详情归属和 CTA 只能指向计划内路径。
+
+每个公开相关文档必须恰好有一条 coverage：used 必须绑定实际 route/section 及原文逐字 evidenceExcerpt；不相关资料可 omitted，但必须给出具体理由。案例、新闻、价格、资质和客户评价只能在存在对应来源时规划。必须使用 inventory 中真实 entity、faq、media 坐标。${revision}
+
+SiteContentPlanWireV2 必须是以下精确扁平形状，不得省略任何字段：
+- 顶层仅允许 wireSchemaVersion、operationToken、inventorySha256、routes、sections、navigation、coverage。wireSchemaVersion 必须为 2，operationToken 必须精确为 ${input.operationToken}，inventorySha256 必须精确为 ${input.inventorySha256}。
+- routes 每项仅允许 routeId、path、title、navigation、parentPath、detailOfPath、purpose、userQuestions、h1、summary、ctaLabel、ctaTargetPath；routes 内绝对不得嵌套 sections。无父级/详情归属/CTA 时相应字段显式为 null。
+- sections 是独立顶层数组，每项仅允许 routeId、sectionId、blockKind、heading、purpose、body、sourceDocumentIds、evidenceExcerpts、mediaIds、entityIds、faqIds。sourceDocumentIds 与 evidenceExcerpts 按下标一一对应。
+- 每个 section（包括 hero、CTA 和纯结构区块）的 sourceDocumentIds 与 evidenceExcerpts 都必须至少各有一项；若区块无法绑定逐字来源，就合并进有来源的区块或省略该区块，绝不能输出空来源数组。
+- navigation 每项仅允许 label、targetPath。coverage 每项仅允许 sourceDocumentId、status、routeIds、omissionReason；used 时 routeIds 非空且 omissionReason=null，omitted 时 routeIds=[] 且 omissionReason 为具体字符串。
+
+严禁自创替代 schema 或别名：不得使用 schemaVersion、pages、routeManifest、blocks、coverages、menu、navItems；routes 项不得使用 id、slug、children、navOrder 或嵌套 sections；sections 项不得使用 id、sourceBindings、sources 或 evidence；coverage 项不得使用 documentId、routes 或 reason。只有允许为空的集合才输出 []；section 的来源与摘录数组不得为空。可空坐标必须输出 null，不得改名或删字段。${repair}
+
+只返回 SiteContentPlanWireV2 扁平 JSON，并把完全相同对象附加为 ${SITEOPS_CONTENT_PLAN_V2_FILENAME}；不得返回源码、ZIP、解释、外部资料或未知事实。`,
+    input.operationToken,
+  );
+}
+
+function siteContentPlanSchemaRepairIssues(error: unknown) {
+  if (!(error instanceof z.ZodError)) return [];
+  return [
+    ...new Set(
+      error.issues.slice(0, 16).map((issue) => {
+        const path = issue.path
+          .map((segment) => String(segment).replace(/[^A-Za-z0-9_-]/gu, ""))
+          .filter(Boolean)
+          .join(".");
+        return `CONTENT_PLAN_SCHEMA_${issue.code.toUpperCase()}@${path || "root"}`;
+      }),
+    ),
+  ];
+}
+
+const SITEOPS_CONTENT_PLAN_WIRE_V2_CONTRACT_FILENAME =
+  "frontmind-site-content-plan-wire-v2-contract.json" as const;
+
+function siteContentPlanWireContractAttachment(input: {
+  operationToken: string;
+  inventorySha256: string;
+  sourceDocumentIds: readonly string[];
+}) {
+  const sourceDocumentIds = [...new Set(input.sourceDocumentIds)];
+  const contract = {
+    contractName: "SiteContentPlanWireV2",
+    contractRevision: 2,
+    outputFilename: SITEOPS_CONTENT_PLAN_V2_FILENAME,
+    coordinates: {
+      operationToken: input.operationToken,
+      inventorySha256: input.inventorySha256,
+      sourceDocumentIds,
+    },
+    shapeRules: {
+      exactTopLevelFields: [
+        "wireSchemaVersion",
+        "operationToken",
+        "inventorySha256",
+        "routes",
+        "sections",
+        "navigation",
+        "coverage",
+      ],
+      sectionsAreTopLevelAndFlat: true,
+      everySectionHasAtLeastOneVerbatimSource: true,
+      everySourceDocumentMustAppearExactlyOnceInCoverage: true,
+      additionalPropertiesAllowed: false,
+    },
+    jsonSchema: siteContentPlanOutputSchema({
+      operationToken: input.operationToken,
+      inventorySha256: input.inventorySha256,
+    }),
+  };
+  const bytes = Buffer.from(`${canonicalJson(contract)}\n`, "utf8");
+  return {
+    filename: SITEOPS_CONTENT_PLAN_WIRE_V2_CONTRACT_FILENAME,
+    mime_type: "application/json",
+    file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+  } as const;
+}
+
+function siteContentPlanAttachment(plan: SiteContentPlanV2) {
+  const bytes = Buffer.from(`${canonicalJson(plan)}\n`, "utf8");
+  return {
+    filename: SITEOPS_CONTENT_PLAN_V2_FILENAME,
+    mime_type: "application/json",
+    file_data: `data:application/json;base64,${bytes.toString("base64")}`,
+  } as const;
 }
 
 const NATIVE_RUNTIME_DIAGNOSTICS_FILENAME =
@@ -4001,28 +4916,34 @@ function nativeRuntimeDiagnosticsAttachment(repair: NativeSourceRepairInput) {
   } as const;
 }
 
-function nativeSourcePrompt(input: {
+export function nativeSourcePrompt(input: {
   operationToken: string;
   baseSourceSha256: string;
   contractVersion: 1 | 2;
   runtimeCoordinates: NativeSourceRuntimeCoordinates | null;
   workflowVersion: string;
   hasCustomerFeedback?: boolean;
+  hasRevisionMedia?: boolean;
+  hasRevisionBaseline?: boolean;
+  hasKnowledgeMedia?: boolean;
   templateCoordinateInstruction?: string;
   repair?: NativeSourceRepairInput;
+  contentPlanSha256?: string;
 }) {
   if (input.contractVersion === 2 && !input.runtimeCoordinates) {
     throw new Error("NATIVE_SOURCE_RUNTIME_COORDINATES_MISSING");
   }
   const systemPrompt = input.repair
-    ? "继续同一 FrontMind AI 建站任务。本轮只修复上一份源码，不是重新设计；原任务中的视觉、内容和事实边界继续有效。"
+    ? input.workflowVersion === SITEOPS_MATERIALIZER_V2_9.frontMindVersion
+      ? "继续同一 FrontMind AI 建站任务。本轮只修复上一份源码，不重新设计；原任务的视觉、冻结计划、内容和事实边界继续有效。一次修完诊断附件全部问题。全局导航和有目标 CTA 必须是真实规范 <a href>，可见链接文字须包含计划标签且允许保留不改变含义的模板装饰。多页初始化与 popstate 必须优先调用宿主 canonicalSitePathname，函数不存在时才回退 window.location.pathname。"
+      : "继续同一 FrontMind AI 建站任务。本轮只修复上一份源码，不是重新设计；原任务中的视觉、内容和事实边界继续有效。"
     : nativeSourceSystemPromptForWorkflow(input.workflowVersion);
   const repair = input.repair
-    ? `\n\n上一份源码未通过${input.repair.kind === "compile" ? "本地编译" : "运行合同或硬安全检查"}。只按 ${NATIVE_RUNTIME_DIAGNOSTICS_FILENAME} 一次性修复全部坐标；不得重新设计或复用失败输出。以本消息重新附加的源码与执行基线为准，重跑 preflight 后返回完整源码 ZIP。`
+    ? `\n\n上一份源码未通过${input.repair.kind === "compile" ? "本地编译" : "运行合同或硬安全检查"}。只按 ${NATIVE_RUNTIME_DIAGNOSTICS_FILENAME} 一次性修复全部坐标；不得重新设计或复用失败输出。以本消息重新附加的源码与执行基线为准，重跑 preflight 和 production build，并逐条打开 route manifest 的全部路由确认无 pageerror、console.error 或空白 root；execution shell 未声明 automatic JSX runtime 时，每个包含 JSX 的模块都必须显式绑定或 import React。返回完整源码 ZIP。`
     : "";
   const deliveryContract =
     input.contractVersion === 2
-      ? `Receipt 必须符合 Structured Output schema，并严格使用：operationToken=${input.operationToken}；baseSourceSha256=${input.baseSourceSha256}；executionBaselineSha256=${input.baseSourceSha256}；preflightVersion=${input.runtimeCoordinates!.preflightVersion}；preflightStatus=passed；preflightSha256=${input.runtimeCoordinates!.preflightSha256}；runtimeContractVersion=${input.runtimeCoordinates!.contractVersion}；runtimeContractSha256=${input.runtimeCoordinates!.contractSha256}；executionShellSha256=${input.runtimeCoordinates!.executionShellSha256}；archiveSha256 必须对应最终 ZIP；fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）。`
+      ? "Receipt 必须符合 Structured Output schema；archiveSha256 必须对应最终 ZIP；fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）。"
       : `交付前必须运行 ${NATIVE_SOURCE_PREFLIGHT_FILENAME} 并通过 package、文件类型、依赖、源码语法和 production build 自检。Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256、实际 fileCount、preflightVersion=${NATIVE_SOURCE_PREFLIGHT_VERSION}、preflightStatus=passed、preflightSha256=${NATIVE_SOURCE_PREFLIGHT_SHA256}。`;
   return promptWithMarker(
     `${systemPrompt}
@@ -4032,6 +4953,14 @@ frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZI
 ${input.templateCoordinateInstruction ?? ""}
 
 ${input.hasCustomerFeedback ? "客户要求见 frontmind-customer-feedback-v1.json；仅在知识与原生样式边界内实现。" : ""}
+
+${input.hasRevisionMedia ? "本轮图片见 frontmind-user-media-manifest-v1.json，且已由 FrontMind 写入源码 public/frontmind-user-media。必须在客户要求指定的页面中使用清单 publicUrl；不得改写、转码或引用外部副本。" : ""}
+
+${input.hasRevisionBaseline ? "这是连续修订：frontmind-parent-content-plan-v1.json 是父版本完整内容计划基线。只修改客户明确要求的部分，未涉及的路由、事实、内容结构与媒体必须原样保留；交付仍须形成一份完整网站。" : ""}
+
+${input.hasKnowledgeMedia ? "内容计划选中的知识库图片见 frontmind-knowledge-media-manifest-v1.json，且可信原始字节已由 FrontMind 写入源码 public/frontmind-knowledge-media。必须按计划页面使用清单 publicUrl 与非空 alt；不得改写、转码或引用外部副本。" : ""}
+
+${input.contentPlanSha256 ? `${SITEOPS_CONTENT_PLAN_V2_FILENAME} 已由 Dashboard 冻结，sha256=${input.contentPlanSha256}；它是唯一信息架构与内容覆盖合同。必须先逐项读取，再适配源码，route manifest 必须与其 routes.path 完全一致。` : ""}
 
 ${deliveryContract}只返回 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME} 与 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME} 各一份后结束；不得解释、浏览或更新计划。${repair}`,
     input.operationToken,
@@ -4055,6 +4984,92 @@ function nativeCompileSignature(error: NativeReactBuildError) {
     .digest("hex");
 }
 
+const NATIVE_SOURCE_OUTPUT_UNAVAILABLE_CODE =
+  "SITEOPS_NATIVE_SOURCE_OUTPUT_UNAVAILABLE" as const;
+// Deliberately independent of provider status/event ids: once this delivery
+// failure has consumed a repair attempt, later polls cannot turn it into a
+// second source-delivery retry under a different terminal shape.
+const NATIVE_SOURCE_OUTPUT_UNAVAILABLE_SIGNATURE = createHash("sha256")
+  .update(
+    JSON.stringify({ code: NATIVE_SOURCE_OUTPUT_UNAVAILABLE_CODE }),
+    "utf8",
+  )
+  .digest("hex");
+
+const NON_RETRYABLE_PROVIDER_QUOTA_ERROR_TYPES = new Set([
+  "credit_exhausted",
+  "credits_exhausted",
+  "insufficient_credits",
+  "quota_exceeded",
+  "quota_limit",
+  "usage_exhausted",
+]);
+
+function nativeSourceTerminalErrorType(
+  events: readonly ManusV2MessageEvent[],
+  operationToken: string,
+) {
+  const ordered = orderManusV2EventsByProviderRank(
+    currentPhaseEvents(events, operationToken),
+    "oldest_first",
+  );
+  let latestStatusIndex = -1;
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const statusUpdate =
+      ordered[index]!.status_update &&
+      typeof ordered[index]!.status_update === "object" &&
+      !Array.isArray(ordered[index]!.status_update)
+        ? (ordered[index]!.status_update as Record<string, unknown>)
+        : null;
+    if (typeof statusUpdate?.agent_status !== "string") continue;
+    latestStatusIndex = index;
+    break;
+  }
+
+  // Bound the terminal error to the most recent execution episode. A source
+  // task may recover from an earlier provider error and continue running in
+  // the same phase; an error before that recovery must not suppress the one
+  // permitted missing-output repair for a later, unrelated terminal.
+  let precedingNonErrorStatusIndex = -1;
+  for (let index = latestStatusIndex - 1; index >= 0; index -= 1) {
+    const statusUpdate =
+      ordered[index]!.status_update &&
+      typeof ordered[index]!.status_update === "object" &&
+      !Array.isArray(ordered[index]!.status_update)
+        ? (ordered[index]!.status_update as Record<string, unknown>)
+        : null;
+    const status =
+      typeof statusUpdate?.agent_status === "string"
+        ? statusUpdate.agent_status.trim().toLowerCase()
+        : "";
+    if (!status || status === "error" || status === "failed") continue;
+    precedingNonErrorStatusIndex = index;
+    break;
+  }
+
+  let event: ManusV2MessageEvent | undefined;
+  for (
+    let index = ordered.length - 1;
+    index > precedingNonErrorStatusIndex;
+    index -= 1
+  ) {
+    if (ordered[index]!.type !== "error_message") continue;
+    event = ordered[index];
+    break;
+  }
+  const envelope =
+    event?.error_message &&
+    typeof event.error_message === "object" &&
+    !Array.isArray(event.error_message)
+      ? (event.error_message as Record<string, unknown>)
+      : null;
+  const errorType =
+    typeof envelope?.error_type === "string"
+      ? envelope.error_type.trim().toLowerCase()
+      : "";
+  return errorType && errorType.length <= 128 ? errorType : null;
+}
+
 const NATIVE_SOURCE_OFFLINE_RESUME_CHECKPOINTS = new Set([
   "archive_validated",
   "compile_started",
@@ -4066,6 +5081,7 @@ async function readNativeSourceOfflineResume(input: {
   state: ProviderState | null;
   operationToken: string;
   baseSourceSha256: string;
+  expectedContentPlanSha256?: string;
   stagingAssetId: string;
   taskId: string;
   buildTaskId: string | null;
@@ -4105,7 +5121,10 @@ async function readNativeSourceOfflineResume(input: {
     input.operation.providerTaskId !== input.taskId ||
     input.buildTaskId !== input.taskId ||
     receipt.operationToken !== input.operationToken ||
-    receipt.baseSourceSha256 !== input.baseSourceSha256
+    receipt.baseSourceSha256 !== input.baseSourceSha256 ||
+    (input.expectedContentPlanSha256 !== undefined &&
+      (!("contentPlanSha256" in receipt) ||
+        receipt.contentPlanSha256 !== input.expectedContentPlanSha256))
   ) {
     throw new SiteOpsManusFailure(
       "FRONTMIND_BUILD_STAGED_SOURCE_IDENTITY_CONFLICT",
@@ -4465,6 +5484,7 @@ async function handleNativeReactSiteBuild(input: {
   brandAsset: Awaited<
     ReturnType<typeof readSelectedOfficialLogoFromKnowledgeArchive>
   >;
+  knowledgeArchiveBytes: Buffer;
   nativeSelection: NativeSelection;
   materializeNative: typeof materializeNativeReactSource;
   materializeNativeFallback: typeof materializeNativeTrustedFallbackSite;
@@ -4477,7 +5497,324 @@ async function handleNativeReactSiteBuild(input: {
   const attempt = input.state?.nativeRepairAttempt ?? 0;
   let currentState = input.state;
   const operationToken = `siteops-native-source:${input.operation.id}:${attempt}`;
-  const baseSourceSha256 = input.nativeSelection.archiveSha256;
+  let revisionSource: {
+    bytes: Buffer;
+    sha256: string;
+    media: SiteOpsRevisionLineageMedia[];
+    attachments: ManusV2Attachment[];
+  } | null = null;
+  let inheritedRevisionDocuments: SupplementalKnowledgeDocument[] = [];
+  let currentRevisionMediaPlanIds: string[] = [];
+  const currentRevisionSourceDocumentId = input.input.feedback
+    ? `customer-revision:${input.operation.id}`
+    : null;
+  const revisionBaseline = input.input.revisionBaseline;
+  const revisionInputAssets = input.input.revisionInputAssets;
+  if (input.context.build.parentBuildId) {
+    if (
+      input.context.build.workflowVersion !== "2.9.0" ||
+      !revisionBaseline ||
+      revisionBaseline.parentBuildId !== input.context.build.parentBuildId
+    ) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_BASE_MISSING",
+        "连续修订缺少已冻结的父版本源码坐标。",
+        "failed",
+      );
+    }
+    const parentRows = await input.db
+      .select()
+      .from(siteBuilds)
+      .where(
+        and(
+          eq(siteBuilds.id, revisionBaseline.parentBuildId),
+          eq(siteBuilds.projectId, input.operation.projectId),
+          eq(siteBuilds.userId, input.operation.userId),
+          gte(siteBuilds.createdAt, input.context.project.currentTaskStartedAt),
+        ),
+      )
+      .limit(1);
+    const parent = parentRows[0] as typeof siteBuilds.$inferSelect | undefined;
+    if (
+      !parent ||
+      parent.sourceLocalAssetId !== revisionBaseline.sourceLocalAssetId ||
+      parent.sourceHash !== revisionBaseline.sourceSha256 ||
+      parent.contentPlanLocalAssetId !==
+        revisionBaseline.contentPlanLocalAssetId ||
+      parent.contentPlanSha256 !== revisionBaseline.contentPlanSha256
+    ) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_BASE_COORDINATES_MISMATCH",
+        "父版本源码或内容计划坐标与当前修订不一致。",
+        "failed",
+      );
+    }
+    const inputRows = await input.db
+      .select()
+      .from(siteBuildInputAssets)
+      .where(
+        and(
+          eq(siteBuildInputAssets.buildId, input.context.build.id),
+          eq(siteBuildInputAssets.projectId, input.operation.projectId),
+          eq(siteBuildInputAssets.userId, input.operation.userId),
+          eq(
+            siteBuildInputAssets.taskStartedAt,
+            input.context.project.currentTaskStartedAt,
+          ),
+          input.context.project.knowledgeInputEpochId
+            ? eq(
+                siteBuildInputAssets.siteOpsKnowledgeInputEpochId,
+                input.context.project.knowledgeInputEpochId,
+              )
+            : isNull(siteBuildInputAssets.siteOpsKnowledgeInputEpochId),
+        ),
+      );
+    if (inputRows.length !== revisionInputAssets.length) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_MEDIA_COORDINATES_MISMATCH",
+        "修订图片与当前版本的冻结坐标不一致。",
+        "failed",
+      );
+    }
+    const rowByAsset = new Map<
+      string,
+      typeof siteBuildInputAssets.$inferSelect
+    >();
+    for (const row of inputRows as Array<
+      typeof siteBuildInputAssets.$inferSelect
+    >) {
+      rowByAsset.set(row.localAssetId, row);
+    }
+    if (rowByAsset.size !== inputRows.length) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_MEDIA_COORDINATES_MISMATCH",
+        "修订图片与当前版本的冻结坐标不一致。",
+        "failed",
+      );
+    }
+    const media: SiteOpsRevisionMedia[] = [];
+    for (const [index, descriptor] of revisionInputAssets.entries()) {
+      const row = rowByAsset.get(descriptor.localAssetId);
+      if (
+        !row ||
+        row.ordinal !== index + 1 ||
+        row.filename !== descriptor.filename ||
+        row.mimeType !== descriptor.mimeType ||
+        row.sizeBytes !== descriptor.sizeBytes ||
+        row.contentSha256 !== descriptor.contentSha256 ||
+        row.width !== descriptor.width ||
+        row.height !== descriptor.height ||
+        row.publicPath !== descriptor.publicPath ||
+        row.siteOpsKnowledgeInputEpochId !==
+          descriptor.siteOpsKnowledgeInputEpochId ||
+        row.siteOpsKnowledgeInputEpochId !==
+          input.context.project.knowledgeInputEpochId ||
+        row.taskStartedAt.getTime() !==
+          input.context.project.currentTaskStartedAt.getTime()
+      ) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_REVISION_MEDIA_COORDINATES_MISMATCH",
+          "修订图片与当前版本的冻结坐标不一致。",
+          "failed",
+        );
+      }
+      const artifact = await input.readArtifact({
+        userId: input.operation.userId,
+        localAssetId: descriptor.localAssetId,
+        expectedSha256: descriptor.contentSha256,
+        expectedMimeTypes: [descriptor.mimeType],
+      });
+      if (!artifact) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_REVISION_MEDIA_UNAVAILABLE",
+          "修订图片的稳定副本不可用。",
+          "failed",
+        );
+      }
+      const bytes = await storedArtifactBytes(
+        artifact,
+        NATIVE_SOURCE_DEFAULT_LIMITS.maxSingleFileBytes,
+      );
+      media.push({ ...descriptor, bytes });
+    }
+    currentRevisionMediaPlanIds = media.map((asset) =>
+      siteOpsCustomerMediaPlanId(asset.publicPath),
+    );
+    const parentArtifact = await input.readArtifact({
+      userId: input.operation.userId,
+      localAssetId: revisionBaseline.sourceLocalAssetId,
+      expectedSha256: revisionBaseline.sourceSha256,
+      expectedMimeTypes: [FRONTMIND_SITE_SOURCE_ARCHIVE_MIME],
+    });
+    if (!parentArtifact) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_BASE_UNAVAILABLE",
+        "父版本源码稳定副本不可用。",
+        "failed",
+      );
+    }
+    const parentSource = await storedArtifactBytes(
+      parentArtifact,
+      NATIVE_SOURCE_DEFAULT_LIMITS.maxArchiveBytes,
+    );
+    const parentPlanArtifact = await input.readArtifact({
+      userId: input.operation.userId,
+      localAssetId: revisionBaseline.contentPlanLocalAssetId,
+      expectedSha256: revisionBaseline.contentPlanSha256,
+      expectedMimeTypes: ["application/json"],
+    });
+    if (!parentPlanArtifact) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_PLAN_UNAVAILABLE",
+        "父版本内容计划稳定副本不可用。",
+        "failed",
+      );
+    }
+    const parentPlanBytes = await storedArtifactBytes(
+      parentPlanArtifact,
+      4 * 1024 * 1024,
+    );
+    try {
+      JSON.parse(parentPlanBytes.toString("utf8"));
+    } catch {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_PLAN_INVALID",
+        "父版本内容计划无法作为连续修订基线。",
+        "failed",
+      );
+    }
+    const inheritedLineage = await loadInheritedSiteOpsRevisionLineage({
+      db: input.db,
+      operation: input.operation,
+      build: input.context.build,
+      taskStartedAt: input.context.project.currentTaskStartedAt,
+      knowledgeInputEpochId: input.context.project.knowledgeInputEpochId,
+      readArtifact: input.readArtifact,
+    });
+    inheritedRevisionDocuments = inheritedLineage.documents;
+    const cumulativeMedia = new Map<string, SiteOpsRevisionLineageMedia>();
+    for (const asset of inheritedLineage.media) {
+      const existing = cumulativeMedia.get(asset.publicPath);
+      if (
+        existing &&
+        (existing.contentSha256 !== asset.contentSha256 ||
+          existing.mimeType !== asset.mimeType ||
+          existing.sizeBytes !== asset.sizeBytes)
+      ) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_REVISION_LINEAGE_MEDIA_CONFLICT",
+          "连续修订的图片路径与冻结内容发生冲突。",
+          "failed",
+        );
+      }
+      cumulativeMedia.set(asset.publicPath, {
+        ...(existing ?? asset),
+        sourceDocumentIds: [
+          ...new Set([
+            ...(existing?.sourceDocumentIds ?? []),
+            ...asset.sourceDocumentIds,
+          ]),
+        ],
+      });
+    }
+    for (const asset of media) {
+      if (!currentRevisionSourceDocumentId) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_REVISION_FEEDBACK_MISSING",
+          "本轮修订缺少可冻结的客户要求来源。",
+          "failed",
+        );
+      }
+      const existing = cumulativeMedia.get(asset.publicPath);
+      if (
+        existing &&
+        (existing.contentSha256 !== asset.contentSha256 ||
+          existing.mimeType !== asset.mimeType ||
+          existing.sizeBytes !== asset.sizeBytes)
+      ) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_REVISION_LINEAGE_MEDIA_CONFLICT",
+          "连续修订的图片路径与冻结内容发生冲突。",
+          "failed",
+        );
+      }
+      cumulativeMedia.set(asset.publicPath, {
+        ...(existing ?? asset),
+        sourceDocumentIds: [
+          ...new Set([
+            ...(existing?.sourceDocumentIds ?? []),
+            currentRevisionSourceDocumentId,
+          ]),
+        ],
+      });
+    }
+    const allMedia = [...cumulativeMedia.values()].sort((left, right) =>
+      left.publicPath.localeCompare(right.publicPath, "en-US"),
+    );
+    // Reinstall the complete lineage from its immutable SiteOps artifacts.
+    // The parent ZIP is still the sole source baseline, while this closes a
+    // missing/corrupt historical-media gap before Manus receives it.
+    const bytes = await overlaySiteOpsRevisionMedia(parentSource, allMedia);
+    const preparedSha256 = sha256(bytes);
+    const manifestBytes = Buffer.from(
+      `${canonicalJson({
+        schemaVersion: 1,
+        parentBuildId: revisionBaseline.parentBuildId,
+        parentSourceSha256: revisionBaseline.sourceSha256,
+        preparedBaseSourceSha256: preparedSha256,
+        files: allMedia.map((asset) => ({
+          filename: asset.filename,
+          mimeType: asset.mimeType,
+          sizeBytes: asset.sizeBytes,
+          contentSha256: asset.contentSha256,
+          width: asset.width,
+          height: asset.height,
+          sourcePath: `public${asset.publicPath}`,
+          publicUrl: asset.publicPath,
+        })),
+      })}\n`,
+      "utf8",
+    );
+    revisionSource = {
+      bytes,
+      sha256: preparedSha256,
+      media: allMedia,
+      attachments: [
+        {
+          filename: "frontmind-user-media-manifest-v1.json",
+          mime_type: "application/json",
+          file_data: `data:application/json;base64,${manifestBytes.toString("base64")}`,
+        },
+        {
+          filename: "frontmind-parent-content-plan-v1.json",
+          mime_type: "application/json",
+          file_data: `data:application/json;base64,${parentPlanBytes.toString("base64")}`,
+        },
+        ...media.map(
+          (asset) =>
+            ({
+              filename: `frontmind-user-media-${asset.contentSha256}${path.posix.extname(asset.publicPath)}`,
+              mime_type: asset.mimeType,
+              file_data: `data:${asset.mimeType};base64,${asset.bytes.toString("base64")}`,
+            }) satisfies ManusV2Attachment,
+        ),
+      ],
+    };
+  } else if (revisionBaseline || revisionInputAssets.length > 0) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_REVISION_COORDINATES_UNEXPECTED",
+      "首轮建站不能携带父版本修订坐标。",
+      "failed",
+    );
+  }
+  let baseSourceSha256 =
+    revisionSource?.sha256 ?? input.nativeSelection.archiveSha256;
+  let sourceOverride = revisionSource
+    ? { bytes: revisionSource.bytes, sha256: revisionSource.sha256 }
+    : null;
+  let requiredRevisionMedia: SiteOpsRevisionLineageMedia[] = [];
+  let knowledgeMedia: TrustedSiteKnowledgeMedia[] = [];
+  const knowledgeMediaRoutePaths = new Map<string, Set<string>>();
   const runtimeVisual = siteOpsRuntimeVisualEvidenceV1Schema.parse({
     queryHash: nativeSelectionQueryHash(input.nativeSelection),
     selectedCandidateId: input.context.sample.id,
@@ -4487,14 +5824,18 @@ async function handleNativeReactSiteBuild(input: {
     supportEvidenceSha256s: [],
     taxonomy: input.taxonomy,
   });
-  const templateCoordinate = nativeTemplateCoordinateDirective(
-    input.nativeSelection,
-  );
+  const templateCoordinate = revisionSource
+    ? null
+    : nativeTemplateCoordinateDirective(input.nativeSelection);
+  const dynamicInformationArchitecture =
+    input.context.build.workflowVersion ===
+    SITEOPS_MATERIALIZER_V2_9.frontMindVersion;
   let taskId =
     input.state?.taskId ?? input.operation.providerTaskId ?? undefined;
   const nativeSourceContractVersion: 1 | 2 =
-    input.state?.schemaVersion === 2 &&
-    input.state.nativeSourceContractVersion === 2
+    dynamicInformationArchitecture ||
+    (input.state?.schemaVersion === 2 &&
+      input.state.nativeSourceContractVersion === 2)
       ? 2
       : taskId
         ? 1
@@ -4528,14 +5869,770 @@ async function handleNativeReactSiteBuild(input: {
       nativeSourceRuntime = input.nativeSourceRuntimeRegistry.current;
     }
   }
+  const customerRevisionDocument =
+    dynamicInformationArchitecture &&
+    input.operation.kind === "build_revision" &&
+    input.input.feedback
+      ? {
+          id: currentRevisionSourceDocumentId!,
+          path: `customer-revision/${input.operation.id}.md`,
+          title: "本轮客户明确修订要求",
+          content: input.input.feedback,
+          kind: "customer_revision",
+          customerVisible: true as const,
+        }
+      : null;
+  const revisionDocuments = [
+    ...inheritedRevisionDocuments,
+    ...(customerRevisionDocument ? [customerRevisionDocument] : []),
+  ];
+  const generationDocuments =
+    revisionDocuments.length > 0
+      ? [...input.documents, ...revisionDocuments]
+      : input.documents;
+  const supplementalRevisionMedia: SupplementalKnowledgeMedia[] =
+    revisionSource?.media.map((asset) => ({
+      id: siteOpsCustomerMediaPlanId(asset.publicPath),
+      sha256: asset.contentSha256,
+      path: asset.publicPath,
+      mimeType: asset.mimeType,
+      caption: asset.filename,
+      alt: asset.filename,
+      size: asset.sizeBytes,
+      width: asset.width,
+      height: asset.height,
+      sourceDocumentIds: asset.sourceDocumentIds,
+    })) ?? [];
+  const inventory = dynamicInformationArchitecture
+    ? knowledgeCoverageInventoryFromSnapshot(
+        input.context.snapshot,
+        revisionDocuments,
+        supplementalRevisionMedia,
+      )
+    : null;
+  const inventoryBinding = inventory
+    ? knowledgeCoverageInventoryAttachment(inventory)
+    : null;
+  const dynamicPlanningBrief = dynamicInformationArchitecture
+    ? siteBriefSchema.parse({
+        ...input.brief,
+        routes: [
+          {
+            id: "root",
+            slug: "/",
+            title: input.brief.companyName,
+            sourceDocumentIds: generationDocuments.map(
+              (document) => document.id,
+            ),
+          },
+        ],
+      })
+    : input.brief;
+  let frozenContentPlan: SiteContentPlanV2 | null = null;
+  let frozenContentPlanCoordinates: {
+    localAssetId: string;
+    sha256: string;
+  } | null = null;
+
+  const loadFrozenContentPlan = async () => {
+    if (!dynamicInformationArchitecture) return null;
+    const state = currentState?.schemaVersion === 2 ? currentState : null;
+    const buildRecord = input.context.build as typeof input.context.build & {
+      contentPlanLocalAssetId?: string | null;
+      contentPlanSha256?: string | null;
+    };
+    const stateLocalAssetId = state?.contentPlanLocalAssetId;
+    const stateSha256 = state?.contentPlanSha256;
+    const buildLocalAssetId = buildRecord.contentPlanLocalAssetId ?? undefined;
+    const buildSha256 = buildRecord.contentPlanSha256 ?? undefined;
+    if (
+      Boolean(stateLocalAssetId) !== Boolean(stateSha256) ||
+      Boolean(buildLocalAssetId) !== Boolean(buildSha256)
+    ) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_COORDINATES_INCOMPLETE",
+        "动态信息架构计划的冻结坐标不完整。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    if (
+      stateLocalAssetId &&
+      stateSha256 &&
+      buildLocalAssetId &&
+      buildSha256 &&
+      (stateLocalAssetId !== buildLocalAssetId || stateSha256 !== buildSha256)
+    ) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_IDENTITY_CONFLICT",
+        "动态信息架构计划的任务状态与构建合同坐标不一致。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    if (
+      state?.contentPlanInventorySha256 &&
+      state.contentPlanInventorySha256 !== inventoryBinding!.inventorySha256
+    ) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_INVENTORY_CONFLICT",
+        "动态信息架构计划绑定的知识清单已发生冲突。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    const localAssetId = stateLocalAssetId ?? buildLocalAssetId;
+    const expectedSha256 = stateSha256 ?? buildSha256;
+    if (!localAssetId && !expectedSha256) return null;
+    if (!localAssetId || !expectedSha256) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_COORDINATES_INCOMPLETE",
+        "动态信息架构计划的冻结坐标不完整。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    const artifact = await input.readArtifact({
+      userId: input.operation.userId,
+      localAssetId,
+      expectedSha256,
+      expectedMimeTypes: ["application/json"],
+    });
+    if (!artifact) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_ARTIFACT_MISSING",
+        "动态信息架构计划附件不可用。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    const bytes = await storedArtifactBytes(artifact, 16 * 1024 * 1024);
+    const parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+    const validated = validateSiteContentPlanV2({
+      plan: parsed,
+      inventory: inventory!,
+      documents: generationDocuments,
+      requiredDocumentIds: currentRevisionSourceDocumentId
+        ? [currentRevisionSourceDocumentId]
+        : [],
+      requiredMediaIds: currentRevisionMediaPlanIds,
+    });
+    return {
+      plan: validated,
+      coordinates: {
+        localAssetId,
+        sha256: expectedSha256,
+      },
+    };
+  };
+
+  const loadedContentPlan = await loadFrozenContentPlan();
+  frozenContentPlan = loadedContentPlan?.plan ?? null;
+  frozenContentPlanCoordinates = loadedContentPlan?.coordinates ?? null;
+  if (
+    dynamicInformationArchitecture &&
+    frozenContentPlan &&
+    currentState?.schemaVersion === 2 &&
+    [
+      "create_unknown",
+      "content_plan_pending",
+      "content_plan_repair_send_ready",
+      "content_plan_repair_send_unknown",
+      "content_plan_repair_pending",
+    ].includes(currentState.stage)
+  ) {
+    if (!taskId || !frozenContentPlanCoordinates) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_SOURCE_HANDOFF_INCOMPLETE",
+        "已冻结的信息架构计划缺少同一任务的源码适配坐标。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    currentState = transitionProviderState(currentState, {
+      stage: "native_source_send_ready",
+      taskId,
+      contentPlanLocalAssetId: frozenContentPlanCoordinates.localAssetId,
+      contentPlanSha256: frozenContentPlanCoordinates.sha256,
+      contentPlanInventorySha256: inventoryBinding!.inventorySha256,
+      buildPhase: "source_waiting",
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      currentState,
+      taskId,
+    );
+  }
+
+  if (dynamicInformationArchitecture && !frozenContentPlan) {
+    const planAttempt =
+      currentState?.schemaVersion === 2
+        ? (currentState.contentPlanAttempt ?? 0)
+        : 0;
+    const planToken =
+      currentState?.schemaVersion === 2 &&
+      currentState.contentPlanOperationToken
+        ? currentState.contentPlanOperationToken
+        : `siteops-content-plan:${input.operation.id}:${planAttempt}`;
+    const planSourceDocumentIds = generationDocuments.map(
+      (document) => document.id,
+    );
+    const planAttachments = (attachmentOperationToken = planToken) => [
+      ...siteOpsSourceDossierAttachments({
+        operationToken: attachmentOperationToken,
+        snapshot: {
+          id: input.context.snapshot.id,
+          archiveSha256: input.context.build.knowledgeArchiveHash,
+          sourceBuildId: input.context.snapshot.sourceBuildId,
+          sourceBuildRevision: input.context.snapshot.sourceBuildRevision,
+        },
+        // SiteBrief is identity/context only in 2.9; Manus owns every route
+        // except the required technical root.
+        brief: briefWithoutBrandAssets(dynamicPlanningBrief),
+        visualEvidence: runtimeVisual,
+        documents: generationDocuments,
+      }),
+      inventoryBinding!.attachment,
+      siteContentPlanWireContractAttachment({
+        operationToken: attachmentOperationToken,
+        inventorySha256: inventoryBinding!.inventorySha256,
+        sourceDocumentIds: planSourceDocumentIds,
+      }),
+      ...(revisionSource?.attachments ?? []),
+      ...(input.input.feedback
+        ? [siteOpsCustomerFeedbackAttachment(input.input.feedback)]
+        : []),
+    ];
+    if (!taskId) {
+      client = client ?? (await input.getClient());
+      if (currentState?.stage === "create_unknown") {
+        const found = await findUniqueCreatedTask(
+          client,
+          input.operation,
+          planToken,
+        );
+        if (!found) {
+          const sync = providerResultSyncWindow(
+            providerStateV2(currentState),
+            Date.now(),
+            input.operation.updatedAt,
+          );
+          if (sync.expired) {
+            throw new SiteOpsManusFailure(
+              "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+              "AI 信息架构任务创建结果未能在限定时间内确认；创建坐标已保留。",
+              "attention_required",
+              sync.state,
+            );
+          }
+          return pending(sync.state, undefined, "design_compiling", 60_000);
+        }
+        taskId = found.id;
+      } else {
+        const createRetryAt = Date.parse(
+          currentState?.schemaVersion === 2
+            ? (currentState.providerNextPollAt ?? "")
+            : "",
+        );
+        if (Number.isFinite(createRetryAt) && createRetryAt > Date.now()) {
+          return pending(
+            providerStateV2(currentState),
+            undefined,
+            "design_compiling",
+            Math.max(2_000, createRetryAt - Date.now()),
+          );
+        }
+        const unknownState = startProviderResultSyncWindow(
+          transitionProviderState(currentState, {
+            stage: "create_unknown",
+            nativeSourceContractVersion: 2,
+            nativeSourceRuntimeCoordinates: nativeSourceRuntime!.coordinates,
+            contentPlanAttempt: planAttempt,
+            contentPlanOperationToken: planToken,
+            contentPlanInventorySha256: inventoryBinding!.inventorySha256,
+            providerNextPollAt: undefined,
+            buildPhase: "source_waiting",
+          }),
+        );
+        await persistOperationProgress(input.db, input.operation, unknownState);
+        currentState = unknownState;
+        try {
+          await input.assertExecutionActive();
+          const created = await client.createTask({
+            title: operationTitle(input.operation),
+            prompt: siteContentPlanPrompt({
+              operationToken: planToken,
+              inventorySha256: inventoryBinding!.inventorySha256,
+              hasRevisionBaseline: Boolean(revisionSource),
+            }),
+            attachments: planAttachments(),
+            locale: input.brief.primaryLanguage,
+            agentProfile: managedAgentProfileModel(input.input.agentProfile),
+            structuredOutputSchema: siteContentPlanOutputSchema({
+              operationToken: planToken,
+              inventorySha256: inventoryBinding!.inventorySha256,
+            }),
+          });
+          taskId = created.taskId;
+        } catch (error) {
+          if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+            return pending(unknownState, undefined, "design_compiling", 60_000);
+          }
+          if (error instanceof ManusV2ApiError && error.retryable) {
+            const retryAfterMs = Math.max(
+              2_000,
+              Math.min(300_000, error.retryAfterMs ?? 10_000),
+            );
+            const retryReadyState = transitionProviderState(unknownState, {
+              stage: "native_input_ready",
+              providerSyncStartedAt: undefined,
+              providerNextPollAt: new Date(
+                Date.now() + retryAfterMs,
+              ).toISOString(),
+            });
+            try {
+              await persistOperationProgress(
+                input.db,
+                input.operation,
+                retryReadyState,
+              );
+              return pending(
+                retryReadyState,
+                undefined,
+                "design_compiling",
+                retryAfterMs,
+              );
+            } catch {
+              return pending(
+                unknownState,
+                undefined,
+                "design_compiling",
+                60_000,
+              );
+            }
+          }
+          throw error;
+        }
+      }
+      const pendingState = transitionProviderState(currentState, {
+        stage:
+          planAttempt > 0
+            ? "content_plan_repair_pending"
+            : "content_plan_pending",
+        taskId,
+        contentPlanAttempt: planAttempt,
+        contentPlanOperationToken: planToken,
+        contentPlanInventorySha256: inventoryBinding!.inventorySha256,
+        providerSyncStartedAt: undefined,
+        providerNextPollAt: undefined,
+        buildPhase: "source_waiting",
+      });
+      await bindCreatedBuildTask({
+        db: input.db,
+        operation: input.operation,
+        buildId: input.context.build.id,
+        taskId,
+        state: pendingState,
+        preservePreview: false,
+      });
+      return pending(pendingState, taskId, "design_compiling", 10_000);
+    }
+
+    client = client ?? (await input.getClient());
+    if (currentState?.stage === "content_plan_repair_send_ready") {
+      const retryAt = Date.parse(
+        currentState.schemaVersion === 2
+          ? (currentState.providerNextPollAt ?? "")
+          : "",
+      );
+      if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+        return pending(
+          currentState,
+          taskId,
+          "design_compiling",
+          Math.max(2_000, retryAt - Date.now()),
+        );
+      }
+      const unknownState = startProviderResultSyncWindow(
+        transitionProviderState(currentState, {
+          stage: "content_plan_repair_send_unknown",
+          providerNextPollAt: undefined,
+        }),
+      );
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        unknownState,
+        taskId,
+      );
+      try {
+        await input.assertExecutionActive();
+        await client.sendMessage({
+          taskId,
+          prompt: siteContentPlanPrompt({
+            operationToken: planToken,
+            inventorySha256: inventoryBinding!.inventorySha256,
+            hasRevisionBaseline: Boolean(revisionSource),
+            repairIssues: ["CONTENT_PLAN_PROVIDER_SEND_RETRY"],
+          }),
+          attachments: planAttachments(planToken),
+          structuredOutputSchema: siteContentPlanOutputSchema({
+            operationToken: planToken,
+            inventorySha256: inventoryBinding!.inventorySha256,
+          }),
+        });
+      } catch (error) {
+        if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+          return pending(unknownState, taskId, "design_compiling", 10_000);
+        }
+        if (error instanceof ManusV2ApiError && error.retryable) {
+          const retryAfterMs = Math.max(
+            2_000,
+            Math.min(300_000, error.retryAfterMs ?? 10_000),
+          );
+          const retryState = transitionProviderState(unknownState, {
+            stage: "content_plan_repair_send_ready",
+            providerSyncStartedAt: undefined,
+            providerNextPollAt: new Date(
+              Date.now() + retryAfterMs,
+            ).toISOString(),
+          });
+          await persistOperationProgress(
+            input.db,
+            input.operation,
+            retryState,
+            taskId,
+          );
+          return pending(retryState, taskId, "design_compiling", retryAfterMs);
+        }
+        throw error;
+      }
+      const repairPendingState = transitionProviderState(unknownState, {
+        stage: "content_plan_repair_pending",
+        providerSyncStartedAt: undefined,
+      });
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        repairPendingState,
+        taskId,
+      );
+      return pending(repairPendingState, taskId, "design_compiling", 10_000);
+    }
+    const polledPlan = await pollEvents(
+      client,
+      taskId,
+      planToken,
+      currentState,
+      { operationId: input.operation.id, buildId: input.context.build.id },
+    );
+    currentState = polledPlan.providerState;
+    if (polledPlan.deferred) {
+      return pending(
+        polledPlan.providerState,
+        taskId,
+        "design_compiling",
+        polledPlan.nextPollMs,
+      );
+    }
+    if (
+      currentState.stage === "content_plan_repair_send_unknown" &&
+      !manusV2EventsContainOperationToken(polledPlan.events, planToken)
+    ) {
+      const sync = providerResultSyncWindow(
+        currentState,
+        Date.now(),
+        input.operation.updatedAt,
+      );
+      if (sync.expired) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+          "AI 信息架构修订消息结果未能在限定时间内确认；原任务坐标已保留。",
+          "attention_required",
+          sync.state,
+        );
+      }
+      return pending(sync.state, taskId, "design_compiling", 60_000);
+    }
+    const planResolution = await resolveBuildWireValue({
+      operationId: input.operation.id,
+      buildId: input.context.build.id,
+      events: polledPlan.events,
+      operationToken: planToken,
+      phase: "design",
+      expectedFilename: SITEOPS_CONTENT_PLAN_V2_FILENAME,
+      taskCompleted: polledPlan.state.completed,
+      acceptCurrentPhaseWhileRunning: true,
+      signal: input.signal,
+      validateCandidate: (value) => {
+        const wire = siteContentPlanWireV2Schema.parse(value);
+        if (
+          wire.operationToken !== planToken ||
+          wire.inventorySha256 !== inventoryBinding!.inventorySha256
+        ) {
+          throw new Error("SITEOPS_CONTENT_PLAN_COORDINATES_MISMATCH");
+        }
+      },
+    });
+    if (
+      !planResolution.value &&
+      !planResolution.invalid &&
+      !polledPlan.state.failed
+    ) {
+      return pending(
+        transitionProviderState(currentState, {
+          stage:
+            planAttempt > 0
+              ? "content_plan_repair_pending"
+              : "content_plan_pending",
+        }),
+        taskId,
+        "design_compiling",
+        10_000,
+      );
+    }
+    try {
+      if (!planResolution.value) {
+        const schemaIssues = siteContentPlanSchemaRepairIssues(
+          planResolution.validationError,
+        );
+        throw new SiteContentPlanValidationError(
+          planResolution.invalid && schemaIssues.length > 0
+            ? schemaIssues
+            : [
+                planResolution.invalid
+                  ? "CONTENT_PLAN_STRUCTURED_OUTPUT_INVALID"
+                  : "CONTENT_PLAN_PROVIDER_TASK_FAILED",
+              ],
+        );
+      }
+      frozenContentPlan = validateSiteContentPlanV2({
+        plan: siteContentPlanV2FromWire(planResolution.value, {
+          operationToken: planToken,
+          inventorySha256: inventoryBinding!.inventorySha256,
+        }),
+        inventory: inventory!,
+        documents: generationDocuments,
+        requiredDocumentIds: currentRevisionSourceDocumentId
+          ? [currentRevisionSourceDocumentId]
+          : [],
+        requiredMediaIds: currentRevisionMediaPlanIds,
+      });
+    } catch (error) {
+      const issues =
+        error instanceof SiteContentPlanValidationError
+          ? error.issues
+          : ["CONTENT_PLAN_SCHEMA_INVALID"];
+      if (planAttempt >= 1) {
+        throw new SiteOpsManusFailure(
+          "SITEOPS_CONTENT_PLAN_REPAIR_EXHAUSTED",
+          "AI 信息架构计划在一次定向修复后仍未通过来源与覆盖校验。",
+          "failed",
+          providerStateV2(currentState),
+        );
+      }
+      const repairAttempt = 1;
+      const repairToken = `siteops-content-plan:${input.operation.id}:${repairAttempt}`;
+      const unknownState = transitionProviderState(currentState, {
+        stage: "content_plan_repair_send_unknown",
+        contentPlanAttempt: repairAttempt,
+        contentPlanOperationToken: repairToken,
+        contentPlanInventorySha256: inventoryBinding!.inventorySha256,
+      });
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        unknownState,
+        taskId,
+      );
+      currentState = unknownState;
+      try {
+        await input.assertExecutionActive();
+        await client.sendMessage({
+          taskId,
+          prompt: siteContentPlanPrompt({
+            operationToken: repairToken,
+            inventorySha256: inventoryBinding!.inventorySha256,
+            hasRevisionBaseline: Boolean(revisionSource),
+            repairIssues: issues,
+          }),
+          attachments: planAttachments(repairToken),
+          structuredOutputSchema: siteContentPlanOutputSchema({
+            operationToken: repairToken,
+            inventorySha256: inventoryBinding!.inventorySha256,
+          }),
+        });
+      } catch (sendError) {
+        if (sendError instanceof ManusV2ApiError && sendError.outcomeUnknown) {
+          return pending(unknownState, taskId, "design_compiling", 10_000);
+        }
+        if (sendError instanceof ManusV2ApiError && sendError.retryable) {
+          const retryAfterMs = Math.max(
+            2_000,
+            Math.min(300_000, sendError.retryAfterMs ?? 10_000),
+          );
+          const retryState = transitionProviderState(unknownState, {
+            stage: "content_plan_repair_send_ready",
+            providerSyncStartedAt: undefined,
+            providerNextPollAt: new Date(
+              Date.now() + retryAfterMs,
+            ).toISOString(),
+          });
+          await persistOperationProgress(
+            input.db,
+            input.operation,
+            retryState,
+            taskId,
+          );
+          return pending(retryState, taskId, "design_compiling", retryAfterMs);
+        }
+        throw sendError;
+      }
+      const repairState = transitionProviderState(unknownState, {
+        stage: "content_plan_repair_pending",
+      });
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        repairState,
+        taskId,
+      );
+      return pending(repairState, taskId, "design_compiling", 10_000);
+    }
+    const planBytes = Buffer.from(
+      `${canonicalJson(frozenContentPlan)}\n`,
+      "utf8",
+    );
+    await input.assertExecutionActive();
+    const planArtifact = await input.persist({
+      userId: input.operation.userId,
+      projectId: input.operation.projectId,
+      kind: "site-content-plan",
+      filename: SITEOPS_CONTENT_PLAN_V2_FILENAME,
+      mimeType: "application/json",
+      buffer: planBytes,
+      maxBytes: 16 * 1024 * 1024,
+      idempotencyKey: `content-plan:${input.operation.id}`,
+    });
+    await input.assertExecutionActive();
+    const bound = await input.db
+      .update(siteBuilds)
+      .set({
+        contentPlanLocalAssetId: planArtifact.id,
+        contentPlanSha256: planArtifact.contentSha256,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(siteBuilds.id, input.context.build.id),
+          eq(siteBuilds.userId, input.operation.userId),
+          eq(siteBuilds.upstreamManusTaskId, taskId),
+          inArray(siteBuilds.status, PROVIDER_MUTABLE_BUILD_STATUSES),
+        ),
+      );
+    const boundRows = Number(
+      (Array.isArray(bound)
+        ? (bound[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+        : (bound as { affectedRows?: unknown } | undefined)?.affectedRows) ?? 0,
+    );
+    if (boundRows !== 1) throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+    currentState = transitionProviderState(currentState, {
+      stage: "native_source_send_ready",
+      contentPlanLocalAssetId: planArtifact.id,
+      contentPlanSha256: planArtifact.contentSha256,
+      contentPlanInventorySha256: inventoryBinding!.inventorySha256,
+      buildPhase: "source_waiting",
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      currentState,
+      taskId,
+    );
+    return pending(currentState, taskId, "design_compiling", 1_000);
+  }
+  if (frozenContentPlan) {
+    const mediaSelection = siteOpsContentPlanMediaSelection(
+      frozenContentPlan,
+      revisionSource?.media ?? [],
+    );
+    if (mediaSelection.unknownCustomerMediaIds.length > 0) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_REVISION_MEDIA_COORDINATES_MISMATCH",
+        "内容计划引用的客户图片不属于当前连续修订来源链。",
+        "failed",
+        providerStateV2(currentState),
+      );
+    }
+    requiredRevisionMedia = mediaSelection.selectedCustomerMedia;
+    for (const [mediaId, routePaths] of mediaSelection.knowledgeRoutePaths) {
+      knowledgeMediaRoutePaths.set(mediaId, routePaths);
+    }
+    const selectedMediaIds = [...knowledgeMediaRoutePaths.keys()];
+    try {
+      knowledgeMedia = await freezeSelectedKnowledgeMediaFromArchive({
+        archiveBytes: input.knowledgeArchiveBytes,
+        assets: input.context.snapshot.assets,
+        selectedMediaIds,
+      });
+      if (knowledgeMedia.length > 0) {
+        const sourceBytes =
+          sourceOverride?.bytes ??
+          (await nativeSelectionBytesForMediaOverlay(input.nativeSelection));
+        const bytes = await overlaySiteOpsKnowledgeMedia(
+          sourceBytes,
+          knowledgeMedia,
+        );
+        sourceOverride = { bytes, sha256: sha256(bytes) };
+        baseSourceSha256 = sourceOverride.sha256;
+      }
+    } catch {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_KNOWLEDGE_MEDIA_INVALID",
+        "内容计划选中的知识库图片未通过来源、解码或源码边界校验。",
+        "failed",
+        providerStateV2(currentState),
+      );
+    }
+  }
+  const effectiveBrief = frozenContentPlan
+    ? siteBriefSchema.parse({
+        ...input.brief,
+        routes: siteContentPlanRoutes(frozenContentPlan),
+      })
+    : input.brief;
+  const expectedContentPlanSha256 = dynamicInformationArchitecture
+    ? (frozenContentPlanCoordinates?.sha256 ??
+      (currentState?.schemaVersion === 2
+        ? currentState.contentPlanSha256
+        : undefined))
+    : undefined;
+  if (dynamicInformationArchitecture && !expectedContentPlanSha256) {
+    throw new SiteOpsManusFailure(
+      "SITEOPS_CONTENT_PLAN_SOURCE_HANDOFF_INCOMPLETE",
+      "动态信息架构源码适配缺少已冻结计划哈希。",
+      "attention_required",
+      providerStateV2(currentState),
+    );
+  }
   const providerSourceAttachment = async (
     sourceClient: ManusV2Client,
   ): Promise<ManusV2Attachment> => {
-    const sourceByteLength = nativeSelectionByteLength(input.nativeSelection);
+    const sourceByteLength =
+      sourceOverride?.bytes.length ??
+      nativeSelectionByteLength(input.nativeSelection);
     if (nativeSourceAttachmentTransport(sourceByteLength) === "inline") {
+      if (sourceOverride) {
+        return {
+          filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+          mime_type: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+          file_data: `data:${FRONTMIND_SITE_SOURCE_ARCHIVE_MIME};base64,${sourceOverride.bytes.toString("base64")}`,
+        };
+      }
       return nativeSourceInlineAttachment(input.nativeSelection);
     }
-    if (input.nativeSelection.bundle.schemaVersion === 6) {
+    if (!sourceOverride && input.nativeSelection.bundle.schemaVersion === 6) {
       assertVisualSelectionBundleV6SourceArchiveSize(
         nativeSelectionInlineBytes(input.nativeSelection),
       );
@@ -4560,20 +6657,31 @@ async function handleNativeReactSiteBuild(input: {
 
     await input.assertExecutionActive();
     const uploaded = await sourceClient.uploadFile(
-      isStaticNativeSelection(input.nativeSelection)
+      sourceOverride
         ? {
             filename: NATIVE_SOURCE_PROVIDER_FILENAME,
             byteLength: sourceByteLength,
-            createReadStream: input.nativeSelection.createArchiveReadStream,
+            createReadStream: () =>
+              Readable.from(sourceOverride!.bytes) as unknown as ReadStream,
             contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
             minimumUsableSeconds: NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
           }
-        : {
-            filename: NATIVE_SOURCE_PROVIDER_FILENAME,
-            bytes: input.nativeSelection.archiveBytes,
-            contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
-            minimumUsableSeconds: NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
-          },
+        : isStaticNativeSelection(input.nativeSelection)
+          ? {
+              filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+              byteLength: sourceByteLength,
+              createReadStream: input.nativeSelection.createArchiveReadStream,
+              contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+              minimumUsableSeconds:
+                NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
+            }
+          : {
+              filename: NATIVE_SOURCE_PROVIDER_FILENAME,
+              bytes: input.nativeSelection.archiveBytes,
+              contentType: FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+              minimumUsableSeconds:
+                NATIVE_SOURCE_PROVIDER_MINIMUM_USABLE_SECONDS,
+            },
     );
     currentState = transitionProviderState(currentState, {
       stage: currentState?.stage ?? "native_input_ready",
@@ -4610,11 +6718,13 @@ async function handleNativeReactSiteBuild(input: {
         sourceBuildId: input.context.snapshot.sourceBuildId,
         sourceBuildRevision: input.context.snapshot.sourceBuildRevision,
       },
-      brief: briefWithoutBrandAssets(input.brief),
+      brief: briefWithoutBrandAssets(dynamicPlanningBrief),
       visualEvidence: runtimeVisual,
-      documents: input.documents,
+      documents: generationDocuments,
     }),
     await providerSourceAttachment(sourceClient),
+    ...(revisionSource?.attachments ?? []),
+    ...knowledgeMediaManifestAttachment(knowledgeMedia),
     ...(nativeSourceContractVersion === 2
       ? [...nativeSourceRuntime!.attachments]
       : [
@@ -4625,6 +6735,9 @@ async function handleNativeReactSiteBuild(input: {
           },
         ]),
     ...(templateCoordinate ? [templateCoordinate.attachment] : []),
+    ...(frozenContentPlan
+      ? [siteContentPlanAttachment(frozenContentPlan)]
+      : []),
     ...nativeBrandAttachment(input.brandAsset),
     ...(input.input.feedback
       ? [siteOpsCustomerFeedbackAttachment(input.input.feedback)]
@@ -4674,6 +6787,7 @@ async function handleNativeReactSiteBuild(input: {
   const materializeTrustedFallback = async (
     requestedReason: NativeTrustedFallbackReason,
   ): Promise<SiteOpsProviderResult | null> => {
+    if (dynamicInformationArchitecture) return null;
     // 2.8 owns no host-rendered approximation of the selected full Template.
     // Keep the immutable visual reference and let the normal recoverable
     // retry/reset state surface instead of sending V7 through the V6
@@ -4975,6 +7089,165 @@ async function handleNativeReactSiteBuild(input: {
     }
   };
   if (
+    dynamicInformationArchitecture &&
+    frozenContentPlan &&
+    (currentState?.stage === "native_source_send_ready" ||
+      currentState?.stage === "native_source_send_unknown")
+  ) {
+    const contentPlanSha256 =
+      currentState?.schemaVersion === 2
+        ? currentState.contentPlanSha256
+        : undefined;
+    if (!taskId || !contentPlanSha256) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_CONTENT_PLAN_SOURCE_HANDOFF_INCOMPLETE",
+        "信息架构计划缺少同一任务的源码适配坐标。",
+        "attention_required",
+        providerStateV2(currentState),
+      );
+    }
+    client = client ?? (await input.getClient());
+    if (currentState.stage === "native_source_send_unknown") {
+      const reconciled = await pollEvents(
+        client,
+        taskId,
+        operationToken,
+        currentState,
+        { operationId: input.operation.id, buildId: input.context.build.id },
+      );
+      if (reconciled.deferred) {
+        return pending(
+          reconciled.providerState,
+          taskId,
+          "design_compiling",
+          reconciled.nextPollMs,
+        );
+      }
+      if (
+        !manusV2EventsContainOperationToken(reconciled.events, operationToken)
+      ) {
+        const sync = providerResultSyncWindow(
+          reconciled.providerState,
+          Date.now(),
+          input.operation.updatedAt,
+        );
+        if (sync.expired) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_PROVIDER_SYNC_ATTENTION",
+            "AI 源码适配消息结果未能在限定时间内确认；冻结计划与原任务坐标已保留。",
+            "attention_required",
+            sync.state,
+          );
+        }
+        return pending(sync.state, taskId, "design_compiling", 60_000);
+      }
+      currentState = transitionProviderState(reconciled.providerState, {
+        stage: "native_source_pending",
+        buildPhase: "source_waiting",
+      });
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        currentState,
+        taskId,
+      );
+      return pending(currentState, taskId, "building", 5_000);
+    }
+    const sendRetryAt = Date.parse(
+      currentState.schemaVersion === 2
+        ? (currentState.providerNextPollAt ?? "")
+        : "",
+    );
+    if (Number.isFinite(sendRetryAt) && sendRetryAt > Date.now()) {
+      return pending(
+        currentState,
+        taskId,
+        "design_compiling",
+        Math.max(2_000, sendRetryAt - Date.now()),
+      );
+    }
+    const unknownState = startProviderResultSyncWindow(
+      transitionProviderState(currentState, {
+        stage: "native_source_send_unknown",
+        phaseOperationToken: operationToken,
+        phaseStartedAt: new Date().toISOString(),
+        nativeRepairAttempt: attempt,
+        providerNextPollAt: undefined,
+        buildPhase: "source_waiting",
+      }),
+    );
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      unknownState,
+      taskId,
+    );
+    currentState = unknownState;
+    try {
+      await input.assertExecutionActive();
+      await client.sendMessage({
+        taskId,
+        prompt: nativeSourcePrompt({
+          operationToken,
+          baseSourceSha256,
+          contractVersion: nativeSourceContractVersion,
+          runtimeCoordinates: nativeSourceRuntime?.coordinates ?? null,
+          workflowVersion: input.context.build.workflowVersion,
+          hasCustomerFeedback: Boolean(input.input.feedback),
+          hasRevisionMedia: Boolean(revisionSource?.media.length),
+          hasRevisionBaseline: Boolean(revisionSource),
+          hasKnowledgeMedia: knowledgeMedia.length > 0,
+          templateCoordinateInstruction: templateCoordinate?.promptInstruction,
+          contentPlanSha256: expectedContentPlanSha256,
+        }),
+        attachments: await sourceAttachments(operationToken, client),
+        structuredOutputSchema: nativeSourceReceiptOutputSchema({
+          operationToken,
+          baseSourceSha256,
+          contractVersion: nativeSourceContractVersion,
+          runtime: nativeSourceRuntime,
+          contentPlanSha256: expectedContentPlanSha256,
+        }),
+      });
+    } catch (error) {
+      if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+        return pending(unknownState, taskId, "design_compiling", 10_000);
+      }
+      if (error instanceof ManusV2ApiError && error.retryable) {
+        const retryAfterMs = Math.max(
+          2_000,
+          Math.min(300_000, error.retryAfterMs ?? 10_000),
+        );
+        const retryState = transitionProviderState(unknownState, {
+          stage: "native_source_send_ready",
+          providerSyncStartedAt: undefined,
+          providerNextPollAt: new Date(Date.now() + retryAfterMs).toISOString(),
+        });
+        await persistOperationProgress(
+          input.db,
+          input.operation,
+          retryState,
+          taskId,
+        );
+        return pending(retryState, taskId, "design_compiling", retryAfterMs);
+      }
+      throw error;
+    }
+    currentState = transitionProviderState(unknownState, {
+      stage: "native_source_pending",
+      providerSyncStartedAt: undefined,
+      buildPhase: "source_waiting",
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      currentState,
+      taskId,
+    );
+    return pending(currentState, taskId, "building", 5_000);
+  }
+  if (
+    !dynamicInformationArchitecture &&
     shouldMaterializeNativeInitialBaseline({
       bundleSchemaVersion: input.nativeSelection.bundle.schemaVersion,
       parentBuildId: input.context.build.parentBuildId,
@@ -5079,8 +7352,12 @@ async function handleNativeReactSiteBuild(input: {
             runtimeCoordinates: nativeSourceRuntime?.coordinates ?? null,
             workflowVersion: input.context.build.workflowVersion,
             hasCustomerFeedback: Boolean(input.input.feedback),
+            hasRevisionMedia: Boolean(revisionSource?.media.length),
+            hasRevisionBaseline: Boolean(revisionSource),
+            hasKnowledgeMedia: knowledgeMedia.length > 0,
             templateCoordinateInstruction:
               templateCoordinate?.promptInstruction,
+            contentPlanSha256: expectedContentPlanSha256,
           }),
           attachments: createAttachments,
           locale: input.brief.primaryLanguage,
@@ -5090,6 +7367,7 @@ async function handleNativeReactSiteBuild(input: {
             baseSourceSha256,
             contractVersion: nativeSourceContractVersion,
             runtime: nativeSourceRuntime,
+            contentPlanSha256: expectedContentPlanSha256,
           }),
         });
         taskId = created.taskId;
@@ -5215,7 +7493,7 @@ async function handleNativeReactSiteBuild(input: {
   }) => {
     if (
       nativeSourceContractVersion === 1 ||
-      attempt >= 2 ||
+      attempt >= NATIVE_SOURCE_MAX_REPAIR_ATTEMPTS ||
       currentState?.nativeLastErrorSignature === repairInput.signature ||
       (currentState?.schemaVersion === 2 && currentState.existingTaskOnly)
     ) {
@@ -5296,7 +7574,11 @@ async function handleNativeReactSiteBuild(input: {
           runtimeCoordinates: nativeSourceRuntime?.coordinates ?? null,
           workflowVersion: input.context.build.workflowVersion,
           hasCustomerFeedback: Boolean(input.input.feedback),
+          hasRevisionMedia: Boolean(revisionSource?.media.length),
+          hasRevisionBaseline: Boolean(revisionSource),
+          hasKnowledgeMedia: knowledgeMedia.length > 0,
           templateCoordinateInstruction: templateCoordinate?.promptInstruction,
+          contentPlanSha256: expectedContentPlanSha256,
           repair,
         }),
         attachments: repairAttachments,
@@ -5305,6 +7587,7 @@ async function handleNativeReactSiteBuild(input: {
           baseSourceSha256,
           contractVersion: nativeSourceContractVersion,
           runtime: nativeSourceRuntime,
+          contentPlanSha256: expectedContentPlanSha256,
         }),
       });
     } catch (sendError) {
@@ -5397,6 +7680,14 @@ async function handleNativeReactSiteBuild(input: {
     nativeSourceContractVersion === 2
       ? nativeSourceRuntime!.receiptSchema
       : siteSourceReceiptV1Schema;
+  const contextualSourceReceiptSchema = expectedContentPlanSha256
+    ? sourceReceiptSchema.refine(
+        (receipt) =>
+          "contentPlanSha256" in receipt &&
+          receipt.contentPlanSha256 === expectedContentPlanSha256,
+        "Source receipt must match the frozen content plan",
+      )
+    : sourceReceiptSchema;
   const stagingIdempotencyKey = `native-source:${operationToken}`;
   const stagingAssetId = siteOpsArtifactIdForIdempotency({
     userId: input.operation.userId,
@@ -5411,11 +7702,12 @@ async function handleNativeReactSiteBuild(input: {
       state: currentState,
       operationToken,
       baseSourceSha256,
+      expectedContentPlanSha256,
       stagingAssetId,
       taskId,
       buildTaskId: boundBuildTaskId,
       repairAttempt: attempt,
-      receiptSchema: sourceReceiptSchema,
+      receiptSchema: contextualSourceReceiptSchema,
       readArtifact: input.readArtifact,
     });
   } catch (error) {
@@ -5571,7 +7863,7 @@ async function handleNativeReactSiteBuild(input: {
         acceptCurrentPhaseWhileRunning: true,
         signal: input.signal,
         validateCandidate: (value) => {
-          sourceReceiptSchema.parse(value);
+          contextualSourceReceiptSchema.parse(value);
         },
       });
   if (receiptResolution.invalid) {
@@ -5657,9 +7949,105 @@ async function handleNativeReactSiteBuild(input: {
         currentState ?? undefined,
       );
     }
+    const missingOutputState = (
+      state: ProviderState,
+      waiting?: { eventId: string; handledAt: string },
+    ) =>
+      transitionProviderState(state, {
+        stage: attempt > 0 ? "native_repair_pending" : "native_source_pending",
+        taskId,
+        nativeRepairAttempt: attempt,
+        buildPhase: attempt > 0 ? "source_repairing" : "source_waiting",
+        ...(waiting
+          ? {
+              handledWaitingEventId: waiting.eventId,
+              handledWaitingAt: waiting.handledAt,
+            }
+          : {}),
+      });
+    const repairMissingOutput = async (state: ProviderState) => {
+      currentState = state;
+      const scheduled = await scheduleNativeRepair({
+        kind: "hard_safety",
+        signature: NATIVE_SOURCE_OUTPUT_UNAVAILABLE_SIGNATURE,
+        diagnostics: [
+          {
+            code: NATIVE_SOURCE_OUTPUT_UNAVAILABLE_CODE,
+            file: null,
+            line: null,
+            column: null,
+          },
+        ],
+      });
+      if (scheduled) return scheduled;
+      throw new SiteOpsManusFailure(
+        NATIVE_SOURCE_OUTPUT_UNAVAILABLE_CODE,
+        "AI 建站未返回完整源码包和回执。",
+        "failed",
+        state,
+      );
+    };
+    const terminalErrorType = dynamicInformationArchitecture
+      ? nativeSourceTerminalErrorType(polled.events, operationToken)
+      : null;
+    if (
+      terminalErrorType &&
+      NON_RETRYABLE_PROVIDER_QUOTA_ERROR_TYPES.has(terminalErrorType) &&
+      (polled.state.failed || polled.state.completed || Boolean(polled.waiting))
+    ) {
+      // Provider detail and message reads are independent and may briefly
+      // disagree (for example detail=error while the latest status event is
+      // still waiting). A typed quota terminal always wins before any wait or
+      // missing-output repair so it can never create another billable send.
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_CONFIGURATION_ERROR",
+        "FrontMind AI 建站服务额度暂不可用，系统已保留当前任务坐标并停止重发。",
+        "attention_required",
+        missingOutputState(polled.providerState),
+      );
+    }
+    if (dynamicInformationArchitecture && polled.waiting) {
+      if (!messageAskUserWaiting(polled.waiting)) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_UNEXPECTED_WAITING_ACTION",
+          "FrontMind AI 建站任务请求了当前流程不允许的外部操作。",
+          "failed",
+          polled.providerState,
+        );
+      }
+      const resolution = handledWaitingResolution(
+        polled.providerState,
+        polled.waiting.eventId,
+      );
+      if (resolution === "pending") {
+        return pending(
+          polled.providerState,
+          taskId,
+          attempt > 0 ? "qa_running" : "building",
+          fallbackReconciliationPollMs(),
+        );
+      }
+      if (resolution === "expired") {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_WAITING_UNRESOLVED",
+          "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
+          "failed",
+          polled.providerState,
+        );
+      }
+      return repairMissingOutput(
+        missingOutputState(polled.providerState, {
+          eventId: polled.waiting.eventId,
+          handledAt: new Date().toISOString(),
+        }),
+      );
+    }
+    if (dynamicInformationArchitecture && polled.state.failed) {
+      return repairMissingOutput(missingOutputState(polled.providerState));
+    }
     if (polled.waiting || polled.state.failed) {
       throw new SiteOpsManusFailure(
-        "SITEOPS_NATIVE_SOURCE_OUTPUT_UNAVAILABLE",
+        NATIVE_SOURCE_OUTPUT_UNAVAILABLE_CODE,
         "AI 建站未返回完整源码包和回执。",
         "failed",
       );
@@ -5678,6 +8066,9 @@ async function handleNativeReactSiteBuild(input: {
     );
     if (grace.expired) {
       currentState = providerStateSchema.parse(grace.state);
+      if (dynamicInformationArchitecture) {
+        return repairMissingOutput(missingOutputState(currentState));
+      }
       const fallback = await materializeTrustedFallback(
         "provider_stopped_without_result",
       );
@@ -5702,7 +8093,19 @@ async function handleNativeReactSiteBuild(input: {
       fallbackReconciliationPollMs(),
     );
   }
-  const receipt = sourceReceiptSchema.parse(receiptResolution.value);
+  const receipt = contextualSourceReceiptSchema.parse(receiptResolution.value);
+  if (
+    expectedContentPlanSha256 !== undefined &&
+    (!("contentPlanSha256" in receipt) ||
+      receipt.contentPlanSha256 !== expectedContentPlanSha256)
+  ) {
+    throw new SiteOpsManusFailure(
+      "SITEOPS_CONTENT_PLAN_SOURCE_RECEIPT_MISMATCH",
+      "AI 源码回执未绑定当前冻结的信息架构计划。",
+      "failed",
+      providerStateV2(currentState),
+    );
+  }
   const rejectedCandidate =
     currentState?.schemaVersion === 2
       ? currentState.nativeRejectedCandidateV1
@@ -5880,6 +8283,7 @@ async function handleNativeReactSiteBuild(input: {
             expectedOperationToken: operationToken,
             expectedBaseSourceSha256: baseSourceSha256,
             expectedExecutionBaselineSha256: baseSourceSha256,
+            expectedContentPlanSha256,
           })
         : await validateNativeReactSourceArchive({
             archive,
@@ -5891,10 +8295,43 @@ async function handleNativeReactSiteBuild(input: {
     if (nativeSourceContractVersion === 2) {
       const routeAudit = nativeSourceRuntime!.audit({
         files: validated.files,
-        expectedRoutePaths: input.brief.routes.map((route) => route.slug),
+        expectedRoutePaths: effectiveBrief.routes.map((route) => route.slug),
+        requireCanonicalSitePathname: dynamicInformationArchitecture,
       });
       if (!routeAudit.ok) {
         throw new NativeRuntimeContractAuditError(routeAudit);
+      }
+    }
+    if (requiredRevisionMedia.length > 0) {
+      const sourceText = [...validated.files.entries()]
+        .filter(([pathname]) =>
+          /\.(?:css|html|js|jsx|mjs|ts|tsx)$/iu.test(pathname),
+        )
+        .map(([, bytes]) => bytes.toString("utf8"))
+        .join("\n");
+      const issues: Array<NativeRuntimeAudit["issues"][number]> = [];
+      for (const asset of requiredRevisionMedia) {
+        const sourcePath = `public${asset.publicPath}`;
+        const actual = validated.files.get(sourcePath);
+        if (!actual || sha256(actual) !== asset.contentSha256) {
+          issues.push({
+            code: "REQUIRED_FILE_MISSING",
+            path: sourcePath,
+            detail: "The frozen user media file is missing or changed.",
+          });
+          continue;
+        }
+        if (!sourceText.includes(asset.publicPath)) {
+          issues.push({
+            code: "APP_SHELL_INVALID",
+            path: sourcePath,
+            detail:
+              "The frozen user media public URL is not referenced by the site source.",
+          });
+        }
+      }
+      if (issues.length > 0) {
+        throw new NativeRuntimeContractAuditError({ ok: false, issues });
       }
     }
     if (!stagingExpiresAt || stagingExpiresAt.getTime() <= Date.now()) {
@@ -6119,21 +8556,53 @@ async function handleNativeReactSiteBuild(input: {
         workflowVersion: input.context.build.workflowVersion,
         selectionHash: input.context.build.selectionHash,
       },
-      brief: input.brief,
+      brief: effectiveBrief,
       mode: "preview",
       abortSignal: input.signal,
+      contentPlan: frozenContentPlan ?? undefined,
+      contentPlanSha256:
+        frozenContentPlanCoordinates?.sha256 ??
+        (currentState?.schemaVersion === 2
+          ? currentState.contentPlanSha256
+          : undefined),
       runtimeAudit:
         nativeSourceContractVersion === 2
           ? nativeSourceRuntime!.audit
           : undefined,
+      requiredUserMedia: requiredRevisionMedia.map((asset) => ({
+        publicPath: asset.publicPath,
+        contentSha256: asset.contentSha256,
+      })),
+      requiredKnowledgeMedia: knowledgeMedia.map((asset) => ({
+        assetId: asset.assetId,
+        publicPath: asset.publicPath,
+        contentSha256: asset.sha256,
+        routePaths: [...(knowledgeMediaRoutePaths.get(asset.assetId) ?? [])],
+      })),
     });
     await input.assertExecutionActive();
   } catch (error) {
     if (
       error instanceof NativeReactBuildError &&
-      error.code === "NATIVE_BUILD_COMPILE_FAILED"
+      [
+        "NATIVE_BUILD_COMPILE_FAILED",
+        "NATIVE_BUILD_RENDER_FAILED",
+        "NATIVE_BUILD_USER_MEDIA_INVALID",
+        "NATIVE_BUILD_CONTENT_PLAN_INVALID",
+      ].includes(error.code)
     ) {
       const signature = nativeCompileSignature(error);
+      const diagnostics =
+        error.diagnostics.length > 0
+          ? error.diagnostics
+          : [
+              {
+                code: error.code,
+                file: null,
+                line: null,
+                column: null,
+              },
+            ];
       const rejectionAttachmentIdentity =
         attachment?.attachmentIdentity ??
         (currentState?.schemaVersion === 2
@@ -6164,9 +8633,12 @@ async function handleNativeReactSiteBuild(input: {
         );
       }
       const scheduled = await scheduleNativeRepair({
-        kind: "compile",
+        kind:
+          error.code === "NATIVE_BUILD_COMPILE_FAILED"
+            ? "compile"
+            : "hard_safety",
         signature,
-        diagnostics: error.diagnostics,
+        diagnostics,
       });
       if (!scheduled) {
         const fallback = await materializeTrustedFallback(
@@ -6180,6 +8652,24 @@ async function handleNativeReactSiteBuild(input: {
         );
       }
       return scheduled;
+    }
+    if (
+      error instanceof NativeReactBuildError &&
+      String(error.code) === "NATIVE_BUILD_CONTENT_PLAN_INVALID"
+    ) {
+      const signature = nativeCompileSignature(error);
+      const scheduled = await scheduleNativeRepair({
+        kind: "hard_safety",
+        signature,
+        diagnostics: error.diagnostics,
+      });
+      if (scheduled) return scheduled;
+      throw new SiteOpsManusFailure(
+        error.code,
+        "AI 建站源码在定向修复后仍未遵守冻结的信息架构计划。",
+        "failed",
+        providerStateV2(currentState),
+      );
     }
     if (error instanceof NativeReactSourceError) {
       throw new SiteOpsManusFailure(
@@ -7482,8 +9972,10 @@ export function createManusSiteOpsProviderHandler(
       const staticTemplateMetadata = Boolean(
         metadataRecord?.schemaVersion === 7 &&
           metadataRecord.renderer === "frontmind_static_template_catalog_v1" &&
-          metadataRecord.workflowVersion ===
-            SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+          (metadataRecord.workflowVersion ===
+            SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+            metadataRecord.workflowVersion ===
+              SITEOPS_MATERIALIZER_V2_9.frontMindVersion),
       );
       if (
         !metadataRecord ||
@@ -7625,8 +10117,10 @@ export function createManusSiteOpsProviderHandler(
           const coordinatesMatch = Boolean(
             staticTemplateMetadata &&
               selectedV7 &&
-              context.build.workflowVersion ===
-                SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION &&
+              (context.build.workflowVersion ===
+                SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+                context.build.workflowVersion ===
+                  SITEOPS_MATERIALIZER_V2_9.frontMindVersion) &&
               metadataRecord.catalogVersion ===
                 selection.bundle.catalogVersion &&
               metadataRecord.catalogPosition === selectedV7.catalogPosition &&
@@ -7680,6 +10174,7 @@ export function createManusSiteOpsProviderHandler(
             visualEvidence,
             taxonomy,
             brandAsset,
+            knowledgeArchiveBytes: archiveBytes,
             nativeSelection,
             materializeNative,
             materializeNativeFallback,
@@ -7759,6 +10254,7 @@ export function createManusSiteOpsProviderHandler(
           visualEvidence,
           taxonomy,
           brandAsset,
+          knowledgeArchiveBytes: archiveBytes,
           nativeSelection,
           materializeNative,
           materializeNativeFallback,

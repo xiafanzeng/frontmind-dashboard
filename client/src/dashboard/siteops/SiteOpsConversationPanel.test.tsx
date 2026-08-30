@@ -513,7 +513,10 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByText("批准后，当前线上官网会进入下线流程。"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("当前企业知识库会保留，并作为全新建站的资料来源。"),
+      screen.getByText("旧知识库版本不会作为全新建站的资料来源。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("批准后必须全新上传并发布知识库，才能开始新任务。"),
     ).toBeInTheDocument();
     expect(
       screen.getByText("旧视觉方案和生成任务不会继续使用。"),
@@ -1592,7 +1595,7 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
-  it("keeps the start action available for a stale empty snapshot projection after reset", async () => {
+  it("blocks a reset task until a newly uploaded knowledge snapshot is published", () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -1621,16 +1624,54 @@ describe("SiteOpsConversationPanel", () => {
 
     expect(
       screen.getByText(
-        "FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。",
+        "重置后的新任务不得复用旧知识库。请先前往知识库智能体，全新上传并发布知识库；完成后刷新本页。",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("知识库 ZIP 版本")).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("更换知识库 ZIP 版本"),
     ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /上传/u }),
-    ).not.toBeInTheDocument();
+    const startButton = screen.getByRole("button", {
+      name: "等待全新知识库发布",
+    });
+    expect(startButton).toBeDisabled();
+    fireEvent.click(startButton);
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("enables the reset task only after the server projects a new eligible snapshot", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            currentKnowledgeSnapshotId: null,
+            status: "draft",
+          },
+          knowledgeSnapshots: [
+            {
+              id: "88888888-8888-4888-8888-888888888888",
+              label: "v8 · 全新知识库.zip",
+              sourceProfile: null,
+              createdAt: "2026-08-30T01:00:00.000Z",
+              active: false,
+            },
+          ],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: true,
+            resetPending: false,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
+          },
+          interactionState: "select_snapshot",
+        })}
+        onAction={onAction}
+      />,
+    );
+
     const startButton = screen.getByRole("button", {
       name: "从知识库开始建站",
     });
@@ -2132,7 +2173,7 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(screen.getByText(/本次没有生成可安全展示的版本/u)).toHaveTextContent(
-      "批准并完成旧站下线后",
+      "批准后需全新上传并发布知识库",
     );
     expect(screen.queryByRole("button", { name: "继续生成官网" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重置建站流程" })).toBeNull();
@@ -2488,7 +2529,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeEnabled();
     expect(
       screen.queryByRole("button", {
-        name: "重置已批准，可从当前知识库重新开始",
+        name: "重置已批准，等待全新知识库",
       }),
     ).toBeNull();
   });
@@ -2502,6 +2543,7 @@ describe("SiteOpsConversationPanel", () => {
             status: "draft",
             currentKnowledgeSnapshotId: null,
           },
+          knowledgeSnapshots: [],
           builds: [
             {
               id: "33333333-3333-4333-8333-333333333333",
@@ -2543,7 +2585,7 @@ describe("SiteOpsConversationPanel", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "重置已批准，可从当前知识库重新开始",
+        name: "重置已批准，等待全新知识库",
       }),
     ).toBeEnabled();
     expect(screen.queryByText("重置申请处理中")).not.toBeInTheDocument();
@@ -3400,5 +3442,112 @@ describe("SiteOpsConversationPanel", () => {
         icpNumber: "京ICP备12345678号",
       }),
     );
+  });
+
+  it("keeps a failed 2.9 revision draft and retries text plus images", async () => {
+    const onSubmitRevision = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("上传暂时失败"))
+      .mockResolvedValueOnce(undefined);
+    const previewBuild = {
+      id: "33333333-3333-4333-8333-333333333333",
+      ordinal: 1,
+      parentBuildId: null,
+      status: "preview_ready" as const,
+      previewUrl:
+        "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      sourceUrl: null,
+      revisionInputs: [
+        {
+          filename: "上一版产品图.png",
+          mimeType: "image/png" as const,
+          sizeBytes: 128,
+          publicPath: `/frontmind-user-media/${"a".repeat(64)}.png`,
+        },
+      ],
+      needsHelp: false,
+      createdAt: "2026-08-22T00:00:00.000Z",
+      updatedAt: "2026-08-22T00:01:00.000Z",
+    };
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          visualGeneration: {
+            ...observation().visualGeneration,
+            workflowVersion: "2.9.0",
+          },
+          builds: [previewBuild],
+          interactionState: "preview_ready",
+        })}
+        onAction={vi.fn()}
+        onSubmitRevision={onSubmitRevision}
+      />,
+    );
+
+    const text = screen.getByLabelText("修改要求");
+    const file = new File([new Uint8Array([1, 2, 3])], "产品图.png", {
+      type: "image/png",
+      lastModified: 1,
+    });
+    fireEvent.change(text, { target: { value: "把图片加入产品页" } });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [file] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "生成修改版本" }));
+    await screen.findByText("上传暂时失败");
+    expect(text).toHaveValue("把图片加入产品页");
+    expect(screen.getByText("产品图.png")).toBeInTheDocument();
+    expect(screen.getByText(/第 1 版 · 上一版产品图.png/u)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试提交" }));
+    await waitFor(() => expect(onSubmitRevision).toHaveBeenCalledTimes(2));
+    expect(onSubmitRevision.mock.calls[1]?.[0]).toMatchObject({
+      text: "把图片加入产品页",
+      files: [file],
+    });
+    await waitFor(() => expect(text).toHaveValue(""));
+  });
+
+  it("keeps the parent preview visible while a child revision is building", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              ordinal: 2,
+              parentBuildId: "33333333-3333-4333-8333-333333333333",
+              status: "building",
+              previewUrl: null,
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:02:00.000Z",
+              updatedAt: "2026-08-22T00:03:00.000Z",
+            },
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 1,
+              parentBuildId: null,
+              status: "preview_ready",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+          interactionState: "building",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("修改版本正在生成；完成前继续保留并展示上一版预览。"),
+    ).toBeInTheDocument();
   });
 });

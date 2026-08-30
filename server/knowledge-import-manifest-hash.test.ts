@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { websiteProjectDeletionTombstones } from "../drizzle/schema";
+import {
+  knowledgeImportReceipts,
+  siteProjects,
+  websiteProjectDeletionTombstones,
+} from "../drizzle/schema";
 import { buildWebsiteKnowledgeImportV4Fixture } from "./__testutils__/website-knowledge-import-archive";
 import { canonicalizeWebsiteKnowledgeImportArchive } from "./website-knowledge-import-archive-adapter";
 
@@ -92,7 +96,9 @@ function importDatabase(
     companyName: string;
     status: string;
   } = { userId: 7, companyName: "示例企业", status: "completed" },
+  siteOpsKnowledgeInputEpochId: string | null = null,
 ) {
+  const receiptInserts: Record<string, unknown>[] = [];
   const txUpdate = {
     set: () => txUpdate,
     where: vi.fn().mockResolvedValue(undefined),
@@ -102,7 +108,11 @@ function importDatabase(
       from: (table: unknown) =>
         table === websiteProjectDeletionTombstones
           ? queryResult([{ status: "active" }])
-          : queryResult(transactionResults.shift() ?? []),
+          : table === siteProjects
+            ? queryResult([
+                { knowledgeInputEpochId: siteOpsKnowledgeInputEpochId },
+              ])
+            : queryResult(transactionResults.shift() ?? []),
     }),
     insert: (table: unknown) => ({
       values:
@@ -110,7 +120,12 @@ function importDatabase(
           ? () => ({
               onDuplicateKeyUpdate: vi.fn().mockResolvedValue(undefined),
             })
-          : vi.fn().mockResolvedValue(undefined),
+          : (values: Record<string, unknown>) => {
+              if (table === knowledgeImportReceipts) {
+                receiptInserts.push(values);
+              }
+              return Promise.resolve(undefined);
+            },
     }),
     update: () => txUpdate,
   };
@@ -130,6 +145,7 @@ function importDatabase(
     where: vi.fn().mockResolvedValue(undefined),
   };
   return {
+    receiptInserts,
     select: () => provisionQuery,
     transaction: async (operation: (value: typeof tx) => unknown) =>
       operation(tx),
@@ -260,6 +276,28 @@ describe("website knowledge import v5 local artifact binding", () => {
         document.path.endsWith("README.md"),
       ),
     ).toBe(false);
+  });
+
+  it("copies the locked SiteOps epoch into a new import receipt", async () => {
+    const knowledgeInputEpochId = "64000000-0000-4000-8000-000000000001";
+    const database = importDatabase(
+      undefined,
+      undefined,
+      knowledgeInputEpochId,
+    );
+    mocks.getDb.mockResolvedValue(database);
+
+    await importWebsiteKnowledgeArtifact({
+      projectId: "project-acceptance-001",
+      idempotencyKey: "website-kb-project-acceptance-epoch-v5",
+      value: value(),
+    });
+
+    expect(database.receiptInserts).toEqual([
+      expect.objectContaining({
+        siteOpsKnowledgeInputEpochId: knowledgeInputEpochId,
+      }),
+    ]);
   });
 
   it("keeps independent project and user imports isolated", async () => {

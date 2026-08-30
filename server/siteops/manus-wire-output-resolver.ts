@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { SITEOPS_CONTENT_PLAN_V2_FILENAME } from "../../shared/siteops-content-plan";
 import {
   classifyManusV2StructuredResultEnvelope,
   manusV2EventOperationToken,
@@ -14,6 +15,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
   design: "frontmind-site-design-wire-v2.json",
   designV3: "frontmind-site-design-wire-v3.json",
+  contentPlanV2: SITEOPS_CONTENT_PLAN_V2_FILENAME,
   content: "frontmind-page-content-wire-v2.json",
   contentV3: "frontmind-page-content-wire-v3.json",
   contentDraftV1: "frontmind-site-content-draft-v1.json",
@@ -24,6 +26,7 @@ export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
 const SITEOPS_WIRE_OUTPUT_MAX_BYTES = Object.freeze({
   design: 256 * 1024,
   content: 2 * 1024 * 1024,
+  contentPlanV2: 16 * 1024 * 1024,
 });
 
 export type SiteOpsWireOutputPhase = "design" | "content";
@@ -427,23 +430,29 @@ function jsonAttachments(
   const sourceReceiptV1 =
     phase === "design" &&
     expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1;
+  const contentPlanV2 =
+    phase === "design" &&
+    expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2;
   if (
     !expectedWireVersion &&
     !contentDraftV1 &&
     !contentPatchV1 &&
-    !sourceReceiptV1
+    !sourceReceiptV1 &&
+    !contentPlanV2
   ) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
-  const phaseStem = sourceReceiptV1
-    ? "frontmind[-_]site[-_]source[-_]receipt[-_]v1"
-    : contentPatchV1
-      ? "frontmind[-_]site[-_]content[-_]patch[-_]v1"
-      : contentDraftV1
-        ? "frontmind[-_]site[-_]content[-_]draft[-_]v1"
-        : phase === "design"
-          ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
-          : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
+  const phaseStem = contentPlanV2
+    ? "frontmind[-_]site[-_]content[-_]plan[-_]v2"
+    : sourceReceiptV1
+      ? "frontmind[-_]site[-_]source[-_]receipt[-_]v1"
+      : contentPatchV1
+        ? "frontmind[-_]site[-_]content[-_]patch[-_]v1"
+        : contentDraftV1
+          ? "frontmind[-_]site[-_]content[-_]draft[-_]v1"
+          : phase === "design"
+            ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
+            : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
   const providerFilenamePattern = new RegExp(
     `^${phaseStem}(?:[-_]repair[-_][1-3])?\\.json$`,
     "u",
@@ -621,8 +630,8 @@ export async function resolveSiteOpsWireOutput(input: {
   phase: SiteOpsWireOutputPhase;
   expectedFilename: string;
   taskCompleted: boolean;
-  /** Explicit safe-data paths only: a token-bound Native receipt or content
-   * patch may enter local validation before the Manus task reports stopped. */
+  /** Explicit safe-data paths only: a token-bound Native receipt, content
+   * plan or content patch may enter local validation before Manus stops. */
   acceptCurrentPhaseWhileRunning?: boolean;
   signal?: AbortSignal;
   fetchPinned?: FetchPinnedPublicHttps;
@@ -636,6 +645,7 @@ export async function resolveSiteOpsWireOutput(input: {
       ? [
           SITEOPS_WIRE_OUTPUT_FILES.design,
           SITEOPS_WIRE_OUTPUT_FILES.designV3,
+          SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2,
           SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1,
         ]
       : [
@@ -644,19 +654,24 @@ export async function resolveSiteOpsWireOutput(input: {
           SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1,
           SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1,
         ];
-  const maxBytes = SITEOPS_WIRE_OUTPUT_MAX_BYTES[input.phase];
+  const maxBytes =
+    input.expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2
+      ? SITEOPS_WIRE_OUTPUT_MAX_BYTES.contentPlanV2
+      : SITEOPS_WIRE_OUTPUT_MAX_BYTES[input.phase];
   if (!allowedFilenames.includes(input.expectedFilename)) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
   const expectedFilename = input.expectedFilename;
   // Executable design/content output remains gated on phase completion. The
-  // two non-executable exceptions are locally revalidated against immutable
+  // Non-executable exceptions are locally revalidated against immutable
   // coordinates before use: a Native receipt still needs its matching ZIP,
-  // while a content patch can only alter predeclared data slots.
+  // a content plan passes strict provenance/graph QA, and a content patch can
+  // only alter predeclared data slots.
   const safeCurrentPhaseResult =
     input.acceptCurrentPhaseWhileRunning === true &&
     ((input.phase === "design" &&
-      expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1) ||
+      (expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1 ||
+        expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentPlanV2)) ||
       (input.phase === "content" &&
         expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentPatchV1));
   if (!input.taskCompleted && !safeCurrentPhaseResult) return null;
@@ -670,6 +685,29 @@ export async function resolveSiteOpsWireOutput(input: {
   let validationCandidate:
     | Pick<SiteOpsWireOutputResolution, "sha256" | "source">
     | undefined;
+  let validationFailurePriority = -1;
+  const rememberValidationFailure = (
+    error: unknown,
+    source: SiteOpsWireOutputResolution["source"],
+    acceptedStructured: boolean,
+    sha256?: string,
+  ) => {
+    // A rejected Structured Output may carry the provider's empty recovery
+    // placeholder. Prefer diagnostics from the exact assistant JSON (then a
+    // phase-owned attachment), while an explicitly accepted Structured Output
+    // remains authoritative when its business validation fails.
+    const priority = acceptedStructured
+      ? 3
+      : source === "assistant_json"
+        ? 2
+        : source === "attachment"
+          ? 1
+          : 0;
+    if (priority <= validationFailurePriority) return;
+    validationFailurePriority = priority;
+    validationError = error;
+    validationCandidate = sha256 ? { sha256, source } : undefined;
+  };
   const addCandidate = (
     value: unknown,
     source: SiteOpsWireOutputResolution["source"],
@@ -680,7 +718,7 @@ export async function resolveSiteOpsWireOutput(input: {
       parsed = candidate(value, input.operationToken, maxBytes);
     } catch (error) {
       sawInvalid = true;
-      validationError ??= error;
+      rememberValidationFailure(error, source, acceptedStructured);
       return;
     }
     if (!parsed) {
@@ -691,8 +729,12 @@ export async function resolveSiteOpsWireOutput(input: {
       input.validateCandidate?.(parsed.value, source);
     } catch (error) {
       sawInvalid = true;
-      validationError ??= error;
-      validationCandidate ??= { sha256: parsed.sha256, source };
+      rememberValidationFailure(
+        error,
+        source,
+        acceptedStructured,
+        parsed.sha256,
+      );
       return;
     }
     const resolution = { ...parsed, source, sources: [source] };

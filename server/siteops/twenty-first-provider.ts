@@ -69,6 +69,7 @@ import {
 } from "../twenty-first-service";
 import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
 import {
+  SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION,
   SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION,
   SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
   isSiteOpsNativeVisualWorkflowVersion,
@@ -93,6 +94,10 @@ import {
   type PreparedNativeTemplateCandidate,
   type PreparedNativeVisualCandidate,
 } from "./native-visual-source";
+
+const isStaticCatalogWorkflowVersion = (version: string) =>
+  version === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+  version === SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION;
 import {
   STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
   STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
@@ -1066,8 +1071,9 @@ async function loadDefaultContext(
     );
   }
   const input = visualSearchOperationInputSchema.parse(operation.input);
-  const staticCatalogMode =
-    input.workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION;
+  const staticCatalogMode = isStaticCatalogWorkflowVersion(
+    input.workflowVersion,
+  );
   const projectRows = await db
     .select()
     .from(siteProjects)
@@ -1779,7 +1785,7 @@ async function searchFamilyRound(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
+        "视觉检索已超时；可申请重置，批准后需全新上传并发布知识库再开始。",
       );
     }
     const composedQuery = composeFamilySearchQuery({
@@ -2153,7 +2159,7 @@ async function mirrorCandidates(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉预览镜像已超时；可申请重置，批准后可从当前企业知识库重新开始。",
+        "视觉预览镜像已超时；可申请重置，批准后需全新上传并发布知识库再开始。",
       );
     }
     const batch = input.candidates.slice(offset, offset + MIRROR_CONCURRENCY);
@@ -2172,7 +2178,7 @@ async function mirrorCandidates(input: {
           if (input.signal.aborted) {
             throw new TwentyFirstProviderFailure(
               "VISUAL_SEARCH_TIMEOUT",
-              "视觉预览镜像已超时；可申请重置，批准后可从当前企业知识库重新开始。",
+              "视觉预览镜像已超时；可申请重置，批准后需全新上传并发布知识库再开始。",
             );
           }
           rejectDiagnostic(input.diagnostics, previewRejectionReason(error));
@@ -3177,9 +3183,9 @@ export async function persistDefaultStaticTemplateCatalogBoards(
         leasedOperation.leaseExpiresAt.getTime() <= Date.now() ||
         !frozenInput.success ||
         !("schemaVersion" in frozenInput.data) ||
-        frozenInput.data.schemaVersion !== 3 ||
-        frozenInput.data.workflowVersion !==
-          SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+        (frozenInput.data.schemaVersion !== 3 &&
+          frozenInput.data.schemaVersion !== 4) ||
+        !isStaticCatalogWorkflowVersion(frozenInput.data.workflowVersion) ||
         frozenInput.data.catalogVersion !== input.catalogVersion ||
         frozenInput.data.knowledgeSnapshotId !== input.context.snapshot.id ||
         canonicalSha256(frozenInput.data) !==
@@ -3239,7 +3245,7 @@ export async function persistDefaultStaticTemplateCatalogBoards(
             sourceMetadata: {
               schemaVersion: 7,
               renderer: "frontmind_static_template_catalog_v1" as const,
-              workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+              workflowVersion: frozenInput.data.workflowVersion,
               catalogVersion: candidate.catalogVersion,
               catalogPosition: candidate.catalogPosition,
               catalogCandidateId: candidate.catalogCandidateId,
@@ -3297,7 +3303,7 @@ export async function persistDefaultStaticTemplateCatalogBoards(
               batchIds,
               mode: "initial",
               page: 1,
-              workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+              workflowVersion: frozenInput.data.workflowVersion,
               catalogVersion: input.catalogVersion,
               candidateCount: STATIC_TEMPLATE_CATALOG_ENTRY_COUNT,
               pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
@@ -5076,6 +5082,21 @@ async function runStaticTemplateCatalogVisualSearch(input: {
   ) => Promise<StaticTemplateCatalogBoardsPersistenceResult>;
   db: any;
 }) {
+  const frozenInput = visualSearchOperationInputSchema.parse(
+    input.operation.input,
+  );
+  if (
+    !("schemaVersion" in frozenInput) ||
+    (frozenInput.schemaVersion !== 3 && frozenInput.schemaVersion !== 4) ||
+    !isStaticCatalogWorkflowVersion(frozenInput.workflowVersion)
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "STATIC_TEMPLATE_CATALOG_OPERATION_INVALID",
+      "固定 Template 目录任务坐标无效，请重置后重试。",
+      "attention_required",
+    );
+  }
+  const workflowVersion = frozenInput.workflowVersion;
   if (
     input.catalog.entries.length !== STATIC_TEMPLATE_CATALOG_ENTRY_COUNT ||
     input.catalog.pageSize !== STATIC_TEMPLATE_CATALOG_PAGE_SIZE ||
@@ -5289,7 +5310,7 @@ async function runStaticTemplateCatalogVisualSearch(input: {
     const selectionBundle = visualSelectionBundleV7Schema.parse({
       schemaVersion: 7,
       renderer: "frontmind_static_template_catalog_v1",
-      workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+      workflowVersion,
       catalogVersion: input.catalog.catalogVersion,
       pageNumber,
       pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
@@ -5381,7 +5402,7 @@ async function runStaticTemplateCatalogVisualSearch(input: {
     result: {
       batchIds: board.batchIds,
       candidateCount: board.candidateCount,
-      workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+      workflowVersion,
       catalogVersion: input.catalog.catalogVersion,
       pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
       pageCount: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
@@ -5439,9 +5460,9 @@ export function createTwentyFirstSiteOpsProviderHandler(
       const parsedInput = visualSearchOperationInputSchema.parse(
         operation.input,
       );
-      const staticCatalogMode =
-        parsedInput.workflowVersion ===
-        SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION;
+      const staticCatalogMode = isStaticCatalogWorkflowVersion(
+        parsedInput.workflowVersion,
+      );
       const nativeSourceMode = isSiteOpsNativeVisualWorkflowVersion(
         parsedInput.workflowVersion,
       );
@@ -5511,9 +5532,9 @@ export function createTwentyFirstSiteOpsProviderHandler(
               context.existingBoard.selectionBundleHash ?? undefined,
             ...(staticCatalogMode &&
             "schemaVersion" in parsedInput &&
-            parsedInput.schemaVersion === 3
+            (parsedInput.schemaVersion === 3 || parsedInput.schemaVersion === 4)
               ? {
-                  workflowVersion: SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION,
+                  workflowVersion: parsedInput.workflowVersion,
                   catalogVersion: parsedInput.catalogVersion,
                   pageSize: STATIC_TEMPLATE_CATALOG_PAGE_SIZE,
                   pageCount: STATIC_TEMPLATE_CATALOG_PAGE_COUNT,
@@ -5604,7 +5625,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
       if (staticCatalogMode) {
         if (
           !("schemaVersion" in parsedInput) ||
-          parsedInput.schemaVersion !== 3
+          (parsedInput.schemaVersion !== 3 && parsedInput.schemaVersion !== 4)
         ) {
           throw new TwentyFirstProviderFailure(
             "STATIC_TEMPLATE_CATALOG_OPERATION_INVALID",

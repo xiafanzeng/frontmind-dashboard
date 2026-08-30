@@ -1329,7 +1329,11 @@ describe("Manus SiteOps provider boundary", () => {
     expect(createClient).not.toHaveBeenCalled();
   });
 
-  it.each(["malformed-receipt", "missing-staging-task"] as const)(
+  it.each([
+    "malformed-receipt",
+    "missing-staging-task",
+    "content-plan-mismatch",
+  ] as const)(
     "fails closed before provider access for a raw %s source checkpoint",
     async (variant) => {
       const taskId = "native-task-1";
@@ -1352,6 +1356,9 @@ describe("Manus SiteOps provider boundary", () => {
         },
         taskId,
         nativeRepairAttempt: 0,
+        ...(variant === "content-plan-mismatch"
+          ? { contentPlanSha256: "d".repeat(64) }
+          : {}),
         buildPhase: "compiling",
         buildCheckpoint: "archive_validated",
         nativeSourceStaging: {

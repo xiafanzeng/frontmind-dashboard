@@ -7,14 +7,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   coverageForTarget,
   createEsaSiteOpsProviderHandler,
+  loadFrozenProductionMediaRequirements,
   materializeSiteOpsProductionSource,
   packageEsaStaticAssets,
+  productionContractMatchesFrozenBuild,
   type EsaDirectApi,
 } from "./esa-provider";
 import {
   SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_MATERIALIZER_V2_7,
+  SITEOPS_MATERIALIZER_V2_9,
 } from "../../shared/siteops";
+import type { SiteContentPlanV2 } from "../../shared/siteops-content-plan";
+import { canonicalJson } from "../../shared/siteops-workflow";
 
 const operation = {
   id: "10000000-0000-4000-8000-000000000001",
@@ -29,6 +34,118 @@ const operation = {
   createdAt: new Date("2026-08-26T00:30:00.000Z"),
   updatedAt: new Date("2026-08-26T00:30:00.000Z"),
 } as const;
+
+const DYNAMIC_PRODUCTION_PLAN = {
+  schemaVersion: 2,
+  inventorySha256: "d".repeat(64),
+  routes: [
+    {
+      id: "home",
+      path: "/",
+      title: "首页",
+      navigation: "primary",
+      parentPath: null,
+      detailOfPath: null,
+      purpose: "介绍动态规划的业务入口",
+      userQuestions: ["可以解决什么问题？"],
+      h1: "由知识库规划的业务入口",
+      summary: "这里展示完整知识资料组织出的业务能力。",
+      cta: { label: "查看产品能力", targetPath: "/platform/" },
+      sections: [
+        {
+          id: "home-proof",
+          blockKind: "prose",
+          heading: "知识证据",
+          purpose: "展示可核验能力",
+          body: "这是由冻结知识资料支持的首页正文。",
+          sourceBindings: [
+            {
+              sourceDocumentId: "doc-dynamic",
+              evidenceExcerpt: "冻结知识资料支持动态信息架构。",
+            },
+          ],
+          mediaIds: [],
+          entityIds: [],
+          faqIds: [],
+        },
+      ],
+    },
+    {
+      id: "platform",
+      path: "/platform/",
+      title: "产品能力",
+      navigation: "primary",
+      parentPath: null,
+      detailOfPath: null,
+      purpose: "汇总知识库中的产品实体",
+      userQuestions: ["有哪些产品能力？"],
+      h1: "产品能力总览",
+      summary: "产品资料丰富，因此由 Manus 规划列表与详情关系。",
+      cta: { label: "查看详情", targetPath: "/platform/alpha/" },
+      sections: [
+        {
+          id: "platform-list",
+          blockKind: "entity_grid",
+          heading: "产品列表",
+          purpose: "呈现产品实体",
+          body: "Alpha 是知识库中具有完整证据的产品实体。",
+          sourceBindings: [
+            {
+              sourceDocumentId: "doc-dynamic",
+              evidenceExcerpt: "冻结知识资料支持动态信息架构。",
+            },
+          ],
+          mediaIds: [],
+          entityIds: ["alpha"],
+          faqIds: [],
+        },
+      ],
+    },
+    {
+      id: "platform-alpha",
+      path: "/platform/alpha/",
+      title: "Alpha 产品",
+      navigation: "hidden",
+      parentPath: "/platform/",
+      detailOfPath: "/platform/",
+      purpose: "解释 Alpha 产品详情",
+      userQuestions: ["Alpha 如何工作？"],
+      h1: "Alpha 产品详情",
+      summary: "详情页来自 Manus 对丰富产品资料的拆分。",
+      cta: { label: "返回产品能力", targetPath: "/platform/" },
+      sections: [
+        {
+          id: "alpha-detail",
+          blockKind: "prose",
+          heading: "Alpha 能力",
+          purpose: "说明产品详情",
+          body: "Alpha 详情正文完整保留冻结知识证据。",
+          sourceBindings: [
+            {
+              sourceDocumentId: "doc-dynamic",
+              evidenceExcerpt: "冻结知识资料支持动态信息架构。",
+            },
+          ],
+          mediaIds: [],
+          entityIds: ["alpha"],
+          faqIds: [],
+        },
+      ],
+    },
+  ],
+  navigation: [
+    { label: "首页", targetPath: "/" },
+    { label: "产品能力", targetPath: "/platform/" },
+  ],
+  coverage: [
+    {
+      sourceDocumentId: "doc-dynamic",
+      status: "used",
+      routeIds: ["home", "platform", "platform-alpha"],
+      omissionReason: null,
+    },
+  ],
+} satisfies SiteContentPlanV2;
 
 const previousEnabled = process.env.FRONTMIND_ESA_ENABLED;
 const previousInstanceId = process.env.FRONTMIND_ESA_INSTANCE_ID;
@@ -1365,11 +1482,19 @@ describe("direct ESA SiteOps provider", () => {
   it.each([
     SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
     SITEOPS_MATERIALIZER_V2_7.frontMindVersion,
-  ])(
+    SITEOPS_MATERIALIZER_V2_9.frontMindVersion,
+  ] as const)(
     "rebuilds Native workflow %s with the native production runtime",
     async (workflowVersion) => {
       const digest = (value: Buffer | string) =>
         createHash("sha256").update(value).digest("hex");
+      const frozenContentPlan =
+        workflowVersion === SITEOPS_MATERIALIZER_V2_9.frontMindVersion
+          ? DYNAMIC_PRODUCTION_PLAN
+          : undefined;
+      const frozenContentPlanSha256 = frozenContentPlan
+        ? digest(`${canonicalJson(frozenContentPlan)}\n`)
+        : null;
       const archive = new JSZip();
       archive.file(
         "package.json",
@@ -1420,6 +1545,8 @@ describe("direct ESA SiteOps provider", () => {
         expect(input.validatedSource.sourceZip.equals(sourceZip)).toBe(true);
         expect(input.canonicalOrigin).toBe("https://example.com");
         expect(input.target).toBe("global_excluding_cn");
+        expect(input.contentPlan).toEqual(frozenContentPlan);
+        expect(input.contentPlanSha256).toBe(frozenContentPlanSha256);
         return nativeOutput as never;
       });
       const materializeProduction = vi.fn();
@@ -1427,13 +1554,44 @@ describe("direct ESA SiteOps provider", () => {
       const output = await materializeSiteOpsProductionSource({
         sourceZip,
         sourceSha256,
+        contentPlan: frozenContentPlan,
         build: {
           id: "13000000-0000-4000-8000-000000000013",
           projectId: operation.projectId,
           knowledgeSnapshotId: "11000000-0000-4000-8000-000000000011",
           workflowVersion,
           selectionHash: "a".repeat(64),
-          brief: {},
+          contentPlanSha256: frozenContentPlanSha256,
+          brief: {
+            companyName: "旧版固定信息架构企业",
+            primaryLanguage: "zh-CN",
+            contacts: [],
+            offerings: [],
+            audience: [],
+            conversionGoal: "联系咨询",
+            contentInventory: {
+              schemaVersion: 1,
+              source: "frozen_knowledge_snapshot",
+              entries: [],
+            },
+            routes: [
+              {
+                id: "home",
+                slug: "/",
+                title: "旧首页",
+                sourceDocumentIds: ["doc-dynamic"],
+              },
+              {
+                id: "about",
+                slug: "/about/",
+                title: "旧关于我们",
+                sourceDocumentIds: ["doc-dynamic"],
+              },
+            ],
+            verifiedFacts: [],
+            publicAssetIds: [],
+            unknowns: [],
+          },
         },
         target: "global_excluding_cn",
         canonicalOrigin: "https://example.com",
@@ -1451,6 +1609,348 @@ describe("direct ESA SiteOps provider", () => {
       });
     },
   );
+
+  it("replays a first-child image into second-child text-only production and separates customer media from knowledge media", async () => {
+    const taskStartedAt = new Date("2026-08-30T01:00:00.000Z");
+    const rootBuildId = "21000000-0000-4000-8000-000000000001";
+    const firstBuildId = "21000000-0000-4000-8000-000000000002";
+    const secondBuildId = "21000000-0000-4000-8000-000000000003";
+    const epochId = "22000000-0000-4000-8000-000000000001";
+    const publicPath = `/frontmind-user-media/${"c".repeat(64)}.png`;
+    const customerMediaId = `customer-media:${createHash("sha256")
+      .update(publicPath, "utf8")
+      .digest("hex")
+      .slice(0, 32)}`;
+    const plan = structuredClone(DYNAMIC_PRODUCTION_PLAN);
+    plan.routes[0]!.sections[0]!.mediaIds = [customerMediaId];
+    const builds = [
+      {
+        id: rootBuildId,
+        parentBuildId: null,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        knowledgeSnapshotId: "23000000-0000-4000-8000-000000000001",
+        knowledgeArchiveHash: "d".repeat(64),
+        workflowVersion: "2.9.0",
+        sourceLocalAssetId: "24000000-0000-4000-8000-000000000001",
+        sourceHash: "a".repeat(64),
+        contentPlanLocalAssetId: "25000000-0000-4000-8000-000000000001",
+        contentPlanSha256: "b".repeat(64),
+        createdAt: taskStartedAt,
+      },
+      {
+        id: firstBuildId,
+        parentBuildId: rootBuildId,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        knowledgeSnapshotId: "23000000-0000-4000-8000-000000000001",
+        knowledgeArchiveHash: "d".repeat(64),
+        workflowVersion: "2.9.0",
+        sourceLocalAssetId: "24000000-0000-4000-8000-000000000002",
+        sourceHash: "e".repeat(64),
+        contentPlanLocalAssetId: "25000000-0000-4000-8000-000000000002",
+        contentPlanSha256: "f".repeat(64),
+        createdAt: new Date("2026-08-30T01:01:00.000Z"),
+      },
+      {
+        id: secondBuildId,
+        parentBuildId: firstBuildId,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        knowledgeSnapshotId: "23000000-0000-4000-8000-000000000001",
+        knowledgeArchiveHash: "d".repeat(64),
+        workflowVersion: "2.9.0",
+        sourceLocalAssetId: "24000000-0000-4000-8000-000000000003",
+        sourceHash: "1".repeat(64),
+        contentPlanLocalAssetId: "25000000-0000-4000-8000-000000000003",
+        contentPlanSha256: "2".repeat(64),
+        createdAt: new Date("2026-08-30T01:02:00.000Z"),
+      },
+    ];
+    const mediaDescriptor = {
+      schemaVersion: 1,
+      localAssetId: "26000000-0000-4000-8000-000000000001",
+      filename: "产品实拍图.png",
+      mimeType: "image/png",
+      sizeBytes: 1024,
+      contentSha256: "c".repeat(64),
+      width: 800,
+      height: 600,
+      publicPath,
+      siteOpsKnowledgeInputEpochId: epochId,
+    } as const;
+    const revisionOperations = [
+      {
+        id: "27000000-0000-4000-8000-000000000001",
+        buildId: firstBuildId,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        kind: "build_revision",
+        status: "succeeded",
+        createdAt: new Date("2026-08-30T01:01:00.000Z"),
+        input: {
+          credentialScope: "customer",
+          manusCredentialId: "28000000-0000-4000-8000-000000000001",
+          manusCredentialVersion: 1,
+          buildId: rootBuildId,
+          childBuildId: firstBuildId,
+          parentBuildId: rootBuildId,
+          feedback: "第一轮加入产品实拍图。",
+          revisionBaseline: {
+            schemaVersion: 1,
+            parentBuildId: rootBuildId,
+            sourceLocalAssetId: builds[0]!.sourceLocalAssetId,
+            sourceSha256: builds[0]!.sourceHash,
+            contentPlanLocalAssetId: builds[0]!.contentPlanLocalAssetId,
+            contentPlanSha256: builds[0]!.contentPlanSha256,
+          },
+          revisionInputAssets: [mediaDescriptor],
+        },
+      },
+      {
+        id: "27000000-0000-4000-8000-000000000002",
+        buildId: secondBuildId,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        kind: "build_revision",
+        status: "succeeded",
+        createdAt: new Date("2026-08-30T01:02:00.000Z"),
+        input: {
+          credentialScope: "customer",
+          manusCredentialId: "28000000-0000-4000-8000-000000000001",
+          manusCredentialVersion: 1,
+          buildId: firstBuildId,
+          childBuildId: secondBuildId,
+          parentBuildId: firstBuildId,
+          feedback: "第二轮只修改文案并保留图片。",
+          revisionBaseline: {
+            schemaVersion: 1,
+            parentBuildId: firstBuildId,
+            sourceLocalAssetId: builds[1]!.sourceLocalAssetId,
+            sourceSha256: builds[1]!.sourceHash,
+            contentPlanLocalAssetId: builds[1]!.contentPlanLocalAssetId,
+            contentPlanSha256: builds[1]!.contentPlanSha256,
+          },
+          revisionInputAssets: [],
+        },
+      },
+    ];
+    const mediaRows = [
+      {
+        id: "29000000-0000-4000-8000-000000000001",
+        buildId: firstBuildId,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        sourceAssetId: "asset_source_first",
+        ...mediaDescriptor,
+        ordinal: 1,
+        taskStartedAt,
+        createdAt: new Date("2026-08-30T01:01:00.000Z"),
+      },
+    ];
+    const queuedRows = [builds, revisionOperations, mediaRows];
+    let queryIndex = 0;
+    const db = {
+      select: vi.fn(() => {
+        const rows = queuedRows[queryIndex++] ?? [];
+        const query: any = {
+          from: vi.fn(() => query),
+          where: vi.fn().mockResolvedValue(rows),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+        return query;
+      }),
+    };
+
+    const result = await loadFrozenProductionMediaRequirements({
+      db: db as never,
+      context: {
+        build: builds[2],
+        project: {
+          currentTaskStartedAt: taskStartedAt,
+          knowledgeInputEpochId: epochId,
+        },
+      } as never,
+      operation: operation as never,
+      contentPlan: plan,
+    });
+
+    expect(result).toEqual({
+      requiredUserMedia: [{ publicPath, contentSha256: "c".repeat(64) }],
+      requiredKnowledgeMedia: [],
+    });
+    expect(queryIndex).toBe(3);
+
+    const removedMediaPlan = structuredClone(plan);
+    removedMediaPlan.routes[0]!.sections[0]!.mediaIds = [];
+    const removedQueue = [builds, revisionOperations, mediaRows];
+    let removedIndex = 0;
+    const removedDb = {
+      select: vi.fn(() => {
+        const rows = removedQueue[removedIndex++] ?? [];
+        const query: any = {
+          from: vi.fn(() => query),
+          where: vi.fn().mockResolvedValue(rows),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+        return query;
+      }),
+    };
+    await expect(
+      loadFrozenProductionMediaRequirements({
+        db: removedDb as never,
+        context: {
+          build: builds[2],
+          project: {
+            currentTaskStartedAt: taskStartedAt,
+            knowledgeInputEpochId: epochId,
+          },
+        } as never,
+        operation: operation as never,
+        contentPlan: removedMediaPlan,
+      }),
+    ).resolves.toEqual({
+      requiredUserMedia: [],
+      requiredKnowledgeMedia: [],
+    });
+
+    const repeatedDescriptor = {
+      ...mediaDescriptor,
+      localAssetId: "26000000-0000-4000-8000-000000000002",
+    };
+    const repeatedRows = [
+      ...mediaRows,
+      {
+        ...mediaRows[0]!,
+        id: "29000000-0000-4000-8000-000000000002",
+        buildId: secondBuildId,
+        sourceAssetId: "asset_source_second",
+        localAssetId: repeatedDescriptor.localAssetId,
+        createdAt: new Date("2026-08-30T01:02:00.000Z"),
+      },
+    ];
+    const repeatedOperations = [
+      revisionOperations[0]!,
+      {
+        ...revisionOperations[1]!,
+        input: {
+          ...revisionOperations[1]!.input,
+          revisionInputAssets: [repeatedDescriptor],
+        },
+      },
+    ];
+    const repeatedQueue = [builds, repeatedOperations, repeatedRows];
+    let repeatedIndex = 0;
+    const repeatedDb = {
+      select: vi.fn(() => {
+        const rows = repeatedQueue[repeatedIndex++] ?? [];
+        const query: any = {
+          from: vi.fn(() => query),
+          where: vi.fn().mockResolvedValue(rows),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+        return query;
+      }),
+    };
+    await expect(
+      loadFrozenProductionMediaRequirements({
+        db: repeatedDb as never,
+        context: {
+          build: builds[2],
+          project: {
+            currentTaskStartedAt: taskStartedAt,
+            knowledgeInputEpochId: epochId,
+          },
+        } as never,
+        operation: operation as never,
+        contentPlan: plan,
+      }),
+    ).resolves.toEqual({
+      requiredUserMedia: [{ publicPath, contentSha256: "c".repeat(64) }],
+      requiredKnowledgeMedia: [],
+    });
+
+    const missingPlanMedia = structuredClone(plan);
+    missingPlanMedia.routes[0]!.sections[0]!.mediaIds = [
+      `customer-media:${"0".repeat(32)}`,
+    ];
+    const missingQueue = [builds, revisionOperations, mediaRows];
+    let missingIndex = 0;
+    const missingDb = {
+      select: vi.fn(() => {
+        const rows = missingQueue[missingIndex++] ?? [];
+        const query: any = {
+          from: vi.fn(() => query),
+          where: vi.fn().mockResolvedValue(rows),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+        return query;
+      }),
+    };
+    await expect(
+      loadFrozenProductionMediaRequirements({
+        db: missingDb as never,
+        context: {
+          build: builds[2],
+          project: {
+            currentTaskStartedAt: taskStartedAt,
+            knowledgeInputEpochId: epochId,
+          },
+        } as never,
+        operation: operation as never,
+        contentPlan: missingPlanMedia,
+      }),
+    ).rejects.toMatchObject({
+      code: "ESA_PRODUCTION_REVISION_MEDIA_INVALID",
+    });
+  });
+
+  it("binds every 2.9 production contract to the frozen content-plan SHA", () => {
+    const contentPlanSha256 = "f".repeat(64);
+    const build = {
+      id: "13000000-0000-4000-8000-000000000013",
+      projectId: operation.projectId,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_9.frontMindVersion,
+      sourceHash: "e".repeat(64),
+      contentPlanSha256,
+    };
+    const contract = {
+      contractKind: "twenty_first_native_build_contract",
+      renderer: "twenty_first_native_react_v1",
+      buildId: build.id,
+      projectId: build.projectId,
+      mode: "production",
+      canonicalOrigin: "https://example.com",
+      target: "global_excluding_cn",
+      sourceSha256: build.sourceHash,
+      contentPlanSha256,
+    };
+    const verify = (
+      contractValue: Record<string, unknown>,
+      frozenBuild = build,
+    ) =>
+      productionContractMatchesFrozenBuild({
+        contractValue,
+        build: frozenBuild,
+        canonicalOrigin: "https://example.com",
+        target: "global_excluding_cn",
+      });
+
+    expect(verify(contract)).toBe(true);
+    expect(verify({ ...contract, contentPlanSha256: "0".repeat(64) })).toBe(
+      false,
+    );
+    const { contentPlanSha256: _missing, ...missingPlanContract } = contract;
+    expect(verify(missingPlanContract)).toBe(false);
+    expect(verify(contract, { ...build, contentPlanSha256: null })).toBe(false);
+    expect(
+      verify(missingPlanContract, {
+        ...build,
+        workflowVersion: SITEOPS_MATERIALIZER_V2_7.frontMindVersion,
+        contentPlanSha256: null,
+      }),
+    ).toBe(true);
+  });
 
   it("recreates a deleted Routine, deploys the frozen version, and restores the exact relation", async () => {
     enableEsaTestRuntime();

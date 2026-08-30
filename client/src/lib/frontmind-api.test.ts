@@ -27,12 +27,17 @@ import {
   sanitizeBrandText,
   type FileUploadStageEvent,
   type ManagedUploadHandle,
+  uploadChatLocalAsset,
   uploadFile,
   uploadKnowledgeBaseLocalAsset,
   uploadFileToUrl,
   withoutProviderTaskNavigationUrls,
 } from "./frontmind-api";
 import { KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS } from "@shared/knowledge-base-local-upload";
+import {
+  SITEOPS_COMPOSER_LOCAL_UPLOAD_HEADERS,
+  SITEOPS_COMPOSER_LOCAL_UPLOAD_SCOPE,
+} from "@shared/siteops-composer-local-upload";
 
 afterEach(() => {
   localStorage.clear();
@@ -1685,6 +1690,68 @@ describe("ordinary chat local v2 contract", () => {
 });
 
 describe("materialized knowledge-base local asset ingress", () => {
+  it("sends the complete SiteOps composer idempotency coordinate", async () => {
+    const headers = new Map<string, string>();
+    class MockXMLHttpRequest {
+      status = 201;
+      responseText = JSON.stringify({
+        localAssetId: `asset_${"s".repeat(30)}`,
+        filename: "product.png",
+        bytes: 3,
+        sha256: "a".repeat(64),
+        expiresAt: Date.now() + 60_000,
+        replayed: false,
+      });
+      upload = { addEventListener: vi.fn() };
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open() {}
+      setRequestHeader(name: string, value: string) {
+        headers.set(name, value);
+      }
+      send() {
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadChatLocalAsset(
+        new File([new Uint8Array([1, 2, 3])], "product.png", {
+          type: "image/png",
+        }),
+        undefined,
+        {
+          siteOpsComposerCoordinate: {
+            clientRequestId: "11111111-1111-4111-8111-111111111111",
+            contentSha256: "a".repeat(64),
+            ordinal: 2,
+          },
+        },
+      ),
+    ).resolves.toMatchObject({
+      fileId: `asset_${"s".repeat(30)}`,
+      replayed: false,
+    });
+
+    expect(headers.get(SITEOPS_COMPOSER_LOCAL_UPLOAD_HEADERS.scope)).toBe(
+      SITEOPS_COMPOSER_LOCAL_UPLOAD_SCOPE,
+    );
+    expect(
+      headers.get(SITEOPS_COMPOSER_LOCAL_UPLOAD_HEADERS.clientRequestId),
+    ).toBe("11111111-1111-4111-8111-111111111111");
+    expect(
+      headers.get(SITEOPS_COMPOSER_LOCAL_UPLOAD_HEADERS.contentSha256),
+    ).toBe("a".repeat(64));
+    expect(headers.get(SITEOPS_COMPOSER_LOCAL_UPLOAD_HEADERS.ordinal)).toBe(
+      "2",
+    );
+  });
+
   it("rejects a partial operation coordinate before constructing XHR", async () => {
     const xhrConstructed = vi.fn();
     class MockXMLHttpRequest {

@@ -379,6 +379,9 @@ export const localAssets = mysqlTable(
     contentSha256: varchar("content_sha256", { length: 64 }).notNull(),
     storageKey: varchar("storage_key", { length: 1024 }).notNull(),
     storageKeyHash: varchar("storage_key_hash", { length: 64 }).notNull(),
+    siteOpsKnowledgeInputEpochId: varchar("site_ops_knowledge_input_epoch_id", {
+      length: 36,
+    }),
     refCount: int("ref_count", { unsigned: true }).default(1).notNull(),
     retainUntil: timestamp("retain_until"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -395,6 +398,10 @@ export const localAssets = mysqlTable(
     index("local_assets_project_hash_idx").on(
       table.presalesProjectId,
       table.contentSha256,
+    ),
+    index("local_assets_siteops_epoch_idx").on(
+      table.accountUserId,
+      table.siteOpsKnowledgeInputEpochId,
     ),
   ],
 );
@@ -2285,6 +2292,10 @@ export const knowledgeImportReceipts = mysqlTable(
       .unique(),
     artifactHash: varchar("artifactHash", { length: 64 }).notNull(),
     sourceFileName: varchar("sourceFileName", { length: 512 }).notNull(),
+    /** SiteOps reset epoch captured when this import receipt is reserved. */
+    siteOpsKnowledgeInputEpochId: varchar("siteOpsKnowledgeInputEpochId", {
+      length: 36,
+    }),
     status: mysqlEnum("status", [
       "pending",
       "processing",
@@ -2848,6 +2859,10 @@ export const knowledgeBaseSnapshots = mysqlTable(
     sourceBuildId: varchar("sourceBuildId", { length: 36 }),
     sourceBuildRevision: int("sourceBuildRevision"),
     sourceTaskId: varchar("sourceTaskId", { length: 255 }),
+    /** Server-derived reset epoch copied from the immutable source reservation. */
+    siteOpsKnowledgeInputEpochId: varchar("siteOpsKnowledgeInputEpochId", {
+      length: 36,
+    }),
     sourceArtifactHash: varchar("sourceArtifactHash", { length: 64 }),
     archiveHash: varchar("archiveHash", { length: 64 }),
     maintenanceTicketId: varchar("maintenanceTicketId", { length: 36 }),
@@ -2898,6 +2913,13 @@ export const knowledgeBaseBuilds = mysqlTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     conversationId: varchar("conversationId", { length: 191 }).notNull(),
+    /**
+     * Server-generated SiteOps reset epoch captured when this immutable build
+     * reservation is created. Historical and non-SiteOps builds remain null.
+     */
+    siteOpsKnowledgeInputEpochId: varchar("site_ops_knowledge_input_epoch_id", {
+      length: 36,
+    }),
     companyName: varchar("companyName", { length: 255 }).notNull(),
     companyWebsite: text("companyWebsite"),
     upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
@@ -3962,6 +3984,11 @@ export const siteProjects = mysqlTable(
       .default("zh-CN")
       .notNull(),
     canonicalHostname: varchar("canonical_hostname", { length: 255 }),
+    /**
+     * Unforgeable fresh-input boundary rotated by an approved SiteOps reset.
+     * Null preserves the historical pre-2.9 compatibility path.
+     */
+    knowledgeInputEpochId: varchar("knowledge_input_epoch_id", { length: 36 }),
     currentTaskStartedAt: timestamp("current_task_started_at")
       .defaultNow()
       .notNull(),
@@ -4043,6 +4070,10 @@ export const siteBuilds = mysqlTable(
     styleRevision: int("style_revision", { unsigned: true }),
     brief: json("brief").$type<Record<string, unknown>>().notNull(),
     selectionHash: varchar("selection_hash", { length: 64 }),
+    contentPlanLocalAssetId: varchar("content_plan_local_asset_id", {
+      length: 36,
+    }),
+    contentPlanSha256: varchar("content_plan_sha256", { length: 64 }),
     contractLocalAssetId: varchar("contract_local_asset_id", {
       length: 36,
     }).references(() => localAssets.id, { onDelete: "restrict" }),
@@ -4125,6 +4156,63 @@ export const siteBuilds = mysqlTable(
         OR
         (${table.quotaPeriodId} IS NOT NULL AND ${table.quotaState} IS NOT NULL)
       )`,
+    ),
+  ],
+);
+
+/** Immutable, tenant-bound user media frozen for one revision build. */
+export const siteBuildInputAssets = mysqlTable(
+  "site_build_input_assets",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    buildId: varchar("build_id", { length: 36 })
+      .notNull()
+      .references(() => siteBuilds.id, { onDelete: "cascade" }),
+    projectId: varchar("project_id", { length: 36 })
+      .notNull()
+      .references(() => siteProjects.id, { onDelete: "cascade" }),
+    userId: int("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    sourceAssetId: varchar("source_asset_id", { length: 191 }).notNull(),
+    localAssetId: varchar("local_asset_id", { length: 36 })
+      .notNull()
+      .references(() => localAssets.id, { onDelete: "restrict" }),
+    ordinal: int("ordinal", { unsigned: true }).notNull(),
+    filename: varchar("filename", { length: 512 }).notNull(),
+    mimeType: varchar("mime_type", { length: 255 }).notNull(),
+    sizeBytes: int("size_bytes", { unsigned: true }).notNull(),
+    contentSha256: varchar("content_sha256", { length: 64 }).notNull(),
+    width: int("width", { unsigned: true }).notNull(),
+    height: int("height", { unsigned: true }).notNull(),
+    publicPath: varchar("public_path", { length: 512 }).notNull(),
+    siteOpsKnowledgeInputEpochId: varchar("site_ops_knowledge_input_epoch_id", {
+      length: 36,
+    }),
+    taskStartedAt: timestamp("task_started_at").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("site_build_input_assets_build_ordinal_uq").on(
+      table.buildId,
+      table.ordinal,
+    ),
+    uniqueIndex("site_build_input_assets_build_source_uq").on(
+      table.buildId,
+      table.sourceAssetId,
+    ),
+    uniqueIndex("site_build_input_assets_build_public_path_uq").on(
+      table.buildId,
+      table.publicPath,
+    ),
+    index("site_build_input_assets_local_asset_idx").on(table.localAssetId),
+    index("site_build_input_assets_project_task_idx").on(
+      table.projectId,
+      table.taskStartedAt,
+    ),
+    index("site_build_input_assets_project_epoch_idx").on(
+      table.projectId,
+      table.siteOpsKnowledgeInputEpochId,
     ),
   ],
 );

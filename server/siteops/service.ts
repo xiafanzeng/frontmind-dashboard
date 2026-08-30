@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
+import path from "node:path";
 import { domainToASCII, domainToUnicode } from "node:url";
 import {
   and,
@@ -20,9 +21,13 @@ import {
   apiCredentials,
   conversations,
   conversationTurns,
+  knowledgeBaseBuilds,
+  knowledgeImportReceipts,
   knowledgeBaseSnapshots,
+  localAssets,
   messages,
   presalesApiCredentials,
+  siteBuildInputAssets,
   siteBuilds,
   siteDeployments,
   siteDnsRecords,
@@ -43,6 +48,7 @@ import {
   SITEOPS_MATERIALIZER_V2_6,
   SITEOPS_MATERIALIZER_V2_7,
   SITEOPS_MATERIALIZER_V2_8,
+  SITEOPS_MATERIALIZER_V2_9,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
@@ -103,6 +109,7 @@ import {
   type AuthenticatedUser,
 } from "../auth-service";
 import { getDb } from "../db";
+import { ownedFileContentResolver } from "../owned-file-content-resolver";
 import { getServicePortal } from "../service-entitlement";
 import { getTwentyFirstCredentialStatus } from "../twenty-first-service";
 import { siteOpsProviderConfigured } from "./providers";
@@ -137,6 +144,12 @@ import {
   safeSiteOpsPersistenceDiagnostics,
   siteOpsPersistenceTransactionOutcome,
 } from "./persistence-diagnostics";
+import {
+  decodedRasterImageDimensions,
+  imageMimeByExtension,
+  isSupportedImageBytes,
+} from "../knowledge-archive-image-validation";
+import { persistSiteOpsArtifact } from "./artifact-store";
 
 export type SiteOpsServiceErrorCode =
   | "CREDENTIAL_ROTATED"
@@ -203,7 +216,8 @@ export function siteOpsBuildWorkflowCoordinates(
     | typeof SITEOPS_MATERIALIZER_V2_5
     | typeof SITEOPS_MATERIALIZER_V2_6
     | typeof SITEOPS_MATERIALIZER_V2_7
-    | typeof SITEOPS_MATERIALIZER_V2_8,
+    | typeof SITEOPS_MATERIALIZER_V2_8
+    | typeof SITEOPS_MATERIALIZER_V2_9,
 ) {
   const persisted = parseSiteOpsPersistedWorkflowCoordinates({
     upstreamVersion: workflow.upstreamVersion,
@@ -242,6 +256,9 @@ export function isSiteOpsOperationReplay(
 const uuidSchema = z.string().uuid();
 const optionalUuidSchema = uuidSchema.optional();
 const TWENTY_FIRST_OPERATION_MARKER_PREFIX = "siteops-21st-operation:";
+const isStaticCatalogWorkflowVersion = (workflowVersion: string | null) =>
+  workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion ||
+  workflowVersion === SITEOPS_MATERIALIZER_V2_9.frontMindVersion;
 const domainSchema = z
   .string()
   .trim()
@@ -880,7 +897,7 @@ export const staticTemplateSelectionMetadataSchema = z
   .object({
     schemaVersion: z.literal(7),
     renderer: z.literal("frontmind_static_template_catalog_v1"),
-    workflowVersion: z.literal("2.8.0"),
+    workflowVersion: z.enum(["2.8.0", "2.9.0"]),
     catalogVersion: z.string().trim().min(1).max(191),
     catalogPosition: z.number().int().min(1).max(32),
     catalogCandidateId: z.string().trim().min(1).max(191),
@@ -990,8 +1007,12 @@ export function isNativeVisualSelectionMetadata(value: unknown) {
 }
 
 export function siteOpsWorkflowForVisualSelectionMetadata(value: unknown) {
-  if (staticTemplateSelectionMetadataSchema.safeParse(value).success) {
-    return SITEOPS_MATERIALIZER_V2_8;
+  const staticTemplate = staticTemplateSelectionMetadataSchema.safeParse(value);
+  if (staticTemplate.success) {
+    return staticTemplate.data.workflowVersion ===
+      SITEOPS_MATERIALIZER_V2_9.frontMindVersion
+      ? SITEOPS_MATERIALIZER_V2_9
+      : SITEOPS_MATERIALIZER_V2_8;
   }
   const nativeTemplate = nativeTemplateSelectionMetadataSchema.safeParse(value);
   if (nativeTemplate.success) {
@@ -1237,10 +1258,10 @@ export function projectStaticTemplateCatalogVisualReadiness(
       entry.executionAdmission.status === "admitted",
   );
   const ready =
-    catalog?.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion &&
-    catalog.catalogVersion === STATIC_TEMPLATE_CATALOG_VERSION &&
-    catalog.pageSize === STATIC_TEMPLATE_CATALOG_PAGE_SIZE &&
-    catalog.pageCount === STATIC_TEMPLATE_CATALOG_PAGE_COUNT &&
+    isStaticCatalogWorkflowVersion(catalog?.workflowVersion ?? null) &&
+    catalog?.catalogVersion === STATIC_TEMPLATE_CATALOG_VERSION &&
+    catalog?.pageSize === STATIC_TEMPLATE_CATALOG_PAGE_SIZE &&
+    catalog?.pageCount === STATIC_TEMPLATE_CATALOG_PAGE_COUNT &&
     requiredAdmissionReady;
   return {
     status: ready ? ("configured" as const) : ("not_configured" as const),
@@ -1585,7 +1606,7 @@ export function resolveVisualCatalogObservationCoordinates(input: {
     typeof input.frozenVisualInput?.workflowVersion === "string"
       ? input.frozenVisualInput.workflowVersion
       : pristineVisualCycle
-        ? SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+        ? SITEOPS_DEFAULT_WORKFLOW.frontMindVersion
         : null;
   const catalogVersion =
     typeof input.frozenVisualInput?.catalogVersion === "string"
@@ -1594,7 +1615,7 @@ export function resolveVisualCatalogObservationCoordinates(input: {
         ? STATIC_TEMPLATE_CATALOG_VERSION
         : null;
   const staticCatalogVisualCycle =
-    workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+    isStaticCatalogWorkflowVersion(workflowVersion);
   return {
     pristineVisualCycle,
     workflowVersion,
@@ -1629,8 +1650,9 @@ export function projectSiteOpsVisualGeneration(input: {
   pageSize?: 8 | 9;
   pageCount?: 3 | 4;
 }) {
-  const staticCatalogMode =
-    input.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+  const staticCatalogMode = isStaticCatalogWorkflowVersion(
+    input.workflowVersion ?? null,
+  );
   const maxPages = staticCatalogMode
     ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT
     : SITEOPS_VISUAL_CANDIDATE_MAX_PAGES;
@@ -2165,6 +2187,203 @@ export function projectSiteOpsCurrentResetCycle<
 
 const siteOpsObservationFlights = new Map<string, Promise<unknown>>();
 
+type SiteOpsKnowledgeSnapshotCandidate = Pick<
+  typeof knowledgeBaseSnapshots.$inferSelect,
+  | "id"
+  | "version"
+  | "status"
+  | "archiveHash"
+  | "sourceBuildId"
+  | "sourceTaskId"
+  | "siteOpsKnowledgeInputEpochId"
+  | "createdAt"
+>;
+
+type SiteOpsKnowledgeResetProvenance = {
+  freshBuildIds: ReadonlySet<string>;
+  freshImportSnapshotIds: ReadonlySet<string>;
+};
+
+/**
+ * A post-reset version floor alone is not a fresh-input boundary: a build or
+ * website-import reservation created before approval could finish afterwards
+ * and receive the next snapshot version. New 2.9 reset cycles therefore bind
+ * the project, source reservation and derived snapshot to one opaque UUID.
+ * Historical null epochs retain their timestamp compatibility path only.
+ */
+export function siteOpsKnowledgeSnapshotSelectableForProject(input: {
+  snapshot: SiteOpsKnowledgeSnapshotCandidate;
+  project: Pick<
+    typeof siteProjects.$inferSelect,
+    | "minimumKnowledgeSnapshotVersion"
+    | "knowledgeInputEpochId"
+    | "currentTaskStartedAt"
+  >;
+  provenance: SiteOpsKnowledgeResetProvenance;
+}) {
+  const minimumVersion = input.project.minimumKnowledgeSnapshotVersion ?? 1;
+  if (
+    input.snapshot.status !== "active" ||
+    !Number.isInteger(input.snapshot.version) ||
+    input.snapshot.version < minimumVersion ||
+    typeof input.snapshot.archiveHash !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(input.snapshot.archiveHash)
+  ) {
+    return false;
+  }
+
+  // Historical/non-reset projects retain their existing compatibility path.
+  if (input.project.minimumKnowledgeSnapshotVersion === null) return true;
+
+  if (input.project.knowledgeInputEpochId) {
+    if (
+      input.snapshot.siteOpsKnowledgeInputEpochId !==
+      input.project.knowledgeInputEpochId
+    ) {
+      return false;
+    }
+    if (input.snapshot.sourceBuildId) {
+      return input.provenance.freshBuildIds.has(input.snapshot.sourceBuildId);
+    }
+    if (input.snapshot.sourceTaskId) {
+      return input.provenance.freshImportSnapshotIds.has(input.snapshot.id);
+    }
+    // A direct snapshot has no immutable pre-commit reservation from which to
+    // derive the opaque epoch. It cannot satisfy a 2.9 fresh-upload reset.
+    return false;
+  }
+
+  if (input.snapshot.sourceBuildId) {
+    return input.provenance.freshBuildIds.has(input.snapshot.sourceBuildId);
+  }
+  if (input.snapshot.sourceTaskId) {
+    return input.provenance.freshImportSnapshotIds.has(input.snapshot.id);
+  }
+  return (
+    input.snapshot.createdAt.getTime() >=
+    input.project.currentTaskStartedAt.getTime()
+  );
+}
+
+async function loadSiteOpsKnowledgeResetProvenance(
+  executor: any,
+  input: {
+    userId: number;
+    project: Pick<
+      typeof siteProjects.$inferSelect,
+      | "minimumKnowledgeSnapshotVersion"
+      | "knowledgeInputEpochId"
+      | "currentTaskStartedAt"
+    >;
+    snapshots: SiteOpsKnowledgeSnapshotCandidate[];
+  },
+): Promise<SiteOpsKnowledgeResetProvenance> {
+  if (input.project.minimumKnowledgeSnapshotVersion === null) {
+    return { freshBuildIds: new Set(), freshImportSnapshotIds: new Set() };
+  }
+  const sourceBuildIds = [
+    ...new Set(
+      input.snapshots.flatMap((snapshot) =>
+        snapshot.sourceBuildId ? [snapshot.sourceBuildId] : [],
+      ),
+    ),
+  ];
+  const importSnapshotIds = input.snapshots.flatMap((snapshot) =>
+    !snapshot.sourceBuildId && snapshot.sourceTaskId ? [snapshot.id] : [],
+  );
+  const [buildRows, receiptRows] = await Promise.all([
+    sourceBuildIds.length === 0
+      ? Promise.resolve([])
+      : executor
+          .select({
+            id: knowledgeBaseBuilds.id,
+            createdAt: knowledgeBaseBuilds.createdAt,
+            siteOpsKnowledgeInputEpochId:
+              knowledgeBaseBuilds.siteOpsKnowledgeInputEpochId,
+          })
+          .from(knowledgeBaseBuilds)
+          .where(
+            and(
+              eq(knowledgeBaseBuilds.userId, input.userId),
+              inArray(knowledgeBaseBuilds.id, sourceBuildIds),
+              input.project.knowledgeInputEpochId
+                ? eq(
+                    knowledgeBaseBuilds.siteOpsKnowledgeInputEpochId,
+                    input.project.knowledgeInputEpochId,
+                  )
+                : gte(
+                    knowledgeBaseBuilds.createdAt,
+                    input.project.currentTaskStartedAt,
+                  ),
+            ),
+          )
+          .limit(sourceBuildIds.length),
+    importSnapshotIds.length === 0
+      ? Promise.resolve([])
+      : executor
+          .select({
+            snapshotId: knowledgeImportReceipts.snapshotId,
+            createdAt: knowledgeImportReceipts.createdAt,
+            siteOpsKnowledgeInputEpochId:
+              knowledgeImportReceipts.siteOpsKnowledgeInputEpochId,
+          })
+          .from(knowledgeImportReceipts)
+          .where(
+            and(
+              eq(knowledgeImportReceipts.userId, input.userId),
+              eq(knowledgeImportReceipts.status, "completed"),
+              inArray(knowledgeImportReceipts.snapshotId, importSnapshotIds),
+              input.project.knowledgeInputEpochId
+                ? eq(
+                    knowledgeImportReceipts.siteOpsKnowledgeInputEpochId,
+                    input.project.knowledgeInputEpochId,
+                  )
+                : gte(
+                    knowledgeImportReceipts.createdAt,
+                    input.project.currentTaskStartedAt,
+                  ),
+            ),
+          )
+          .limit(importSnapshotIds.length),
+  ]);
+  return {
+    freshBuildIds: new Set(
+      buildRows.flatMap(
+        (row: {
+          id: string | null;
+          createdAt: Date;
+          siteOpsKnowledgeInputEpochId: string | null;
+        }) =>
+          typeof row.id === "string" &&
+          (input.project.knowledgeInputEpochId
+            ? row.siteOpsKnowledgeInputEpochId ===
+              input.project.knowledgeInputEpochId
+            : row.createdAt.getTime() >=
+              input.project.currentTaskStartedAt.getTime())
+            ? [row.id]
+            : [],
+      ),
+    ),
+    freshImportSnapshotIds: new Set(
+      receiptRows.flatMap(
+        (row: {
+          snapshotId: string | null;
+          createdAt: Date;
+          siteOpsKnowledgeInputEpochId: string | null;
+        }) =>
+          typeof row.snapshotId === "string" &&
+          (input.project.knowledgeInputEpochId
+            ? row.siteOpsKnowledgeInputEpochId ===
+              input.project.knowledgeInputEpochId
+            : row.createdAt.getTime() >=
+              input.project.currentTaskStartedAt.getTime())
+            ? [row.snapshotId]
+            : [],
+      ),
+    ),
+  };
+}
+
 export async function runSiteOpsObservationQueries(
   tasks: ReadonlyArray<() => Promise<unknown>>,
   concurrency = 4,
@@ -2477,6 +2696,53 @@ async function projectObservationOnce(
     batchRows: rawBatchRows,
     timelineOperationRows: rawTimelineOperationRows,
   });
+  const snapshotProvenance = await loadSiteOpsKnowledgeResetProvenance(
+    executor,
+    {
+      userId: input.userId,
+      project: input.project,
+      snapshots: snapshotRows,
+    },
+  );
+  const selectableSnapshotRows = snapshotRows.filter(
+    (snapshot: typeof knowledgeBaseSnapshots.$inferSelect) =>
+      siteOpsKnowledgeSnapshotSelectableForProject({
+        snapshot,
+        project: input.project,
+        provenance: snapshotProvenance,
+      }),
+  );
+  const visibleBuildIds = buildRows.map(
+    (row: typeof siteBuilds.$inferSelect) => row.id,
+  );
+  const buildInputRows =
+    visibleBuildIds.length > 0
+      ? await executor
+          .select()
+          .from(siteBuildInputAssets)
+          .where(
+            and(
+              inArray(siteBuildInputAssets.buildId, visibleBuildIds),
+              eq(siteBuildInputAssets.projectId, input.project.id),
+              eq(siteBuildInputAssets.userId, input.userId),
+              eq(
+                siteBuildInputAssets.taskStartedAt,
+                input.project.currentTaskStartedAt,
+              ),
+            ),
+          )
+      : [];
+  const buildInputsByBuildId = new Map<
+    string,
+    Array<typeof siteBuildInputAssets.$inferSelect>
+  >();
+  for (const asset of buildInputRows as Array<
+    typeof siteBuildInputAssets.$inferSelect
+  >) {
+    const current = buildInputsByBuildId.get(asset.buildId) ?? [];
+    current.push(asset);
+    buildInputsByBuildId.set(asset.buildId, current);
+  }
 
   const frozenVisualOperation = timelineOperationRows
     .filter((row: { kind: string }) => row.kind === "visual_search")
@@ -2653,7 +2919,7 @@ async function projectObservationOnce(
       const projectedContent =
         originalPayload?.reset === true &&
         originalPayload?.unpublishCompleted === true
-          ? "旧官网已下线，官网重置已完成；企业知识库保持不变，可以从知识库开始建站。"
+          ? "旧官网已下线，官网重置已完成；旧知识库版本不会复用。请全新上传并发布知识库后再开始建站。"
           : row.content;
       return [
         {
@@ -2814,19 +3080,15 @@ async function projectObservationOnce(
       const parsed = siteBriefSchema.safeParse(input.project.brief);
       return parsed.success ? parsed.data : null;
     })(),
-    knowledgeSnapshots: snapshotRows
-      .filter(
-        (row: typeof knowledgeBaseSnapshots.$inferSelect) =>
-          typeof row.archiveHash === "string" &&
-          /^[a-f0-9]{64}$/u.test(row.archiveHash),
-      )
-      .map((row: typeof knowledgeBaseSnapshots.$inferSelect) => ({
+    knowledgeSnapshots: selectableSnapshotRows.map(
+      (row: typeof knowledgeBaseSnapshots.$inferSelect) => ({
         id: row.id,
         label: `v${row.version} · ${row.sourceFileName}`,
         sourceProfile: null,
         createdAt: row.createdAt.toISOString(),
         active: row.id === input.project.currentKnowledgeSnapshotId,
-      })),
+      }),
+    ),
     messages: messagesProjected,
     visualCandidates,
     visualCandidatePages,
@@ -2878,6 +3140,27 @@ async function projectObservationOnce(
         sourceUrl: row.sourceLocalAssetId
           ? `/api/site-ops/builds/${row.id}/source`
           : null,
+        contentPlan: {
+          status:
+            row.contentPlanLocalAssetId && row.contentPlanSha256
+              ? ("ready" as const)
+              : ("pending" as const),
+          sha256:
+            row.contentPlanLocalAssetId && row.contentPlanSha256
+              ? row.contentPlanSha256
+              : null,
+        },
+        revisionInputs: (buildInputsByBuildId.get(row.id) ?? [])
+          .sort((left, right) => left.ordinal - right.ordinal)
+          .map((asset) => ({
+            filename: asset.filename,
+            mimeType: asset.mimeType as
+              | "image/png"
+              | "image/jpeg"
+              | "image/webp",
+            sizeBytes: asset.sizeBytes,
+            publicPath: asset.publicPath,
+          })),
         buildDelivery,
         ...buildProgress,
         needsHelp:
@@ -3177,6 +3460,246 @@ export async function disconnectSiteOpsAliyunConnection(
   }
 }
 
+const SITEOPS_REVISION_WORKFLOW_VERSION = "2.9.0";
+const SITEOPS_REVISION_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const SITEOPS_UNBOUND_INPUT_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+type FrozenSiteOpsRevisionInputAsset = {
+  id: string;
+  sourceAssetId: string;
+  localAssetId: string;
+  ordinal: number;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  contentSha256: string;
+  width: number;
+  height: number;
+  publicPath: string;
+  siteOpsKnowledgeInputEpochId: string | null;
+  taskStartedAt: Date;
+};
+
+async function revisionInputBytes(
+  stream: AsyncIterable<unknown>,
+  expectedSize?: number,
+) {
+  const chunks: Buffer[] = [];
+  let sizeBytes = 0;
+  for await (const raw of stream) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as any);
+    sizeBytes += chunk.length;
+    if (sizeBytes > SITEOPS_REVISION_IMAGE_MAX_BYTES) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "单张图片不能超过 8 MiB。",
+        400,
+      );
+    }
+    chunks.push(chunk);
+  }
+  if (
+    sizeBytes < 1 ||
+    (expectedSize !== undefined && sizeBytes !== expectedSize)
+  ) {
+    throw new SiteOpsServiceError(
+      "INVALID_INPUT",
+      "图片内容不完整，请重新上传。",
+      400,
+    );
+  }
+  return Buffer.concat(chunks, sizeBytes);
+}
+
+async function freezeSiteOpsRevisionInputAssets(input: {
+  db: Awaited<ReturnType<typeof requireDb>>;
+  actor: AuthenticatedUser;
+  conversationId: string;
+  clientRequestId: string;
+  localAssetIds: string[];
+}) {
+  if (input.localAssetIds.length === 0) return [];
+  const project = await loadOwnedProject(
+    input.db,
+    input.actor.id,
+    input.conversationId,
+  );
+  if (!project?.knowledgeInputEpochId) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前任务不支持带图片修改，请批准重置后重新生成官网。",
+      409,
+    );
+  }
+  const knowledgeInputEpochId = project.knowledgeInputEpochId;
+  if (
+    !project.currentBuildId ||
+    ![
+      "preview_ready",
+      "approved",
+      "live",
+      "failed",
+      "attention_required",
+    ].includes(project.status)
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "图片只能在首轮官网预览生成后加入修改版本。",
+      409,
+    );
+  }
+  const parentRows = await input.db
+    .select()
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.id, project.currentBuildId),
+        eq(siteBuilds.projectId, project.id),
+        eq(siteBuilds.userId, input.actor.id),
+        gte(siteBuilds.createdAt, project.currentTaskStartedAt),
+      ),
+    )
+    .limit(1);
+  const parent = parentRows[0];
+  if (
+    !parent ||
+    parent.workflowVersion !== SITEOPS_REVISION_WORKFLOW_VERSION ||
+    !parent.sourceLocalAssetId ||
+    !parent.sourceHash ||
+    !parent.contentPlanLocalAssetId ||
+    !parent.contentPlanSha256
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前预览不支持带图片修改，请批准重置后重新生成官网。",
+      409,
+    );
+  }
+
+  const frozen: FrozenSiteOpsRevisionInputAsset[] = [];
+  const publicPaths = new Set<string>();
+  let totalInputBytes = 0;
+  for (const [index, sourceAssetId] of input.localAssetIds.entries()) {
+    const sourceRows = await input.db
+      .select({ id: localAssets.id })
+      .from(localAssets)
+      .where(
+        and(
+          eq(localAssets.id, sourceAssetId),
+          eq(localAssets.scope, "managed_user"),
+          eq(localAssets.accountUserId, input.actor.id),
+          isNull(localAssets.presalesProjectId),
+          gt(localAssets.retainUntil, new Date()),
+          eq(localAssets.siteOpsKnowledgeInputEpochId, knowledgeInputEpochId),
+        ),
+      )
+      .limit(1);
+    if (!sourceRows[0]) {
+      throw new SiteOpsServiceError(
+        "FORBIDDEN",
+        "图片不存在、已过期或不属于当前建站任务，请重新上传。",
+        403,
+      );
+    }
+    let resolved: Awaited<ReturnType<typeof ownedFileContentResolver.resolve>>;
+    try {
+      resolved = await ownedFileContentResolver.resolve({
+        ownerUserId: input.actor.id,
+        fileId: sourceAssetId,
+        expectedSourceKind: "managed_local_asset",
+      });
+    } catch {
+      throw new SiteOpsServiceError(
+        "FORBIDDEN",
+        "图片不存在、已过期或不属于当前账号，请重新上传。",
+        403,
+      );
+    }
+    const extension = path.extname(resolved.filename).toLowerCase();
+    const mimeType = imageMimeByExtension[extension];
+    if (
+      !mimeType ||
+      ![".png", ".jpg", ".jpeg", ".webp"].includes(extension) ||
+      resolved.mimeType.toLowerCase() !== mimeType
+    ) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "仅支持 PNG、JPEG 或 WebP 图片。",
+        400,
+      );
+    }
+    const bytes = await revisionInputBytes(resolved.stream, resolved.sizeBytes);
+    totalInputBytes += bytes.length;
+    if (totalInputBytes > 32 * 1024 * 1024) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "本次图片总大小不能超过 32 MiB。",
+        400,
+      );
+    }
+    if (!isSupportedImageBytes(extension, bytes)) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "图片格式与内容不一致，请重新上传。",
+        400,
+      );
+    }
+    const dimensions = await decodedRasterImageDimensions(extension, bytes);
+    if (!dimensions) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "图片无法安全解码或像素尺寸过大。",
+        400,
+      );
+    }
+    const contentSha256 = createHash("sha256").update(bytes).digest("hex");
+    if (resolved.sha256 && resolved.sha256.toLowerCase() !== contentSha256) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "图片完整性校验失败，请重新上传。",
+        400,
+      );
+    }
+    const publicExtension = extension === ".jpeg" ? ".jpg" : extension;
+    const publicPath = `/frontmind-user-media/${contentSha256}${publicExtension}`;
+    if (publicPaths.has(publicPath)) {
+      throw new SiteOpsServiceError(
+        "INVALID_INPUT",
+        "请移除内容重复的图片后再提交。",
+        400,
+      );
+    }
+    publicPaths.add(publicPath);
+    const stable = await persistSiteOpsArtifact({
+      userId: input.actor.id,
+      projectId: project.id,
+      kind: "revision-input",
+      filename: `frontmind-user-media-${contentSha256}${publicExtension}`,
+      mimeType,
+      buffer: bytes,
+      maxBytes: SITEOPS_REVISION_IMAGE_MAX_BYTES,
+      idempotencyKey: `${input.clientRequestId}:${sourceAssetId}:${contentSha256}`,
+      retainUntil: new Date(Date.now() + SITEOPS_UNBOUND_INPUT_RETENTION_MS),
+    });
+    frozen.push({
+      id: randomUUID(),
+      sourceAssetId,
+      localAssetId: stable.id,
+      ordinal: index + 1,
+      filename: resolved.filename,
+      mimeType,
+      sizeBytes: bytes.length,
+      contentSha256,
+      width: dimensions.width,
+      height: dimensions.height,
+      publicPath,
+      siteOpsKnowledgeInputEpochId: knowledgeInputEpochId,
+      taskStartedAt: project.currentTaskStartedAt,
+    });
+  }
+  return frozen;
+}
+
 export async function sendSiteOpsMessage(
   actor: AuthenticatedUser,
   value: unknown,
@@ -3192,6 +3715,39 @@ export async function sendSiteOpsMessage(
   } as const;
   const requestHash = hashSiteOpsRequest(request);
   const db = await requireDb();
+  // A committed child may already have moved the project to `building` when
+  // the HTTP response is lost. Prove an exact replay before re-freezing its
+  // inputs; the transaction below repeats this check to close concurrent
+  // first-writer races.
+  const replayProject = await loadOwnedProject(
+    db,
+    actor.id,
+    input.conversationId,
+  );
+  if (!replayProject) {
+    throw new SiteOpsServiceError("NOT_FOUND", "AI 建站会话不存在。", 404);
+  }
+  const replayRows = await db
+    .select()
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, replayProject.id),
+        eq(siteOperations.clientRequestId, input.clientRequestId),
+        gte(siteOperations.createdAt, replayProject.currentTaskStartedAt),
+      ),
+    )
+    .limit(1);
+  if (isSiteOpsOperationReplay(replayRows[0], requestHash)) {
+    return observeSiteOps(actor, { conversationId: input.conversationId });
+  }
+  const revisionInputAssets = await freezeSiteOpsRevisionInputAssets({
+    db,
+    actor,
+    conversationId: input.conversationId,
+    clientRequestId: input.clientRequestId,
+    localAssetIds: input.localAssetIds,
+  });
   await db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
       tx,
@@ -3222,15 +3778,6 @@ export async function sendSiteOpsMessage(
         "REVISION_CONFLICT",
         "建站项目已更新，请刷新后重试。",
         409,
-      );
-    }
-    if (input.localAssetIds.length > 0) {
-      // File ownership is verified by the upload/download subsystem. SiteOps v1
-      // does not copy arbitrary bytes into the build contract from chat input.
-      throw new SiteOpsServiceError(
-        "INVALID_INPUT",
-        "当前建站会话不接收临时附件；请先在企业知识库中更新资料，再返回官网流程。",
-        400,
       );
     }
     const turnId = randomUUID();
@@ -3271,6 +3818,7 @@ export async function sendSiteOpsMessage(
           buildId: project.currentBuildId,
           feedback: input.text,
         },
+        inputAssets: revisionInputAssets,
       });
       return;
     }
@@ -3577,8 +4125,8 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
   assertCurrentVisualWorkflowVersion(frozen.data.workflowVersion);
   if (
     "schemaVersion" in frozen.data &&
-    frozen.data.schemaVersion === 3 &&
-    frozen.data.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+    (frozen.data.schemaVersion === 3 || frozen.data.schemaVersion === 4) &&
+    isStaticCatalogWorkflowVersion(frozen.data.workflowVersion)
   ) {
     return null;
   }
@@ -3618,7 +4166,8 @@ export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
     workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion &&
     workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion &&
     workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion &&
-    workflowVersion !== SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_8.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_9.frontMindVersion
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -3665,7 +4214,8 @@ export function siteOpsVisualCycleWorkflowVersion(
     workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion &&
     workflowVersion !== SITEOPS_MATERIALIZER_V2_6.frontMindVersion &&
     workflowVersion !== SITEOPS_MATERIALIZER_V2_7.frontMindVersion &&
-    workflowVersion !== SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_8.frontMindVersion &&
+    workflowVersion !== SITEOPS_MATERIALIZER_V2_9.frontMindVersion
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -4027,10 +4577,18 @@ async function handleSelectSnapshot(
     )
     .limit(200)
     .for("update");
+  const snapshotProvenance = await loadSiteOpsKnowledgeResetProvenance(tx, {
+    userId: input.actor.id,
+    project: input.project,
+    snapshots: rows,
+  });
   const snapshot = rows.find(
     (row: typeof knowledgeBaseSnapshots.$inferSelect) =>
-      typeof row.archiveHash === "string" &&
-      /^[a-f0-9]{64}$/u.test(row.archiveHash),
+      siteOpsKnowledgeSnapshotSelectableForProject({
+        snapshot: row,
+        project: input.project,
+        provenance: snapshotProvenance,
+      }),
   );
   if (!snapshot) {
     throw new SiteOpsServiceError(
@@ -4258,14 +4816,14 @@ async function handleVisualSearch(
   const frozenWorkflowVersion =
     frozenVisualInputs.length > 0
       ? siteOpsVisualCycleWorkflowVersion(frozenVisualInputs)
-      : SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+      : SITEOPS_DEFAULT_WORKFLOW.frontMindVersion;
   const staticCatalogVisualCycle =
     frozenVisualInputs.length === 0 ||
     frozenVisualInputs.some(
       (frozen) =>
         "schemaVersion" in frozen &&
-        frozen.schemaVersion === 3 &&
-        frozen.workflowVersion === SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
+        (frozen.schemaVersion === 3 || frozen.schemaVersion === 4) &&
+        isStaticCatalogWorkflowVersion(frozen.workflowVersion),
     );
   const historicalCredentialCoordinates = new Set(
     staticCatalogVisualCycle
@@ -4407,7 +4965,7 @@ async function handleVisualSearch(
     );
   }
   const workflowVersion = staticCatalogVisualCycle
-    ? SITEOPS_MATERIALIZER_V2_8.frontMindVersion
+    ? frozenWorkflowVersion
     : mode === "supplemental"
       ? await frozenSupplementalVisualWorkflowVersion(tx, {
           batches: currentPublishedBatches,
@@ -4435,15 +4993,25 @@ async function handleVisualSearch(
   const admissionRevision = input.project.revision + 1;
   const operationPayload = createVisualSearchOperationInput(
     staticCatalogVisualCycle
-      ? {
-          schemaVersion: 3,
-          knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-          workflowVersion: SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
-          catalogVersion: staticCatalog!.catalogVersion,
-          mode: "initial",
-          page: 1,
-          admissionRevision,
-        }
+      ? workflowVersion === SITEOPS_MATERIALIZER_V2_9.frontMindVersion
+        ? {
+            schemaVersion: 4,
+            knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+            workflowVersion: SITEOPS_MATERIALIZER_V2_9.frontMindVersion,
+            catalogVersion: staticCatalog!.catalogVersion,
+            mode: "initial",
+            page: 1,
+            admissionRevision,
+          }
+        : {
+            schemaVersion: 3,
+            knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+            workflowVersion: SITEOPS_MATERIALIZER_V2_8.frontMindVersion,
+            catalogVersion: staticCatalog!.catalogVersion,
+            mode: "initial",
+            page: 1,
+            admissionRevision,
+          }
       : {
           schemaVersion: 2,
           knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
@@ -4615,9 +5183,11 @@ async function selectVisualSample(
     const latestVisualInput = latestVisualOperation?.input as
       | Record<string, unknown>
       | undefined;
-    const recoveryStaticCatalog =
-      latestVisualInput?.workflowVersion ===
-      SITEOPS_MATERIALIZER_V2_8.frontMindVersion;
+    const recoveryStaticCatalog = isStaticCatalogWorkflowVersion(
+      typeof latestVisualInput?.workflowVersion === "string"
+        ? latestVisualInput.workflowVersion
+        : null,
+    );
     const recoveryPageCount = recoveryStaticCatalog
       ? STATIC_TEMPLATE_CATALOG_PAGE_COUNT
       : SITEOPS_VISUAL_CANDIDATE_MAX_PAGES;
@@ -4917,10 +5487,7 @@ async function selectVisualSample(
         eq(websiteStyleSampleBatches.status, "published"),
       ),
     );
-  if (
-    selectedWorkflow.frontMindVersion !==
-    SITEOPS_MATERIALIZER_V2_8.frontMindVersion
-  ) {
+  if (!isStaticCatalogWorkflowVersion(selectedWorkflow.frontMindVersion)) {
     await tx
       .update(websiteStyleSampleBatches)
       .set({ status: "superseded", updatedAt: new Date() })
@@ -5174,8 +5741,16 @@ async function handleRevision(
     requestId: string;
     requestHash: string;
     payload: { buildId: string; feedback: string };
+    inputAssets?: FrozenSiteOpsRevisionInputAsset[];
   },
 ) {
+  if (!input.project.knowledgeInputEpochId) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前任务不支持对话修订，请批准重置后重新生成官网。",
+      409,
+    );
+  }
   const rows = await tx
     .select()
     .from(siteBuilds)
@@ -5206,6 +5781,19 @@ async function handleRevision(
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "当前官网版本缺少可冻结的视觉方案，请提交官网重制需求。",
+      409,
+    );
+  }
+  if (
+    parent.workflowVersion !== SITEOPS_REVISION_WORKFLOW_VERSION ||
+    !parent.sourceLocalAssetId ||
+    !parent.sourceHash ||
+    !parent.contentPlanLocalAssetId ||
+    !parent.contentPlanSha256
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前预览缺少 2.9 修订源码或内容计划基线，请批准重置后重新生成官网。",
       409,
     );
   }
@@ -5244,6 +5832,14 @@ async function handleRevision(
   const nativeVisual = isNativeVisualSelectionMetadata(styleMetadata);
   const selectedWorkflow =
     siteOpsWorkflowForVisualSelectionMetadata(styleMetadata);
+  const selectedWorkflowVersion: string = selectedWorkflow.frontMindVersion;
+  if (selectedWorkflowVersion !== SITEOPS_REVISION_WORKFLOW_VERSION) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前视觉方案不支持连续修订，请批准重置后重新生成官网。",
+      409,
+    );
+  }
   const buildWorkflowCoordinates =
     siteOpsBuildWorkflowCoordinates(selectedWorkflow);
   const derivedReferenceBlueprint = nativeVisual
@@ -5316,6 +5912,44 @@ async function handleRevision(
     selectionHash: parent.selectionHash,
     status: "preparing",
   });
+  const inputAssets = input.inputAssets ?? [];
+  if (inputAssets.length > 0) {
+    if (
+      inputAssets.some(
+        (asset) =>
+          asset.taskStartedAt.getTime() !==
+            input.project.currentTaskStartedAt.getTime() ||
+          asset.siteOpsKnowledgeInputEpochId !==
+            input.project.knowledgeInputEpochId,
+      )
+    ) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "本次图片已不属于当前建站任务，请重新上传。",
+        409,
+      );
+    }
+    await tx.insert(siteBuildInputAssets).values(
+      inputAssets.map((asset) => ({
+        ...asset,
+        buildId,
+        projectId: input.project.id,
+        userId: input.actor.id,
+      })),
+    );
+    await tx
+      .update(localAssets)
+      .set({ retainUntil: null })
+      .where(
+        and(
+          inArray(
+            localAssets.id,
+            inputAssets.map((asset) => asset.localAssetId),
+          ),
+          eq(localAssets.accountUserId, input.actor.id),
+        ),
+      );
+  }
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
     project: input.project,
@@ -5325,7 +5959,27 @@ async function handleRevision(
     payload: {
       ...input.payload,
       childBuildId: buildId,
-      workflowVersion: selectedWorkflow.frontMindVersion,
+      workflowVersion: selectedWorkflowVersion,
+      revisionBaseline: {
+        schemaVersion: 1,
+        parentBuildId: parent.id,
+        sourceLocalAssetId: parent.sourceLocalAssetId,
+        sourceSha256: parent.sourceHash,
+        contentPlanLocalAssetId: parent.contentPlanLocalAssetId,
+        contentPlanSha256: parent.contentPlanSha256,
+      },
+      revisionInputAssets: inputAssets.map((asset) => ({
+        schemaVersion: 1,
+        localAssetId: asset.localAssetId,
+        filename: asset.filename,
+        mimeType: asset.mimeType,
+        sizeBytes: asset.sizeBytes,
+        contentSha256: asset.contentSha256,
+        width: asset.width,
+        height: asset.height,
+        publicPath: asset.publicPath,
+        siteOpsKnowledgeInputEpochId: asset.siteOpsKnowledgeInputEpochId,
+      })),
       ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },

@@ -12,14 +12,17 @@ import {
   websiteStyleSampleBatches,
   websiteStyleSamples,
 } from "../../drizzle/schema";
+import { siteContentPlanV2Schema } from "../../shared/siteops-content-plan";
 import { getDb } from "../db";
 import { readSiteOpsArtifact } from "./artifact-store";
 import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
 import { completeSiteOpsAliyunOAuth } from "./service";
+import { previewNavigationBridgeSource } from "./preview-routing";
 import { customerVisibleStyleBatchStatusCondition } from "./visual-batch-visibility";
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 2_000;
+const MAX_CONTENT_PLAN_BYTES = 4 * 1024 * 1024;
 
 type AliyunOAuthCompletionStatus = "success" | "cancelled" | "failed";
 type AliyunOAuthCallbackStage =
@@ -352,10 +355,37 @@ function addPreviewExecutableNonces(html: string, nonce: string) {
   return result;
 }
 
+export type SiteOpsPreviewRoutingMode =
+  | "legacy_static_literals"
+  | "canonical_pathname";
+
+function previewNavigationBridge(input: {
+  nonce: string;
+  previewPrefix: string;
+}) {
+  return `<script nonce="${input.nonce}">${previewNavigationBridgeSource(input.previewPrefix)}</script>`;
+}
+
+function injectPreviewNavigationBridge(input: {
+  html: string;
+  nonce: string;
+  previewPrefix: string;
+}) {
+  const bridge = previewNavigationBridge(input);
+  if (/<head\b[^>]*>/iu.test(input.html)) {
+    return input.html.replace(/<head\b[^>]*>/iu, (head) => `${head}${bridge}`);
+  }
+  if (/<body\b[^>]*>/iu.test(input.html)) {
+    return input.html.replace(/<body\b[^>]*>/iu, (body) => `${bridge}${body}`);
+  }
+  return `${bridge}${input.html}`;
+}
+
 export async function createSandboxedPreviewDocument(input: {
   zip: JSZip;
   entryName: string;
   previewPrefix: string;
+  previewRoutingMode?: SiteOpsPreviewRoutingMode;
 }) {
   const files = new Map(
     Object.values(input.zip.files)
@@ -447,6 +477,11 @@ export async function createSandboxedPreviewDocument(input: {
       "",
     )
     .replace(/<base\b[^>]*>/giu, "");
+  html = injectPreviewNavigationBridge({
+    html,
+    nonce,
+    previewPrefix: input.previewPrefix,
+  });
   html = await replaceAsync(
     html,
     /<link\b(?=[^>]*\brel=["']stylesheet["'])[^>]*\bhref=["']([^"']+)["'][^>]*>/giu,
@@ -474,6 +509,8 @@ export async function createSandboxedPreviewDocument(input: {
         bytes: Buffer.from(embeddedSource, "utf8"),
         mimeType: "text/javascript; charset=utf-8",
         previewPrefix: input.previewPrefix,
+        previewRoutingMode:
+          input.previewRoutingMode ?? "legacy_static_literals",
       }).toString("utf8");
       const attributes = `${before} ${after}`
         .replace(/\s(?:crossorigin|integrity)(?:=["'][^"']*["'])?/giu, "")
@@ -542,6 +579,7 @@ export function rewriteSiteOpsPreviewDocument(input: {
   bytes: Buffer;
   mimeType: string;
   previewPrefix: string;
+  previewRoutingMode?: SiteOpsPreviewRoutingMode;
 }) {
   const mediaType = input.mimeType.split(";", 1)[0]?.trim().toLowerCase();
   if (
@@ -579,20 +617,22 @@ export function rewriteSiteOpsPreviewDocument(input: {
       );
   }
   if (
-    mediaType === "text/javascript" ||
-    mediaType === "application/javascript"
+    (mediaType === "text/javascript" ||
+      mediaType === "application/javascript") &&
+    (input.previewRoutingMode ?? "legacy_static_literals") ===
+      "legacy_static_literals"
   ) {
-    text = text
-      .replace(
-        /(["'`])(\/(?!\/)[A-Za-z0-9._~!$&()*+,;=:@%/?#-]*)\1/gu,
-        (_match, quote: string, url: string) =>
-          `${quote}${prefixPreviewRootUrl(url, input.previewPrefix)}${quote}`,
-      )
-      .replace(
-        /(`)(\/(?!\/)(?=[A-Za-z0-9._~!$&()*+,;=:@%/?#${}-]))/gu,
-        (_match, quote: string, root: string) =>
-          `${quote}${prefixPreviewRootUrl(root, input.previewPrefix)}`,
-      );
+    // Historical 2.8 bundles commonly use literal route tables. Keep those
+    // keys aligned with the build-scoped preview URL, but deliberately leave
+    // dynamic template literals alone: prefixing `/${segment}/` here can
+    // compose with an already-prefixed pathname and produce a double prefix.
+    // The navigation bridge above scopes dynamic anchors and History API
+    // calls at execution time instead.
+    text = text.replace(
+      /(["'])(\/(?!\/)[A-Za-z0-9._~!$&()*+,;=:@%/?#-]*)\1/gu,
+      (_match, quote: string, url: string) =>
+        `${quote}${prefixPreviewRootUrl(url, input.previewPrefix)}${quote}`,
+    );
   }
   return Buffer.from(rewriteCssRootUrls(text, input.previewPrefix), "utf8");
 }
@@ -612,6 +652,42 @@ async function ownedBuild(userId: number, buildId: string) {
     )
     .limit(1);
   return rows[0] ?? null;
+}
+
+async function frozenPreviewRouteEntries(input: {
+  userId: number;
+  build: typeof siteBuilds.$inferSelect;
+}) {
+  if (input.build.workflowVersion !== "2.9.0") return null;
+  if (!input.build.contentPlanLocalAssetId || !input.build.contentPlanSha256) {
+    return undefined;
+  }
+  const asset = await readSiteOpsArtifact({
+    userId: input.userId,
+    localAssetId: input.build.contentPlanLocalAssetId,
+    expectedSha256: input.build.contentPlanSha256,
+    expectedMimeTypes: ["application/json"],
+  });
+  if (!asset) return undefined;
+  const bytes = await streamToBuffer(
+    asset.stored.createReadStream(),
+    MAX_CONTENT_PLAN_BYTES,
+  );
+  let candidate: unknown;
+  try {
+    candidate = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  const plan = siteContentPlanV2Schema.safeParse(candidate);
+  if (!plan.success) return undefined;
+  return new Set(
+    plan.data.routes.map((route) =>
+      route.path === "/"
+        ? "index.html"
+        : `${route.path.replace(/^\/+|\/+$/gu, "")}/index.html`,
+    ),
+  );
 }
 
 async function sendOwnedAsset(input: {
@@ -939,7 +1015,7 @@ siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
       const previewHeight = Number(metadata.previewHeight);
       const rowLocalAssetId = nonEmptyString(row?.localAssetId);
       if (
-        metadata.workflowVersion !== "2.8.0" ||
+        !["2.8.0", "2.9.0"].includes(String(metadata.workflowVersion)) ||
         !catalogVersion ||
         !candidateId ||
         !previewAssetId ||
@@ -1032,6 +1108,13 @@ siteOpsArtifactApi.get("/builds/:buildId/preview/*", async (req, res) => {
     if (!owned?.build.distLocalAssetId || !owned.build.distHash) {
       return notFound(res);
     }
+    const allowedRouteEntries = await frozenPreviewRouteEntries({
+      userId,
+      build: owned.build,
+    });
+    if (owned.build.workflowVersion === "2.9.0" && !allowedRouteEntries) {
+      return notFound(res);
+    }
     const asset = await readSiteOpsArtifact({
       userId,
       localAssetId: owned.build.distLocalAssetId,
@@ -1054,6 +1137,10 @@ siteOpsArtifactApi.get("/builds/:buildId/preview/*", async (req, res) => {
       ? [`${requestPath}index.html`]
       : [requestPath, `${requestPath}/index.html`];
     const entry = candidates
+      .filter(
+        (candidate) =>
+          allowedRouteEntries == null || allowedRouteEntries.has(candidate),
+      )
       .map((candidate) => zip.file(candidate))
       .find(Boolean);
     if (
@@ -1072,6 +1159,10 @@ siteOpsArtifactApi.get("/builds/:buildId/preview/*", async (req, res) => {
       zip,
       entryName: entry.name,
       previewPrefix: `/api/site-ops/builds/${encodeURIComponent(req.params.buildId)}/preview/`,
+      previewRoutingMode:
+        owned.build.workflowVersion === "2.9.0"
+          ? "canonical_pathname"
+          : "legacy_static_literals",
     });
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.setHeader("Content-Type", "text/html; charset=utf-8");

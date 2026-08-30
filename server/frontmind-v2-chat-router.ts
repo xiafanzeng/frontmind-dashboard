@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 
 import axios from "axios";
-import { and, desc, eq, gt, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, gt, gte, inArray, isNull, or } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -17,6 +17,8 @@ import {
   localAssets,
   messages,
   providerFileLeases,
+  siteBuilds,
+  siteProjects,
 } from "../drizzle/schema";
 import { getDecryptedCredentialForAccountById } from "./auth-service";
 import { getDb } from "./db";
@@ -70,6 +72,12 @@ import {
   KnowledgeBaseTurnReservationError,
 } from "./knowledge-base-turn-service";
 import {
+  parseSiteOpsComposerLocalUploadCoordinate,
+  SiteOpsComposerLocalAssetCoordinateError,
+  siteOpsComposerLocalAssetExistingRowDisposition,
+  siteOpsComposerLocalAssetIdentity,
+} from "./siteops-composer-local-asset-upload";
+import {
   OwnedFileContentError,
   ownedFileContentResolver,
 } from "./owned-file-content-resolver";
@@ -104,6 +112,7 @@ const CHAT_SCHEMA_HASH = createHash("sha256")
   .update("dashboard.general-chat:v2:local-task-local-message-local-artifact")
   .digest("hex");
 const MAX_LOCAL_ASSET_BYTES = 100 * 1024 * 1024;
+const MAX_SITEOPS_COMPOSER_ASSET_BYTES = 8 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const LOCAL_CONTENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const RESULT_GRACE_MS = 120_000;
@@ -269,6 +278,55 @@ async function requireDb(): Promise<Db> {
   const db = await getDb();
   if (!db) throw new ChatV2HttpError("DATABASE_UNAVAILABLE", 503, true);
   return db;
+}
+
+type SiteOpsComposerUploadEpoch = {
+  projectId: string;
+  currentTaskStartedAt: Date;
+  knowledgeInputEpochId: string;
+};
+
+async function currentSiteOpsComposerUploadEpoch(
+  db: Db,
+  userId: number,
+): Promise<SiteOpsComposerUploadEpoch | null> {
+  const project = (
+    await db
+      .select()
+      .from(siteProjects)
+      .where(eq(siteProjects.userId, userId))
+      .limit(1)
+  )[0];
+  if (!project?.currentBuildId || !project.knowledgeInputEpochId) return null;
+  const build = (
+    await db
+      .select()
+      .from(siteBuilds)
+      .where(
+        and(
+          eq(siteBuilds.id, project.currentBuildId),
+          eq(siteBuilds.projectId, project.id),
+          eq(siteBuilds.userId, userId),
+          eq(siteBuilds.workflowVersion, "2.9.0"),
+          inArray(siteBuilds.status, ["preview_ready", "approved"]),
+          gte(siteBuilds.createdAt, project.currentTaskStartedAt),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (
+    !build?.sourceLocalAssetId ||
+    !build.sourceHash ||
+    !build.contentPlanLocalAssetId ||
+    !build.contentPlanSha256
+  ) {
+    return null;
+  }
+  return {
+    projectId: project.id,
+    currentTaskStartedAt: project.currentTaskStartedAt,
+    knowledgeInputEpochId: project.knowledgeInputEpochId,
+  };
 }
 
 function clientFor(apiKey: string, accountUserId: number) {
@@ -4047,6 +4105,9 @@ router.post("/assets", async (req, res) => {
   let knowledgeCoordinate: ReturnType<
     typeof parseKnowledgeBaseLocalUploadCoordinate
   > = null;
+  let siteOpsComposerCoordinate: ReturnType<
+    typeof parseSiteOpsComposerLocalUploadCoordinate
+  > = null;
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
     const ownerUserId = req.frontmindUser.id;
@@ -4068,11 +4129,27 @@ router.post("/assets", async (req, res) => {
       knowledgeCoordinate = parseKnowledgeBaseLocalUploadCoordinate(
         req.headers,
       );
+      siteOpsComposerCoordinate = parseSiteOpsComposerLocalUploadCoordinate(
+        req.headers,
+      );
     } catch (error) {
       if (error instanceof KnowledgeBaseLocalAssetCoordinateError) {
         throw new ChatV2HttpError(error.code, 400);
       }
+      if (error instanceof SiteOpsComposerLocalAssetCoordinateError) {
+        throw new ChatV2HttpError(error.code, 400);
+      }
       throw error;
+    }
+    if (knowledgeCoordinate && siteOpsComposerCoordinate) {
+      throw new ChatV2HttpError("LOCAL_ASSET_COORDINATE_CONFLICT", 400);
+    }
+    if (
+      siteOpsComposerCoordinate &&
+      (declaredBytes > MAX_SITEOPS_COMPOSER_ASSET_BYTES ||
+        !["image/jpeg", "image/png", "image/webp"].includes(mimeType))
+    ) {
+      throw new ChatV2HttpError("SITEOPS_COMPOSER_ASSET_INVALID", 400);
     }
     const knowledgeIdentity = knowledgeCoordinate
       ? knowledgeBaseLocalAssetIdentity({
@@ -4108,9 +4185,51 @@ router.post("/assets", async (req, res) => {
         throw knowledgeBaseUploadReservationError(error);
       }
     };
+    const assertSiteOpsComposerCoordinate = async (
+      authoritativeContentSha256?: string,
+      expectedEpoch?: SiteOpsComposerUploadEpoch,
+    ) => {
+      if (!siteOpsComposerCoordinate) return null;
+      if (
+        authoritativeContentSha256 &&
+        authoritativeContentSha256 !== siteOpsComposerCoordinate.contentSha256
+      ) {
+        throw new ChatV2HttpError("LOCAL_ASSET_SHA256_MISMATCH", 400);
+      }
+      const db = await requireDb();
+      const current = await currentSiteOpsComposerUploadEpoch(db, ownerUserId);
+      if (!current) {
+        throw new ChatV2HttpError("SITEOPS_COMPOSER_UPLOAD_NOT_AVAILABLE", 409);
+      }
+      if (
+        expectedEpoch &&
+        (current.projectId !== expectedEpoch.projectId ||
+          current.knowledgeInputEpochId !==
+            expectedEpoch.knowledgeInputEpochId ||
+          current.currentTaskStartedAt.getTime() !==
+            expectedEpoch.currentTaskStartedAt.getTime())
+      ) {
+        throw new ChatV2HttpError("SITEOPS_COMPOSER_UPLOAD_EPOCH_CHANGED", 409);
+      }
+      return current;
+    };
     // Reject forged, reset or already-dispatched coordinates before consuming
     // a potentially 100 MiB request body.
     await assertKnowledgeCoordinate();
+    const siteOpsComposerEpoch = await assertSiteOpsComposerCoordinate();
+    const siteOpsComposerIdentity =
+      siteOpsComposerCoordinate && siteOpsComposerEpoch
+        ? siteOpsComposerLocalAssetIdentity({
+            userId: ownerUserId,
+            projectId: siteOpsComposerEpoch.projectId,
+            currentTaskStartedAt: siteOpsComposerEpoch.currentTaskStartedAt,
+            knowledgeInputEpochId: siteOpsComposerEpoch.knowledgeInputEpochId,
+            coordinate: siteOpsComposerCoordinate,
+            filename,
+            mimeType,
+            sizeBytes: declaredBytes,
+          })
+        : null;
     console.info("[FrontMindV2Asset] upload_start", {
       traceId,
       declaredBytes,
@@ -4124,19 +4243,24 @@ router.post("/assets", async (req, res) => {
             expectedResetRevision: knowledgeCoordinate.expectedResetRevision,
           }
         : {}),
+      ...(siteOpsComposerCoordinate
+        ? { siteOpsComposerOrdinal: siteOpsComposerCoordinate.ordinal }
+        : {}),
     });
     const persistUpload = async () => {
       const db = await requireDb();
-      const id = knowledgeIdentity?.localAssetId || localAssetId();
+      const deterministicIdentity =
+        knowledgeIdentity ?? siteOpsComposerIdentity;
+      const id = deterministicIdentity?.localAssetId || localAssetId();
       const loadExisting = async () =>
-        knowledgeIdentity
+        deterministicIdentity
           ? (
               await db
                 .select()
                 .from(localAssets)
                 .where(
                   and(
-                    eq(localAssets.id, knowledgeIdentity.localAssetId),
+                    eq(localAssets.id, deterministicIdentity.localAssetId),
                     eq(localAssets.scope, "managed_user"),
                     eq(localAssets.accountUserId, ownerUserId),
                   ),
@@ -4149,7 +4273,9 @@ router.post("/assets", async (req, res) => {
       const staged = await stagePresalesFileContent({
         fileId: id,
         stream: req,
-        maxBytes: MAX_LOCAL_ASSET_BYTES,
+        maxBytes: siteOpsComposerCoordinate
+          ? MAX_SITEOPS_COMPOSER_ASSET_BYTES
+          : MAX_LOCAL_ASSET_BYTES,
         onProgress: (nextReceivedBytes) => {
           receivedBytes = nextReceivedBytes;
           while (
@@ -4202,35 +4328,81 @@ router.post("/assets", async (req, res) => {
               authoritativeContentSha256: staged.sha256,
             })
           : null;
+        const authoritativeSiteOpsComposerIdentity =
+          siteOpsComposerCoordinate && siteOpsComposerEpoch
+            ? siteOpsComposerLocalAssetIdentity({
+                userId: ownerUserId,
+                projectId: siteOpsComposerEpoch.projectId,
+                currentTaskStartedAt: siteOpsComposerEpoch.currentTaskStartedAt,
+                knowledgeInputEpochId:
+                  siteOpsComposerEpoch.knowledgeInputEpochId,
+                coordinate: siteOpsComposerCoordinate,
+                filename,
+                mimeType,
+                sizeBytes: declaredBytes!,
+                authoritativeContentSha256: staged.sha256,
+              })
+            : null;
         const finalizeUpload = async () => {
           // Reset/dispatch can advance while the body is in flight. Re-prove
           // the reservation immediately before the short durable commit.
           await assertKnowledgeCoordinate(staged.sha256);
+          await assertSiteOpsComposerCoordinate(
+            staged.sha256,
+            siteOpsComposerEpoch ?? undefined,
+          );
           const now = Date.now();
           const replayPayload = async (
             existing: typeof localAssets.$inferSelect,
           ) => {
+            const authoritativeIdentity =
+              authoritativeKnowledgeIdentity ??
+              authoritativeSiteOpsComposerIdentity;
+            if (!authoritativeIdentity) {
+              throw new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
+            }
             const storageIdentity = sealLocalAssetStorageIdentity({
-              storageKey: authoritativeKnowledgeIdentity!.storageKey!,
+              storageKey: authoritativeIdentity.storageKey!,
             });
             const storedContent = await storedLocalAssetContentState({
               id: existing.id,
               sizeBytes: existing.sizeBytes,
               contentSha256: existing.contentSha256,
             });
-            const disposition = knowledgeBaseLocalAssetExistingRowDisposition({
-              existing,
-              expected: {
-                localAssetId: knowledgeIdentity!.localAssetId,
-                ownerUserId,
-                sizeBytes: staged.sizeBytes,
-                contentSha256: staged.sha256,
-                storageKey: authoritativeKnowledgeIdentity!.storageKey!,
-                storageKeyHash: storageIdentity.storageKeyHash,
-              },
-              storedContent,
-              now,
-            });
+            const disposition = siteOpsComposerCoordinate
+              ? siteOpsComposerLocalAssetExistingRowDisposition({
+                  existing,
+                  expected: {
+                    localAssetId: siteOpsComposerIdentity!.localAssetId,
+                    ownerUserId,
+                    filename,
+                    mimeType,
+                    sizeBytes: staged.sizeBytes,
+                    contentSha256: staged.sha256,
+                    storageKey:
+                      authoritativeSiteOpsComposerIdentity!.storageKey,
+                    storageKeyHash: storageIdentity.storageKeyHash,
+                    currentTaskStartedAt:
+                      siteOpsComposerEpoch!.currentTaskStartedAt,
+                    knowledgeInputEpochId:
+                      siteOpsComposerEpoch!.knowledgeInputEpochId,
+                  },
+                  storedContent,
+                  now,
+                })
+              : knowledgeBaseLocalAssetExistingRowDisposition({
+                  existing,
+                  expected: {
+                    localAssetId: knowledgeIdentity!.localAssetId,
+                    ownerUserId,
+                    sizeBytes: staged.sizeBytes,
+                    contentSha256: staged.sha256,
+                    storageKey: authoritativeKnowledgeIdentity!.storageKey!,
+                    storageKeyHash: storageIdentity.storageKeyHash,
+                  },
+                  storedContent,
+                  now,
+                });
             if (disposition.action === "conflict") {
               throw new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
             }
@@ -4254,6 +4426,12 @@ router.post("/assets", async (req, res) => {
                     eq(localAssets.contentSha256, existing.contentSha256),
                     eq(localAssets.storageKey, existing.storageKey),
                     eq(localAssets.storageKeyHash, existing.storageKeyHash),
+                    existing.siteOpsKnowledgeInputEpochId
+                      ? eq(
+                          localAssets.siteOpsKnowledgeInputEpochId,
+                          existing.siteOpsKnowledgeInputEpochId,
+                        )
+                      : isNull(localAssets.siteOpsKnowledgeInputEpochId),
                     eq(localAssets.refCount, existing.refCount),
                   ),
                 );
@@ -4336,10 +4514,14 @@ router.post("/assets", async (req, res) => {
           };
 
           const existing = await loadExisting();
-          if (existing && knowledgeIdentity) return replayPayload(existing);
+          if (existing && deterministicIdentity) {
+            return replayPayload(existing);
+          }
 
           const storageKey =
-            authoritativeKnowledgeIdentity?.storageKey ?? `frontmind-v2:${id}`;
+            authoritativeKnowledgeIdentity?.storageKey ??
+            authoritativeSiteOpsComposerIdentity?.storageKey ??
+            `frontmind-v2:${id}`;
           await staged.commit({
             filename,
             mimeType,
@@ -4358,6 +4540,8 @@ router.post("/assets", async (req, res) => {
                 sizeBytes: staged.sizeBytes,
                 contentSha256: staged.sha256,
                 storageKey,
+                siteOpsKnowledgeInputEpochId:
+                  siteOpsComposerEpoch?.knowledgeInputEpochId ?? null,
                 refCount: 1,
                 retainUntil: new Date(now + LOCAL_CONTENT_RETENTION_MS),
               }),
@@ -4374,7 +4558,9 @@ router.post("/assets", async (req, res) => {
             } catch {
               throw insertError;
             }
-            if (winner && knowledgeIdentity) return replayPayload(winner);
+            if (winner && deterministicIdentity) {
+              return replayPayload(winner);
+            }
             await removeStoredPresalesFile(id).catch(() => undefined);
             temporaryDiscarded = true;
             throw insertError;
@@ -4393,7 +4579,7 @@ router.post("/assets", async (req, res) => {
             },
           };
         };
-        return knowledgeIdentity
+        return deterministicIdentity
           ? withStoredPresalesFileMutationLock(id, finalizeUpload)
           : finalizeUpload();
       } catch (error) {

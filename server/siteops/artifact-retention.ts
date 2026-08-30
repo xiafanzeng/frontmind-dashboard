@@ -2,6 +2,7 @@ import { and, eq, like, or, sql } from "drizzle-orm";
 
 import {
   localAssets,
+  siteBuildInputAssets,
   siteBuilds,
   siteDeployments,
   socialPackages,
@@ -171,6 +172,7 @@ export async function isSiteOpsArtifactReferenced(
     .from(siteBuilds)
     .where(
       or(
+        eq(siteBuilds.contentPlanLocalAssetId, localAssetId),
         eq(siteBuilds.contractLocalAssetId, localAssetId),
         eq(siteBuilds.sourceLocalAssetId, localAssetId),
         eq(siteBuilds.distLocalAssetId, localAssetId),
@@ -180,6 +182,13 @@ export async function isSiteOpsArtifactReferenced(
     )
     .limit(1);
   if (buildReferences[0]) return true;
+
+  const buildInputReferences = await database
+    .select({ id: siteBuildInputAssets.id })
+    .from(siteBuildInputAssets)
+    .where(eq(siteBuildInputAssets.localAssetId, localAssetId))
+    .limit(1);
+  if (buildInputReferences[0]) return true;
 
   const deploymentReferences = await database
     .select({ id: siteDeployments.id })

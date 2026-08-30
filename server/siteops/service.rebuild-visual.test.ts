@@ -54,6 +54,8 @@ vi.mock("./static-template-catalog", async (importOriginal) => {
 import {
   apiCredentials,
   conversationTurns,
+  knowledgeBaseBuilds,
+  knowledgeImportReceipts,
   knowledgeBaseSnapshots,
   messages,
   presalesApiCredentials,
@@ -71,7 +73,11 @@ import {
   NATIVE_RUNTIME_CONTRACT_V1_SHA256,
   NATIVE_RUNTIME_EXECUTION_SHELL_V1_SHA256,
 } from "./native-react-source";
-import { actOnSiteOps, siteBriefFromSnapshot } from "./service";
+import {
+  actOnSiteOps,
+  siteBriefFromSnapshot,
+  siteOpsKnowledgeSnapshotSelectableForProject,
+} from "./service";
 import { staticTemplateAdmissionEvidenceSha256 } from "./static-template-catalog";
 
 type Insert = { table: unknown; values: Record<string, unknown> };
@@ -92,6 +98,7 @@ function serviceDatabaseFixture() {
     revision: 8,
     brief: null,
     currentTaskStartedAt: now,
+    knowledgeInputEpochId: null as string | null,
     minimumKnowledgeSnapshotVersion: null as number | null,
     updatedAt: now,
   };
@@ -101,6 +108,9 @@ function serviceDatabaseFixture() {
     archiveHash: "a".repeat(64),
     version: 2,
     sourceFileName: "knowledge.zip",
+    sourceBuildId: null as string | null,
+    sourceTaskId: null as string | null,
+    siteOpsKnowledgeInputEpochId: null as string | null,
     documents: [
       {
         id: "overview-source",
@@ -117,6 +127,16 @@ function serviceDatabaseFixture() {
     createdAt: now,
   };
   const snapshots = [snapshot];
+  const knowledgeBuildRows: Array<{
+    id: string;
+    createdAt: Date;
+    siteOpsKnowledgeInputEpochId: string | null;
+  }> = [];
+  const knowledgeImportRows: Array<{
+    snapshotId: string;
+    createdAt: Date;
+    siteOpsKnowledgeInputEpochId: string | null;
+  }> = [];
   const userRows: Array<{ id: number }> = [{ id: 7 }];
   const sampleId = "40000000-0000-4000-8000-000000000004";
   const previewLocalAssetId = "41000000-0000-4000-8000-000000000004";
@@ -230,6 +250,8 @@ function serviceDatabaseFixture() {
       return inTransaction && keys.includes("sample") ? visualRows : [];
     }
     if (table === knowledgeBaseSnapshots) return snapshots;
+    if (table === knowledgeBaseBuilds) return knowledgeBuildRows;
+    if (table === knowledgeImportReceipts) return knowledgeImportRows;
     if (table === users) return userRows;
     if (table === siteOperations) {
       if (inTransaction && keys.includes("input") && keys.includes("status")) {
@@ -350,6 +372,8 @@ function serviceDatabaseFixture() {
     visualCycleOperations,
     credentialReads,
     snapshots,
+    knowledgeBuildRows,
+    knowledgeImportRows,
     userRows,
     inspirationTaxonomy,
     referenceBlueprint,
@@ -448,7 +472,92 @@ beforeEach(() => {
   dependencies.getTwentyFirstCredentialStatus.mockClear();
 });
 
+describe("SiteOps post-reset knowledge observation fence", () => {
+  const project = {
+    minimumKnowledgeSnapshotVersion: 3,
+    knowledgeInputEpochId: null,
+    currentTaskStartedAt: new Date("2026-08-23T00:00:00.000Z"),
+  };
+  const snapshot = {
+    id: "29000000-0000-4000-8000-000000000002",
+    version: 3,
+    status: "active" as const,
+    archiveHash: "a".repeat(64),
+    sourceBuildId: null,
+    sourceTaskId: null,
+    siteOpsKnowledgeInputEpochId: null,
+    createdAt: new Date("2026-08-24T00:00:00.000Z"),
+  };
+
+  it("fails closed when a task-backed snapshot has no matching fresh import receipt", () => {
+    expect(
+      siteOpsKnowledgeSnapshotSelectableForProject({
+        snapshot: {
+          ...snapshot,
+          sourceTaskId: "unproven-task",
+        },
+        project,
+        provenance: {
+          freshBuildIds: new Set(),
+          freshImportSnapshotIds: new Set(),
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a direct synchronous upload committed before the reset epoch", () => {
+    expect(
+      siteOpsKnowledgeSnapshotSelectableForProject({
+        snapshot: {
+          ...snapshot,
+          createdAt: new Date("2026-08-22T23:59:59.000Z"),
+        },
+        project,
+        provenance: {
+          freshBuildIds: new Set(),
+          freshImportSnapshotIds: new Set(),
+        },
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsKnowledgeSnapshotSelectableForProject({
+        snapshot: {
+          ...snapshot,
+          createdAt: new Date(project.currentTaskStartedAt),
+        },
+        project,
+        provenance: {
+          freshBuildIds: new Set(),
+          freshImportSnapshotIds: new Set(),
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a direct same-second commit once a 2.9 opaque epoch is active", () => {
+    expect(
+      siteOpsKnowledgeSnapshotSelectableForProject({
+        snapshot: {
+          ...snapshot,
+          createdAt: new Date(project.currentTaskStartedAt),
+          siteOpsKnowledgeInputEpochId: "61000000-0000-4000-8000-000000000001",
+        },
+        project: {
+          ...project,
+          knowledgeInputEpochId: "61000000-0000-4000-8000-000000000001",
+        },
+        provenance: {
+          freshBuildIds: new Set(),
+          freshImportSnapshotIds: new Set(),
+        },
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("SiteOps visual selection and current-task revisions", () => {
+  const freshKnowledgeEpochId = "62000000-0000-4000-8000-000000000001";
+
   it("locks the account and binds the newest valid active snapshot without a client-selected id", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentKnowledgeSnapshotId = null;
@@ -586,6 +695,200 @@ describe("SiteOps visual selection and current-task revisions", () => {
     expect(fixture.project.currentKnowledgeSnapshotId).toBeNull();
   });
 
+  it("binds only an active snapshot at or above the post-reset floor", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    fixture.project.minimumKnowledgeSnapshotVersion = 3;
+    fixture.project.knowledgeInputEpochId = freshKnowledgeEpochId;
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        connectKnowledgeInput(fixture.project.revision),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
+    expect(fixture.project.currentKnowledgeSnapshotId).toBeNull();
+    expect(
+      fixture.inserts.some(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "brief_message",
+      ),
+    ).toBe(false);
+
+    const sourceBuildId = "62100000-0000-4000-8000-000000000001";
+    const freshSnapshot = {
+      ...fixture.snapshots[0]!,
+      id: "22000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "b".repeat(64),
+      sourceBuildId,
+      sourceTaskId: "knowledge-task-current-epoch",
+      siteOpsKnowledgeInputEpochId: freshKnowledgeEpochId,
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    };
+    fixture.snapshots.unshift(freshSnapshot);
+    fixture.knowledgeBuildRows.push({
+      id: sourceBuildId,
+      createdAt: new Date(fixture.project.currentTaskStartedAt),
+      siteOpsKnowledgeInputEpochId: freshKnowledgeEpochId,
+    });
+    await actOnSiteOps(
+      actor as never,
+      connectKnowledgeInput(fixture.project.revision),
+    );
+    expect(fixture.project.currentKnowledgeSnapshotId).toBe(freshSnapshot.id);
+  });
+
+  it("rejects a post-reset snapshot published from a pre-reset knowledge build", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    fixture.project.minimumKnowledgeSnapshotVersion = 3;
+    fixture.project.knowledgeInputEpochId = freshKnowledgeEpochId;
+    const sourceBuildId = "23000000-0000-4000-8000-000000000002";
+    fixture.snapshots.splice(0, fixture.snapshots.length, {
+      ...fixture.snapshots[0]!,
+      id: "24000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "c".repeat(64),
+      sourceBuildId,
+      sourceTaskId: "knowledge-task-created-before-reset",
+      siteOpsKnowledgeInputEpochId: "62000000-0000-4000-8000-000000000000",
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    });
+    fixture.knowledgeBuildRows.push({
+      id: sourceBuildId,
+      // The old reservation is deliberately indistinguishable by
+      // TIMESTAMP(0); only the opaque epoch proves that it predates reset.
+      createdAt: new Date(fixture.project.currentTaskStartedAt),
+      siteOpsKnowledgeInputEpochId: "62000000-0000-4000-8000-000000000000",
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        connectKnowledgeInput(fixture.project.revision),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
+    expect(fixture.project.currentKnowledgeSnapshotId).toBeNull();
+    expect(
+      fixture.inserts.some(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "brief_message",
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts a post-reset snapshot only when its knowledge build reservation is fresh", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    fixture.project.minimumKnowledgeSnapshotVersion = 3;
+    fixture.project.knowledgeInputEpochId = freshKnowledgeEpochId;
+    const sourceBuildId = "25000000-0000-4000-8000-000000000002";
+    const freshSnapshot = {
+      ...fixture.snapshots[0]!,
+      id: "26000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "d".repeat(64),
+      sourceBuildId,
+      sourceTaskId: "knowledge-task-created-after-reset",
+      siteOpsKnowledgeInputEpochId: freshKnowledgeEpochId,
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    };
+    fixture.snapshots.splice(0, fixture.snapshots.length, freshSnapshot);
+    fixture.knowledgeBuildRows.push({
+      id: sourceBuildId,
+      createdAt: new Date(fixture.project.currentTaskStartedAt),
+      siteOpsKnowledgeInputEpochId: freshKnowledgeEpochId,
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      connectKnowledgeInput(fixture.project.revision),
+    );
+
+    expect(fixture.project.currentKnowledgeSnapshotId).toBe(freshSnapshot.id);
+  });
+
+  it("rejects a post-reset snapshot completed from a pre-reset website import reservation", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    fixture.project.minimumKnowledgeSnapshotVersion = 3;
+    fixture.project.knowledgeInputEpochId = freshKnowledgeEpochId;
+    const importedSnapshot = {
+      ...fixture.snapshots[0]!,
+      id: "27000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "e".repeat(64),
+      sourceBuildId: null,
+      sourceTaskId: "website-import-created-before-reset",
+      siteOpsKnowledgeInputEpochId: "62000000-0000-4000-8000-000000000000",
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    };
+    fixture.snapshots.splice(0, fixture.snapshots.length, importedSnapshot);
+    fixture.knowledgeImportRows.push({
+      snapshotId: importedSnapshot.id,
+      createdAt: new Date(fixture.project.currentTaskStartedAt),
+      siteOpsKnowledgeInputEpochId: "62000000-0000-4000-8000-000000000000",
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        connectKnowledgeInput(fixture.project.revision),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
+    expect(fixture.project.currentKnowledgeSnapshotId).toBeNull();
+  });
+
+  it("accepts a post-reset snapshot from a fresh website import reservation", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    fixture.project.minimumKnowledgeSnapshotVersion = 3;
+    fixture.project.knowledgeInputEpochId = freshKnowledgeEpochId;
+    const importedSnapshot = {
+      ...fixture.snapshots[0]!,
+      id: "28000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "f".repeat(64),
+      sourceBuildId: null,
+      sourceTaskId: "website-import-created-after-reset",
+      siteOpsKnowledgeInputEpochId: freshKnowledgeEpochId,
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    };
+    fixture.snapshots.splice(0, fixture.snapshots.length, importedSnapshot);
+    fixture.knowledgeImportRows.push({
+      snapshotId: importedSnapshot.id,
+      createdAt: new Date(fixture.project.currentTaskStartedAt),
+      siteOpsKnowledgeInputEpochId: freshKnowledgeEpochId,
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      connectKnowledgeInput(fixture.project.revision),
+    );
+
+    expect(fixture.project.currentKnowledgeSnapshotId).toBe(
+      importedSnapshot.id,
+    );
+  });
+
   it("rejects a second supplemental visual operation while one is active", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;
@@ -678,7 +981,7 @@ describe("SiteOps visual selection and current-task revisions", () => {
     ).toBe(false);
   });
 
-  it("starts a pristine 2.8 catalog cycle without reading the 21st credential", async () => {
+  it("starts a pristine 2.9 catalog cycle without reading the 21st credential", async () => {
     const fixture = serviceDatabaseFixture();
     prepareVisualAction(fixture, "collecting_brief");
     dependencies.getDb.mockResolvedValue(fixture.db);
@@ -698,8 +1001,8 @@ describe("SiteOps visual selection and current-task revisions", () => {
           entry.values.kind === "visual_search",
       )?.values.input,
     ).toMatchObject({
-      schemaVersion: 3,
-      workflowVersion: "2.8.0",
+      schemaVersion: 4,
+      workflowVersion: "2.9.0",
       mode: "initial",
       page: 1,
     });

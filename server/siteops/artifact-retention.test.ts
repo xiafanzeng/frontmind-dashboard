@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   localAssets,
+  siteBuildInputAssets,
   siteBuilds,
   visualCandidatePoolItems,
   visualCandidatePoolPages,
@@ -95,6 +96,42 @@ describe("SiteOps artifact retention", () => {
     );
     await expect(
       isSiteOpsArtifactReferenced(buildDatabase, assetId),
+    ).resolves.toBe(true);
+  });
+
+  it("pins content plans and stable revision input media", async () => {
+    let buildWhere: SQL | null = null;
+    const contentPlanDatabase = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: (condition: SQL) => ({
+            limit: async () => {
+              if (table === localAssets) return [{ id: assetId }];
+              if (table === siteBuilds) {
+                buildWhere = condition;
+                return [{ id: "build-content-plan" }];
+              }
+              return [];
+            },
+          }),
+        }),
+      }),
+    } as never;
+    await expect(
+      isSiteOpsArtifactReferenced(contentPlanDatabase, assetId),
+    ).resolves.toBe(true);
+    expect(new MySqlDialect().sqlToQuery(buildWhere!).sql).toContain(
+      "content_plan_local_asset_id",
+    );
+
+    const inputMediaDatabase = referenceDatabase(
+      new Map([
+        [localAssets, [{ id: assetId }]],
+        [siteBuildInputAssets, [{ id: "revision-input-1" }]],
+      ]),
+    );
+    await expect(
+      isSiteOpsArtifactReferenced(inputMediaDatabase, assetId),
     ).resolves.toBe(true);
   });
 

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  SITEOPS_DEFAULT_WORKFLOW,
   SITEOPS_MATERIALIZER_V2_8,
+  SITEOPS_MATERIALIZER_V2_9,
   SITEOPS_WORKFLOWS_BY_VERSION,
   parseSiteOpsPersistedWorkflowCoordinates,
   siteOpsPersistedWorkflowCoordinateSchema,
@@ -9,7 +11,7 @@ import {
 
 describe("SiteOps persisted workflow coordinates", () => {
   it("keeps every registered workflow within the shared 1-32 character boundary", () => {
-    expect(Object.keys(SITEOPS_WORKFLOWS_BY_VERSION)).toHaveLength(14);
+    expect(Object.keys(SITEOPS_WORKFLOWS_BY_VERSION)).toHaveLength(15);
     for (const workflow of Object.values(SITEOPS_WORKFLOWS_BY_VERSION)) {
       expect(
         parseSiteOpsPersistedWorkflowCoordinates({
@@ -58,5 +60,15 @@ describe("SiteOps persisted workflow coordinates", () => {
         "806e2e87226f454ad6344f2e14d687f997d9716783536a336757113641ec26ce",
       qaPolicyVersion: "siteops-native-qa-v1",
     });
+  });
+
+  it("defaults new roots to 2.9 while retaining the exact historical 2.8 entry", () => {
+    expect(SITEOPS_DEFAULT_WORKFLOW).toBe(SITEOPS_MATERIALIZER_V2_9);
+    expect(SITEOPS_WORKFLOWS_BY_VERSION["2.8.0"]).toBe(
+      SITEOPS_MATERIALIZER_V2_8,
+    );
+    expect(SITEOPS_WORKFLOWS_BY_VERSION["2.9.0"]).toBe(
+      SITEOPS_MATERIALIZER_V2_9,
+    );
   });
 });

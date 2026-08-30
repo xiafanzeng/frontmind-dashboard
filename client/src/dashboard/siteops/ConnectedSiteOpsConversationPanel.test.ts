@@ -8,6 +8,7 @@ import {
   shouldPollSiteOpsObservation,
   siteOpsClientRequestId,
   siteOpsPollIntervalMs,
+  siteOpsRevisionAttempt,
 } from "./ConnectedSiteOpsConversationPanel";
 
 describe("connected SiteOps request identity", () => {
@@ -19,6 +20,51 @@ describe("connected SiteOps request identity", () => {
       /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
     );
     expect(requestId).not.toContain("siteops-");
+  });
+
+  it("reuses the request id and uploaded asset coordinates for an exact retry", async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], "product.png", {
+      type: "image/png",
+      lastModified: 7,
+    });
+    const first = await siteOpsRevisionAttempt(null, {
+      text: "加入产品页",
+      files: [file],
+      expectedProjectRevision: 9,
+    });
+    first.localAssetIds.set(0, "asset_uploaded_once");
+    const retry = await siteOpsRevisionAttempt(first, {
+      text: "加入产品页",
+      files: [file],
+      expectedProjectRevision: 10,
+    });
+    expect(retry).toBe(first);
+    expect(retry.clientRequestId).toBe(first.clientRequestId);
+    expect(retry.expectedProjectRevision).toBe(9);
+    expect(retry.contentSha256s).toEqual(first.contentSha256s);
+    expect(retry.localAssetIds.get(0)).toBe("asset_uploaded_once");
+    expect(retry.inFlightUploads).toBe(first.inFlightUploads);
+
+    const changed = await siteOpsRevisionAttempt(first, {
+      text: "加入关于页",
+      files: [file],
+      expectedProjectRevision: 10,
+    });
+    expect(changed.clientRequestId).not.toBe(first.clientRequestId);
+    expect(changed.localAssetIds.size).toBe(0);
+
+    const sameMetadataDifferentBytes = new File(
+      [new Uint8Array([3, 2, 1])],
+      "product.png",
+      { type: "image/png", lastModified: 7 },
+    );
+    const replaced = await siteOpsRevisionAttempt(first, {
+      text: "加入产品页",
+      files: [sameMetadataDifferentBytes],
+      expectedProjectRevision: 10,
+    });
+    expect(replaced.clientRequestId).not.toBe(first.clientRequestId);
+    expect(replaced.localAssetIds.size).toBe(0);
   });
 
   it("accepts select_visual only with an operation, building state and an advanced revision", () => {

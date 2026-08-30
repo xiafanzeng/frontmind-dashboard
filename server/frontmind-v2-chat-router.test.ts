@@ -12,6 +12,10 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
     resolve(process.cwd(), "client/src/lib/frontmind-api.ts"),
     "utf8",
   );
+  const siteOpsServiceSource = readFileSync(
+    resolve(process.cwd(), "server/siteops/service.ts"),
+    "utf8",
+  );
   const dispatchValidationSource = readFileSync(
     resolve(process.cwd(), "server/general-chat-dispatch-validation.ts"),
     "utf8",
@@ -31,6 +35,43 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
       "await client.fileDetail(reusable.providerFileId)",
     );
     expect(serverSource).toContain('.set({ uploadState: "expired" })');
+  });
+
+  it("wires SiteOps composer uploads through the tenant, reset epoch and exact replay fence", () => {
+    const assetRoute = serverSource.slice(
+      serverSource.indexOf('router.post("/assets"'),
+      serverSource.indexOf('router.get("/assets/:localAssetId/content"'),
+    );
+    expect(assetRoute).toContain("parseSiteOpsComposerLocalUploadCoordinate(");
+    expect(assetRoute).toContain("req.headers,");
+    expect(assetRoute).toContain("MAX_SITEOPS_COMPOSER_ASSET_BYTES");
+    expect(assetRoute).toContain(
+      '["image/jpeg", "image/png", "image/webp"].includes(mimeType)',
+    );
+    expect(assetRoute).toContain("currentSiteOpsComposerUploadEpoch(");
+    expect(serverSource).toContain(
+      "!project?.currentBuildId || !project.knowledgeInputEpochId",
+    );
+    expect(siteOpsServiceSource).toContain(
+      "if (!project?.knowledgeInputEpochId)",
+    );
+    expect(siteOpsServiceSource).toContain(
+      "if (!input.project.knowledgeInputEpochId)",
+    );
+    expect(siteOpsServiceSource).toMatch(
+      /eq\(\s*localAssets\.siteOpsKnowledgeInputEpochId,\s*knowledgeInputEpochId,?\s*\)/u,
+    );
+    expect(assetRoute).toContain("current.knowledgeInputEpochId !==");
+    expect(assetRoute).toContain("siteOpsComposerLocalAssetIdentity({");
+    expect(assetRoute).toContain(
+      "siteOpsComposerLocalAssetExistingRowDisposition({",
+    );
+    expect(assetRoute).toMatch(
+      /siteOpsKnowledgeInputEpochId:\s+siteOpsComposerEpoch\?\.knowledgeInputEpochId \?\? null/u,
+    );
+    expect(
+      assetRoute.match(/await assertSiteOpsComposerCoordinate\(/gu),
+    ).toHaveLength(2);
   });
 
   it("never routes ordinary chat through a Manus v1 endpoint", () => {

@@ -306,12 +306,32 @@ export const SITEOPS_MATERIALIZER_V2_8 = {
   qaPolicyVersion: "siteops-native-qa-v1",
 } as const;
 
+/** Dynamic Information Architecture 2.9 retains the admitted static template
+ * catalog while moving page selection to a source-bound Manus content plan.
+ * Historical 2.8 builds remain registered against their original bytes. */
+export const SITEOPS_MATERIALIZER_V2_9 = {
+  upstreamVersion: "frontmind-static-catalog-v1",
+  upstreamSha256:
+    "84dfe4652fb1aa9f3ff31e3b3515dec1361c7cd9191e656aa3c5f39d9554d4ca",
+  frontMindVersion: "2.9.0",
+  runtimeManifestSha256:
+    "2e4ed3b5fda75794e84cc12c68db53fdd20e34cee2e57913a44027d052affba9",
+  starterVersion: "frontmind-static-catalog-v1",
+  starterSha256:
+    "35bce4f24d8498cbb508ab1fcf777ca43503fa59e32c58d4265535d665cf2644",
+  componentLibraryVersion: "frontmind-static-catalog-v1",
+  materializerVersion: "2.9.0",
+  materializerSha256:
+    "67de87d7364f498891e4b7245995261a790c247e6a2b11f1e2406f943eb4ea37",
+  qaPolicyVersion: "siteops-native-qa-v2-dynamic-ia",
+} as const;
+
 /** Current host-owned renderer. Historical 2.6 builds and the explicitly
  * labelled native fallback keep using these immutable coordinates. */
 export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_6;
 
 /** Workflow frozen for every newly admitted/reset SiteOps root. */
-export const SITEOPS_DEFAULT_WORKFLOW = SITEOPS_MATERIALIZER_V2_8;
+export const SITEOPS_DEFAULT_WORKFLOW = SITEOPS_MATERIALIZER_V2_9;
 
 export const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -328,6 +348,7 @@ export const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_6.frontMindVersion]: SITEOPS_MATERIALIZER_V2_6,
   [SITEOPS_MATERIALIZER_V2_7.frontMindVersion]: SITEOPS_MATERIALIZER_V2_7,
   [SITEOPS_MATERIALIZER_V2_8.frontMindVersion]: SITEOPS_MATERIALIZER_V2_8,
+  [SITEOPS_MATERIALIZER_V2_9.frontMindVersion]: SITEOPS_MATERIALIZER_V2_9,
 } as const;
 
 // Fail at module load if any current or historical registry entry crosses the
@@ -1634,7 +1655,7 @@ export const visualSelectionBundleV7Schema = z
   .object({
     schemaVersion: z.literal(7),
     renderer: z.literal("frontmind_static_template_catalog_v1"),
-    workflowVersion: z.literal("2.8.0"),
+    workflowVersion: z.enum(["2.8.0", "2.9.0"]),
     catalogVersion: z.string().trim().min(1).max(191),
     pageNumber: z.number().int().min(1).max(4),
     pageSize: z.literal(8),
@@ -1807,7 +1828,13 @@ export const siteOpsSendMessageInputSchema = z
     conversationId: z.string().trim().min(1).max(191),
     clientRequestId: z.string().trim().min(8).max(128),
     text: z.string().trim().min(1).max(20_000),
-    localAssetIds: z.array(z.string().uuid()).max(20).default([]),
+    localAssetIds: z
+      .array(z.string().regex(/^asset_[A-Za-z0-9_-]{1,185}$/u))
+      .max(8)
+      .refine((ids) => new Set(ids).size === ids.length, {
+        message: "附件不能重复。",
+      })
+      .default([]),
     expectedProjectRevision: z.number().int().positive(),
   })
   .strict();

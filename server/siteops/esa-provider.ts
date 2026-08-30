@@ -1,14 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import * as EsaModels from "@alicloud/esa20240910";
 import * as OpenApi from "@alicloud/openapi-client";
-import { and, eq, gt, ne } from "drizzle-orm";
+import { and, eq, gt, gte, inArray, ne } from "drizzle-orm";
 import JSZip from "jszip";
 import { z } from "zod";
 
 import {
+  knowledgeBaseSnapshots,
   messages,
   siteBuilds,
+  siteBuildInputAssets,
   siteDeployments,
   siteDnsRecords,
   siteOperations,
@@ -18,6 +20,11 @@ import {
   type SiteOperation,
 } from "../../drizzle/schema";
 import { buildContractV2Schema } from "../../shared/siteops-design";
+import {
+  siteContentPlanV2Schema,
+  type SiteContentPlanV2,
+} from "../../shared/siteops-content-plan";
+import { canonicalJson } from "../../shared/siteops-workflow";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
 import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
@@ -25,9 +32,13 @@ import { AliyunCredential, AliyunEsaClient } from "./aliyun-sdk-constructors";
 import { materializeProductionSiteFromSource } from "./build-runtime";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import { fetchPinnedPublicHttps } from "./remote-preview";
+import { siteOpsRevisionLineageFromRows } from "./manus-provider";
 import { rebuildNativeReactProductionFromSource } from "./native-react-build-runtime";
 import { validateNativeReactSourceArchive } from "./native-react-source";
-import { isSiteOpsNativeVisualWorkflowVersion } from "./native-visual-source";
+import {
+  isSiteOpsNativeVisualWorkflowVersion,
+  SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION,
+} from "./native-visual-source";
 import {
   APPROVED_RESET_UNPUBLISH,
   approvedResetUnpublishFreshEpochMatches,
@@ -47,6 +58,7 @@ const ESA_TIMEOUT_MS = 15_000;
 const MAX_DIST_ZIP_BYTES = 40 * 1024 * 1024;
 const MAX_DIST_FILES = 5_000;
 const MAX_DIST_EXPANDED_BYTES = 120 * 1024 * 1024;
+const MAX_CONTENT_PLAN_BYTES = 16 * 1024 * 1024;
 const FRONTMIND_MARKER_PATH = "frontmind-deployment.json";
 const DNS_TTL = 600;
 
@@ -66,6 +78,11 @@ const productionMaterializationSchema = z
     target: z.enum(["global_excluding_cn", "mainland_cn"]),
     sourceLocalAssetId: z.string().uuid(),
     sourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    contentPlanLocalAssetId: z.string().uuid().optional(),
+    contentPlanSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
     contractLocalAssetId: z.string().uuid(),
     contractSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     productionSourceLocalAssetId: z.string().uuid(),
@@ -613,6 +630,41 @@ async function streamToBuffer(
     throw new EsaProviderFailure(
       "ESA_DIST_SIZE_INVALID",
       "官网 dist ZIP 大小与冻结产物不一致。",
+      "failed",
+    );
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function streamFrozenContentPlan(
+  stream: NodeJS.ReadableStream,
+  expectedBytes: number,
+) {
+  if (expectedBytes < 1 || expectedBytes > MAX_CONTENT_PLAN_BYTES) {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_INVALID",
+      "冻结内容计划缺失或无效，不能生成 production 产物。",
+      "failed",
+    );
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > expectedBytes || total > MAX_CONTENT_PLAN_BYTES) {
+      throw new EsaProviderFailure(
+        "ESA_PRODUCTION_CONTENT_PLAN_INVALID",
+        "冻结内容计划缺失或无效，不能生成 production 产物。",
+        "failed",
+      );
+    }
+    chunks.push(buffer);
+  }
+  if (total !== expectedBytes) {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_INVALID",
+      "冻结内容计划缺失或无效，不能生成 production 产物。",
       "failed",
     );
   }
@@ -1580,6 +1632,11 @@ function assertFrozenProductionMaterialization(input: {
     materialization.target !== context.deployment.target ||
     materialization.sourceLocalAssetId !== context.build.sourceLocalAssetId ||
     materialization.sourceSha256 !== context.build.sourceHash ||
+    (context.build.workflowVersion === SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION &&
+      (materialization.contentPlanLocalAssetId !==
+        context.build.contentPlanLocalAssetId ||
+        materialization.contentPlanSha256 !==
+          context.build.contentPlanSha256)) ||
     materialization.distLocalAssetId !== context.deployment.distLocalAssetId ||
     materialization.distSha256 !== context.deployment.distHash
   ) {
@@ -1624,9 +1681,52 @@ async function persistCheckedArtifact(input: {
  * first ESA mutation. A retry either consumes this exact record or fails
  * closed; it can never fall back to the build's preview/noindex dist.
  */
+function validatedProductionContentPlan(input: {
+  workflowVersion: string;
+  contentPlan: unknown;
+  contentPlanSha256: string | null;
+}) {
+  if (input.workflowVersion !== SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION) {
+    return undefined;
+  }
+  const parsed = siteContentPlanV2Schema.safeParse(input.contentPlan);
+  if (
+    !parsed.success ||
+    !/^[a-f0-9]{64}$/u.test(input.contentPlanSha256 ?? "")
+  ) {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_INVALID",
+      "冻结内容计划缺失或无效，不能生成 production 产物。",
+      "failed",
+    );
+  }
+  const actualSha256 = createHash("sha256")
+    .update(`${canonicalJson(parsed.data)}\n`, "utf8")
+    .digest("hex");
+  if (actualSha256 !== input.contentPlanSha256) {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_INVALID",
+      "冻结内容计划缺失或无效，不能生成 production 产物。",
+      "failed",
+    );
+  }
+  return parsed.data;
+}
+
 export async function materializeSiteOpsProductionSource(input: {
   sourceZip: Buffer;
   sourceSha256: string;
+  contentPlan: SiteContentPlanV2 | unknown | undefined;
+  requiredUserMedia?: readonly {
+    publicPath: string;
+    contentSha256: string;
+  }[];
+  requiredKnowledgeMedia?: readonly {
+    assetId: string;
+    publicPath: string;
+    contentSha256: string;
+    routePaths: readonly string[];
+  }[];
   build: Pick<
     typeof siteBuilds.$inferSelect,
     | "id"
@@ -1634,6 +1734,7 @@ export async function materializeSiteOpsProductionSource(input: {
     | "knowledgeSnapshotId"
     | "workflowVersion"
     | "selectionHash"
+    | "contentPlanSha256"
     | "brief"
   >;
   target: "global_excluding_cn" | "mainland_cn";
@@ -1652,6 +1753,11 @@ export async function materializeSiteOpsProductionSource(input: {
       abortSignal: input.signal,
     });
   }
+  const contentPlan = validatedProductionContentPlan({
+    workflowVersion: input.build.workflowVersion,
+    contentPlan: input.contentPlan,
+    contentPlanSha256: input.build.contentPlanSha256,
+  });
   const archive = await JSZip.loadAsync(input.sourceZip, { checkCRC32: true });
   const fileCount = Object.values(archive.files).filter(
     (entry) => !entry.dir,
@@ -1678,6 +1784,10 @@ export async function materializeSiteOpsProductionSource(input: {
       selectionHash: input.build.selectionHash,
     },
     brief: input.build.brief,
+    contentPlan,
+    contentPlanSha256: input.build.contentPlanSha256,
+    requiredUserMedia: input.requiredUserMedia,
+    requiredKnowledgeMedia: input.requiredKnowledgeMedia,
     canonicalOrigin: input.canonicalOrigin,
     target: input.target,
     timeoutMs: 70_000,
@@ -1697,6 +1807,322 @@ export async function materializeSiteOpsProductionSource(input: {
     provenanceJson: native.provenanceJson,
     provenanceSha256: native.provenanceSha256,
   } satisfies Awaited<ReturnType<typeof materializeProductionSiteFromSource>>;
+}
+
+export function productionContractMatchesFrozenBuild(input: {
+  contractValue: Record<string, unknown>;
+  build: Pick<
+    typeof siteBuilds.$inferSelect,
+    "id" | "projectId" | "workflowVersion" | "sourceHash" | "contentPlanSha256"
+  >;
+  canonicalOrigin: string;
+  target: "global_excluding_cn" | "mainland_cn";
+}) {
+  const { build, canonicalOrigin, contractValue, target } = input;
+  if (contractValue.contractKind === "twenty_first_native_build_contract") {
+    const requiresFrozenContentPlan =
+      build.workflowVersion === SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION;
+    return (
+      contractValue.renderer === "twenty_first_native_react_v1" &&
+      contractValue.buildId === build.id &&
+      contractValue.projectId === build.projectId &&
+      contractValue.mode === "production" &&
+      contractValue.canonicalOrigin === canonicalOrigin &&
+      contractValue.target === target &&
+      contractValue.sourceSha256 === build.sourceHash &&
+      (!requiresFrozenContentPlan ||
+        (/^[a-f0-9]{64}$/u.test(build.contentPlanSha256 ?? "") &&
+          contractValue.contentPlanSha256 === build.contentPlanSha256))
+    );
+  }
+  const parsed = buildContractV2Schema.safeParse(contractValue);
+  return (
+    parsed.success &&
+    parsed.data.seo.environment === "production" &&
+    parsed.data.target.environment === target &&
+    parsed.data.target.canonicalOrigin === canonicalOrigin
+  );
+}
+
+async function readFrozenProductionContentPlan(input: {
+  context: DeploymentContext;
+  operation: SiteOperation;
+  readArtifact: typeof readSiteOpsArtifact;
+}) {
+  const { build } = input.context;
+  if (build.workflowVersion !== SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION) {
+    return undefined;
+  }
+  if (!build.contentPlanLocalAssetId || !build.contentPlanSha256) {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_NOT_FOUND",
+      "已批准版本缺少冻结内容计划，不能生成 production 产物。",
+      "failed",
+    );
+  }
+  try {
+    const artifact = await input.readArtifact({
+      userId: input.operation.userId,
+      localAssetId: build.contentPlanLocalAssetId,
+      expectedSha256: build.contentPlanSha256,
+      expectedMimeTypes: ["application/json"],
+    });
+    if (!artifact) {
+      throw new EsaProviderFailure(
+        "ESA_PRODUCTION_CONTENT_PLAN_NOT_FOUND",
+        "已批准版本缺少冻结内容计划，不能生成 production 产物。",
+        "failed",
+      );
+    }
+    const bytes = await streamFrozenContentPlan(
+      artifact.stored.createReadStream(),
+      artifact.row.sizeBytes,
+    );
+    const candidate = JSON.parse(bytes.toString("utf8")) as unknown;
+    return validatedProductionContentPlan({
+      workflowVersion: build.workflowVersion,
+      contentPlan: candidate,
+      contentPlanSha256: build.contentPlanSha256,
+    });
+  } catch (error) {
+    if (error instanceof EsaProviderFailure) throw error;
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_INVALID",
+      "冻结内容计划缺失或无效，不能生成 production 产物。",
+      "failed",
+    );
+  }
+}
+
+export async function loadFrozenProductionMediaRequirements(input: {
+  db: DbExecutor;
+  context: DeploymentContext;
+  operation: SiteOperation;
+  contentPlan: SiteContentPlanV2 | undefined;
+}) {
+  if (!input.contentPlan) {
+    return {
+      requiredUserMedia: [] as Array<{
+        publicPath: string;
+        contentSha256: string;
+      }>,
+      requiredKnowledgeMedia: [] as Array<{
+        assetId: string;
+        publicPath: string;
+        contentSha256: string;
+        routePaths: string[];
+      }>,
+    };
+  }
+  const failUserMedia = (): never => {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_REVISION_MEDIA_INVALID",
+      "连续修订的冻结图片来源链缺失或无效，不能生成 production 产物。",
+      "failed",
+    );
+  };
+  let userMediaRows: Array<typeof siteBuildInputAssets.$inferSelect> = [];
+  if (input.context.build.parentBuildId) {
+    try {
+      const builds = (await input.db
+        .select()
+        .from(siteBuilds)
+        .where(
+          and(
+            eq(siteBuilds.projectId, input.context.build.projectId),
+            eq(siteBuilds.userId, input.operation.userId),
+            gte(
+              siteBuilds.createdAt,
+              input.context.project.currentTaskStartedAt,
+            ),
+          ),
+        )) as Array<typeof siteBuilds.$inferSelect>;
+      const buildIds = builds.map((row) => row.id);
+      if (buildIds.length === 0) failUserMedia();
+      const [operations, assets] = await Promise.all([
+        input.db
+          .select()
+          .from(siteOperations)
+          .where(inArray(siteOperations.buildId, buildIds)),
+        input.db
+          .select()
+          .from(siteBuildInputAssets)
+          .where(inArray(siteBuildInputAssets.buildId, buildIds)),
+      ]);
+      userMediaRows = siteOpsRevisionLineageFromRows({
+        currentBuild: input.context.build,
+        projectId: input.context.build.projectId,
+        userId: input.operation.userId,
+        taskStartedAt: input.context.project.currentTaskStartedAt,
+        knowledgeInputEpochId: input.context.project.knowledgeInputEpochId,
+        builds,
+        operations,
+        assets,
+        includeCurrentBuild: true,
+      }).assets.map(({ row }) => row);
+    } catch (error) {
+      if (error instanceof EsaProviderFailure) throw error;
+      failUserMedia();
+    }
+  } else {
+    const unexpectedRootAssets = await input.db
+      .select()
+      .from(siteBuildInputAssets)
+      .where(
+        and(
+          eq(siteBuildInputAssets.buildId, input.context.build.id),
+          eq(siteBuildInputAssets.projectId, input.context.build.projectId),
+          eq(siteBuildInputAssets.userId, input.operation.userId),
+        ),
+      );
+    if (unexpectedRootAssets.length > 0) failUserMedia();
+  }
+  const expectedExtension = new Map([
+    ["image/jpeg", "jpg"],
+    ["image/png", "png"],
+    ["image/webp", "webp"],
+  ] as const);
+  const customerMediaById = new Map<string, (typeof userMediaRows)[number]>();
+  const uniqueUserMediaByPublicPath = new Map<
+    string,
+    (typeof userMediaRows)[number]
+  >();
+  const userMediaByLocalAsset = new Map<
+    string,
+    (typeof userMediaRows)[number]
+  >();
+  const sameRenderedMedia = (
+    left: (typeof userMediaRows)[number],
+    right: (typeof userMediaRows)[number],
+  ) =>
+    left.publicPath === right.publicPath &&
+    left.contentSha256 === right.contentSha256 &&
+    left.mimeType === right.mimeType &&
+    left.sizeBytes === right.sizeBytes &&
+    left.width === right.width &&
+    left.height === right.height;
+  for (const asset of userMediaRows) {
+    const extension = expectedExtension.get(
+      asset.mimeType as "image/jpeg" | "image/png" | "image/webp",
+    );
+    const customerMediaId = `customer-media:${createHash("sha256")
+      .update(asset.publicPath, "utf8")
+      .digest("hex")
+      .slice(0, 32)}`;
+    if (
+      !extension ||
+      !/^[a-f0-9]{64}$/u.test(asset.contentSha256) ||
+      asset.publicPath !==
+        `/frontmind-user-media/${asset.contentSha256}.${extension}` ||
+      asset.sizeBytes < 1 ||
+      asset.sizeBytes > 8 * 1024 * 1024 ||
+      asset.width < 1 ||
+      asset.height < 1
+    ) {
+      failUserMedia();
+    }
+    const samePath = uniqueUserMediaByPublicPath.get(asset.publicPath);
+    const sameLocalAsset = userMediaByLocalAsset.get(asset.localAssetId);
+    const sameCustomerId = customerMediaById.get(customerMediaId);
+    if (
+      (samePath && !sameRenderedMedia(samePath, asset)) ||
+      (sameLocalAsset && !sameRenderedMedia(sameLocalAsset, asset)) ||
+      (sameCustomerId && !sameRenderedMedia(sameCustomerId, asset))
+    ) {
+      failUserMedia();
+    }
+    if (samePath) {
+      if (!sameLocalAsset) userMediaByLocalAsset.set(asset.localAssetId, asset);
+      continue;
+    }
+    uniqueUserMediaByPublicPath.set(asset.publicPath, asset);
+    userMediaByLocalAsset.set(asset.localAssetId, asset);
+    customerMediaById.set(customerMediaId, asset);
+  }
+  const routePathsByMediaId = new Map<string, Set<string>>();
+  const selectedCustomerMediaIds = new Set<string>();
+  for (const route of input.contentPlan.routes) {
+    for (const mediaId of new Set(
+      route.sections.flatMap((section) => section.mediaIds),
+    )) {
+      if (mediaId.startsWith("customer-media:")) {
+        if (
+          !/^customer-media:[a-f0-9]{32}$/u.test(mediaId) ||
+          !customerMediaById.has(mediaId)
+        ) {
+          failUserMedia();
+        }
+        selectedCustomerMediaIds.add(mediaId);
+        continue;
+      }
+      const routePaths = routePathsByMediaId.get(mediaId) ?? new Set<string>();
+      routePaths.add(route.path);
+      routePathsByMediaId.set(mediaId, routePaths);
+    }
+  }
+  const requiredUserMedia = [...selectedCustomerMediaIds].map((mediaId) => {
+    const asset = customerMediaById.get(mediaId);
+    if (!asset) return failUserMedia();
+    return {
+      publicPath: asset.publicPath,
+      contentSha256: asset.contentSha256,
+    };
+  });
+  if (routePathsByMediaId.size === 0) {
+    return { requiredUserMedia, requiredKnowledgeMedia: [] };
+  }
+  const snapshotRows = await input.db
+    .select({ assets: knowledgeBaseSnapshots.assets })
+    .from(knowledgeBaseSnapshots)
+    .where(
+      and(
+        eq(knowledgeBaseSnapshots.id, input.context.build.knowledgeSnapshotId),
+        eq(knowledgeBaseSnapshots.userId, input.operation.userId),
+      ),
+    )
+    .limit(1);
+  const snapshotAssets = snapshotRows[0]?.assets;
+  if (!snapshotAssets) {
+    throw new EsaProviderFailure(
+      "ESA_PRODUCTION_CONTENT_PLAN_MEDIA_INVALID",
+      "冻结内容计划引用的知识图片缺失或无效，不能生成 production 产物。",
+      "failed",
+    );
+  }
+  const requiredKnowledgeMedia = [...routePathsByMediaId].map(
+    ([assetId, routePaths]) => {
+      const matches = snapshotAssets.filter((asset) => asset.id === assetId);
+      const asset = matches[0];
+      const extension = asset
+        ? expectedExtension.get(
+            asset.mimeType as "image/jpeg" | "image/png" | "image/webp",
+          )
+        : undefined;
+      if (
+        matches.length !== 1 ||
+        !asset ||
+        asset.ownership !== "first_party" ||
+        !extension ||
+        !/^[a-f0-9]{64}$/u.test(asset.sha256 ?? "") ||
+        !Number.isSafeInteger(asset.size) ||
+        asset.size < 1 ||
+        asset.size > 8 * 1024 * 1024
+      ) {
+        throw new EsaProviderFailure(
+          "ESA_PRODUCTION_CONTENT_PLAN_MEDIA_INVALID",
+          "冻结内容计划引用的知识图片缺失或无效，不能生成 production 产物。",
+          "failed",
+        );
+      }
+      return {
+        assetId,
+        publicPath: `/frontmind-knowledge-media/${asset.sha256}.${extension}`,
+        contentSha256: asset.sha256!,
+        routePaths: [...routePaths],
+      };
+    },
+  );
+  return { requiredUserMedia, requiredKnowledgeMedia };
 }
 
 async function ensureProductionMaterialization(input: {
@@ -1758,11 +2184,24 @@ async function ensureProductionMaterialization(input: {
     sourceArtifact.stored.createReadStream(),
     sourceArtifact.row.sizeBytes,
   );
+  const contentPlan = await readFrozenProductionContentPlan({
+    context: input.context,
+    operation: input.operation,
+    readArtifact: input.readArtifact,
+  });
+  const mediaRequirements = await loadFrozenProductionMediaRequirements({
+    db: input.db,
+    context: input.context,
+    operation: input.operation,
+    contentPlan,
+  });
   let output: Awaited<ReturnType<typeof materializeProductionSiteFromSource>>;
   try {
     output = await materializeSiteOpsProductionSource({
       sourceZip,
       sourceSha256: input.context.build.sourceHash,
+      contentPlan,
+      ...mediaRequirements,
       build: input.context.build,
       target: input.context.deployment.target,
       canonicalOrigin: input.canonicalOrigin,
@@ -1780,24 +2219,12 @@ async function ensureProductionMaterialization(input: {
   const contractValue = JSON.parse(
     output.contractJson.toString("utf8"),
   ) as Record<string, unknown>;
-  const nativeContract =
-    contractValue.contractKind === "twenty_first_native_build_contract";
-  const contractValid = nativeContract
-    ? contractValue.renderer === "twenty_first_native_react_v1" &&
-      contractValue.buildId === input.context.build.id &&
-      contractValue.projectId === input.context.build.projectId &&
-      contractValue.mode === "production" &&
-      contractValue.canonicalOrigin === input.canonicalOrigin &&
-      contractValue.target === input.context.deployment.target &&
-      contractValue.sourceSha256 === input.context.build.sourceHash
-    : (() => {
-        const contract = buildContractV2Schema.parse(contractValue);
-        return (
-          contract.seo.environment === "production" &&
-          contract.target.environment === input.context.deployment.target &&
-          contract.target.canonicalOrigin === input.canonicalOrigin
-        );
-      })();
+  const contractValid = productionContractMatchesFrozenBuild({
+    contractValue,
+    build: input.context.build,
+    canonicalOrigin: input.canonicalOrigin,
+    target: input.context.deployment.target,
+  });
   if (
     !contractValid ||
     output.qaReport.mode !== "production" ||
@@ -1867,6 +2294,13 @@ async function ensureProductionMaterialization(input: {
     target: input.context.deployment.target,
     sourceLocalAssetId: input.context.build.sourceLocalAssetId,
     sourceSha256: input.context.build.sourceHash,
+    ...(input.context.build.workflowVersion ===
+    SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION
+      ? {
+          contentPlanLocalAssetId: input.context.build.contentPlanLocalAssetId,
+          contentPlanSha256: input.context.build.contentPlanSha256,
+        }
+      : {}),
     contractLocalAssetId: contractArtifact.id,
     contractSha256: output.contractSha256,
     productionSourceLocalAssetId: productionSourceArtifact.id,

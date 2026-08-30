@@ -52,6 +52,7 @@ import {
 export const SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION = "2.5.0" as const;
 export const SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION = "2.7.0" as const;
 export const SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION = "2.8.0" as const;
+export const SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION = "2.9.0" as const;
 
 /** Native 2.5 remains readable for immutable replay; every newly admitted
  * complete-Template operation uses 2.7. */
@@ -59,7 +60,8 @@ export function isSiteOpsNativeVisualWorkflowVersion(workflowVersion: string) {
   return (
     workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION ||
     workflowVersion === SITEOPS_NATIVE_TEMPLATE_WORKFLOW_VERSION ||
-    workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION
+    workflowVersion === SITEOPS_STATIC_TEMPLATE_WORKFLOW_VERSION ||
+    workflowVersion === SITEOPS_DYNAMIC_IA_WORKFLOW_VERSION
   );
 }
 export const VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE = "application/zip" as const;

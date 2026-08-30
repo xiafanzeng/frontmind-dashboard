@@ -316,7 +316,7 @@ describe("Manus bound-task read reconciliation", () => {
   it("reuses an authenticated deterministic rejection for the exact frozen candidate only", () => {
     const coordinates = {
       taskId,
-      repairAttempt: 2,
+      repairAttempt: 3,
       operationToken,
       attachmentIdentity: "attachment-1:attachment:0",
       archiveSha256: "a".repeat(64),
@@ -347,7 +347,7 @@ describe("Manus bound-task read reconciliation", () => {
     expect(
       nativeRejectedCandidateMatches(verdict, {
         ...coordinates,
-        repairAttempt: 1,
+        repairAttempt: 2,
       }),
     ).toBe(false);
     expect(
@@ -1172,5 +1172,44 @@ describe("Manus bound-task read reconciliation", () => {
     ]) {
       expect(persisted).not.toHaveProperty(key);
     }
+  });
+
+  it("serializes the third native repair attempt and rejects a fourth", () => {
+    const state = {
+      schemaVersion: 2 as const,
+      stage: "native_repair_pending" as const,
+      taskId,
+      attempts: {
+        extraction: 0,
+        design: 0,
+        content: 0,
+        materialization: 0,
+      },
+      nativeSourceContractVersion: 2 as const,
+      nativeRepairAttempt: 2,
+    };
+    const third = startNativeRepairAttemptState({
+      state,
+      taskId,
+      repairAttempt: 3,
+      operationToken: "siteops-native-source:operation-1:3",
+      errorSignature: "d".repeat(64),
+      now: Date.parse("2026-08-29T00:10:00.000Z"),
+    });
+
+    expect(JSON.parse(JSON.stringify(third))).toMatchObject({
+      nativeRepairAttempt: 3,
+      phaseOperationToken: "siteops-native-source:operation-1:3",
+      stage: "native_repair_send_unknown",
+    });
+    expect(() =>
+      startNativeRepairAttemptState({
+        state: third,
+        taskId,
+        repairAttempt: 4,
+        operationToken: "siteops-native-source:operation-1:4",
+        errorSignature: "e".repeat(64),
+      }),
+    ).toThrow();
   });
 });

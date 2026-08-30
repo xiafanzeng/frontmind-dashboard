@@ -622,6 +622,8 @@ export const siteSourceReceiptV2Schema = z
     runtimeContractSha256: z.string().regex(SHA256_PATTERN),
     executionShellSha256: z.string().regex(SHA256_PATTERN),
     executionBaselineSha256: z.string().regex(SHA256_PATTERN),
+    /** Present and mandatory at the 2.9 provider boundary; optional here for 2.8 replay. */
+    contentPlanSha256: z.string().regex(SHA256_PATTERN).optional(),
   })
   .strict();
 
@@ -834,6 +836,7 @@ export const nativeRuntimeAuditIssueCodeSchema = z.enum([
   "EAGER_ROUTES_REQUIRED",
   "ROUTE_MANIFEST_INVALID",
   "ROUTE_MANIFEST_MISMATCH",
+  "CANONICAL_PATHNAME_REQUIRED",
   "HOST_CONFIG_FORBIDDEN",
   "FRAMEWORK_FORBIDDEN",
   "REMOTE_RESOURCE_FORBIDDEN",
@@ -1617,6 +1620,10 @@ export function auditNativeRuntimeContractV1(input: {
   contract?: unknown;
   /** Raw SiteBrief slugs or canonical paths, in SiteBrief order. */
   expectedRoutePaths?: readonly string[];
+  /** Workflow 2.9 multi-page sources must resolve their initial and popstate
+   * route through the host preview bridge instead of reading the private
+   * preview prefix as a public site pathname. */
+  requireCanonicalSitePathname?: boolean;
 }): NativeRuntimeAudit {
   const issues: NativeRuntimeAuditIssue[] = [];
   const seen = new Set<string>();
@@ -1832,6 +1839,17 @@ export function auditNativeRuntimeContractV1(input: {
         );
       }
     }
+    if (
+      input.requireCanonicalSitePathname &&
+      routeManifest?.some((route) => route !== "/") &&
+      !/\bcanonicalSitePathname\s*(?:\?\.)?\s*\(/u.test(routes)
+    ) {
+      add(
+        "CANONICAL_PATHNAME_REQUIRED",
+        contract.entrypoints.routes,
+        "workflow 2.9 multi-page routing must call the host canonicalSitePathname bridge",
+      );
+    }
   }
 
   for (const [pathname, bytes] of input.files) {
@@ -1945,6 +1963,8 @@ export async function validateNativeReactSourceArchive(input: {
   requiredReceiptVersion?: 1 | 2;
   /** The admitted/normalized template hash bound before provider execution. */
   expectedExecutionBaselineSha256?: string;
+  /** Freeze a dynamic-IA source archive to the exact accepted content plan. */
+  expectedContentPlanSha256?: string;
   /** Injectable only for deterministic tests; production uses the frozen V1. */
   runtimeContract?: unknown;
   limits?: Partial<NativeSourceLimits>;
@@ -2000,6 +2020,18 @@ export async function validateNativeReactSourceArchive(input: {
     ) {
       throw new NativeReactSourceError("NATIVE_SOURCE_RECEIPT_INVALID");
     }
+  }
+  if (
+    input.expectedContentPlanSha256 !== undefined &&
+    (!v2Receipt ||
+      !SHA256_PATTERN.test(input.expectedContentPlanSha256) ||
+      !v2Receipt.contentPlanSha256 ||
+      !secureStringEqual(
+        v2Receipt.contentPlanSha256,
+        input.expectedContentPlanSha256,
+      ))
+  ) {
+    throw new NativeReactSourceError("NATIVE_SOURCE_RECEIPT_INVALID");
   }
   if (
     !secureStringEqual(receipt.operationToken, input.expectedOperationToken)

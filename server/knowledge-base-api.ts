@@ -50,7 +50,7 @@ import {
 import {
   getDashboardWorkspace,
   getKnowledgeSnapshotById,
-  getLatestKnowledgeSnapshot,
+  getLatestKnowledgeSnapshotForSiteOpsInput,
 } from "./dashboard-service";
 import {
   downloadArchiveBytes,
@@ -6176,7 +6176,7 @@ router.post("/start/reserve", async (req, res) => {
     const newBuildPolicy = knowledgeBaseNewBuildPolicyBinding();
     const [prefillKnowledgeSnapshot, latestSkillDescriptor] = await Promise.all(
       [
-        getLatestKnowledgeSnapshot(req.frontmindUser.id),
+        getLatestKnowledgeSnapshotForSiteOpsInput(req.frontmindUser.id),
         getKnowledgeBaseSkillDescriptor({
           version: newBuildPolicy.skillVersion,
           contentHash: newBuildPolicy.skillContentHash,
@@ -6201,6 +6201,7 @@ router.post("/start/reserve", async (req, res) => {
       userAttachmentCount: attachmentManifest.length,
       expectedAttachmentCount:
         attachmentManifest.length + 2 + (prefillKnowledgeSnapshot ? 1 : 0),
+      prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
       deferDispatchUntilAttachments: true,
       clientAttachmentManifest: attachmentManifest,
       expectedResetRevision,

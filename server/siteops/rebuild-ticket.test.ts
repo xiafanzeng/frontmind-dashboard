@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   deliveryTicketEvents,
   deliveryTickets,
+  knowledgeBaseSnapshots,
   messages,
   siteBuilds,
   siteDeployments,
@@ -10,6 +11,7 @@ import {
   siteOperations,
   siteProjects,
   socialPackages,
+  users,
   visualCandidatePoolPages,
   visualCandidatePools,
   websiteStyleSampleBatches,
@@ -580,6 +582,8 @@ function fixture(options?: {
   ticketStatus?: string;
   resetOperation?: Record<string, unknown>;
   cancelCasFails?: boolean;
+  latestSnapshotVersion?: number | null;
+  userExists?: boolean;
 }) {
   const initialGlobalLiveDeploymentId = "50000000-0000-4000-8000-000000000005";
   const project = {
@@ -594,6 +598,7 @@ function fixture(options?: {
     brief: { companyName: "FrontMind" },
     status: "approved",
     revision: 12,
+    knowledgeInputEpochId: null as string | null,
     currentTaskStartedAt: new Date("2026-08-24T07:00:00.000Z"),
     updatedAt: new Date("2026-08-24T07:00:00.000Z"),
     ...options?.projectOverrides,
@@ -647,6 +652,14 @@ function fixture(options?: {
   const rowsFor = (table: unknown, fields?: Record<string, unknown>) => {
     if (table === siteProjects) return [project];
     if (table === siteBuilds) return [build];
+    if (table === users) {
+      return options?.userExists === false ? [] : [{ id: project.userId }];
+    }
+    if (table === knowledgeBaseSnapshots) {
+      return options?.latestSnapshotVersion === null
+        ? []
+        : [{ version: options?.latestSnapshotVersion ?? 7 }];
+    }
     if (table === deliveryTickets) return [ticket];
     if (table === siteOperations) {
       if (fields && "completedAt" in fields) {
@@ -711,6 +724,9 @@ function fixture(options?: {
         return query;
       },
       limit() {
+        return query;
+      },
+      orderBy() {
         return query;
       },
       for() {
@@ -828,6 +844,33 @@ describe("site rebuild reset approval", () => {
     expect(state.project.currentTaskStartedAt).toEqual(
       new Date("2026-08-24T08:00:00.000Z"),
     );
+    expect(state.project.knowledgeInputEpochId).toMatch(
+      /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
+    );
+  });
+
+  it("rotates distinct opaque epochs for approvals in the same database second", async () => {
+    const approvedAt = new Date("2026-08-24T08:00:00.987Z");
+    const first = fixture();
+    const second = fixture();
+
+    await approveSiteOpsRebuildTicket(first.tx, {
+      ticket: first.ticket,
+      actorUserId: 1,
+      now: approvedAt,
+    });
+    await approveSiteOpsRebuildTicket(second.tx, {
+      ticket: second.ticket,
+      actorUserId: 1,
+      now: approvedAt,
+    });
+
+    expect(first.project.currentTaskStartedAt).toEqual(
+      second.project.currentTaskStartedAt,
+    );
+    expect(first.project.knowledgeInputEpochId).not.toBe(
+      second.project.knowledgeInputEpochId,
+    );
   });
 
   it("creates the local reset epoch immediately and queues old external cleanup", async () => {
@@ -853,19 +896,24 @@ describe("site rebuild reset approval", () => {
       resetExpectedProjectRevision: 12,
       resetEpochDecoupled: true,
       resetAppliedProjectRevision: 13,
+      minimumKnowledgeSnapshotVersion: 8,
       frozenReset: expect.objectContaining({
         expectedCurrentBuildId: buildId,
         expectedGlobalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
       }),
     });
     expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: snapshotId,
+      currentKnowledgeSnapshotId: null,
       currentBuildId: null,
       globalLiveDeploymentId: null,
       brief: null,
       status: "draft",
       revision: 13,
+      minimumKnowledgeSnapshotVersion: 8,
       currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
+      knowledgeInputEpochId: expect.stringMatching(
+        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
+      ),
     });
     expect(state.updates).toEqual(
       expect.arrayContaining([
@@ -894,6 +942,78 @@ describe("site rebuild reset approval", () => {
         expect.objectContaining({ table: messages }),
       ]),
     );
+  });
+
+  it("sets the fresh-upload floor above the highest retained snapshot version", async () => {
+    const state = fixture({ latestSnapshotVersion: 41 });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      minimumKnowledgeSnapshotVersion: 42,
+    });
+    expect(state.project).toMatchObject({
+      currentKnowledgeSnapshotId: null,
+      minimumKnowledgeSnapshotVersion: 42,
+    });
+  });
+
+  it("requires the first newly published snapshot when no prior version exists", async () => {
+    const state = fixture({ latestSnapshotVersion: null });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      minimumKnowledgeSnapshotVersion: 1,
+    });
+    expect(state.project).toMatchObject({
+      currentKnowledgeSnapshotId: null,
+      minimumKnowledgeSnapshotVersion: 1,
+    });
+  });
+
+  it("never lowers an existing fresh-upload floor after retained rows are cleaned", async () => {
+    const state = fixture({
+      latestSnapshotVersion: 3,
+      projectOverrides: { minimumKnowledgeSnapshotVersion: 17 },
+    });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      minimumKnowledgeSnapshotVersion: 17,
+    });
+    expect(state.project.minimumKnowledgeSnapshotVersion).toBe(17);
+  });
+
+  it("fails closed when the account serialization row is missing", async () => {
+    const state = fixture({ userExists: false });
+
+    await expect(
+      approveSiteOpsRebuildTicket(state.tx, {
+        ticket: state.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T08:00:00.000Z"),
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_TICKET" });
+
+    expect(state.project).toMatchObject({
+      currentKnowledgeSnapshotId: snapshotId,
+      currentBuildId: buildId,
+      revision: 12,
+    });
   });
 
   it("replays an existing reset marker without changing project state again", async () => {
@@ -1136,9 +1256,10 @@ describe("site rebuild reset approval", () => {
     expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
     expect(state.project).toMatchObject({
       currentBuildId: null,
-      currentKnowledgeSnapshotId: snapshotId,
+      currentKnowledgeSnapshotId: null,
       status: "draft",
       revision: 13,
+      minimumKnowledgeSnapshotVersion: 8,
     });
   });
 
@@ -1242,7 +1363,10 @@ describe("site rebuild reset approval", () => {
         expect.objectContaining({ table: messages }),
       ]),
     );
-    expect(state.project.currentKnowledgeSnapshotId).toBe(snapshotId);
+    expect(state.project).toMatchObject({
+      currentKnowledgeSnapshotId: null,
+      minimumKnowledgeSnapshotVersion: 8,
+    });
   });
 
   it.each([
@@ -1382,7 +1506,8 @@ describe("site rebuild reset approval", () => {
     expect(state.project).toMatchObject({
       revision: 13,
       currentBuildId: null,
-      currentKnowledgeSnapshotId: snapshotId,
+      currentKnowledgeSnapshotId: null,
+      minimumKnowledgeSnapshotVersion: 8,
       status: "draft",
     });
     expect(state.inserts).toEqual([
@@ -1850,13 +1975,13 @@ describe("site rebuild reset approval", () => {
       projectRevision: 13,
     });
     expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: snapshotId,
+      currentKnowledgeSnapshotId: null,
       currentBuildId: null,
       globalLiveDeploymentId: null,
       mainlandLiveDeploymentId: null,
       canonicalHostname: null,
       currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
-      minimumKnowledgeSnapshotVersion: null,
+      minimumKnowledgeSnapshotVersion: 8,
       brief: null,
       status: "draft",
       revision: 13,

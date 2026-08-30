@@ -124,6 +124,8 @@ describe("service portal migration chain", () => {
       "0064_siteops_v1",
       "0065_siteops_alidns_oauth",
       "0066_visual_candidate_pools",
+      "0067_siteops_revision_inputs",
+      "0068_siteops_knowledge_input_epoch",
     ]);
   });
 
@@ -172,6 +174,57 @@ describe("service portal migration chain", () => {
       await readFile(path.join(drizzleRoot, "migration-policy.json"), "utf8"),
     ) as { migrations: Record<string, string> };
     expect(policy.migrations["0066_visual_candidate_pools"]).toBe("expand");
+  });
+
+  it("adds immutable revision input assets as an expand-only table", async () => {
+    const migrationSql = await migration("0067_siteops_revision_inputs.sql");
+    expect(migrationSql).toContain("CREATE TABLE `site_build_input_assets`");
+    expect(migrationSql).toContain(
+      "CONSTRAINT `site_build_input_assets_build_source_uq` UNIQUE(`build_id`,`source_asset_id`)",
+    );
+    expect(migrationSql).toContain(
+      "CONSTRAINT `site_build_input_assets_local_asset_id_local_assets_id_fk`",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `site_builds` ADD `content_plan_local_asset_id` varchar(36)",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `site_builds` ADD `content_plan_sha256` varchar(64)",
+    );
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+    const policy = JSON.parse(
+      await readFile(path.join(drizzleRoot, "migration-policy.json"), "utf8"),
+    ) as { migrations: Record<string, string> };
+    expect(policy.migrations["0067_siteops_revision_inputs"]).toBe("expand");
+  });
+
+  it("adds nullable SiteOps knowledge epochs without backfilling historical rows", async () => {
+    const migrationSql = await migration(
+      "0068_siteops_knowledge_input_epoch.sql",
+    );
+    for (const coordinate of [
+      ["site_projects", "knowledge_input_epoch_id"],
+      ["knowledge_base_builds", "site_ops_knowledge_input_epoch_id"],
+      ["knowledge_base_snapshots", "siteOpsKnowledgeInputEpochId"],
+      ["knowledge_import_receipts", "siteOpsKnowledgeInputEpochId"],
+      ["local_assets", "site_ops_knowledge_input_epoch_id"],
+      ["site_build_input_assets", "site_ops_knowledge_input_epoch_id"],
+    ] as const) {
+      expect(migrationSql).toContain(
+        `ALTER TABLE \`${coordinate[0]}\` ADD \`${coordinate[1]}\` varchar(36)`,
+      );
+    }
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+    const policy = JSON.parse(
+      await readFile(path.join(drizzleRoot, "migration-policy.json"), "utf8"),
+    ) as { migrations: Record<string, string> };
+    expect(policy.migrations["0068_siteops_knowledge_input_epoch"]).toBe(
+      "expand",
+    );
   });
 
   it("adds an optional unsigned overseas brand-tracking quota as an expand migration", async () => {

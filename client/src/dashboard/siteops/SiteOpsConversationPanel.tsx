@@ -33,11 +33,13 @@ import {
   Download,
   ExternalLink,
   FileArchive,
+  ImagePlus,
   Loader2,
   RefreshCw,
   Sparkles,
   UserRound,
   Wrench,
+  X,
 } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./siteops-conversation-panel.css";
@@ -80,6 +82,11 @@ export type SiteOpsConversationPanelProps = {
   onRefresh?: () => Promise<void> | void;
   onAction?: (input: SiteOpsActionContext) => Promise<void> | void;
   onRetrySelectVisual?: () => Promise<void> | void;
+  onSubmitRevision?: (input: {
+    text: string;
+    files: File[];
+    onProgress: (fileIndex: number, percent: number) => void;
+  }) => Promise<void> | void;
   onBeginAliyun?: () => Promise<{
     authorizationUrl: string;
     expiresAt: string;
@@ -657,6 +664,7 @@ export default function SiteOpsConversationPanel({
   onRefresh,
   onAction,
   onRetrySelectVisual,
+  onSubmitRevision,
   onBeginAliyun,
   aliyunDomains = [],
   aliyunDomainsLoading = false,
@@ -685,6 +693,28 @@ export default function SiteOpsConversationPanel({
   >(null);
   const [icpNumber, setIcpNumber] = useState("");
   const [activeVisualPage, setActiveVisualPage] = useState(1);
+  const [revisionText, setRevisionText] = useState("");
+  const [revisionFiles, setRevisionFiles] = useState<File[]>([]);
+  const [revisionProgress, setRevisionProgress] = useState<number[]>([]);
+  const [revisionSubmitting, setRevisionSubmitting] = useState(false);
+  const [revisionError, setRevisionError] = useState<string | null>(null);
+  const revisionPreviewUrls = useMemo(
+    () =>
+      revisionFiles.map((file) =>
+        typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+          ? URL.createObjectURL(file)
+          : null,
+      ),
+    [revisionFiles],
+  );
+  useEffect(
+    () => () => {
+      for (const url of revisionPreviewUrls) {
+        if (url) URL.revokeObjectURL(url);
+      }
+    },
+    [revisionPreviewUrls],
+  );
   const aliyunAuthorizationWindow = useRef<Window | null>(null);
   const aliyunFlowPhaseRef = useRef<AliyunFlowPhase>("idle");
   const aliyunFlowGenerationRef = useRef(0);
@@ -724,6 +754,18 @@ export default function SiteOpsConversationPanel({
       ) ?? latestAttempt
     );
   }, [latestAttempt, observation?.builds]);
+  const revisionImageHistory = useMemo(
+    () =>
+      (observation?.builds ?? [])
+        .flatMap((build) =>
+          (build.revisionInputs ?? []).map((asset) => ({
+            ...asset,
+            buildOrdinal: build.ordinal,
+          })),
+        )
+        .sort((left, right) => right.buildOrdinal - left.buildOrdinal),
+    [observation?.builds],
+  );
   const hasSuccessfulBuild = useMemo(
     () =>
       observation?.builds.some((build) =>
@@ -745,10 +787,11 @@ export default function SiteOpsConversationPanel({
         ]
       : [];
   }, [observation?.visualCandidatePages, observation?.visualCandidates]);
-  const usesStaticTemplateCatalog =
-    observation?.visualGeneration.workflowVersion === "2.8.0";
+  const usesStaticTemplateCatalog = ["2.8.0", "2.9.0"].includes(
+    observation?.visualGeneration.workflowVersion ?? "",
+  );
   const staticCatalogVersion = usesStaticTemplateCatalog
-    ? (observation.visualGeneration.catalogVersion ?? "2.8.0-pending")
+    ? (observation?.visualGeneration.catalogVersion ?? "static-catalog-pending")
     : null;
 
   useEffect(() => {
@@ -801,6 +844,79 @@ export default function SiteOpsConversationPanel({
       previewWindow.focus();
     } catch {
       setPreviewOpenError("预览标签页未能安全打开，请使用下方安全链接重试。");
+    }
+  }
+
+  function chooseRevisionFiles(files: File[]) {
+    const supported = new Set(["image/png", "image/jpeg", "image/webp"]);
+    if (files.length > 8) {
+      setRevisionError("一次最多上传 8 张图片。");
+      return;
+    }
+    if (files.some((file) => !supported.has(file.type))) {
+      setRevisionError("仅支持 PNG、JPEG 或 WebP 图片。");
+      return;
+    }
+    if (files.some((file) => file.size < 1 || file.size > 8 * 1024 * 1024)) {
+      setRevisionError("每张图片必须小于 8 MiB。");
+      return;
+    }
+    if (files.reduce((total, file) => total + file.size, 0) > 32 * 1024 * 1024) {
+      setRevisionError("本次图片总大小不能超过 32 MiB。");
+      return;
+    }
+    setRevisionFiles(files);
+    setRevisionProgress(files.map(() => 0));
+    setRevisionError(null);
+  }
+
+  function addRevisionFiles(files: File[]) {
+    const merged = [...revisionFiles];
+    for (const file of files) {
+      const duplicate = merged.some(
+        (candidate) =>
+          candidate.name === file.name &&
+          candidate.size === file.size &&
+          candidate.type === file.type &&
+          candidate.lastModified === file.lastModified,
+      );
+      if (!duplicate) merged.push(file);
+    }
+    chooseRevisionFiles(merged);
+  }
+
+  async function submitRevision(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const text = revisionText.trim();
+    if (!text || !onSubmitRevision || revisionSubmitting || interactionPending) {
+      return;
+    }
+    setRevisionSubmitting(true);
+    setRevisionError(null);
+    setRevisionProgress(revisionFiles.map(() => 0));
+    try {
+      await onSubmitRevision({
+        text,
+        files: revisionFiles,
+        onProgress: (fileIndex, percent) => {
+          setRevisionProgress((current) => {
+            const next = [...current];
+            next[fileIndex] = Math.max(0, Math.min(100, Math.round(percent)));
+            return next;
+          });
+        },
+      });
+      setRevisionText("");
+      setRevisionFiles([]);
+      setRevisionProgress([]);
+    } catch (revisionFailure) {
+      setRevisionError(
+        revisionFailure instanceof Error
+          ? customerFacingMessage(revisionFailure.message)
+          : "修改需求没有提交成功，请重试。",
+      );
+    } finally {
+      setRevisionSubmitting(false);
     }
   }
 
@@ -1342,8 +1458,14 @@ export default function SiteOpsConversationPanel({
     : rebuildRequestPending
       ? "重置申请处理中"
       : rebuildRequestActive && observation.rebuildRequest.resetApplied
-        ? "重置已批准，可从当前知识库重新开始"
+        ? "重置已批准，等待全新知识库"
         : "申请重置并全新开始";
+  const freshKnowledgeUploadRequired = Boolean(
+    observation.project.status === "draft" &&
+      observation.interactionState === "select_snapshot" &&
+      observation.rebuildRequest.resetApplied &&
+      observation.knowledgeSnapshots.length === 0,
+  );
   const hideExistingBuildDuringActiveRebuild = Boolean(
     rebuildRequestActive &&
       observation.rebuildRequest.resetApplied &&
@@ -1417,7 +1539,8 @@ export default function SiteOpsConversationPanel({
                 <p>提交后将由 FrontMind 人工受理；受理前不会改动当前官网。</p>
                 <ul>
                   <li>批准后，当前线上官网会进入下线流程。</li>
-                  <li>当前企业知识库会保留，并作为全新建站的资料来源。</li>
+                  <li>旧知识库版本不会作为全新建站的资料来源。</li>
+                  <li>批准后必须全新上传并发布知识库，才能开始新任务。</li>
                   <li>旧视觉方案和生成任务不会继续使用。</li>
                   <li>域名、备案和阿里云连接会保留。</li>
                 </ul>
@@ -1430,7 +1553,7 @@ export default function SiteOpsConversationPanel({
               value={rebuildReason}
               maxLength={2_000}
               rows={5}
-              placeholder="例如：希望保留当前企业知识库并重新生成官网。"
+              placeholder="例如：希望清空旧建站链路，并使用全新上传发布的知识库重新生成官网。"
               onChange={(event) => setRebuildReason(event.target.value)}
             />
           </label>
@@ -1495,14 +1618,16 @@ export default function SiteOpsConversationPanel({
               <div>
                 <h3 id="siteops-snapshot-title">从知识库开始建站</h3>
                 <p>
-                  FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。
+                  {freshKnowledgeUploadRequired
+                    ? "重置后的新任务不得复用旧知识库。请先前往知识库智能体，全新上传并发布知识库；完成后刷新本页。"
+                    : "FrontMind 只会读取当前重置边界之后全新上传并发布的企业知识库。"}
                 </p>
               </div>
             </div>
             <button
               type="button"
               className="siteops-primary-button"
-              disabled={interactionLocked}
+              disabled={interactionLocked || freshKnowledgeUploadRequired}
               onClick={() =>
                 runAction(
                   "select_snapshot",
@@ -1522,7 +1647,9 @@ export default function SiteOpsConversationPanel({
                   aria-hidden="true"
                 />
               )}
-              从知识库开始建站
+              {freshKnowledgeUploadRequired
+                ? "等待全新知识库发布"
+                : "从知识库开始建站"}
             </button>
           </section>
         )}
@@ -1959,6 +2086,19 @@ export default function SiteOpsConversationPanel({
           </div>
         )}
 
+      {!hideExistingBuildDuringActiveRebuild &&
+        latestAttempt &&
+        latestBuild?.previewUrl &&
+        latestAttempt.id !== latestBuild.id &&
+        ["preparing", "design_compiling", "building", "qa_running"].includes(
+          latestAttempt.status,
+        ) && (
+          <div className="siteops-notice warning" role="status">
+            <Clock3 size={18} aria-hidden="true" />
+            <span>修改版本正在生成；完成前继续保留并展示上一版预览。</span>
+          </div>
+        )}
+
       {latestBuild && !hideExistingBuildDuringActiveRebuild && (
         <section
           className="siteops-build-card"
@@ -1995,7 +2135,7 @@ export default function SiteOpsConversationPanel({
               !latestBuild.recoverable &&
               !latestBuild.previewUrl && (
                 <p>
-                  本次没有生成可安全展示的版本。可以申请重置；批准并完成旧站下线后，可从当前企业知识库重新开始建站。
+                  本次没有生成可安全展示的版本。可以申请重置；批准后需全新上传并发布知识库，再创建新的建站任务。
                 </p>
               )}
           </div>
@@ -2153,6 +2293,166 @@ export default function SiteOpsConversationPanel({
           </div>
         </section>
       )}
+
+      {onSubmitRevision &&
+        observation.visualGeneration.workflowVersion === "2.9.0" &&
+        latestBuild?.previewUrl &&
+        latestAttempt?.id === latestBuild.id &&
+        ["preview_ready", "approved"].includes(latestBuild.status) && (
+          <section
+            className="siteops-revision-composer"
+            aria-labelledby="siteops-revision-title"
+          >
+            <div>
+              <span>继续完善官网</span>
+              <h3 id="siteops-revision-title">告诉 FrontMind 需要怎么修改</h3>
+              <p>
+                当前预览会保留到新版本完成。可以补充文字要求，并上传最多 8
+                张图片。
+              </p>
+            </div>
+            <form
+              onSubmit={submitRevision}
+              onDragOver={(event) => {
+                if (event.dataTransfer.types.includes("Files")) {
+                  event.preventDefault();
+                }
+              }}
+              onDrop={(event) => {
+                if (event.dataTransfer.files.length < 1) return;
+                event.preventDefault();
+                addRevisionFiles(Array.from(event.dataTransfer.files));
+              }}
+            >
+              <label>
+                <span>修改要求</span>
+                <textarea
+                  value={revisionText}
+                  maxLength={20_000}
+                  rows={5}
+                  disabled={revisionSubmitting || interactionPending}
+                  placeholder="例如：把第一张产品图加入产品与服务页，保留现有配色和其他页面内容。"
+                  onChange={(event) => setRevisionText(event.target.value)}
+                  onPaste={(event) => {
+                    const pastedImages = Array.from(
+                      event.clipboardData.files,
+                    ).filter((file) => file.type.startsWith("image/"));
+                    if (pastedImages.length > 0) addRevisionFiles(pastedImages);
+                  }}
+                />
+              </label>
+              <div className="siteops-revision-file-control">
+                <label className="siteops-secondary-button">
+                  <ImagePlus size={16} aria-hidden="true" />
+                  选择图片
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    multiple
+                    disabled={revisionSubmitting || interactionPending}
+                    onChange={(event) => {
+                      addRevisionFiles(Array.from(event.target.files ?? []));
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                <span>
+                  可点击、拖放或粘贴；PNG / JPEG / WebP；单张 8 MiB，总计 32 MiB
+                </span>
+              </div>
+              {revisionFiles.length > 0 && (
+                <ul className="siteops-revision-files" aria-label="待上传图片">
+                  {revisionFiles.map((file, index) => (
+                    <li key={`${file.name}:${file.size}:${file.lastModified}`}>
+                      {revisionPreviewUrls[index] && (
+                        <img
+                          src={revisionPreviewUrls[index]!}
+                          alt={`${file.name} 本地预览`}
+                        />
+                      )}
+                      <div>
+                        <strong>{file.name}</strong>
+                        <span>
+                          {(file.size / 1024 / 1024).toFixed(2)} MiB
+                          {revisionSubmitting
+                            ? ` · ${revisionProgress[index] ?? 0}%`
+                            : ""}
+                        </span>
+                      </div>
+                      {!revisionSubmitting && (
+                        <button
+                          type="button"
+                          aria-label={`移除 ${file.name}`}
+                          onClick={() =>
+                            chooseRevisionFiles(
+                              revisionFiles.filter(
+                                (_candidate, candidateIndex) =>
+                                  candidateIndex !== index,
+                              ),
+                            )
+                          }
+                        >
+                          <X size={15} aria-hidden="true" />
+                        </button>
+                      )}
+                      {revisionSubmitting && (
+                        <progress
+                          max={100}
+                          value={revisionProgress[index] ?? 0}
+                          aria-label={`${file.name} 上传进度`}
+                        />
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {revisionImageHistory.length > 0 && (
+                <div className="siteops-revision-history">
+                  <strong>已用于历史修改版本的图片</strong>
+                  <ul>
+                    {revisionImageHistory.map((asset) => (
+                      <li
+                        key={`${asset.buildOrdinal}:${asset.publicPath}`}
+                        title={asset.publicPath}
+                      >
+                        第 {asset.buildOrdinal} 版 · {asset.filename}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {revisionError && (
+                <p className="siteops-revision-error" role="alert">
+                  {revisionError}
+                </p>
+              )}
+              <div className="siteops-revision-submit">
+                <button
+                  type="submit"
+                  className="siteops-primary-button"
+                  disabled={Boolean(
+                    !revisionText.trim() ||
+                      revisionSubmitting ||
+                      interactionPending,
+                  )}
+                >
+                  {revisionSubmitting && (
+                    <Loader2
+                      className="siteops-spin"
+                      size={15}
+                      aria-hidden="true"
+                    />
+                  )}
+                  {revisionSubmitting
+                    ? "正在提交修改"
+                    : revisionError
+                      ? "重试提交"
+                      : "生成修改版本"}
+                </button>
+              </div>
+            </form>
+          </section>
+        )}
 
       {currentSnapshotId &&
         ["preview_ready", "approved", "live"].includes(
