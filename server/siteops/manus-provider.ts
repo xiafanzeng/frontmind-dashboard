@@ -4943,12 +4943,12 @@ export function nativeSourcePrompt(input: {
     : "";
   const deliveryContract =
     input.contractVersion === 2
-      ? "Receipt 必须符合 Structured Output schema；archiveSha256 必须对应最终 ZIP；fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）。"
+      ? "Receipt 必须符合 Structured Output schema 且 preflightStatus=passed；archiveSha256 必须对应最终 ZIP；fileCount 必须填写最终 ZIP 的非目录文件条目数（不计目录项）。"
       : `交付前必须运行 ${NATIVE_SOURCE_PREFLIGHT_FILENAME} 并通过 package、文件类型、依赖、源码语法和 production build 自检。Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256、实际 fileCount、preflightVersion=${NATIVE_SOURCE_PREFLIGHT_VERSION}、preflightStatus=passed、preflightSha256=${NATIVE_SOURCE_PREFLIGHT_SHA256}。`;
   return promptWithMarker(
     `${systemPrompt}
 
-frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZIP 是唯一视觉与组件基线。不得采用附件之外的企业事实、媒体、依赖或外部资源。
+frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZIP 是唯一视觉与组件基线，baseSourceSha256=${input.baseSourceSha256}。不得采用附件之外的企业事实、媒体、依赖或外部资源。
 
 ${input.templateCoordinateInstruction ?? ""}
 
