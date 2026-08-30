@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   deliveryTicketEvents,
   deliveryTickets,
-  knowledgeBaseSnapshots,
   messages,
   siteBuilds,
   siteDeployments,
@@ -11,7 +10,6 @@ import {
   siteOperations,
   siteProjects,
   socialPackages,
-  users,
   visualCandidatePoolPages,
   visualCandidatePools,
   websiteStyleSampleBatches,
@@ -335,7 +333,7 @@ describe("SiteOps rebuild ticket coordinates", () => {
     ).toBe(false);
   });
 
-  it("reads the permanent fresh-root floor from the project without reviving completed tickets", async () => {
+  it("does not revive a completed reset from a legacy project snapshot floor", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
     const rows = [[], [{ minimumKnowledgeSnapshotVersion: 11 }]];
     let selectCall = 0;
@@ -367,16 +365,16 @@ describe("SiteOps rebuild ticket coordinates", () => {
       allowed: true,
       ticketId: null,
       status: null,
-      resetApplied: true,
+      resetApplied: false,
       resetPending: false,
-      minimumKnowledgeSnapshotVersion: 11,
+      minimumKnowledgeSnapshotVersion: null,
       resetSourceBuildId: null,
       acceptedForCurrentCycle: false,
     });
-    expect(selectCall).toBe(2);
+    expect(selectCall).toBe(1);
   });
 
-  it("keeps active ticket state while taking the reset floor from the project", async () => {
+  it("keeps active reset state without projecting a legacy snapshot floor", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
     const currentBuildId = "70000000-0000-4000-8000-000000000007";
     const activeNote = JSON.stringify({
@@ -385,6 +383,8 @@ describe("SiteOps rebuild ticket coordinates", () => {
       projectId,
       sourceBuildId: currentBuildId,
       knowledgeSnapshotId: "80000000-0000-4000-8000-000000000008",
+      resetAppliedAt: "2026-08-24T08:00:00.000Z",
+      resetAppliedProjectRevision: 12,
     });
     const rows = [
       [{ id: currentBuildId }],
@@ -428,11 +428,11 @@ describe("SiteOps rebuild ticket coordinates", () => {
       status: "submitted",
       resetApplied: true,
       resetPending: false,
-      minimumKnowledgeSnapshotVersion: 9,
+      minimumKnowledgeSnapshotVersion: null,
       resetSourceBuildId: currentBuildId,
-      acceptedForCurrentCycle: false,
+      acceptedForCurrentCycle: true,
     });
-    expect(selectCall).toBe(3);
+    expect(selectCall).toBe(2);
   });
 
   it("does not reconstruct a missing project floor from retained operations", async () => {
@@ -484,7 +484,7 @@ describe("SiteOps rebuild ticket coordinates", () => {
       resetSourceBuildId: null,
       acceptedForCurrentCycle: false,
     });
-    expect(selectCall).toBe(2);
+    expect(selectCall).toBe(1);
   });
 
   it("upgrades a production-shaped V2 build ticket to a stable project coordinate on resubmission", () => {
@@ -582,8 +582,6 @@ function fixture(options?: {
   ticketStatus?: string;
   resetOperation?: Record<string, unknown>;
   cancelCasFails?: boolean;
-  latestSnapshotVersion?: number | null;
-  userExists?: boolean;
 }) {
   const initialGlobalLiveDeploymentId = "50000000-0000-4000-8000-000000000005";
   const project = {
@@ -599,6 +597,7 @@ function fixture(options?: {
     status: "approved",
     revision: 12,
     knowledgeInputEpochId: null as string | null,
+    minimumKnowledgeSnapshotVersion: null as number | null,
     currentTaskStartedAt: new Date("2026-08-24T07:00:00.000Z"),
     updatedAt: new Date("2026-08-24T07:00:00.000Z"),
     ...options?.projectOverrides,
@@ -652,14 +651,6 @@ function fixture(options?: {
   const rowsFor = (table: unknown, fields?: Record<string, unknown>) => {
     if (table === siteProjects) return [project];
     if (table === siteBuilds) return [build];
-    if (table === users) {
-      return options?.userExists === false ? [] : [{ id: project.userId }];
-    }
-    if (table === knowledgeBaseSnapshots) {
-      return options?.latestSnapshotVersion === null
-        ? []
-        : [{ version: options?.latestSnapshotVersion ?? 7 }];
-    }
     if (table === deliveryTickets) return [ticket];
     if (table === siteOperations) {
       if (fields && "completedAt" in fields) {
@@ -896,20 +887,20 @@ describe("site rebuild reset approval", () => {
       resetExpectedProjectRevision: 12,
       resetEpochDecoupled: true,
       resetAppliedProjectRevision: 13,
-      minimumKnowledgeSnapshotVersion: 8,
+      minimumKnowledgeSnapshotVersion: 1,
       frozenReset: expect.objectContaining({
         expectedCurrentBuildId: buildId,
         expectedGlobalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
       }),
     });
     expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: null,
+      currentKnowledgeSnapshotId: snapshotId,
       currentBuildId: null,
       globalLiveDeploymentId: null,
       brief: null,
       status: "draft",
       revision: 13,
-      minimumKnowledgeSnapshotVersion: 8,
+      minimumKnowledgeSnapshotVersion: null,
       currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
       knowledgeInputEpochId: expect.stringMatching(
         /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
@@ -944,45 +935,8 @@ describe("site rebuild reset approval", () => {
     );
   });
 
-  it("sets the fresh-upload floor above the highest retained snapshot version", async () => {
-    const state = fixture({ latestSnapshotVersion: 41 });
-
-    const result = await approveSiteOpsRebuildTicket(state.tx, {
-      ticket: state.ticket,
-      actorUserId: 1,
-      now: new Date("2026-08-24T08:00:00.000Z"),
-    });
-
-    expect(JSON.parse(result!.internalNote)).toMatchObject({
-      minimumKnowledgeSnapshotVersion: 42,
-    });
-    expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: null,
-      minimumKnowledgeSnapshotVersion: 42,
-    });
-  });
-
-  it("requires the first newly published snapshot when no prior version exists", async () => {
-    const state = fixture({ latestSnapshotVersion: null });
-
-    const result = await approveSiteOpsRebuildTicket(state.tx, {
-      ticket: state.ticket,
-      actorUserId: 1,
-      now: new Date("2026-08-24T08:00:00.000Z"),
-    });
-
-    expect(JSON.parse(result!.internalNote)).toMatchObject({
-      minimumKnowledgeSnapshotVersion: 1,
-    });
-    expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: null,
-      minimumKnowledgeSnapshotVersion: 1,
-    });
-  });
-
-  it("never lowers an existing fresh-upload floor after retained rows are cleaned", async () => {
+  it("preserves the current snapshot and clears a legacy freshness floor", async () => {
     const state = fixture({
-      latestSnapshotVersion: 3,
       projectOverrides: { minimumKnowledgeSnapshotVersion: 17 },
     });
 
@@ -993,26 +947,11 @@ describe("site rebuild reset approval", () => {
     });
 
     expect(JSON.parse(result!.internalNote)).toMatchObject({
-      minimumKnowledgeSnapshotVersion: 17,
+      minimumKnowledgeSnapshotVersion: 1,
     });
-    expect(state.project.minimumKnowledgeSnapshotVersion).toBe(17);
-  });
-
-  it("fails closed when the account serialization row is missing", async () => {
-    const state = fixture({ userExists: false });
-
-    await expect(
-      approveSiteOpsRebuildTicket(state.tx, {
-        ticket: state.ticket,
-        actorUserId: 1,
-        now: new Date("2026-08-24T08:00:00.000Z"),
-      }),
-    ).rejects.toMatchObject({ code: "INVALID_TICKET" });
-
     expect(state.project).toMatchObject({
       currentKnowledgeSnapshotId: snapshotId,
-      currentBuildId: buildId,
-      revision: 12,
+      minimumKnowledgeSnapshotVersion: null,
     });
   });
 
@@ -1256,10 +1195,10 @@ describe("site rebuild reset approval", () => {
     expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
     expect(state.project).toMatchObject({
       currentBuildId: null,
-      currentKnowledgeSnapshotId: null,
+      currentKnowledgeSnapshotId: snapshotId,
       status: "draft",
       revision: 13,
-      minimumKnowledgeSnapshotVersion: 8,
+      minimumKnowledgeSnapshotVersion: null,
     });
   });
 
@@ -1364,8 +1303,8 @@ describe("site rebuild reset approval", () => {
       ]),
     );
     expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: null,
-      minimumKnowledgeSnapshotVersion: 8,
+      currentKnowledgeSnapshotId: snapshotId,
+      minimumKnowledgeSnapshotVersion: null,
     });
   });
 
@@ -1506,8 +1445,8 @@ describe("site rebuild reset approval", () => {
     expect(state.project).toMatchObject({
       revision: 13,
       currentBuildId: null,
-      currentKnowledgeSnapshotId: null,
-      minimumKnowledgeSnapshotVersion: 8,
+      currentKnowledgeSnapshotId: snapshotId,
+      minimumKnowledgeSnapshotVersion: null,
       status: "draft",
     });
     expect(state.inserts).toEqual([
@@ -1975,13 +1914,13 @@ describe("site rebuild reset approval", () => {
       projectRevision: 13,
     });
     expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: null,
+      currentKnowledgeSnapshotId: snapshotId,
       currentBuildId: null,
       globalLiveDeploymentId: null,
       mainlandLiveDeploymentId: null,
       canonicalHostname: null,
       currentTaskStartedAt: new Date("2026-08-24T08:00:00.000Z"),
-      minimumKnowledgeSnapshotVersion: 8,
+      minimumKnowledgeSnapshotVersion: null,
       brief: null,
       status: "draft",
       revision: 13,

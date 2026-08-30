@@ -1505,7 +1505,7 @@ describe("delivery execution authorization and settlement", () => {
             id: ticketId,
             status: "completed",
             publicSummary:
-              "官网重置已完成，旧知识库版本不会复用；客户需全新上传并发布知识库后再开始建站。",
+              "官网重置已完成，企业知识库保持不变；客户可从知识库开始建站。",
             quotaState: "consumed",
             quotaReleasedAt: null,
             technicalDedupeKey: null,

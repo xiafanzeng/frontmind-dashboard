@@ -1,7 +1,6 @@
 import { trpc } from "@/lib/trpc";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { httpBatchLink, httpLink, splitLink } from "@trpc/client";
-import { useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import superjson from "superjson";
 import App from "./App";
@@ -74,15 +73,6 @@ function credentialedFetch(input: RequestInfo | URL, init?: RequestInit) {
   });
 }
 
-function BootCompletionSignal() {
-  useEffect(() => {
-    // The static HTML shell owns the loading watchdog. Signal only after React
-    // commits its first frame, so a stalled render still exposes recovery UI.
-    window.dispatchEvent(new Event("frontmind:booted"));
-  }, []);
-  return null;
-}
-
 // ============================================================
 // Version check on focus (Stale-While-Revalidate pattern)
 //
@@ -127,7 +117,6 @@ createRoot(rootElement).render(
   <trpc.Provider client={trpcClient} queryClient={queryClient}>
     <QueryClientProvider client={queryClient}>
       <AuthSessionProvider>
-        <BootCompletionSignal />
         <App />
       </AuthSessionProvider>
     </QueryClientProvider>

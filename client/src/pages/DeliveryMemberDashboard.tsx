@@ -279,7 +279,7 @@ function siteRebuildResetIssueCopy(issue: SiteRebuildResetIssue | null) {
 function focusedSiteRebuildStatus(ticket: unknown) {
   const reset = siteRebuildResetProjection(ticket);
   if (reset.state === "completed") {
-    return "当前需求状态：旧官网已下线，旧知识库版本不会复用；客户需全新上传并发布知识库后再开始建站。";
+    return "当前需求状态：旧官网已下线，企业知识库保持不变；客户可点击“从知识库开始建站”。";
   }
   if (reset.state === "queued") {
     return "当前需求状态：正在完成官网重置，旧官网已进入安全下线队列。";
@@ -2572,7 +2572,7 @@ function DeliveryTicketActions({
       await onDone();
       toast.success("官网重置需求已通过", {
         description:
-          "旧官网正在安全下线；旧知识库版本不会用于新任务。客户需全新上传并发布知识库后再开始建站。",
+          "旧官网正在安全下线；企业知识库保持不变。完成后客户可点击“从知识库开始建站”。",
       });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "通过重置需求失败");
@@ -2586,7 +2586,7 @@ function DeliveryTicketActions({
         <div className="mt-3 rounded-xl border bg-muted/25 px-4 py-3 text-sm leading-6">
           <strong>重置需求已通过</strong>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            旧官网已下线；旧知识库版本不会复用，客户需全新上传并发布知识库后再开始建站。
+            旧官网已下线；企业知识库保持不变，客户可点击“从知识库开始建站”。
           </p>
         </div>
       );
@@ -2677,7 +2677,7 @@ function DeliveryTicketActions({
               <DialogDescription>
                 {recheck
                   ? "确认后，系统会检查同一重置任务的真实外部状态；不会重复执行已经确认的下线步骤。"
-                  : "确认后，旧官网将进入安全下线流程；当前官网轮次将重置，旧知识库版本不会复用。客户需全新上传并发布知识库后，才能创建全新官网任务。"}
+                  : "确认后，旧官网将进入安全下线流程；下线确认完成后，当前官网轮次将重置，企业知识库保持不变，客户可点击“从知识库开始建站”创建全新官网任务。"}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

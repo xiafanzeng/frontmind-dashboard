@@ -1,22 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import {
-  and,
-  asc,
-  desc,
-  eq,
-  gte,
-  inArray,
-  isNull,
-  like,
-  max,
-  or,
-} from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, like, max, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   deliveryProjectAssignments,
   deliveryTicketEvents,
   deliveryTickets,
-  knowledgeBaseSnapshots,
   messages,
   serviceQuotaPeriods,
   siteBuilds,
@@ -979,7 +967,7 @@ export async function loadSiteOpsRebuildRequest(
         deliveryTickets.technicalDedupeKey,
         siteOpsRebuildProjectDedupeKey(input.projectId),
       );
-  const [buildRows, ticketRows, projectRows] = await Promise.all([
+  const [buildRows, ticketRows] = await Promise.all([
     input.currentBuildId
       ? executor
           .select()
@@ -1010,28 +998,10 @@ export async function loadSiteOpsRebuildRequest(
       )
       .orderBy(asc(deliveryTickets.createdAt))
       .limit(1),
-    executor
-      .select({
-        minimumKnowledgeSnapshotVersion:
-          siteProjects.minimumKnowledgeSnapshotVersion,
-      })
-      .from(siteProjects)
-      .where(
-        and(
-          eq(siteProjects.id, input.projectId),
-          eq(siteProjects.userId, input.userId),
-        ),
-      )
-      .limit(1),
   ]);
   const ticket = ticketRows[0];
   const activeNote = parseSiteOpsRebuildNote(ticket?.internalNote);
-  const minimumKnowledgeSnapshotVersion =
-    projectRows[0]?.minimumKnowledgeSnapshotVersion ??
-    siteOpsRebuildMinimumSnapshotVersion(ticket?.internalNote);
-  const resetApplied =
-    minimumKnowledgeSnapshotVersion !== null ||
-    siteOpsRebuildResetApplied(ticket?.internalNote);
+  const resetApplied = siteOpsRebuildResetApplied(ticket?.internalNote);
   const disposition = siteOpsRebuildRequestDisposition({
     hasWorkflowProgress:
       input.hasWorkflowProgress ??
@@ -1045,11 +1015,12 @@ export async function loadSiteOpsRebuildRequest(
     status: ticket?.status ?? null,
     resetApplied,
     resetPending: siteOpsRebuildResetPending(ticket?.internalNote),
-    minimumKnowledgeSnapshotVersion,
+    // Kept in the public projection for older clients only. Snapshot floors
+    // are no longer a SiteOps runtime boundary.
+    minimumKnowledgeSnapshotVersion: null,
     resetSourceBuildId: activeNote?.sourceBuildId ?? null,
     acceptedForCurrentCycle: siteOpsRebuildAcceptedForCurrentCycle({
-      // A completed ticket contributes only the permanent isolation floor.
-      // It must never authorize another child build after its cycle closed.
+      // Only an active ticket may authorize work in its exact build cycle.
       internalNote: ticket?.internalNote,
       currentBuildId: input.currentBuildId,
     }),
@@ -1469,7 +1440,6 @@ async function applyFreshLocalResetEpoch(
     ticketId: string;
     project: typeof siteProjects.$inferSelect;
     expectedRevision: number;
-    minimumKnowledgeSnapshotVersion: number;
     knowledgeInputEpochId: string;
     resetEpochStartedAt: Date;
     now: Date;
@@ -1483,14 +1453,14 @@ async function applyFreshLocalResetEpoch(
   const projectUpdate = await tx
     .update(siteProjects)
     .set({
-      currentKnowledgeSnapshotId: null,
+      currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
       currentBuildId: null,
       globalLiveDeploymentId: null,
       mainlandLiveDeploymentId: null,
       canonicalHostname: null,
       knowledgeInputEpochId: input.knowledgeInputEpochId,
       currentTaskStartedAt: input.resetEpochStartedAt,
-      minimumKnowledgeSnapshotVersion: input.minimumKnowledgeSnapshotVersion,
+      minimumKnowledgeSnapshotVersion: null,
       brief: null,
       status: "draft",
       revision: nextRevision,
@@ -1641,8 +1611,7 @@ async function applyFreshLocalResetEpoch(
     conversationId: input.project.conversationId,
     userId: input.project.userId,
     role: "assistant",
-    content:
-      "官网重置已完成，旧知识库版本不会复用。请全新上传并发布一份知识库，再创建全新建站任务。旧官网的外部下线确认将在后台继续。",
+    content: "重置已批准，可从当前知识库重新开始",
     sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
     metadata: {
       siteOps: {
@@ -1652,7 +1621,7 @@ async function applyFreshLocalResetEpoch(
         status: "active",
         payload: {
           rebuildTicketId: input.ticketId,
-          requested: "fresh_knowledge_upload",
+          requested: "reuse_current_knowledge",
           reset: true,
           freshRootApplied: true,
           unpublishCompleted: false,
@@ -2084,57 +2053,15 @@ export async function approveSiteOpsRebuildTicket(
         ),
       );
   }
-  // Use the same account-row serialization boundary as knowledge publication
-  // before allocating the next accepted snapshot version. Include archived
-  // versions so restoring an old row to active can never cross the reset.
-  const lockedUserRows = await tx
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.id, project.userId))
-    .limit(1)
-    .for("update");
-  if (!lockedUserRows[0]) {
-    throw new SiteOpsRebuildTicketError(
-      "INVALID_TICKET",
-      "当前客户账号已不可用，未启动官网重置。",
-    );
-  }
-  const latestSnapshotRows = await tx
-    .select({ version: knowledgeBaseSnapshots.version })
-    .from(knowledgeBaseSnapshots)
-    .where(eq(knowledgeBaseSnapshots.userId, project.userId))
-    .orderBy(desc(knowledgeBaseSnapshots.version))
-    .limit(1)
-    .for("update");
-  const latestSnapshotVersion = Number(latestSnapshotRows[0]?.version ?? 0);
-  const existingSnapshotFloor = Number(
-    project.minimumKnowledgeSnapshotVersion ?? 1,
-  );
-  if (
-    !Number.isSafeInteger(latestSnapshotVersion) ||
-    latestSnapshotVersion < 0 ||
-    latestSnapshotVersion >= 2_147_483_647 ||
-    !Number.isSafeInteger(existingSnapshotFloor) ||
-    existingSnapshotFloor < 1 ||
-    existingSnapshotFloor > 2_147_483_647
-  ) {
-    throw new SiteOpsRebuildTicketError(
-      "INVALID_TICKET",
-      "当前知识库版本坐标无效，未启动官网重置。",
-    );
-  }
-  // Never lower a previously established floor if retained rows were cleaned
-  // up or repaired after an earlier reset.
-  const minimumKnowledgeSnapshotVersion = Math.max(
-    existingSnapshotFloor,
-    latestSnapshotVersion + 1,
-  );
+  // V4/V5 keep this positive coordinate only for compatibility with already
+  // persisted tickets and provider results. It is not a knowledge freshness
+  // floor: SiteOps resets preserve the account's current active snapshot.
+  const minimumKnowledgeSnapshotVersion = 1;
   const preservedBuildId = project.currentBuildId ?? existingNote.sourceBuildId;
   await applyFreshLocalResetEpoch(tx, {
     ticketId: input.ticket.id,
     project: frozenProject as typeof siteProjects.$inferSelect,
     expectedRevision: frozenProject.revision,
-    minimumKnowledgeSnapshotVersion,
     knowledgeInputEpochId,
     resetEpochStartedAt,
     now,
@@ -2866,7 +2793,7 @@ export async function finalizeApprovedSiteOpsReset(
       .set({
         status: "completed",
         publicSummary:
-          "官网本地重置与旧网站外部下线均已完成；旧知识库版本不会用于新任务，客户需全新上传并发布知识库。",
+          "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可创建全新官网任务。",
         internalNote: JSON.stringify(appliedNote),
         quotaState: "consumed",
         technicalDedupeKey: null,
@@ -2892,7 +2819,7 @@ export async function finalizeApprovedSiteOpsReset(
       kind: "delivery_result",
       visibility: "customer",
       message:
-        "旧官网外部下线确认完成；请全新上传并发布知识库后再开始新的建站任务。",
+        "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可创建全新官网任务。",
       fromStatus: priorTicketStatus,
       toStatus: "completed",
       actorContext: {
@@ -3177,7 +3104,7 @@ export async function finalizeApprovedSiteOpsReset(
     .set({
       status: "completed",
       publicSummary:
-        "旧网站已安全下线，官网重置已完成；企业知识库保持不变，可创建全新的根建站任务。",
+        "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可创建全新官网任务。",
       internalNote: JSON.stringify(appliedNote),
       quotaState: "consumed",
       technicalDedupeKey: null,
@@ -3203,7 +3130,7 @@ export async function finalizeApprovedSiteOpsReset(
     kind: "delivery_result",
     visibility: "customer",
     message:
-      "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可创建全新官网根任务。",
+      "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可创建全新官网任务。",
     fromStatus: priorTicketStatus,
     toStatus: "completed",
     actorContext: {

@@ -50,7 +50,7 @@ import {
 import {
   getDashboardWorkspace,
   getKnowledgeSnapshotById,
-  getLatestKnowledgeSnapshotForSiteOpsInput,
+  getLatestKnowledgeSnapshot,
 } from "./dashboard-service";
 import {
   downloadArchiveBytes,
@@ -6176,7 +6176,7 @@ router.post("/start/reserve", async (req, res) => {
     const newBuildPolicy = knowledgeBaseNewBuildPolicyBinding();
     const [prefillKnowledgeSnapshot, latestSkillDescriptor] = await Promise.all(
       [
-        getLatestKnowledgeSnapshotForSiteOpsInput(req.frontmindUser.id),
+        getLatestKnowledgeSnapshot(req.frontmindUser.id),
         getKnowledgeBaseSkillDescriptor({
           version: newBuildPolicy.skillVersion,
           contentHash: newBuildPolicy.skillContentHash,

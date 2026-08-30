@@ -242,6 +242,26 @@ function Router() {
   );
 }
 
+export function WorkspaceLoadingState() {
+  return (
+    <div
+      className="flex min-h-[100dvh] items-center justify-center bg-background"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
+        <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-muted">
+          <Loader2
+            className="h-5 w-5 animate-spin text-primary"
+            aria-hidden="true"
+          />
+        </div>
+        正在打开工作空间
+      </div>
+    </div>
+  );
+}
+
 /**
  * Inner app shell that has access to ConversationProvider context.
  * Activates the resume-polling hook so that conversations stuck in
@@ -253,18 +273,7 @@ function AppShell({ resumePolling = true }: { resumePolling?: boolean }) {
   return (
     <>
       {resumePolling && <ConversationResumePolling />}
-      <Suspense
-        fallback={
-          <div className="flex min-h-[100dvh] items-center justify-center bg-background">
-            <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
-              <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                <Loader2 className="h-5 w-5 animate-spin" />
-              </div>
-              正在载入工作空间
-            </div>
-          </div>
-        }
-      >
+      <Suspense fallback={<WorkspaceLoadingState />}>
         <Router />
       </Suspense>
     </>
@@ -280,16 +289,7 @@ export function AuthBoundary() {
   const { user, loading, error, refresh } = useAuth();
 
   if (loading) {
-    return (
-      <div className="flex min-h-[100dvh] items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-            <Loader2 className="h-5 w-5 animate-spin" />
-          </div>
-          正在打开工作空间
-        </div>
-      </div>
-    );
+    return <WorkspaceLoadingState />;
   }
 
   if (!user && error) {

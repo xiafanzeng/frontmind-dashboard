@@ -7,7 +7,7 @@ const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
 const INFRASTRUCTURE_TERM =
   /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|(?:access|refresh)\s*token|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu;
 const FRESH_RESET_MESSAGE =
-  "本次没有生成可安全展示的版本；可申请重置，批准后需全新上传并发布知识库再开始。";
+  "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。";
 
 const PUBLIC_BUILD_ERROR_COPY: Readonly<Record<string, string>> = {
   FRONTMIND_BUILD_REQUEST_INVALID: FRESH_RESET_MESSAGE,

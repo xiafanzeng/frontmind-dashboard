@@ -27,7 +27,6 @@ import {
   localAssets,
   messages,
   providerFileLeases,
-  siteProjects,
   upstreamResources,
   type ConversationTurn,
   type KnowledgeBaseBuild,
@@ -831,8 +830,8 @@ export interface ReserveKnowledgeBaseStartBuildInput {
   requestPayload: Record<string, unknown>;
   recoveryMetadata: Record<string, unknown>;
   /**
-   * Snapshot selected by the start API. For a 2.9 SiteOps project this must
-   * belong to the exact opaque input epoch copied into the new build.
+   * Account-owned active snapshot selected by the start API for optional
+   * prefill. SiteOps task lineage does not constrain knowledge-base reuse.
    */
   prefillSnapshotId?: string | null;
   /**
@@ -5168,10 +5167,10 @@ export async function reserveKnowledgeBaseStartBuild(
 
   return db.transaction(async (tx: any) => {
     // Global mutation lock order is credential -> current owner slot ->
-    // knowledge reset state -> SiteOps project epoch -> start attachment
-    // ownership -> active reset tombstone -> retained reset tombstone -> build
-    // -> turn. Locking every requested upload here closes the discard/start
-    // race across processes and database replicas.
+    // knowledge reset state -> start attachment ownership -> active reset
+    // tombstone -> retained reset tombstone -> build -> turn. Locking every
+    // requested upload here closes the discard/start race across processes
+    // and database replicas.
     const pinnedCredential = await lockKnowledgeBaseReservationCredential(
       tx,
       input.apiCredentialId ?? null,
@@ -5217,64 +5216,46 @@ export async function reserveKnowledgeBaseStartBuild(
         "知识库已完成重置，请清空旧资料后重新开始",
       );
     }
-    // Serialize with SiteOps reset approval and copy its opaque epoch into the
-    // immutable build reservation. A pre-reset request that wins this lock
-    // keeps the old/null epoch; approval then rotates the project epoch, so a
-    // delayed publication can never qualify as fresh based on timestamp alone.
-    const siteProjectRows = await tx
-      .select({ knowledgeInputEpochId: siteProjects.knowledgeInputEpochId })
-      .from(siteProjects)
-      .where(eq(siteProjects.userId, input.userId))
-      .limit(1)
-      .for("update");
-    const siteOpsKnowledgeInputEpochId =
-      siteProjectRows[0]?.knowledgeInputEpochId ?? null;
-    if (siteOpsKnowledgeInputEpochId) {
-      const recoveryIncludesPrefill =
-        input.recoveryMetadata.includePrefill === true;
-      if (recoveryIncludesPrefill !== Boolean(prefillSnapshotId)) {
+    const recoveryIncludesPrefill =
+      input.recoveryMetadata.includePrefill === true;
+    if (recoveryIncludesPrefill !== Boolean(prefillSnapshotId)) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        "Knowledge-base start prefill attachment ledger is inconsistent",
+      );
+    }
+    if (input.deferDispatchUntilAttachments === true) {
+      const expectedGeneratedAttachmentCount =
+        (input.userAttachmentCount ?? 0) + 2 + (prefillSnapshotId ? 1 : 0);
+      if (input.expectedAttachmentCount !== expectedGeneratedAttachmentCount) {
         throw new KnowledgeBaseTurnReservationError(
           "INVALID_REQUEST",
-          "Knowledge-base start prefill attachment ledger is inconsistent",
+          "Knowledge-base start generated attachment count is inconsistent",
         );
       }
-      if (input.deferDispatchUntilAttachments === true) {
-        const expected2_9AttachmentCount =
-          (input.userAttachmentCount ?? 0) + 2 + (prefillSnapshotId ? 1 : 0);
-        if (input.expectedAttachmentCount !== expected2_9AttachmentCount) {
-          throw new KnowledgeBaseTurnReservationError(
-            "INVALID_REQUEST",
-            "Knowledge-base start generated attachment count is inconsistent",
-          );
-        }
-      }
-      if (prefillSnapshotId) {
-        const snapshotRows = (await tx
-          .select({
-            id: knowledgeBaseSnapshots.id,
-            userId: knowledgeBaseSnapshots.userId,
-            siteOpsKnowledgeInputEpochId:
-              knowledgeBaseSnapshots.siteOpsKnowledgeInputEpochId,
-          })
-          .from(knowledgeBaseSnapshots)
-          .where(eq(knowledgeBaseSnapshots.id, prefillSnapshotId))
-          .limit(1)) as Array<{
-          id: string;
-          userId: number;
-          siteOpsKnowledgeInputEpochId: string | null;
-        }>;
-        const snapshot = snapshotRows[0];
-        if (
-          !snapshot ||
-          snapshot.id !== prefillSnapshotId ||
-          snapshot.userId !== input.userId ||
-          snapshot.siteOpsKnowledgeInputEpochId !== siteOpsKnowledgeInputEpochId
-        ) {
-          throw new KnowledgeBaseTurnReservationError(
-            "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
-            "知识库已完成重置，请从本轮全新资料重新开始",
-          );
-        }
+    }
+    if (prefillSnapshotId) {
+      const snapshotRows = (await tx
+        .select({
+          id: knowledgeBaseSnapshots.id,
+          userId: knowledgeBaseSnapshots.userId,
+        })
+        .from(knowledgeBaseSnapshots)
+        .where(eq(knowledgeBaseSnapshots.id, prefillSnapshotId))
+        .limit(1)) as Array<{
+        id: string;
+        userId: number;
+      }>;
+      const snapshot = snapshotRows[0];
+      if (
+        !snapshot ||
+        snapshot.id !== prefillSnapshotId ||
+        snapshot.userId !== input.userId
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+          "知识库已完成重置，请从本轮全新资料重新开始",
+        );
       }
     }
     const startAttachmentResources = await lockKnowledgeBaseStartAttachments({
@@ -5334,7 +5315,7 @@ export async function reserveKnowledgeBaseStartBuild(
         id: candidateBuildId,
         userId: input.userId,
         conversationId,
-        siteOpsKnowledgeInputEpochId,
+        siteOpsKnowledgeInputEpochId: null,
         companyName,
         companyWebsite,
         skillName,
@@ -5387,15 +5368,6 @@ export async function reserveKnowledgeBaseStartBuild(
       throw new KnowledgeBaseTurnReservationError(
         "BUILD_NOT_FOUND",
         "Knowledge-base build could not be reserved",
-      );
-    }
-    if (
-      siteOpsKnowledgeInputEpochId &&
-      build.siteOpsKnowledgeInputEpochId !== siteOpsKnowledgeInputEpochId
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
-        "知识库已完成重置，请从本轮全新资料重新开始",
       );
     }
     if (

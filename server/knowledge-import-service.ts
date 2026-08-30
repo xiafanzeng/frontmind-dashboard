@@ -4,7 +4,6 @@ import { z } from "zod";
 
 import {
   knowledgeImportReceipts,
-  siteProjects,
   websiteUserProvisions,
 } from "../drizzle/schema";
 import {
@@ -323,18 +322,6 @@ async function reserveReceipt(input: {
   const keyHash = idempotencyHash(input.idempotencyKey);
   return db.transaction(async (tx) => {
     await lockActiveKnowledgeImportProject(tx, input.projectId);
-    // Serialize with SiteOps reset approval. The epoch is never supplied by
-    // the caller: a delayed pre-reset receipt retains its old/null coordinate
-    // and therefore cannot become valid merely by completing in the same
-    // TIMESTAMP(0) second as approval.
-    const siteProjectRows = await tx
-      .select({ knowledgeInputEpochId: siteProjects.knowledgeInputEpochId })
-      .from(siteProjects)
-      .where(eq(siteProjects.userId, input.userId))
-      .limit(1)
-      .for("update");
-    const siteOpsKnowledgeInputEpochId =
-      siteProjectRows[0]?.knowledgeInputEpochId ?? null;
     const rows = await tx
       .select()
       .from(knowledgeImportReceipts)
@@ -498,7 +485,7 @@ async function reserveReceipt(input: {
         idempotencyKeyHash: keyHash,
         artifactHash: knowledgeImportArtifactSha256(input.value).toLowerCase(),
         sourceFileName: knowledgeImportFilename(input.value),
-        siteOpsKnowledgeInputEpochId,
+        siteOpsKnowledgeInputEpochId: null,
         status: "processing",
         attemptCount: 1,
         revision: 1,

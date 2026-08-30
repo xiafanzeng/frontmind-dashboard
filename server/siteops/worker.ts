@@ -424,7 +424,7 @@ export function knownSiteOpsBuildFailure(
     message:
       error instanceof Error && error.message.trim()
         ? error.message
-        : "本次没有生成可安全展示的版本；可申请重置，批准后需全新上传并发布知识库再开始。",
+        : "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
   };
 }
 

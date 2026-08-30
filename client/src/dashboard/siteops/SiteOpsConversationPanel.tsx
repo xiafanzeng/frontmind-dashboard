@@ -861,7 +861,10 @@ export default function SiteOpsConversationPanel({
       setRevisionError("每张图片必须小于 8 MiB。");
       return;
     }
-    if (files.reduce((total, file) => total + file.size, 0) > 32 * 1024 * 1024) {
+    if (
+      files.reduce((total, file) => total + file.size, 0) >
+      32 * 1024 * 1024
+    ) {
       setRevisionError("本次图片总大小不能超过 32 MiB。");
       return;
     }
@@ -888,7 +891,12 @@ export default function SiteOpsConversationPanel({
   async function submitRevision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = revisionText.trim();
-    if (!text || !onSubmitRevision || revisionSubmitting || interactionPending) {
+    if (
+      !text ||
+      !onSubmitRevision ||
+      revisionSubmitting ||
+      interactionPending
+    ) {
       return;
     }
     setRevisionSubmitting(true);
@@ -1458,14 +1466,8 @@ export default function SiteOpsConversationPanel({
     : rebuildRequestPending
       ? "重置申请处理中"
       : rebuildRequestActive && observation.rebuildRequest.resetApplied
-        ? "重置已批准，等待全新知识库"
+        ? "重置已批准，可从当前知识库重新开始"
         : "申请重置并全新开始";
-  const freshKnowledgeUploadRequired = Boolean(
-    observation.project.status === "draft" &&
-      observation.interactionState === "select_snapshot" &&
-      observation.rebuildRequest.resetApplied &&
-      observation.knowledgeSnapshots.length === 0,
-  );
   const hideExistingBuildDuringActiveRebuild = Boolean(
     rebuildRequestActive &&
       observation.rebuildRequest.resetApplied &&
@@ -1539,8 +1541,7 @@ export default function SiteOpsConversationPanel({
                 <p>提交后将由 FrontMind 人工受理；受理前不会改动当前官网。</p>
                 <ul>
                   <li>批准后，当前线上官网会进入下线流程。</li>
-                  <li>旧知识库版本不会作为全新建站的资料来源。</li>
-                  <li>批准后必须全新上传并发布知识库，才能开始新任务。</li>
+                  <li>当前企业知识库会保留，并作为全新建站的资料来源。</li>
                   <li>旧视觉方案和生成任务不会继续使用。</li>
                   <li>域名、备案和阿里云连接会保留。</li>
                 </ul>
@@ -1553,7 +1554,7 @@ export default function SiteOpsConversationPanel({
               value={rebuildReason}
               maxLength={2_000}
               rows={5}
-              placeholder="例如：希望清空旧建站链路，并使用全新上传发布的知识库重新生成官网。"
+              placeholder="例如：希望保留当前企业知识库并重新生成官网。"
               onChange={(event) => setRebuildReason(event.target.value)}
             />
           </label>
@@ -1618,16 +1619,14 @@ export default function SiteOpsConversationPanel({
               <div>
                 <h3 id="siteops-snapshot-title">从知识库开始建站</h3>
                 <p>
-                  {freshKnowledgeUploadRequired
-                    ? "重置后的新任务不得复用旧知识库。请先前往知识库智能体，全新上传并发布知识库；完成后刷新本页。"
-                    : "FrontMind 只会读取当前重置边界之后全新上传并发布的企业知识库。"}
+                  FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。
                 </p>
               </div>
             </div>
             <button
               type="button"
               className="siteops-primary-button"
-              disabled={interactionLocked || freshKnowledgeUploadRequired}
+              disabled={interactionLocked}
               onClick={() =>
                 runAction(
                   "select_snapshot",
@@ -1647,9 +1646,7 @@ export default function SiteOpsConversationPanel({
                   aria-hidden="true"
                 />
               )}
-              {freshKnowledgeUploadRequired
-                ? "等待全新知识库发布"
-                : "从知识库开始建站"}
+              从知识库开始建站
             </button>
           </section>
         )}
@@ -2135,7 +2132,7 @@ export default function SiteOpsConversationPanel({
               !latestBuild.recoverable &&
               !latestBuild.previewUrl && (
                 <p>
-                  本次没有生成可安全展示的版本。可以申请重置；批准后需全新上传并发布知识库，再创建新的建站任务。
+                  本次没有生成可安全展示的版本。可以申请重置；批准并完成旧站下线后，可从当前企业知识库重新开始建站。
                 </p>
               )}
           </div>

@@ -1785,7 +1785,7 @@ async function searchFamilyRound(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉检索已超时；可申请重置，批准后需全新上传并发布知识库再开始。",
+        "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
       );
     }
     const composedQuery = composeFamilySearchQuery({
@@ -2159,7 +2159,7 @@ async function mirrorCandidates(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉预览镜像已超时；可申请重置，批准后需全新上传并发布知识库再开始。",
+        "视觉预览镜像已超时；可申请重置，批准后可从当前企业知识库重新开始。",
       );
     }
     const batch = input.candidates.slice(offset, offset + MIRROR_CONCURRENCY);
@@ -2178,7 +2178,7 @@ async function mirrorCandidates(input: {
           if (input.signal.aborted) {
             throw new TwentyFirstProviderFailure(
               "VISUAL_SEARCH_TIMEOUT",
-              "视觉预览镜像已超时；可申请重置，批准后需全新上传并发布知识库再开始。",
+              "视觉预览镜像已超时；可申请重置，批准后可从当前企业知识库重新开始。",
             );
           }
           rejectDiagnostic(input.diagnostics, previewRejectionReason(error));

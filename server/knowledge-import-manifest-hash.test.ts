@@ -4,7 +4,6 @@ import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   knowledgeImportReceipts,
-  siteProjects,
   websiteProjectDeletionTombstones,
 } from "../drizzle/schema";
 import { buildWebsiteKnowledgeImportV4Fixture } from "./__testutils__/website-knowledge-import-archive";
@@ -96,7 +95,6 @@ function importDatabase(
     companyName: string;
     status: string;
   } = { userId: 7, companyName: "示例企业", status: "completed" },
-  siteOpsKnowledgeInputEpochId: string | null = null,
 ) {
   const receiptInserts: Record<string, unknown>[] = [];
   const txUpdate = {
@@ -108,11 +106,7 @@ function importDatabase(
       from: (table: unknown) =>
         table === websiteProjectDeletionTombstones
           ? queryResult([{ status: "active" }])
-          : table === siteProjects
-            ? queryResult([
-                { knowledgeInputEpochId: siteOpsKnowledgeInputEpochId },
-              ])
-            : queryResult(transactionResults.shift() ?? []),
+          : queryResult(transactionResults.shift() ?? []),
     }),
     insert: (table: unknown) => ({
       values:
@@ -278,13 +272,8 @@ describe("website knowledge import v5 local artifact binding", () => {
     ).toBe(false);
   });
 
-  it("copies the locked SiteOps epoch into a new import receipt", async () => {
-    const knowledgeInputEpochId = "64000000-0000-4000-8000-000000000001";
-    const database = importDatabase(
-      undefined,
-      undefined,
-      knowledgeInputEpochId,
-    );
+  it("keeps a new import receipt independent from SiteOps lineage", async () => {
+    const database = importDatabase();
     mocks.getDb.mockResolvedValue(database);
 
     await importWebsiteKnowledgeArtifact({
@@ -295,7 +284,7 @@ describe("website knowledge import v5 local artifact binding", () => {
 
     expect(database.receiptInserts).toEqual([
       expect.objectContaining({
-        siteOpsKnowledgeInputEpochId: knowledgeInputEpochId,
+        siteOpsKnowledgeInputEpochId: null,
       }),
     ]);
   });

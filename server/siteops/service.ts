@@ -21,8 +21,6 @@ import {
   apiCredentials,
   conversations,
   conversationTurns,
-  knowledgeBaseBuilds,
-  knowledgeImportReceipts,
   knowledgeBaseSnapshots,
   localAssets,
   messages,
@@ -2189,199 +2187,38 @@ const siteOpsObservationFlights = new Map<string, Promise<unknown>>();
 
 type SiteOpsKnowledgeSnapshotCandidate = Pick<
   typeof knowledgeBaseSnapshots.$inferSelect,
-  | "id"
-  | "version"
-  | "status"
-  | "archiveHash"
-  | "sourceBuildId"
-  | "sourceTaskId"
-  | "siteOpsKnowledgeInputEpochId"
-  | "createdAt"
+  "status" | "archiveHash"
 >;
 
-type SiteOpsKnowledgeResetProvenance = {
-  freshBuildIds: ReadonlySet<string>;
-  freshImportSnapshotIds: ReadonlySet<string>;
-};
-
 /**
- * A post-reset version floor alone is not a fresh-input boundary: a build or
- * website-import reservation created before approval could finish afterwards
- * and receive the next snapshot version. New 2.9 reset cycles therefore bind
- * the project, source reservation and derived snapshot to one opaque UUID.
- * Historical null epochs retain their timestamp compatibility path only.
+ * SiteOps consumes the account's current published knowledge base. Website
+ * task epochs isolate builds, revisions and local assets; they do not make an
+ * otherwise active knowledge snapshot stale.
  */
 export function siteOpsKnowledgeSnapshotSelectableForProject(input: {
   snapshot: SiteOpsKnowledgeSnapshotCandidate;
-  project: Pick<
+  project?: Pick<
     typeof siteProjects.$inferSelect,
     | "minimumKnowledgeSnapshotVersion"
     | "knowledgeInputEpochId"
     | "currentTaskStartedAt"
   >;
-  provenance: SiteOpsKnowledgeResetProvenance;
+  provenance?: {
+    freshBuildIds: ReadonlySet<string>;
+    freshImportSnapshotIds: ReadonlySet<string>;
+  };
 }) {
-  const minimumVersion = input.project.minimumKnowledgeSnapshotVersion ?? 1;
-  if (
-    input.snapshot.status !== "active" ||
-    !Number.isInteger(input.snapshot.version) ||
-    input.snapshot.version < minimumVersion ||
-    typeof input.snapshot.archiveHash !== "string" ||
-    !/^[a-f0-9]{64}$/u.test(input.snapshot.archiveHash)
-  ) {
-    return false;
-  }
-
-  // Historical/non-reset projects retain their existing compatibility path.
-  if (input.project.minimumKnowledgeSnapshotVersion === null) return true;
-
-  if (input.project.knowledgeInputEpochId) {
-    if (
-      input.snapshot.siteOpsKnowledgeInputEpochId !==
-      input.project.knowledgeInputEpochId
-    ) {
-      return false;
-    }
-    if (input.snapshot.sourceBuildId) {
-      return input.provenance.freshBuildIds.has(input.snapshot.sourceBuildId);
-    }
-    if (input.snapshot.sourceTaskId) {
-      return input.provenance.freshImportSnapshotIds.has(input.snapshot.id);
-    }
-    // A direct snapshot has no immutable pre-commit reservation from which to
-    // derive the opaque epoch. It cannot satisfy a 2.9 fresh-upload reset.
-    return false;
-  }
-
-  if (input.snapshot.sourceBuildId) {
-    return input.provenance.freshBuildIds.has(input.snapshot.sourceBuildId);
-  }
-  if (input.snapshot.sourceTaskId) {
-    return input.provenance.freshImportSnapshotIds.has(input.snapshot.id);
-  }
   return (
-    input.snapshot.createdAt.getTime() >=
-    input.project.currentTaskStartedAt.getTime()
+    input.snapshot.status === "active" &&
+    typeof input.snapshot.archiveHash === "string" &&
+    /^[a-f0-9]{64}$/u.test(input.snapshot.archiveHash)
   );
 }
 
-async function loadSiteOpsKnowledgeResetProvenance(
-  executor: any,
-  input: {
-    userId: number;
-    project: Pick<
-      typeof siteProjects.$inferSelect,
-      | "minimumKnowledgeSnapshotVersion"
-      | "knowledgeInputEpochId"
-      | "currentTaskStartedAt"
-    >;
-    snapshots: SiteOpsKnowledgeSnapshotCandidate[];
-  },
-): Promise<SiteOpsKnowledgeResetProvenance> {
-  if (input.project.minimumKnowledgeSnapshotVersion === null) {
-    return { freshBuildIds: new Set(), freshImportSnapshotIds: new Set() };
-  }
-  const sourceBuildIds = [
-    ...new Set(
-      input.snapshots.flatMap((snapshot) =>
-        snapshot.sourceBuildId ? [snapshot.sourceBuildId] : [],
-      ),
-    ),
-  ];
-  const importSnapshotIds = input.snapshots.flatMap((snapshot) =>
-    !snapshot.sourceBuildId && snapshot.sourceTaskId ? [snapshot.id] : [],
-  );
-  const [buildRows, receiptRows] = await Promise.all([
-    sourceBuildIds.length === 0
-      ? Promise.resolve([])
-      : executor
-          .select({
-            id: knowledgeBaseBuilds.id,
-            createdAt: knowledgeBaseBuilds.createdAt,
-            siteOpsKnowledgeInputEpochId:
-              knowledgeBaseBuilds.siteOpsKnowledgeInputEpochId,
-          })
-          .from(knowledgeBaseBuilds)
-          .where(
-            and(
-              eq(knowledgeBaseBuilds.userId, input.userId),
-              inArray(knowledgeBaseBuilds.id, sourceBuildIds),
-              input.project.knowledgeInputEpochId
-                ? eq(
-                    knowledgeBaseBuilds.siteOpsKnowledgeInputEpochId,
-                    input.project.knowledgeInputEpochId,
-                  )
-                : gte(
-                    knowledgeBaseBuilds.createdAt,
-                    input.project.currentTaskStartedAt,
-                  ),
-            ),
-          )
-          .limit(sourceBuildIds.length),
-    importSnapshotIds.length === 0
-      ? Promise.resolve([])
-      : executor
-          .select({
-            snapshotId: knowledgeImportReceipts.snapshotId,
-            createdAt: knowledgeImportReceipts.createdAt,
-            siteOpsKnowledgeInputEpochId:
-              knowledgeImportReceipts.siteOpsKnowledgeInputEpochId,
-          })
-          .from(knowledgeImportReceipts)
-          .where(
-            and(
-              eq(knowledgeImportReceipts.userId, input.userId),
-              eq(knowledgeImportReceipts.status, "completed"),
-              inArray(knowledgeImportReceipts.snapshotId, importSnapshotIds),
-              input.project.knowledgeInputEpochId
-                ? eq(
-                    knowledgeImportReceipts.siteOpsKnowledgeInputEpochId,
-                    input.project.knowledgeInputEpochId,
-                  )
-                : gte(
-                    knowledgeImportReceipts.createdAt,
-                    input.project.currentTaskStartedAt,
-                  ),
-            ),
-          )
-          .limit(importSnapshotIds.length),
-  ]);
-  return {
-    freshBuildIds: new Set(
-      buildRows.flatMap(
-        (row: {
-          id: string | null;
-          createdAt: Date;
-          siteOpsKnowledgeInputEpochId: string | null;
-        }) =>
-          typeof row.id === "string" &&
-          (input.project.knowledgeInputEpochId
-            ? row.siteOpsKnowledgeInputEpochId ===
-              input.project.knowledgeInputEpochId
-            : row.createdAt.getTime() >=
-              input.project.currentTaskStartedAt.getTime())
-            ? [row.id]
-            : [],
-      ),
-    ),
-    freshImportSnapshotIds: new Set(
-      receiptRows.flatMap(
-        (row: {
-          snapshotId: string | null;
-          createdAt: Date;
-          siteOpsKnowledgeInputEpochId: string | null;
-        }) =>
-          typeof row.snapshotId === "string" &&
-          (input.project.knowledgeInputEpochId
-            ? row.siteOpsKnowledgeInputEpochId ===
-              input.project.knowledgeInputEpochId
-            : row.createdAt.getTime() >=
-              input.project.currentTaskStartedAt.getTime())
-            ? [row.snapshotId]
-            : [],
-      ),
-    ),
-  };
+function siteOpsKnowledgeSnapshotAvailable(
+  snapshot: SiteOpsKnowledgeSnapshotCandidate,
+) {
+  return siteOpsKnowledgeSnapshotSelectableForProject({ snapshot });
 }
 
 export async function runSiteOpsObservationQueries(
@@ -2545,10 +2382,6 @@ async function projectObservationOnce(
           and(
             eq(knowledgeBaseSnapshots.userId, input.userId),
             eq(knowledgeBaseSnapshots.status, "active"),
-            gte(
-              knowledgeBaseSnapshots.version,
-              input.project.minimumKnowledgeSnapshotVersion ?? 1,
-            ),
           ),
         )
         .orderBy(desc(knowledgeBaseSnapshots.version))
@@ -2679,8 +2512,8 @@ async function projectObservationOnce(
     timelineOperationRows,
   } = projectSiteOpsCurrentResetCycle({
     successfulResetApplied:
-      (rebuildRequest.resetApplied &&
-        input.project.minimumKnowledgeSnapshotVersion !== null) ||
+      input.project.knowledgeInputEpochId !== null ||
+      rebuildRequest.resetApplied ||
       rawTimelineMessageRows.some(
         (row: { sentAt: Date; metadata: unknown }) =>
           row.sentAt.getTime() ===
@@ -2696,21 +2529,9 @@ async function projectObservationOnce(
     batchRows: rawBatchRows,
     timelineOperationRows: rawTimelineOperationRows,
   });
-  const snapshotProvenance = await loadSiteOpsKnowledgeResetProvenance(
-    executor,
-    {
-      userId: input.userId,
-      project: input.project,
-      snapshots: snapshotRows,
-    },
-  );
   const selectableSnapshotRows = snapshotRows.filter(
     (snapshot: typeof knowledgeBaseSnapshots.$inferSelect) =>
-      siteOpsKnowledgeSnapshotSelectableForProject({
-        snapshot,
-        project: input.project,
-        provenance: snapshotProvenance,
-      }),
+      siteOpsKnowledgeSnapshotAvailable(snapshot),
   );
   const visibleBuildIds = buildRows.map(
     (row: typeof siteBuilds.$inferSelect) => row.id,
@@ -2919,7 +2740,7 @@ async function projectObservationOnce(
       const projectedContent =
         originalPayload?.reset === true &&
         originalPayload?.unpublishCompleted === true
-          ? "旧官网已下线，官网重置已完成；旧知识库版本不会复用。请全新上传并发布知识库后再开始建站。"
+          ? "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可创建全新官网任务。"
           : row.content;
       return [
         {
@@ -4564,10 +4385,6 @@ async function handleSelectSnapshot(
       and(
         eq(knowledgeBaseSnapshots.userId, input.actor.id),
         eq(knowledgeBaseSnapshots.status, "active"),
-        gte(
-          knowledgeBaseSnapshots.version,
-          input.project.minimumKnowledgeSnapshotVersion ?? 1,
-        ),
       ),
     )
     .orderBy(
@@ -4577,25 +4394,14 @@ async function handleSelectSnapshot(
     )
     .limit(200)
     .for("update");
-  const snapshotProvenance = await loadSiteOpsKnowledgeResetProvenance(tx, {
-    userId: input.actor.id,
-    project: input.project,
-    snapshots: rows,
-  });
   const snapshot = rows.find(
     (row: typeof knowledgeBaseSnapshots.$inferSelect) =>
-      siteOpsKnowledgeSnapshotSelectableForProject({
-        snapshot: row,
-        project: input.project,
-        provenance: snapshotProvenance,
-      }),
+      siteOpsKnowledgeSnapshotAvailable(row),
   );
   if (!snapshot) {
     throw new SiteOpsServiceError(
       "NOT_FOUND",
-      input.project.minimumKnowledgeSnapshotVersion
-        ? "官网重置后必须重新上传并发布一份新知识库，请完成后再开始建站。"
-        : "当前账号还没有可用于建站的已发布知识库，请先完成知识库后重试。",
+      "当前账号还没有可用于建站的已发布知识库",
       404,
     );
   }
@@ -5613,11 +5419,7 @@ async function selectVisualSample(
     buildId,
     provider: "manus",
   });
-  if (
-    parentBuildId === null &&
-    input.rebuildRequest.resetApplied &&
-    input.project.minimumKnowledgeSnapshotVersion !== null
-  ) {
+  if (parentBuildId === null && input.project.knowledgeInputEpochId !== null) {
     const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
     console.info("[siteops] fresh_root_created", {
       event: "siteops_fresh_root_created",

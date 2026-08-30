@@ -513,10 +513,7 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByText("批准后，当前线上官网会进入下线流程。"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("旧知识库版本不会作为全新建站的资料来源。"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("批准后必须全新上传并发布知识库，才能开始新任务。"),
+      screen.getByText("当前企业知识库会保留，并作为全新建站的资料来源。"),
     ).toBeInTheDocument();
     expect(
       screen.getByText("旧视觉方案和生成任务不会继续使用。"),
@@ -1595,7 +1592,7 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
-  it("blocks a reset task until a newly uploaded knowledge snapshot is published", () => {
+  it("keeps a reset task actionable while the observation projection is empty", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -1624,7 +1621,7 @@ describe("SiteOpsConversationPanel", () => {
 
     expect(
       screen.getByText(
-        "重置后的新任务不得复用旧知识库。请先前往知识库智能体，全新上传并发布知识库；完成后刷新本页。",
+        "FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("知识库 ZIP 版本")).not.toBeInTheDocument();
@@ -1632,14 +1629,19 @@ describe("SiteOpsConversationPanel", () => {
       screen.queryByLabelText("更换知识库 ZIP 版本"),
     ).not.toBeInTheDocument();
     const startButton = screen.getByRole("button", {
-      name: "等待全新知识库发布",
+      name: "从知识库开始建站",
     });
-    expect(startButton).toBeDisabled();
+    expect(startButton).toBeEnabled();
     fireEvent.click(startButton);
-    expect(onAction).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "select_snapshot",
+        input: {},
+      }),
+    );
   });
 
-  it("enables the reset task only after the server projects a new eligible snapshot", async () => {
+  it("starts a reset task from the current server-selected snapshot", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -2173,7 +2175,7 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(screen.getByText(/本次没有生成可安全展示的版本/u)).toHaveTextContent(
-      "批准后需全新上传并发布知识库",
+      "可从当前企业知识库重新开始建站",
     );
     expect(screen.queryByRole("button", { name: "继续生成官网" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重置建站流程" })).toBeNull();
@@ -2529,7 +2531,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeEnabled();
     expect(
       screen.queryByRole("button", {
-        name: "重置已批准，等待全新知识库",
+        name: "重置已批准，可从当前知识库重新开始",
       }),
     ).toBeNull();
   });
@@ -2585,7 +2587,7 @@ describe("SiteOpsConversationPanel", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "重置已批准，等待全新知识库",
+        name: "重置已批准，可从当前知识库重新开始",
       }),
     ).toBeEnabled();
     expect(screen.queryByText("重置申请处理中")).not.toBeInTheDocument();
